@@ -382,8 +382,10 @@ pipeline, not a scheduler, and there are no events or blocked tasks. `examples/p
 
 Floating point sums over large tables can differ in their last digits between runs, as they do in C++. Groups come out
 in another order, which SQL allows, and so do the matches of a key in the build side of a join, as threads add their
-rows in the order they finish. Not ported: cross products, AsOf, IEJoin and the other special joins on threads, sort
-and window on threads, parallel CSV and `InterruptState`.
+rows in the order they finish. The piecewise merge, IE and nested loop joins are that join with another lookup, so they
+probe on threads too, with the build side sorted once instead of the sorted runs of both sides that C++ merges. Not
+ported: cross products, AsOf and the other special joins on threads, sort and window on threads, parallel CSV and
+`InterruptState`.
 
 ### Spilling
 

@@ -20,13 +20,40 @@ pub enum VariantNode {
     Array(Vec<VariantNode>),
 }
 
+/// Dropping a deeply nested value one level at a time, as the drop glue's recursion would overflow
+/// the stack.
+impl Drop for VariantNode {
+    fn drop(&mut self) {
+        let mut pending: Vec<VariantNode> = match self {
+            Self::Object(children) if children.iter().any(|(_, c)| c.is_nested()) => {
+                std::mem::take(children).into_iter().map(|(_, c)| c).collect()
+            }
+            Self::Array(items) if items.iter().any(VariantNode::is_nested) => std::mem::take(items),
+            _ => return,
+        };
+        while let Some(mut node) = pending.pop() {
+            match &mut node {
+                Self::Object(children) => pending.extend(std::mem::take(children).into_iter().map(|(_, c)| c)),
+                Self::Array(items) => pending.append(items),
+                _ => {}
+            }
+        }
+    }
+}
+
+impl VariantNode {
+    fn is_nested(&self) -> bool {
+        matches!(self, Self::Object(_) | Self::Array(_))
+    }
+}
+
 const NULL_TAG: u8 = 0;
 const OBJECT_TAG: u8 = 1;
 const ARRAY_TAG: u8 = 2;
 const SCALAR_TAG: u8 = 3;
 
 /// The scalar types a VARIANT holds, by the code they are stored with. DECIMAL has its own code.
-const SCALAR_TYPES: [LogicalTypeId; 29] = {
+const SCALAR_TYPES: [LogicalTypeId; 30] = {
     use LogicalTypeId::*;
     [
         Boolean,
@@ -58,6 +85,8 @@ const SCALAR_TYPES: [LogicalTypeId; 29] = {
         Interval,
         Bignum,
         Bit,
+        // `VariantLogicalType::GEOMETRY`: the geometry's blob
+        Geometry,
     ]
 };
 const DECIMAL_CODE: u8 = 255;
@@ -65,28 +94,37 @@ const DECIMAL_CODE: u8 = 255;
 impl VariantNode {
     /// `ConvertToVariant`.
     pub fn from_value(value: &Value) -> Result<Self> {
+        Self::from_value_with(value, &|_| None)
+    }
+
+    /// `from_value`, where `leaf` converts the values it knows (a JSON, which is parsed) itself.
+    pub fn from_value_with(value: &Value, leaf: &dyn Fn(&Value) -> Option<Result<Self>>) -> Result<Self> {
         if value.is_null() {
             return Ok(Self::Null);
         }
+        if let Some(node) = leaf(value) {
+            return node;
+        }
+        let from_value = |v: &Value| Self::from_value_with(v, leaf);
         let ty = value.logical_type();
         Ok(match (ty.id(), value.data()) {
             (LogicalTypeId::Variant, ValueData::Bytes(bytes)) => Self::decode(bytes)?,
             (LogicalTypeId::Union, ValueData::Struct(fields)) => match fields[0].as_i128() {
-                Some(tag) => Self::from_value(&fields[tag as usize + 1])?,
+                Some(tag) => from_value(&fields[tag as usize + 1])?,
                 None => Self::Null,
             },
             (LogicalTypeId::Tuple, ValueData::Struct(fields)) => {
-                Self::Array(fields.iter().map(Self::from_value).collect::<Result<_>>()?)
+                Self::Array(fields.iter().map(from_value).collect::<Result<_>>()?)
             }
             (_, ValueData::Struct(fields)) => {
                 let mut children = Vec::with_capacity(fields.len());
                 for ((name, _), field) in ty.struct_children().iter().zip(fields) {
-                    children.push((name.clone(), Self::from_value(field)?));
+                    children.push((name.clone(), from_value(field)?));
                 }
                 children.sort_by(|a, b| a.0.cmp(&b.0));
                 Self::Object(children)
             }
-            (_, ValueData::List(items)) => Self::Array(items.iter().map(Self::from_value).collect::<Result<_>>()?),
+            (_, ValueData::List(items)) => Self::Array(items.iter().map(from_value).collect::<Result<_>>()?),
             (LogicalTypeId::Enum, _) => Self::Scalar(Value::varchar(value.try_to_string()?)),
             _ => Self::Scalar(value.clone()),
         })
@@ -148,6 +186,18 @@ impl VariantNode {
 
     /// `CAST(variant AS VARCHAR)`.
     pub fn render(&self) -> Result<String> {
+        self.render_at(0)
+    }
+
+    /// `VariantVisitor::CheckDepth`: a value this deep is refused.
+    fn render_at(&self, depth: usize) -> Result<String> {
+        const MAX_RECURSION_DEPTH: usize = 128;
+        if depth >= MAX_RECURSION_DEPTH {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!("VARIANT exceeds maximum recursion depth of {MAX_RECURSION_DEPTH}"),
+            ));
+        }
         match self {
             Self::Null => Ok("NULL".to_string()),
             Self::Scalar(value) => value.try_to_string(),
@@ -157,13 +207,16 @@ impl VariantNode {
                     entries.push(format!(
                         "{}: {}",
                         escape_nested_string(key, true),
-                        child.render_child()?
+                        child.render_child_at(depth + 1)?
                     ));
                 }
                 Ok(format!("{{{}}}", entries.join(", ")))
             }
             Self::Array(items) => {
-                let items = items.iter().map(Self::render_child).collect::<Result<Vec<_>>>()?;
+                let items = items
+                    .iter()
+                    .map(|item| item.render_child_at(depth + 1))
+                    .collect::<Result<Vec<_>>>()?;
                 Ok(format!("[{}]", items.join(", ")))
             }
         }
@@ -171,9 +224,13 @@ impl VariantNode {
 
     /// `render` inside of a nested value: strings are escaped where they need it.
     pub fn render_child(&self) -> Result<String> {
+        self.render_child_at(0)
+    }
+
+    fn render_child_at(&self, depth: usize) -> Result<String> {
         match self {
-            Self::Scalar(value) => Ok(escape_nested_string(&value.try_to_string()?, false)),
-            other => other.render(),
+            Self::Scalar(value) if depth < 128 => Ok(escape_nested_string(&value.try_to_string()?, false)),
+            other => other.render_at(depth),
         }
     }
 
@@ -183,24 +240,43 @@ impl VariantNode {
         out
     }
 
+    /// The values in order, nested ones from a stack of their own rather than by recursion.
     fn write(&self, out: &mut Vec<u8>) {
+        enum Next<'a> {
+            Node(&'a VariantNode),
+            Key(&'a str),
+        }
+        let write_len = |out: &mut Vec<u8>, length: usize| out.extend_from_slice(&(length as u32).to_le_bytes());
+        let mut pending = vec![Next::Node(self)];
+        while let Some(next) = pending.pop() {
+            match next {
+                Next::Key(key) => {
+                    write_len(out, key.len());
+                    out.extend_from_slice(key.as_bytes());
+                }
+                Next::Node(Self::Object(children)) => {
+                    out.push(OBJECT_TAG);
+                    write_len(out, children.len());
+                    for (key, child) in children.iter().rev() {
+                        pending.push(Next::Node(child));
+                        pending.push(Next::Key(key));
+                    }
+                }
+                Next::Node(Self::Array(items)) => {
+                    out.push(ARRAY_TAG);
+                    write_len(out, items.len());
+                    pending.extend(items.iter().rev().map(Next::Node));
+                }
+                Next::Node(other) => other.write_scalar(out),
+            }
+        }
+    }
+
+    fn write_scalar(&self, out: &mut Vec<u8>) {
         let write_len = |out: &mut Vec<u8>, length: usize| out.extend_from_slice(&(length as u32).to_le_bytes());
         match self {
             Self::Null => out.push(NULL_TAG),
-            Self::Object(children) => {
-                out.push(OBJECT_TAG);
-                write_len(out, children.len());
-                for (key, child) in children {
-                    write_len(out, key.len());
-                    out.extend_from_slice(key.as_bytes());
-                    child.write(out);
-                }
-            }
-            Self::Array(items) => {
-                out.push(ARRAY_TAG);
-                write_len(out, items.len());
-                items.iter().for_each(|item| item.write(out));
-            }
+            Self::Object(_) | Self::Array(_) => unreachable!("written by write"),
             Self::Scalar(value) => {
                 out.push(SCALAR_TAG);
                 let ty = value.logical_type();
@@ -275,28 +351,63 @@ impl Reader<'_> {
         Ok(u32::from_le_bytes(self.take::<4>()?) as usize)
     }
 
+    /// One value, its nested ones read with a stack of their own rather than by recursion.
     fn node(&mut self) -> Result<VariantNode> {
-        let [tag] = self.take::<1>()?;
-        match tag {
-            NULL_TAG => Ok(VariantNode::Null),
-            OBJECT_TAG => {
-                let size = self.length()?;
-                let mut children = Vec::with_capacity(size);
-                for _ in 0..size {
-                    let length = self.length()?;
-                    let key = String::from_utf8_lossy(self.slice(length)?).into_owned();
-                    children.push((key, self.node()?));
+        // an object or array being read: what it has so far and how many more children it has
+        enum Open {
+            Object(Vec<(String, VariantNode)>, usize, String),
+            Array(Vec<VariantNode>, usize),
+        }
+        let mut open: Vec<Open> = Vec::new();
+        loop {
+            // the key of the next child of an object comes before it
+            if let Some(Open::Object(children, remaining, key)) = open.last_mut()
+                && *remaining > children.len()
+            {
+                let length = self.length()?;
+                *key = String::from_utf8_lossy(self.slice(length)?).into_owned();
+            }
+            let [tag] = self.take::<1>()?;
+            let mut done = match tag {
+                NULL_TAG => VariantNode::Null,
+                OBJECT_TAG => match self.length()? {
+                    0 => VariantNode::Object(Vec::new()),
+                    size => {
+                        open.push(Open::Object(Vec::with_capacity(size.min(1024)), size, String::new()));
+                        continue;
+                    }
+                },
+                ARRAY_TAG => match self.length()? {
+                    0 => VariantNode::Array(Vec::new()),
+                    size => {
+                        open.push(Open::Array(Vec::with_capacity(size.min(1024)), size));
+                        continue;
+                    }
+                },
+                _ => VariantNode::Scalar(self.scalar()?),
+            };
+            // hand the finished value to its parent, closing every parent it completes
+            loop {
+                match open.last_mut() {
+                    None => return Ok(done),
+                    Some(Open::Object(children, size, key)) => {
+                        children.push((std::mem::take(key), done));
+                        if children.len() < *size {
+                            break;
+                        }
+                    }
+                    Some(Open::Array(items, size)) => {
+                        items.push(done);
+                        if items.len() < *size {
+                            break;
+                        }
+                    }
                 }
-                Ok(VariantNode::Object(children))
+                done = match open.pop().expect("checked above") {
+                    Open::Object(children, ..) => VariantNode::Object(children),
+                    Open::Array(items, _) => VariantNode::Array(items),
+                };
             }
-            ARRAY_TAG => {
-                let size = self.length()?;
-                (0..size)
-                    .map(|_| self.node())
-                    .collect::<Result<Vec<_>>>()
-                    .map(VariantNode::Array)
-            }
-            _ => self.scalar().map(VariantNode::Scalar),
         }
     }
 
@@ -347,6 +458,7 @@ mod physical_type {
     pub const DECIMAL: u8 = 15;
     pub const OBJECT: u8 = 29;
     pub const ARRAY: u8 = 30;
+    pub const GEOMETRY: u8 = 33;
 }
 
 /// The scalar types of `VariantLogicalType`, by their tag; `None` where the tag is no plain scalar.
@@ -669,67 +781,123 @@ impl VariantNode {
 
     /// The row of [`unshredded_type`] that DuckDB stores this value as. A NULL at the top is a NULL row.
     pub fn to_unshredded(&self) -> Result<Value> {
-        let ty = unshredded_type();
         if *self == Self::Null {
-            return Ok(Value::null(ty));
+            return Ok(Value::null(unshredded_type()));
         }
-        let mut keys = std::collections::BTreeSet::new();
-        self.collect_keys(&mut keys);
-        let mut physical = Physical {
-            keys: keys.into_iter().collect(),
-            ..Physical::default()
-        };
-        physical.emit(self)?;
-        let fields = ty.struct_children();
-        let child_of = |at: usize| fields[at].1.child_type().cloned().expect("a list");
-        let keys = Value::list(
-            LogicalType::VARCHAR,
-            physical.keys.iter().map(|k| Value::varchar(k.as_str())).collect(),
-        )?;
-        let children_type = child_of(1);
-        let children = physical
-            .children
-            .iter()
-            .map(|(key, value)| {
-                Value::new(
-                    children_type.clone(),
-                    ValueData::Struct(vec![
-                        key.map_or_else(|| Value::null(LogicalType::UINTEGER), Value::uinteger),
-                        Value::uinteger(*value),
-                    ]),
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let values_type = child_of(2);
-        let values = physical
-            .values
-            .iter()
-            .map(|(tag, offset)| {
-                Value::new(
-                    values_type.clone(),
-                    ValueData::Struct(vec![Value::utinyint(*tag), Value::uinteger(*offset)]),
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Value::new(
-            ty,
-            ValueData::Struct(vec![
-                keys,
-                Value::list(children_type, children)?,
-                Value::list(values_type, values)?,
-                Value::blob(physical.data.as_slice()),
-            ]),
-        )
+        Ok(unshredded_row(&[self])?.0)
     }
 
     /// A row of [`unshredded_type`] back as a value; a NULL row is a NULL.
     pub fn from_unshredded(row: &Value) -> Result<Self> {
+        match UnshreddedRow::parse(row)? {
+            Some(row) if !row.physical.values.is_empty() => row.node(0),
+            _ => Ok(Self::Null),
+        }
+    }
+
+    /// `VariantLogicalType`: the tag DuckDB stores the value with.
+    pub fn type_code(&self) -> u8 {
+        match self {
+            Self::Null => physical_type::NULL,
+            Self::Object(_) => physical_type::OBJECT,
+            Self::Array(_) => physical_type::ARRAY,
+            Self::Scalar(value) => match value.logical_type().id() {
+                LogicalTypeId::Boolean if *value == Value::boolean(true) => physical_type::BOOL_TRUE,
+                LogicalTypeId::Boolean => physical_type::BOOL_FALSE,
+                LogicalTypeId::Decimal => physical_type::DECIMAL,
+                LogicalTypeId::Geometry => physical_type::GEOMETRY,
+                id => tag_of_scalar_type(id).unwrap_or(physical_type::NULL),
+            },
+        }
+    }
+
+    /// How many entries of the `values` list the value takes: one for it and each value inside.
+    pub fn value_count(&self) -> u32 {
+        match self {
+            Self::Object(entries) => 1 + entries.iter().map(|(_, child)| child.value_count()).sum::<u32>(),
+            Self::Array(items) => 1 + items.iter().map(VariantNode::value_count).sum::<u32>(),
+            _ => 1,
+        }
+    }
+}
+
+/// The row of [`unshredded_type`] holding several values one after the other (`VariantNormalizer`), as the
+/// leftovers of a shredded row are stored, and where in `values` each of them starts. No values is a NULL row.
+pub fn unshredded_row(roots: &[&VariantNode]) -> Result<(Value, Vec<u32>)> {
+    let ty = unshredded_type();
+    if roots.is_empty() {
+        return Ok((Value::null(ty), Vec::new()));
+    }
+    let mut keys = std::collections::BTreeSet::new();
+    for root in roots {
+        root.collect_keys(&mut keys);
+    }
+    let mut physical = Physical {
+        keys: keys.into_iter().collect(),
+        ..Physical::default()
+    };
+    let mut starts = Vec::with_capacity(roots.len());
+    for root in roots {
+        starts.push(physical.emit(root)?);
+    }
+    let fields = ty.struct_children();
+    let child_of = |at: usize| fields[at].1.child_type().cloned().expect("a list");
+    let keys = Value::list(
+        LogicalType::VARCHAR,
+        physical.keys.iter().map(|k| Value::varchar(k.as_str())).collect(),
+    )?;
+    let children_type = child_of(1);
+    let children = physical
+        .children
+        .iter()
+        .map(|(key, value)| {
+            Value::new(
+                children_type.clone(),
+                ValueData::Struct(vec![
+                    key.map_or_else(|| Value::null(LogicalType::UINTEGER), Value::uinteger),
+                    Value::uinteger(*value),
+                ]),
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let values_type = child_of(2);
+    let values = physical
+        .values
+        .iter()
+        .map(|(tag, offset)| {
+            Value::new(
+                values_type.clone(),
+                ValueData::Struct(vec![Value::utinyint(*tag), Value::uinteger(*offset)]),
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let row = Value::new(
+        ty,
+        ValueData::Struct(vec![
+            keys,
+            Value::list(children_type, children)?,
+            Value::list(values_type, values)?,
+            Value::blob(physical.data.as_slice()),
+        ]),
+    )?;
+    Ok((row, starts))
+}
+
+/// A row of [`unshredded_type`], decoded, whose values can be read from any of their entries.
+pub struct UnshreddedRow {
+    physical: Physical,
+}
+
+impl UnshreddedRow {
+    /// `None` for a NULL row.
+    pub fn parse(row: &Value) -> Result<Option<Self>> {
         let ValueData::Struct(fields) = row.data() else {
-            return Ok(Self::Null);
+            return Ok(None);
         };
         let list = |at: usize| -> Result<&[Value]> {
             match fields.get(at).map(Value::data) {
                 Some(ValueData::List(items)) => Ok(items),
+                Some(ValueData::Null) => Ok(&[]),
                 _ => Err(corrupt_variant()),
             }
         };
@@ -752,10 +920,12 @@ impl VariantNode {
                 _ => Vec::new(),
             },
         };
-        if physical.values.is_empty() {
-            return Ok(Self::Null);
-        }
-        physical.node(0, 0)
+        Ok(Some(Self { physical }))
+    }
+
+    /// The value whose entry of `values` is `index`.
+    pub fn node(&self, index: u32) -> Result<VariantNode> {
+        self.physical.node(index, 0)
     }
 }
 

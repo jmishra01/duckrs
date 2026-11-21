@@ -27,7 +27,7 @@
 //! arrives as one piece.
 
 mod json;
-mod unicode;
+use duckrs_common::render_width as unicode;
 
 #[cfg(test)]
 mod tests;

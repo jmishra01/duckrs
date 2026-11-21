@@ -19,6 +19,21 @@ use std::sync::Arc;
 
 /// The `column_ids` entry of a scan for the `rowid` pseudo-column (`COLUMN_IDENTIFIER_ROW_ID`).
 pub const COLUMN_IDENTIFIER_ROW_ID: usize = usize::MAX;
+/// The `column_ids` entry of a scan for the `row_number` virtual column
+/// (`COLUMN_IDENTIFIER_ROW_NUMBER`): the place of a row among the rows of the table, from 1.
+pub const COLUMN_IDENTIFIER_ROW_NUMBER: usize = usize::MAX - 1;
+
+/// A field of a STRUCT or VARIANT column that a scan outputs in place of the column, cast or not.
+#[derive(Debug, Clone)]
+pub struct PushedExtract {
+    /// the names along the path, as `column.a.b` shows it
+    pub names: Vec<String>,
+    /// what gives it from the column, which is `Reference(0)` in it
+    pub expression: crate::planner::expression::BoundExpr,
+    /// of a field of a VARIANT by keys, those keys and what gives it from the field (at `Reference(0)`): the
+    /// cast, if any, which a scan that reads the field from the typed part applies
+    pub variant_path: Option<(Vec<String>, crate::planner::expression::BoundExpr)>,
+}
 
 #[derive(Debug, Clone)]
 pub enum LogicalOperatorKind {
@@ -32,12 +47,20 @@ pub enum LogicalOperatorKind {
         /// `multi_column_filters`: conditions on several of `column_ids`, copies of filters that stay above the
         /// scan, which only tell it which row groups it need not read
         zone_filters: Vec<BoundExpr>,
+        /// `OptionalFilter`s: conditions on one column each that, like `zone_filters`, only skip row
+        /// groups, as the rows are filtered elsewhere (the scan late materialization adds)
+        optional_filters: Vec<BoundExpr>,
         /// `projection_ids`: the positions in `column_ids` that it outputs, without one all of them.
         /// A column keeps its binding either way.
         projection: Option<Vec<usize>>,
         /// `is_index_scan`: the rows that an ART found, by position, which is all that gets read.
         /// The filters still run on them.
         index_rows: Option<Arc<Vec<usize>>>,
+        /// `extra_info.sample_options`: a SYSTEM sample the scan takes (`SamplingPushdown`)
+        sample: Option<TableSample>,
+        /// Per position of `column_ids` (or empty for none), a field of the column that the scan outputs in
+        /// its place (`ColumnIndex::IsPushdownExtract`).
+        extracts: Vec<Option<Arc<PushedExtract>>>,
     },
     /// The `range` and `generate_series` table functions: `count` integers from `start`.
     Range {
@@ -118,6 +141,12 @@ pub enum LogicalOperatorKind {
         aggregates: Vec<BoundAggregate>,
         grouping_sets: Vec<BTreeSet<usize>>,
         grouping_functions: Vec<Vec<usize>>,
+        /// `CanUsePerfectHashAggregate`, which the statistics tell: the groups are integers of so
+        /// small a range that a value's offset from the minimum can index the groups' table
+        perfect_hash: bool,
+        /// `CapGroupedAggregateCardinalityByKeyDomain`, which the statistics tell: at most how many
+        /// combinations of groups there are, from the ranges and types of the groups
+        domain_cap: Option<u64>,
     },
     /// `LogicalOrder`: sorts by the expressions, in order.
     Order { orders: Vec<BoundOrderByNode> },
@@ -140,8 +169,11 @@ pub enum LogicalOperatorKind {
     LimitPercent { percent: f64, offset: u64 },
     /// `LogicalSample`: a random part of the child's rows.
     Sample { options: SampleOptions },
-    /// `LogicalDistinct` (`DISTINCT`, not `DISTINCT ON`): one row per distinct `targets`.
-    Distinct { targets: Vec<BoundExpr> },
+    /// `LogicalDistinct`: one row per distinct `targets`, the first one with DISTINCT ON (`on`).
+    Distinct { targets: Vec<BoundExpr>, on: bool },
+    /// `LogicalSecureView`: the plan of a SECURE VIEW, which it passes on. The optimizer pushes
+    /// nothing into it, so that no expression of the query sees the rows the view hides.
+    SecureView { view_name: String },
     /// `LogicalUnnest`: a row per element of the lists of `expressions`, next to the child's
     /// columns. A list that runs out gives NULL.
     Unnest {
@@ -167,6 +199,8 @@ pub enum LogicalOperatorKind {
     /// `LogicalRecursiveCTE`: the rows of its child, then those of `recursive`, run over and over
     /// on the rows of the last round in `working`, until a round adds nothing.
     RecursiveCte {
+        /// the name of the CTE, for `EXPLAIN`
+        name: String,
         table_index: usize,
         types: Vec<LogicalType>,
         union_all: bool,
@@ -184,6 +218,23 @@ pub enum LogicalOperatorKind {
         table_index: usize,
         types: Vec<LogicalType>,
         working: Arc<Mutex<ColumnDataCollection>>,
+    },
+    /// `LogicalMaterializedCTE`: runs `children[0]` once, into `data`, and is then `children[1]`,
+    /// whose `CteRef`s of `table_index` read those rows.
+    MaterializedCte {
+        name: String,
+        table_index: usize,
+        data: Arc<Mutex<ColumnDataCollection>>,
+        /// `CTE_MATERIALIZE_ALWAYS`: `CTEInlining` must leave it; otherwise `CTE_MATERIALIZE_DEFAULT`
+        always: bool,
+    },
+    /// `LogicalCTERef` of a materialized CTE: the rows of the CTE `cte_index`, from its `data`.
+    CteRef {
+        table_index: usize,
+        cte_index: usize,
+        types: Vec<LogicalType>,
+        names: Vec<String>,
+        data: Arc<Mutex<ColumnDataCollection>>,
     },
     /// `LogicalDelimGet`: the distinct values of the correlated columns of a `DelimJoin` around it.
     DelimGet {
@@ -233,6 +284,8 @@ pub enum LogicalOperatorKind {
         join_type: JoinType,
         conditions: Vec<JoinCondition>,
         predicate: Option<BoundExpr>,
+        /// the operator its comparisons make, which the end of the optimizer picks
+        algorithm: JoinAlgorithm,
     },
     /// `LogicalAsOfJoin`: for each left row, the closest right row with `left op right` among those
     /// with equal `conditions` that `predicate` lets through.
@@ -306,6 +359,21 @@ pub enum LogicalOperatorKind {
     },
 }
 
+/// The physical operator of a join (`PlanComparisonJoin`): a hash join with equalities among its
+/// conditions, a blockwise nested loop join without conditions, and for comparisons the others.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum JoinAlgorithm {
+    /// `PhysicalHashJoin`, or `PhysicalBlockwiseNLJoin` without conditions it can use
+    #[default]
+    Hash,
+    /// `PhysicalNestedLoopJoin`
+    NestedLoop,
+    /// `PhysicalPiecewiseMergeJoin`
+    PiecewiseMerge,
+    /// `PhysicalIEJoin`
+    IeJoin,
+}
+
 /// What a column of a recursive CTE is to its USING KEY.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CteKeyColumn {
@@ -344,17 +412,42 @@ pub struct OnConflict {
     pub condition: Option<BoundExpr>,
 }
 
-/// An equality between the two sides of a join (`JoinCondition`).
+/// A comparison between the two sides of a join (`JoinCondition`): `left comparison right`.
+/// The optimizer only sees equalities; the comparisons of `predicate` that are conditions in C++
+/// join them at the end of it ([`crate::optimizer::range_joins`]).
 #[derive(Debug, Clone)]
 pub struct JoinCondition {
     /// reads the left child
     pub left: BoundExpr,
     /// reads the right child
     pub right: BoundExpr,
-    /// `IS NOT DISTINCT FROM`: NULLs are equal
-    pub null_safe: bool,
+    /// `=`, or `IS NOT DISTINCT FROM`, where NULLs are equal; past the optimizer also the others
+    pub comparison: ComparisonOp,
     /// what the join tells a scan below its left side of its keys on the right
     pub filter: Option<std::sync::Arc<crate::execution::join_filter::JoinFilter>>,
+}
+
+impl JoinCondition {
+    /// `IS NOT DISTINCT FROM`: NULLs are equal.
+    pub fn null_safe(&self) -> bool {
+        self.comparison == ComparisonOp::NotDistinctFrom
+    }
+    /// `=` or `IS NOT DISTINCT FROM`: a key of a hash join.
+    pub fn is_equality(&self) -> bool {
+        matches!(self.comparison, ComparisonOp::Equal | ComparisonOp::NotDistinctFrom)
+    }
+    /// The comparison of the condition for its sides, `IS NOT DISTINCT FROM` if `null_safe`.
+    pub fn equality(null_safe: bool) -> ComparisonOp {
+        if null_safe { ComparisonOp::NotDistinctFrom } else { ComparisonOp::Equal }
+    }
+}
+
+/// A SYSTEM sample of a table scan: whole vectors at `sample_size` percent, or about as many rows
+/// as asked for, at `rate` of them (`SampleOptions` with its `sample_rate`).
+#[derive(Debug, Clone)]
+pub struct TableSample {
+    pub options: SampleOptions,
+    pub rate: f64,
 }
 
 /// An ORDER BY term with its resolved order and NULL order (`BoundOrderByNode`).
@@ -455,18 +548,22 @@ impl LogicalOperator {
                 table,
                 column_ids,
                 projection,
+                extracts,
                 ..
             } => {
-                let type_of = |&i: &usize| {
-                    if i == COLUMN_IDENTIFIER_ROW_ID {
+                let type_of = |p: usize| {
+                    let i = column_ids[p];
+                    if let Some(Some(extract)) = extracts.get(p) {
+                        extract.expression.return_type.clone()
+                    } else if i == COLUMN_IDENTIFIER_ROW_ID || i == COLUMN_IDENTIFIER_ROW_NUMBER {
                         LogicalType::BIGINT
                     } else {
                         table.columns[i].ty.clone()
                     }
                 };
                 match projection {
-                    Some(positions) => positions.iter().map(|&p| type_of(&column_ids[p])).collect(),
-                    None => column_ids.iter().map(type_of).collect(),
+                    Some(positions) => positions.iter().map(|&p| type_of(p)).collect(),
+                    None => (0..column_ids.len()).map(type_of).collect(),
                 }
             }
             LogicalOperatorKind::ColumnSelect { keep } => {
@@ -481,9 +578,9 @@ impl LogicalOperator {
             LogicalOperatorKind::CopyToParquet { options, .. } => options.output.types(),
             LogicalOperatorKind::CopyToFile { options, .. } => options.output.types(),
             LogicalOperatorKind::Range { .. } => vec![LogicalType::BIGINT],
-            LogicalOperatorKind::JsonScan { scan, .. } => scan.output_types(),
+            LogicalOperatorKind::JsonScan { scan, .. } => scan.projected_types(),
             LogicalOperatorKind::ParquetScan { scan, .. } => scan.output_types(),
-            LogicalOperatorKind::CsvScan { scan, .. } => scan.output_types(),
+            LogicalOperatorKind::CsvScan { scan, .. } => scan.projected_types(),
             LogicalOperatorKind::EmptyResult { types, .. } => types.clone(),
             // the dummy scan's single column is never read
             LogicalOperatorKind::DummyScan { .. } => vec![LogicalType::INTEGER],
@@ -513,14 +610,20 @@ impl LogicalOperator {
             | LogicalOperatorKind::Limit { .. }
             | LogicalOperatorKind::Sample { .. }
             | LogicalOperatorKind::LimitPercent { .. }
+            | LogicalOperatorKind::SecureView { .. }
             | LogicalOperatorKind::Distinct { .. } => self.children[0].types(),
             LogicalOperatorKind::Projection { expressions, .. } => {
                 expressions.iter().map(|e| e.return_type.clone()).collect()
             }
+            // and the `rowid` of each row
             LogicalOperatorKind::Delete {
                 table, returning: true, ..
+            } => {
+                let mut types = table.types();
+                types.push(LogicalType::BIGINT);
+                types
             }
-            | LogicalOperatorKind::Insert {
+            LogicalOperatorKind::Insert {
                 table, returning: true, ..
             }
             | LogicalOperatorKind::Update {
@@ -540,7 +643,9 @@ impl LogicalOperator {
             | LogicalOperatorKind::ExceptIntersect { types, .. }
             | LogicalOperatorKind::RecursiveCte { types, .. }
             | LogicalOperatorKind::WorkingTable { types, .. }
+            | LogicalOperatorKind::CteRef { types, .. }
             | LogicalOperatorKind::DelimGet { types, .. } => types.clone(),
+            LogicalOperatorKind::MaterializedCte { .. } => self.children[1].types(),
             LogicalOperatorKind::DelimJoin { mark_index, .. } => {
                 let mut types = self.children[0].types();
                 match mark_index {
@@ -623,9 +728,17 @@ impl LogicalOperator {
             }
             LogicalOperatorKind::ExpressionGet { table_index, types, .. }
             | LogicalOperatorKind::ChunkGet { table_index, types, .. } => numbered(*table_index, types.len()),
-            LogicalOperatorKind::JsonScan { table_index, scan } => numbered(*table_index, scan.output_types().len()),
             LogicalOperatorKind::ParquetScan { table_index, scan } => numbered(*table_index, scan.output_types().len()),
-            LogicalOperatorKind::CsvScan { table_index, scan } => numbered(*table_index, scan.output_types().len()),
+            LogicalOperatorKind::JsonScan { table_index, scan } => scan
+                .projected_columns()
+                .into_iter()
+                .map(|column| ColumnBinding::new(*table_index, column))
+                .collect(),
+            LogicalOperatorKind::CsvScan { table_index, scan } => scan
+                .projected_columns()
+                .into_iter()
+                .map(|column| ColumnBinding::new(*table_index, column))
+                .collect(),
             LogicalOperatorKind::MatchRecognize { table_index, data } => {
                 numbered(*table_index, data.output_types.len())
             }
@@ -654,6 +767,7 @@ impl LogicalOperator {
             | LogicalOperatorKind::Limit { .. }
             | LogicalOperatorKind::Sample { .. }
             | LogicalOperatorKind::LimitPercent { .. }
+            | LogicalOperatorKind::SecureView { .. }
             | LogicalOperatorKind::Distinct { .. } => self.children[0].column_bindings(),
             LogicalOperatorKind::Projection {
                 table_index,
@@ -663,8 +777,8 @@ impl LogicalOperator {
                 table,
                 table_index,
                 returning,
-            }
-            | LogicalOperatorKind::Insert {
+            } => numbered(*table_index, if *returning { table.columns.len() + 1 } else { 1 }),
+            LogicalOperatorKind::Insert {
                 table,
                 table_index,
                 returning,
@@ -686,7 +800,9 @@ impl LogicalOperator {
             | LogicalOperatorKind::ExceptIntersect { table_index, types, .. }
             | LogicalOperatorKind::RecursiveCte { table_index, types, .. }
             | LogicalOperatorKind::WorkingTable { table_index, types, .. }
+            | LogicalOperatorKind::CteRef { table_index, types, .. }
             | LogicalOperatorKind::DelimGet { table_index, types, .. } => numbered(*table_index, types.len()),
+            LogicalOperatorKind::MaterializedCte { .. } => self.children[1].column_bindings(),
             LogicalOperatorKind::DelimJoin { mark_index, .. } => {
                 let mut bindings = self.children[0].column_bindings();
                 match mark_index {
@@ -735,8 +851,15 @@ impl LogicalOperator {
             }
             LogicalOperatorKind::MarkJoin { predicate, .. } => predicate.iter_mut().collect(),
             LogicalOperatorKind::Get {
-                filters, zone_filters, ..
-            } => filters.iter_mut().chain(zone_filters.iter_mut()).collect(),
+                filters,
+                zone_filters,
+                optional_filters,
+                ..
+            } => filters
+                .iter_mut()
+                .chain(zone_filters.iter_mut())
+                .chain(optional_filters.iter_mut())
+                .collect(),
             LogicalOperatorKind::ParquetScan { scan, .. } => {
                 std::sync::Arc::make_mut(scan).filters.iter_mut().collect()
             }
@@ -757,7 +880,7 @@ impl LogicalOperator {
             LogicalOperatorKind::Filter { expressions }
             | LogicalOperatorKind::Projection { expressions, .. }
             | LogicalOperatorKind::Unnest { expressions, .. }
-            | LogicalOperatorKind::Distinct { targets: expressions } => expressions.iter_mut().collect(),
+            | LogicalOperatorKind::Distinct { targets: expressions, .. } => expressions.iter_mut().collect(),
             LogicalOperatorKind::LateralJoin {
                 correlated, predicate, ..
             } => correlated.iter_mut().chain(predicate.iter_mut()).collect(),

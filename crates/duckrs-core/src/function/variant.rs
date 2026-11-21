@@ -32,7 +32,11 @@ pub(super) fn to_variant(value: &Value) -> Result<Value> {
     if value.is_null() {
         return Ok(Value::null(variant_type()));
     }
-    Ok(variant_value(&VariantNode::from_value(value)?))
+    // a JSON inside a nested value is parsed, as one at the top is
+    let leaf = |v: &Value| {
+        super::json::is_json_type(v.logical_type()).then(|| super::json::json_text_to_variant(&v.try_to_string()?))
+    };
+    Ok(variant_value(&VariantNode::from_value_with(value, &leaf)?))
 }
 
 fn decode(value: &Value) -> Result<VariantNode> {
@@ -64,11 +68,63 @@ fn expected(kind: &str, node: &VariantNode) -> Failure {
     ))
 }
 
-/// `CastVariant`.
+/// `ValueConverter`: the value a VARIANT holds, as the types it has. An ARRAY of values of different
+/// types is a list of VARIANTs.
+fn node_to_value(node: &VariantNode) -> Value {
+    match node {
+        VariantNode::Null => Value::sql_null(),
+        VariantNode::Scalar(value) => value.clone(),
+        VariantNode::Array(items) => {
+            let values: Vec<Value> = items.iter().map(node_to_value).collect();
+            let same = values
+                .first()
+                .map(Value::logical_type)
+                .filter(|first| values.iter().all(|v| v.logical_type() == *first));
+            match same {
+                Some(child) => {
+                    let ty = LogicalType::list(child.clone());
+                    Value::new(ty, ValueData::List(values)).expect("a list value")
+                }
+                None => {
+                    let items = items.iter().map(variant_value).collect();
+                    Value::new(LogicalType::list(variant_type()), ValueData::List(items)).expect("a list value")
+                }
+            }
+        }
+        VariantNode::Object(children) => Value::struct_value(
+            children
+                .iter()
+                .map(|(name, child)| (name.clone(), node_to_value(child)))
+                .collect(),
+        ),
+    }
+}
+
+/// `CastVariant`, which falls back on casting the value a nested VARIANT holds when it does not have
+/// the shape of the target.
 fn convert(node: &VariantNode, target: &LogicalType) -> Conversion<Value> {
+    use LogicalTypeId as L;
+    match convert_shape(node, target) {
+        Err(Failure::Message(message))
+            if matches!(target.id(), L::Struct | L::Tuple | L::List | L::Array)
+                && !matches!(node, VariantNode::Scalar(_)) =>
+        {
+            match cast_value(&node_to_value(node), target, CastMode::Strict) {
+                Ok(cast) if !cast.is_null() => Ok(cast),
+                _ => Err(Failure::Message(message)),
+            }
+        }
+        other => other,
+    }
+}
+
+fn convert_shape(node: &VariantNode, target: &LogicalType) -> Conversion<Value> {
     use LogicalTypeId as L;
     if matches!(node, VariantNode::Null) {
         return Ok(Value::null(target.clone()));
+    }
+    if target.id() == L::Union {
+        return Err(Failure::Message("Can't convert VARIANT".to_string()));
     }
     // a string can hold the VARCHAR form of a nested value
     if let VariantNode::Scalar(value) = node
@@ -140,8 +196,9 @@ fn convert(node: &VariantNode, target: &LogicalType) -> Conversion<Value> {
                 unreachable!("a list value");
             };
             for (i, item) in items.iter().enumerate() {
+                // a NULL entry has no key
                 let ValueData::Struct(fields) = item.data() else {
-                    return Err(expected("OBJECT", node));
+                    return Err(Failure::Message("Map keys can not be NULL.".to_string()));
                 };
                 if fields[0].is_null() {
                     return Err(Failure::Error(conversion_error(
@@ -184,7 +241,9 @@ pub(super) fn from_variant(value: &Value, target: &LogicalType) -> Result<Value>
     if value.is_null() {
         return Ok(Value::null(target.clone()));
     }
-    match convert(&decode(value)?, target) {
+    let node = decode(value)?;
+    check_depth(&node)?;
+    match convert(&node, target) {
         Ok(value) => Ok(value),
         Err(Failure::Error(error)) => Err(error),
         Err(Failure::Message(message)) => Err(conversion_error(format!("{message} to '{target}'"))),
@@ -226,18 +285,19 @@ fn variant_typeof(args: &DataChunk, result: &mut Vector) -> Result<()> {
 }
 
 /// One step of `variant_extract`: a child, or nothing.
-fn extract_child(node: &VariantNode, key: &Value) -> Option<VariantNode> {
-    match (node, key.data()) {
+/// The child at `key`, moved out of `node` (a clone of a deep child would recurse).
+fn extract_child(node: VariantNode, key: &Value) -> Option<VariantNode> {
+    let mut node = node;
+    match (&mut node, key.data()) {
         (VariantNode::Object(children), ValueData::Bytes(key)) => {
             let key = String::from_utf8_lossy(key);
-            children
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case(&key))
-                .map(|(_, c)| c.clone())
+            // object keys are case-sensitive
+            let at = children.iter().position(|(k, _)| *k == key)?;
+            Some(children.swap_remove(at).1)
         }
         (VariantNode::Array(items), _) => {
-            let index = key.as_i128().filter(|i| *i >= 1)?;
-            items.get(index as usize - 1).cloned()
+            let index = key.as_i128().filter(|i| *i >= 1)? as usize;
+            (index <= items.len()).then(|| items.swap_remove(index - 1))
         }
         _ => None,
     }
@@ -248,7 +308,7 @@ fn variant_extract(args: &DataChunk, result: &mut Vector) -> Result<()> {
         if row[0].is_null() || row[1].is_null() {
             return Ok(Value::null(variant_type()));
         }
-        Ok(match extract_child(&decode(&row[0])?, &row[1]) {
+        Ok(match extract_child(decode(&row[0])?, &row[1]) {
             // a NULL inside of a VARIANT is NULL once it is taken out
             Some(VariantNode::Null) | None => Value::null(variant_type()),
             Some(node) => variant_value(&node),
@@ -256,38 +316,42 @@ fn variant_extract(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
-/// `variant_keys`, of the value or of a child: the sorted keys of an object.
+/// `WriteKeysResult`: the keys of an object in lexicographic order, none of anything else.
 fn variant_keys(args: &DataChunk, result: &mut Vector) -> Result<()> {
-    let ty = result.logical_type().clone();
-    row_wise(args, result, |row| {
-        if row[0].is_null() {
-            return Ok(Value::null(ty.clone()));
-        }
-        let mut node = decode(&row[0])?;
-        if let Some(key) = row.get(1)
-            && !key.is_null()
-        {
-            let Some(child) = extract_child(&node, key) else {
-                return Ok(Value::null(ty.clone()));
-            };
-            node = child;
-        }
-        let keys = match node {
-            VariantNode::Object(children) => children.into_iter().map(|(k, _)| Value::varchar(k)).collect(),
-            _ => Vec::new(),
-        };
-        Value::list(LogicalType::VARCHAR, keys)
+    over_paths(args, result, &LogicalType::list(LogicalType::VARCHAR), &|node| {
+        let ty = LogicalType::list(LogicalType::VARCHAR);
+        Ok(match &node {
+            None => Value::null(ty),
+            Some(VariantNode::Object(children)) => {
+                let mut keys: Vec<&String> = children.iter().map(|(k, _)| k).collect();
+                keys.sort();
+                Value::list(LogicalType::VARCHAR, keys.into_iter().map(Value::varchar).collect())?
+            }
+            Some(_) => Value::list(LogicalType::VARCHAR, Vec::new())?,
+        })
+    })
+}
+
+/// `WriteTypeResult`: the `VariantLogicalType` of the value.
+fn variant_type_name(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    over_paths(args, result, &LogicalType::VARCHAR, &|node| {
+        Ok(match &node {
+            None => Value::null(LogicalType::VARCHAR),
+            Some(VariantNode::Scalar(value)) if value.logical_type().id() == LogicalTypeId::Decimal => {
+                Value::varchar("DECIMAL")
+            }
+            Some(node) => Value::varchar(node.type_name()),
+        })
     })
 }
 
 fn variant_array_length(args: &DataChunk, result: &mut Vector) -> Result<()> {
-    row_wise(args, result, |row| {
-        if row[0].is_null() {
-            return Ok(Value::null(LogicalType::BIGINT));
-        }
-        Ok(match decode(&row[0])? {
-            VariantNode::Array(items) => Value::bigint(items.len() as i64),
-            _ => Value::null(LogicalType::BIGINT),
+    // `WriteArrayLengthsResult`: 0 for what is no array, NULL for what is not there
+    over_paths(args, result, &LogicalType::UBIGINT, &|node| {
+        Ok(match &node {
+            Some(VariantNode::Array(items)) => Value::ubigint(items.len() as u64),
+            Some(_) => Value::ubigint(0),
+            None => Value::null(LogicalType::UBIGINT),
         })
     })
 }
@@ -299,19 +363,51 @@ pub fn is_variant_function(name: &str) -> bool {
         "variant_typeof"
             | "variant_extract"
             | "variant_keys"
+            | "variant_type"
+            | "variant_contains"
+            | "variant_normalize"
+            | "variant_comparator"
             | "variant_array_length"
+            | "variant_exists"
+            | "variant_extract_string"
             | "variant_to_parquet_variant"
             | "variant_bytes_to_variant"
     )
 }
 
 /// `variant_extract(child, key)`, which is what `child.key` and `child[key]` bind to.
-pub(super) fn bind_extract(child: BoundExpr, key: BoundExpr) -> Result<BoundExpr> {
+pub(crate) fn bind_extract(child: BoundExpr, key: BoundExpr) -> Result<BoundExpr> {
+    // a foldable key (`1::UINTEGER`) is a constant
+    let key = if key.is_foldable() && !matches!(key.kind, BoundExprKind::Constant(_)) {
+        BoundExpr::constant(crate::execution::expression_executor::evaluate_scalar(&key)?)
+    } else {
+        key
+    };
     let BoundExprKind::Constant(constant) = &key.kind else {
         return Err(binder_error(
             "'variant_extract' expects the second argument to be a constant",
         ));
     };
+    // the overloads take a VARCHAR key or a UINTEGER index, which an integer literal only fits if
+    // its value does
+    let index = constant.logical_type().is_integral()
+        && (constant.is_null()
+            || constant
+                .as_i128()
+                .is_some_and(|i| (0..=i128::from(u32::MAX)).contains(&i)));
+    if !(index
+        || matches!(
+            constant.logical_type().id(),
+            LogicalTypeId::Varchar | LogicalTypeId::StringLiteral | LogicalTypeId::SqlNull
+        ))
+    {
+        return Err(binder_error(format!(
+            "No function matches the given name and argument types 'variant_extract({}, {})'. You might need to \
+             add explicit type casts.",
+            child.return_type,
+            super::binder::expression_return_type(&key)
+        )));
+    }
     if constant.logical_type().is_integral() && constant.as_i128() == Some(0) {
         return Err(binder_error(
             "Extracting index 0 from VARIANT(ARRAY) is invalid, indexes are 1-based",
@@ -335,6 +431,31 @@ pub fn bind_variant_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
     if lower == "variant_to_parquet_variant" || lower == "variant_bytes_to_variant" {
         return bind_parquet_variant_function(&lower, children);
     }
+    if matches!(
+        lower.as_str(),
+        "variant_exists" | "variant_extract_string" | "variant_array_length" | "variant_keys" | "variant_type"
+    ) {
+        return bind_path_function(&lower, children);
+    }
+    if lower == "variant_contains" {
+        let [haystack, needle] = <[BoundExpr; 2]>::try_from(children).map_err(|children| {
+            binder_error(format!(
+                "No function matches the given name and argument types 'variant_contains({})'. You might need to \
+                 add explicit type casts.",
+                children
+                    .iter()
+                    .map(|c| super::binder::expression_return_type(c).to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })?;
+        return Ok(bound_function(
+            &lower,
+            vec![as_variant(haystack), as_variant(needle)],
+            LogicalType::BOOLEAN,
+            variant_contains,
+        ));
+    }
     let mut children = children.into_iter();
     let (Some(child), key, None) = (children.next(), children.next(), children.next()) else {
         return Err(binder_error(format!(
@@ -355,23 +476,163 @@ pub fn bind_variant_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
             LogicalType::BIGINT,
             variant_array_length,
         )),
-        ("variant_keys", None) => Ok(bound_function(
+        ("variant_extract", Some(key)) => bind_extract(child, key),
+        ("variant_normalize", None) => Ok(bound_function(&lower, vec![child], variant_type(), variant_normalize)),
+        ("variant_comparator", None) => Ok(bound_function(
             &lower,
             vec![child],
-            LogicalType::list(LogicalType::VARCHAR),
-            variant_keys,
+            LogicalType::BLOB,
+            variant_comparator,
         )),
-        ("variant_keys", Some(key)) => Ok(bound_function(
-            &lower,
-            vec![child, key],
-            LogicalType::list(LogicalType::VARCHAR),
-            variant_keys,
-        )),
-        ("variant_extract", Some(key)) => bind_extract(child, key),
         _ => Err(binder_error(format!(
             "{lower} expects either one VARIANT column argument, or a VARIANT column and a path"
         ))),
     }
+}
+
+// Ported from duckdb/src/function/scalar/variant/{variant_path_function,variant_bind_utils,variant_exists,
+// variant_extract_string,variant_array_length}.cpp @ rust-port-baseline
+
+/// `VariantPathFunction::CreateFunctionSet` + `VariantBindUtils::VariantPathBind`: a function of a VARIANT at a path
+/// (one key of an object, or the value itself for an empty one), or at each of a list of paths.
+fn bind_path_function(name: &str, children: Vec<BoundExpr>) -> Result<BoundExpr> {
+    let (callback, element): (super::ScalarCallback, LogicalType) = match name {
+        "variant_exists" => (variant_exists, LogicalType::BOOLEAN),
+        "variant_extract_string" => (variant_extract_string, LogicalType::VARCHAR),
+        "variant_keys" => (variant_keys, LogicalType::list(LogicalType::VARCHAR)),
+        "variant_type" => (variant_type_name, LogicalType::VARCHAR),
+        _ => (variant_array_length, LogicalType::UBIGINT),
+    };
+    let mut children = children;
+    // `path_optional`: variant_exists and variant_extract_string need a path
+    if children.len() == 1 && matches!(name, "variant_exists" | "variant_extract_string") {
+        return Err(binder_error(format!(
+            "No function matches the given name and argument types '{name}({})'. You might need to add explicit \
+             type casts.",
+            super::binder::expression_return_type(&children[0])
+        )));
+    }
+    if children.len() != 1 && children.len() != 2 {
+        return Err(binder_error(format!(
+            "{name} expects either one VARIANT column argument, or two VARIANT column and VARCHAR path arguments"
+        )));
+    }
+    children[0] = as_variant(children[0].clone());
+    if children.len() == 1 {
+        return Ok(bound_function(name, children, element, callback));
+    }
+    let path = &children[1];
+    let path_type = path.return_type.clone();
+    // a NULL path makes the function NULL, as any NULL argument does
+    if path_type.id() == LogicalTypeId::SqlNull {
+        return Ok(BoundExpr::constant(Value::null(element)));
+    }
+    let list = match path_type.id() {
+        LogicalTypeId::Varchar => false,
+        LogicalTypeId::List
+            if matches!(
+                path_type.child_type().map(LogicalType::id),
+                Some(LogicalTypeId::Varchar | LogicalTypeId::SqlNull)
+            ) =>
+        {
+            true
+        }
+        // no overload takes it (`FunctionBinder::BindFunction`)
+        _ => {
+            return Err(binder_error(format!(
+                "No function matches the given name and argument types '{name}({}, {})'. You might need to add \
+                 explicit type casts.",
+                children[0].return_type,
+                super::binder::expression_return_type(&children[1])
+            )));
+        }
+    };
+    if !path.is_foldable() {
+        return Err(binder_error(format!("{name} expects the path to be a constant")));
+    }
+    let value = crate::execution::expression_executor::evaluate_scalar(path)?;
+    if value.is_null() {
+        return Err(binder_error(format!("{name} does not accept NULL paths")));
+    }
+    if let ValueData::List(items) = value.data()
+        && items.iter().any(Value::is_null)
+    {
+        return Err(binder_error(format!("'{name}' does not accept NULL paths")));
+    }
+    children[1] = BoundExpr::constant(value);
+    let ty = if list { LogicalType::list(element) } else { element };
+    Ok(bound_function(name, children, ty, callback))
+}
+
+/// `VariantPathFunction::ResolvePath`: the value at a key of an object, if it is there.
+fn resolve_path(node: VariantNode, key: &str) -> Option<VariantNode> {
+    if key.is_empty() {
+        return Some(node);
+    }
+    let mut node = node;
+    match &mut node {
+        VariantNode::Object(children) => std::mem::take(children)
+            .into_iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, child)| child),
+        _ => None,
+    }
+}
+
+/// Each row's value at the path (or the paths) of a path function, as `write` makes it.
+fn over_paths(
+    args: &DataChunk,
+    result: &mut Vector,
+    element: &LogicalType,
+    write: &dyn Fn(Option<VariantNode>) -> Result<Value>,
+) -> Result<()> {
+    let ty = result.logical_type().clone();
+    row_wise(args, result, |row| {
+        if row[0].is_null() {
+            return Ok(Value::null(ty.clone()));
+        }
+        let node = decode(&row[0])?;
+        match row.get(1).map(Value::data) {
+            None => write(Some(node)),
+            Some(ValueData::List(paths)) => {
+                let items = paths
+                    .iter()
+                    .map(|path| write(resolve_path(node.clone(), &path.try_to_string()?)))
+                    .collect::<Result<Vec<_>>>()?;
+                Value::list(element.clone(), items)
+            }
+            Some(_) => write(resolve_path(node, &row[1].try_to_string()?)),
+        }
+    })
+}
+
+fn variant_exists(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    over_paths(args, result, &LogicalType::BOOLEAN, &|node| {
+        Ok(Value::boolean(node.is_some()))
+    })
+}
+
+/// `VariantStringWriter`: a VARCHAR as it is, anything else as its JSON, and a JSON string without its quotes.
+fn variant_extract_string(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    over_paths(args, result, &LogicalType::VARCHAR, &|node| {
+        let node = match node {
+            None | Some(VariantNode::Null) => return Ok(Value::null(LogicalType::VARCHAR)),
+            Some(node) => node,
+        };
+        if let VariantNode::Scalar(value) = &node
+            && value.logical_type().id() == LogicalTypeId::Varchar
+        {
+            return Ok(Value::varchar(value.try_to_string()?));
+        }
+        check_depth(&node)?;
+        let json = super::json::value_to_json(&variant_value(&node))?;
+        if let duckrs_common::json::Json::Str(text) = &json {
+            return Ok(Value::varchar(text.clone()));
+        }
+        let mut out = String::new();
+        json.write(&mut out);
+        Ok(Value::varchar(out))
+    })
 }
 
 /// `variant_to_parquet_variant` and `variant_bytes_to_variant` of the Parquet extension.
@@ -418,5 +679,238 @@ fn variant_bytes_to_variant(args: &DataChunk, result: &mut Vector) -> Result<()>
             VariantNode::Null => Ok(Value::null(variant_type())),
             node => Ok(variant_value(&node)),
         }
+    })
+}
+
+// Ported from duckdb/src/function/scalar/variant/{variant_contains,variant_comparator}.cpp
+
+/// `GetVariantComparisonType` with the value it compares by: numbers by their decimal digits,
+/// reals as doubles with every NaN alike, times and timestamps as nanoseconds.
+#[derive(PartialEq)]
+enum Comparable {
+    Null,
+    Boolean(bool),
+    Number(String),
+    Real(u64),
+    Uuid(i128),
+    Timestamp(i128),
+    TimestampTz(i128),
+    Time(i128),
+    TimeTz(i128),
+    Interval(i128),
+    Varchar(Vec<u8>),
+    Blob(Vec<u8>),
+    Bitstring(Vec<u8>),
+    Geometry(Vec<u8>),
+    Array,
+    Object,
+}
+
+/// A number's digits without trailing zeros after the point (`VariantGetNumberKey`).
+fn number_text(unscaled: String, scale: usize) -> String {
+    let (negative, digits) = match unscaled.strip_prefix('-') {
+        Some(digits) => (true, digits.to_string()),
+        None => (false, unscaled),
+    };
+    let digits = format!("{digits:0>width$}", width = scale + 1);
+    let (whole, fraction) = digits.split_at(digits.len() - scale);
+    let whole = whole.trim_start_matches('0');
+    let fraction = fraction.trim_end_matches('0');
+    let whole = if whole.is_empty() { "0" } else { whole };
+    let text = if fraction.is_empty() {
+        whole.to_string()
+    } else {
+        format!("{whole}.{fraction}")
+    };
+    if negative && text != "0" {
+        format!("-{text}")
+    } else {
+        text
+    }
+}
+
+fn comparable(node: &VariantNode) -> Result<Comparable> {
+    use LogicalTypeId as Id;
+    let value = match node {
+        VariantNode::Null => return Ok(Comparable::Null),
+        VariantNode::Array(_) => return Ok(Comparable::Array),
+        VariantNode::Object(_) => return Ok(Comparable::Object),
+        VariantNode::Scalar(value) => value,
+    };
+    let int = || value.as_i128().unwrap_or(0);
+    let bytes = || match value.data() {
+        ValueData::Bytes(bytes) => bytes.clone(),
+        _ => Vec::new(),
+    };
+    Ok(match value.logical_type().id() {
+        Id::Boolean => Comparable::Boolean(*value == Value::boolean(true)),
+        Id::TinyInt
+        | Id::SmallInt
+        | Id::Integer
+        | Id::BigInt
+        | Id::HugeInt
+        | Id::UTinyInt
+        | Id::USmallInt
+        | Id::UInteger
+        | Id::UBigInt
+        | Id::UHugeInt
+        | Id::Bignum => Comparable::Number(number_text(value.try_to_string()?, 0)),
+        Id::Decimal => {
+            let (_, scale) = value.logical_type().decimal_properties().unwrap_or((18, 0));
+            Comparable::Number(number_text(int().to_string(), usize::from(scale)))
+        }
+        Id::Float | Id::Double => {
+            let real = match value.data() {
+                ValueData::Float(f) => f64::from(*f),
+                ValueData::Double(d) => *d,
+                _ => 0.0,
+            };
+            // `Radix::EncodeDouble`: every NaN alike, and -0.0 is 0.0
+            let real = if real.is_nan() {
+                f64::NAN
+            } else if real == 0.0 {
+                0.0
+            } else {
+                real
+            };
+            Comparable::Real(real.to_bits())
+        }
+        Id::Uuid => Comparable::Uuid(int()),
+        Id::Date => Comparable::Timestamp(int() * 86_400_000_000_000),
+        Id::TimestampSec => Comparable::Timestamp(int() * 1_000_000_000),
+        Id::TimestampMs => Comparable::Timestamp(int() * 1_000_000),
+        Id::Timestamp => Comparable::Timestamp(int() * 1000),
+        Id::TimestampNs => Comparable::Timestamp(int()),
+        Id::TimestampTz => Comparable::TimestampTz(int() * 1000),
+        Id::TimestampTzNs => Comparable::TimestampTz(int()),
+        Id::Time => Comparable::Time(int() * 1000),
+        Id::TimeNs => Comparable::Time(int()),
+        Id::TimeTz => Comparable::TimeTz(int()),
+        Id::Interval => match value.data() {
+            ValueData::Interval(i) => Comparable::Interval(
+                (i128::from(i.months) * 30 + i128::from(i.days)) * 86_400_000_000 + i128::from(i.micros),
+            ),
+            _ => Comparable::Interval(0),
+        },
+        Id::Blob => Comparable::Blob(bytes()),
+        Id::Bit => Comparable::Bitstring(bytes()),
+        Id::Geometry => Comparable::Geometry(bytes()),
+        _ => Comparable::Varchar(bytes()),
+    })
+}
+
+/// `IsEqual`: a needle's array items and object entries each have to be somewhere in the haystack's.
+fn contains_equal(haystack: &VariantNode, needle: &VariantNode) -> Result<bool> {
+    let category = comparable(haystack)?;
+    let needle_category = comparable(needle)?;
+    match (haystack, needle) {
+        (VariantNode::Array(hay), VariantNode::Array(items)) => {
+            for item in items {
+                let mut found = false;
+                for candidate in hay {
+                    if contains_equal(candidate, item)? {
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        (VariantNode::Object(hay), VariantNode::Object(entries)) => {
+            for (key, item) in entries {
+                let mut found = false;
+                for (candidate_key, candidate) in hay {
+                    if candidate_key == key && contains_equal(candidate, item)? {
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        _ => Ok(category == needle_category),
+    }
+}
+
+/// `RecursiveHaystackWalk`
+fn haystack_walk(haystack: &VariantNode, needle: &VariantNode) -> Result<bool> {
+    if contains_equal(haystack, needle)? {
+        return Ok(true);
+    }
+    match haystack {
+        VariantNode::Array(items) => {
+            for item in items {
+                if haystack_walk(item, needle)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        VariantNode::Object(children) => {
+            for (_, child) in children {
+                if haystack_walk(child, needle)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn variant_contains(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    row_wise(args, result, |row| {
+        if row[0].is_null() || row[1].is_null() {
+            return Ok(Value::null(LogicalType::BOOLEAN));
+        }
+        Ok(Value::boolean(haystack_walk(&decode(&row[0])?, &decode(&row[1])?)?))
+    })
+}
+
+/// `VariantNormalizer::Normalize`: the value again, with its objects' keys in order (which a decoded
+/// object already has), after `VariantVisitor::CheckDepth`.
+fn variant_normalize(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    row_wise(args, result, |row| {
+        if row[0].is_null() {
+            return Ok(Value::null(variant_type()));
+        }
+        let node = decode(&row[0])?;
+        check_depth(&node)?;
+        Ok(variant_value(&node))
+    })
+}
+
+/// `VariantVisitor::CheckDepth`: a traversal goes at most 128 levels deep.
+fn check_depth(node: &VariantNode) -> Result<()> {
+    let mut stack = vec![(node, 0usize)];
+    while let Some((node, depth)) = stack.pop() {
+        if depth >= 128 {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "VARIANT exceeds maximum recursion depth of 128",
+            ));
+        }
+        match node {
+            VariantNode::Array(items) => stack.extend(items.iter().map(|item| (item, depth + 1))),
+            VariantNode::Object(children) => stack.extend(children.iter().map(|(_, child)| (child, depth + 1))),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// `VariantComparatorFunction`: a BLOB that orders as the VARIANT does.
+fn variant_comparator(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    row_wise(args, result, |row| match row[0].data() {
+        ValueData::Bytes(bytes) if !row[0].is_null() => {
+            Ok(Value::blob(duckrs_common::sort_key::variant_comparator_key(bytes)?))
+        }
+        _ => Ok(Value::null(LogicalType::BLOB)),
     })
 }

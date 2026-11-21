@@ -208,6 +208,10 @@ pub struct Transformer<'g> {
     cte_stack: Vec<CteMap>,
     /// `max_expression_depth`: how deep expression trees may nest.
     pub max_expression_depth: usize,
+    /// `ParserOptions::integer_division`
+    pub integer_division: bool,
+    /// `regex_match_operator_semantics = full`: the regex operators match the whole string
+    pub regex_full_match: bool,
     /// An upper bound of the depth of the expression being transformed (`expression_depth`).
     expression_depth: usize,
     /// Where the stack was when the statement's transform started; deep trees stop before
@@ -227,6 +231,8 @@ impl<'g> Transformer<'g> {
             pivot_entries: Vec::new(),
             cte_stack: Vec::new(),
             max_expression_depth: DEFAULT_MAX_EXPRESSION_DEPTH,
+            integer_division: false,
+            regex_full_match: false,
             expression_depth: 0,
             stack_base: crate::matcher::stack_position(),
         }
@@ -517,7 +523,7 @@ impl<'g> Transformer<'g> {
                 for tail in self.subs(node, "OtherOperatorTail") {
                     tails.push(self.other_operator_tail(tail)?);
                 }
-                apply_other_operators(expr, tails)
+                apply_other_operators(expr, tails, self.regex_full_match)
             }
             "BitwiseExpression" => self.binary_chain(node, "TildeExpression", "BitwiseExpressionTail", "BitOperator"),
             "AdditiveExpression" => {
@@ -800,7 +806,11 @@ impl<'g> Transformer<'g> {
             _ => "CollateExpression",
         };
         for t in self.subs(node, tail) {
-            let op = Self::text(self.req(t, op_rule)?);
+            let mut op = Self::text(self.req(t, op_rule)?);
+            // `TransformMultiplicativeExpression`: with `integer_division`, `/` is `//`
+            if self.integer_division && op == "/" {
+                op = "//".to_string();
+            }
             let right = self.expr(self.req(t, operand)?)?;
             expr = FunctionExpr::operator(op, vec![expr, right]).into();
         }
@@ -925,7 +935,7 @@ impl<'g> Transformer<'g> {
             expr = match tail {
                 IsTail::Test(test) => apply_is_test(expr, test),
                 IsTail::Distinct(op, right) | IsTail::Comparison(op, right) => Expr::comparison(op, expr, right),
-                IsTail::Other(op, right) => apply_other_operators(expr, vec![(op, right)])?,
+                IsTail::Other(op, right) => apply_other_operators(expr, vec![(op, right)], self.regex_full_match)?,
                 IsTail::Cast(target) => Expr::cast(expr, target),
             };
             previous = kind;
@@ -934,6 +944,14 @@ impl<'g> Transformer<'g> {
     }
 
     fn between_in_like(&mut self, node: &ParseNode) -> Result<Expr> {
+        // `TransformBetweenInLikeExpression`: each IN and each cast after it is a level
+        let predicates: usize = self
+            .subs(node, "InPredicate")
+            .iter()
+            .map(|predicate| 1 + self.subs(predicate, "CastOperator").len())
+            .sum::<usize>()
+            + usize::from(self.sub(node, "BetweenLikeOp").is_some());
+        self.stack_check(predicates)?;
         let mut expr = self.expr(self.req(node, "OtherOperatorExpression")?)?;
         for predicate in self.subs(node, "InPredicate") {
             let negated = self.has(predicate, "NOT");
@@ -998,17 +1016,19 @@ impl<'g> Transformer<'g> {
     }
 
     fn like_clause(&mut self, node: &ParseNode) -> Result<Expr> {
+        // `RegexMatchOperatorFunctionName`
+        let regex = if self.regex_full_match { "regexp_full_match" } else { REGEX_MATCH_FUNCTION };
         let mut variation = match self.name(self.alt(self.req(node, "LikeVariations")?)?) {
             "LikeToken" => "~~".to_string(),
             "ILikeToken" => "~~*".to_string(),
             "GlobToken" => "~~~".to_string(),
             "SimilarToToken" => "regexp_full_match".to_string(),
-            "RegexMatchToken" => REGEX_MATCH_FUNCTION.to_string(),
-            "RegexInsensitiveMatchToken" => format!("{REGEX_MATCH_FUNCTION}__case_insensitive"),
+            "RegexMatchToken" => regex.to_string(),
+            "RegexInsensitiveMatchToken" => format!("{regex}__case_insensitive"),
             "NotILikeOp" => "!~~*".to_string(),
             "NotLikeOp" => "!~~".to_string(),
-            "NotRegexInsensitiveMatchOp" => format!("!{REGEX_MATCH_FUNCTION}__case_insensitive"),
-            _ => format!("!{REGEX_MATCH_FUNCTION}"),
+            "NotRegexInsensitiveMatchOp" => format!("!{regex}__case_insensitive"),
+            _ => format!("!{regex}"),
         };
         let case_insensitive = match variation.strip_suffix("__case_insensitive") {
             Some(base) => {
@@ -1385,13 +1405,14 @@ impl<'g> Transformer<'g> {
             }
             star.relation_name = names[0].clone();
         }
+        // `QualifiedColumnEquality`: a prefix comparison, "tbl.i" being the same as "i" but not as "tbl2.i"
         let same = |a: &QualifiedColumnName, b: &QualifiedColumnName| {
             a.column.eq_ignore_ascii_case(&b.column)
-                && a.qualification.len() == b.qualification.len()
                 && a.qualification
                     .iter()
-                    .zip(&b.qualification)
-                    .all(|(x, y)| x.eq_ignore_ascii_case(y))
+                    .rev()
+                    .zip(b.qualification.iter().rev())
+                    .all(|(x, y)| x.is_empty() || y.is_empty() || x.eq_ignore_ascii_case(y))
         };
         if let Some(exclude) = self.sub(node, "ExcludeList") {
             let names = self.alt(self.req(exclude, "ExcludeNames")?)?;
@@ -1965,7 +1986,7 @@ impl<'g> Transformer<'g> {
             Some(n) => Ok(Some(n)),
             None => Err(Error::new(
                 ErrorKind::Binder,
-                format!("Expected an integer as array bound instead of {literal}"),
+                format!("Expected an integer as array bound instead of {}", literal.text),
             )),
         }
     }
@@ -3246,7 +3267,7 @@ fn operator_function(name: &str, children: Vec<Expr>) -> Result<Expr> {
 }
 
 /// `TransformInfixOtherOperatorExpression`.
-fn apply_other_operators(mut expr: Expr, tails: Vec<(ParsedOperator, Expr)>) -> Result<Expr> {
+fn apply_other_operators(mut expr: Expr, tails: Vec<(ParsedOperator, Expr)>, regex_full_match: bool) -> Result<Expr> {
     for (op, right) in tails {
         let Some(is_any) = op.any_all else {
             expr = operator_function(&op.name, vec![expr, right])?;
@@ -3273,7 +3294,7 @@ fn apply_other_operators(mut expr: Expr, tails: Vec<(ParsedOperator, Expr)>) -> 
             _ => None,
         };
         if let Some((negated, case_insensitive)) = regex {
-            expr = regex_any_all(expr, right, negated, case_insensitive, is_any);
+            expr = regex_any_all(expr, right, negated, case_insensitive, is_any, regex_full_match);
             continue;
         }
         let Some(cmp) = comparison else {
@@ -3301,12 +3322,20 @@ fn apply_other_operators(mut expr: Expr, tails: Vec<(ParsedOperator, Expr)>) -> 
 }
 
 /// `TransformRegexAnyAllList`.
-fn regex_any_all(left: Expr, right: Expr, negated: bool, case_insensitive: bool, is_any: bool) -> Expr {
+fn regex_any_all(
+    left: Expr,
+    right: Expr,
+    negated: bool,
+    case_insensitive: bool,
+    is_any: bool,
+    regex_full_match: bool,
+) -> Expr {
     let mut children = vec![left, Expr::column(vec!["__regex_pattern".into()])];
     if case_insensitive {
         children.push(Expr::constant(Literal::string("i")));
     }
-    let mut regex_match: Expr = FunctionExpr::new(REGEX_MATCH_FUNCTION, children).into();
+    let function = if regex_full_match { "regexp_full_match" } else { REGEX_MATCH_FUNCTION };
+    let mut regex_match: Expr = FunctionExpr::new(function, children).into();
     if negated {
         regex_match = Expr::not_op(regex_match);
     }
@@ -3586,6 +3615,17 @@ fn visit_all_table_ref_exprs_mut(table_ref: &mut TableRef, f: &mut impl FnMut(&m
         TableRefKind::Subquery(select) => visit_all_query_node_exprs_mut(&mut select.node, f),
         TableRefKind::TableFunction { function, .. } => visit_expr_mut(function, f),
         TableRefKind::ExpressionList(rows) => rows.iter_mut().flatten().for_each(|e| visit_expr_mut(e, f)),
+        TableRefKind::Pivot(pivot) => {
+            visit_all_table_ref_exprs_mut(&mut pivot.source, f);
+            pivot.aggregates.iter_mut().for_each(|e| visit_expr_mut(e, f));
+            for column in &mut pivot.pivots {
+                column.pivot_expressions.iter_mut().for_each(|e| visit_expr_mut(e, f));
+                column.entries.iter_mut().filter_map(|e| e.expr.as_mut()).for_each(|e| visit_expr_mut(e, f));
+                if let Some(subquery) = &mut column.subquery {
+                    visit_all_query_node_exprs_mut(subquery, f);
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -3602,6 +3642,17 @@ fn visit_table_ref_exprs_mut(table_ref: &mut TableRef, f: &mut impl FnMut(&mut E
         TableRefKind::Subquery(select) => visit_query_node_exprs_mut(&mut select.node, f),
         TableRefKind::TableFunction { function, .. } => visit_expr_mut(function, f),
         TableRefKind::ExpressionList(rows) => rows.iter_mut().flatten().for_each(|e| visit_expr_mut(e, f)),
+        TableRefKind::Pivot(pivot) => {
+            visit_table_ref_exprs_mut(&mut pivot.source, f);
+            pivot.aggregates.iter_mut().for_each(|e| visit_expr_mut(e, f));
+            for column in &mut pivot.pivots {
+                column.pivot_expressions.iter_mut().for_each(|e| visit_expr_mut(e, f));
+                column.entries.iter_mut().filter_map(|e| e.expr.as_mut()).for_each(|e| visit_expr_mut(e, f));
+                if let Some(subquery) = &mut column.subquery {
+                    visit_query_node_exprs_mut(subquery, f);
+                }
+            }
+        }
         _ => {}
     }
 }

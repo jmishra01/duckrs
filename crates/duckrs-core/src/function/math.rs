@@ -8,7 +8,7 @@ use super::nested::bound_function;
 use super::{ScalarCallback, ScalarFunction, ScalarFunctionSet};
 use crate::execution::expression_executor::evaluate_scalar;
 use crate::planner::expression::BoundExpr;
-use duckrs_common::types::LogicalType;
+use duckrs_common::types::{LogicalType, LogicalTypeId};
 use duckrs_common::value::{Value, ValueData};
 use duckrs_common::vector::{DataChunk, Vector};
 use duckrs_common::{Error, ErrorKind, Result};
@@ -51,7 +51,7 @@ fn binary_set(name: &str, callback: ScalarCallback) -> ScalarFunctionSet {
 fn finite(value: f64) -> Result<f64> {
     if value.is_infinite() {
         return Err(out_of_range(format!(
-            "input value {value} is out of range for numeric function"
+            "input value {value:.6} is out of range for numeric function"
         )));
     }
     Ok(value)
@@ -80,12 +80,15 @@ unary!(exp, x => x.exp());
 unary!(sin, x => finite(x)?.sin());
 unary!(cos, x => finite(x)?.cos());
 unary!(tan, x => finite(x)?.tan());
+// `NoInfiniteNoZeroDoubleWrapper` over `CoTanOperator`
 unary!(cot, x => {
-    let tangent = finite(x)?.tan();
-    if tangent == 0.0 || tangent.is_nan() {
-        return Err(out_of_range("cannot take cotangent of zero"));
+    let x = finite(x)?;
+    if x == 0.0 {
+        return Err(out_of_range(format!(
+            "input value {x:.6} is out of range for numeric function cotangent"
+        )));
     }
-    1.0 / tangent
+    1.0 / x.tan()
 });
 unary!(asin, x => {
     if !(-1.0..=1.0).contains(&x) {
@@ -99,17 +102,13 @@ unary!(acos, x => {
     }
     x.acos()
 });
-unary!(atan, x => finite(x)?.atan());
+unary!(atan, x => x.atan());
 unary!(sinh, x => x.sinh());
 unary!(cosh, x => x.cosh());
 unary!(tanh, x => x.tanh());
 unary!(asinh, x => x.asinh());
-unary!(acosh, x => {
-    if x < 1.0 {
-        return Err(out_of_range("ACOSH is undefined below 1"));
-    }
-    x.acosh()
-});
+// `AcoshOperator`: NaN below 1
+unary!(acosh, x => x.acosh());
 unary!(atanh, x => {
     if !(-1.0..=1.0).contains(&x) {
         return Err(Error::new(ErrorKind::InvalidInput, "ATANH is undefined outside [-1,1]"));
@@ -382,6 +381,10 @@ pub fn bind_decimal_round(name: &str, children: &[BoundExpr]) -> Result<Option<B
         "trunc" => (DecimalRounding::Trunc, decimal_trunc),
         _ => return Ok(None),
     };
+    // an untyped NULL folds the call before its bind runs
+    if precision.return_type.id() == LogicalTypeId::SqlNull {
+        return Ok(Some(BoundExpr::constant(Value::sql_null())));
+    }
     if !precision.is_foldable() {
         return Err(Error::new(
             ErrorKind::Binder,
@@ -427,47 +430,100 @@ fn round_integer(args: &DataChunk, result: &mut Vector) -> Result<()> {
         if precision >= 0 {
             return Ok(row[0].clone());
         }
-        if precision < -38 {
-            return Value::new(ty.clone(), ValueData::Int64(0));
+        // `Hugeint::CACHED_POWERS_OF_TEN`
+        if precision <= -39 {
+            return super::cast::integer_value(0, &ty);
         }
         let power = 10i128.pow((-precision) as u32);
         let half = power / 2;
-        let rounded = if value >= 0 {
-            (value + half) / power * power
-        } else {
-            (value - half) / power * power
+        let (mut rounded, remainder) = (value / power, value % power);
+        if remainder >= half {
+            rounded += 1;
+        } else if remainder <= -half {
+            rounded -= 1;
+        }
+        let overflow = || out_of_range("Overflow in round of integer");
+        let rounded = rounded.checked_mul(power).ok_or_else(overflow)?;
+        let (min, max) = match ty.id() {
+            LogicalTypeId::TinyInt => (i128::from(i8::MIN), i128::from(i8::MAX)),
+            LogicalTypeId::SmallInt => (i128::from(i16::MIN), i128::from(i16::MAX)),
+            LogicalTypeId::Integer => (i128::from(i32::MIN), i128::from(i32::MAX)),
+            LogicalTypeId::BigInt => (i128::from(i64::MIN), i128::from(i64::MAX)),
+            _ => (i128::MIN, i128::MAX),
         };
-        i64::try_from(rounded)
-            .map_err(|_| out_of_range("Overflow in round of integer"))
-            .and_then(|v| Value::new(ty.clone(), ValueData::Int64(v)))
+        if !(min..=max).contains(&rounded) {
+            return Err(overflow());
+        }
+        super::cast::integer_value(rounded, &ty)
     })
 }
 
-fn gcd_of(left: i128, right: i128) -> i128 {
-    let (mut a, mut b) = (left.abs(), right.abs());
-    while b != 0 {
-        (a, b) = (b, a % b);
+/// `TryAbsOperator`: the minimum of the type has no absolute value.
+fn try_abs(value: i128, minimum: i128) -> Result<i128> {
+    if value == minimum {
+        return Err(out_of_range(format!("Overflow on abs({value})")));
     }
-    a
+    Ok(value.abs())
+}
+
+/// `GreatestCommonDivisor<T>`, for the type whose minimum is `minimum`.
+fn typed_gcd(left: i128, right: i128, minimum: i128) -> Result<i128> {
+    if (left == minimum && right == -1) || (left == -1 && right == minimum) {
+        return Ok(1);
+    }
+    let (mut a, mut b) = (left, right);
+    loop {
+        if a == 0 {
+            return try_abs(b, minimum);
+        }
+        b %= a;
+        if b == 0 {
+            return try_abs(a, minimum);
+        }
+        a %= b;
+    }
+}
+
+/// The range of the BIGINT or HUGEINT the function gives.
+fn integer_range(result: &Vector) -> (i128, i128) {
+    if result.logical_type().id() == duckrs_common::types::LogicalTypeId::HugeInt {
+        (i128::MIN, i128::MAX)
+    } else {
+        (i128::from(i64::MIN), i128::from(i64::MAX))
+    }
+}
+
+fn integer_value(result_type: &LogicalType, value: i128) -> Value {
+    if result_type.id() == duckrs_common::types::LogicalTypeId::HugeInt {
+        Value::hugeint(value)
+    } else {
+        Value::bigint(value as i64)
+    }
 }
 
 fn gcd(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    let (minimum, _) = integer_range(result);
+    let ty = result.logical_type().clone();
     strict_rows(args, result, |row| {
-        let (a, b) = (row[0].as_i128().expect("a BIGINT"), row[1].as_i128().expect("a BIGINT"));
-        Ok(Value::bigint(gcd_of(a, b) as i64))
+        let (a, b) = (row[0].as_i128().expect("an integer"), row[1].as_i128().expect("an integer"));
+        Ok(integer_value(&ty, typed_gcd(a, b, minimum)?))
     })
 }
 
+/// `LeastCommonMultipleOperator`.
 fn lcm(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    let (minimum, maximum) = integer_range(result);
+    let ty = result.logical_type().clone();
     strict_rows(args, result, |row| {
-        let (a, b) = (row[0].as_i128().expect("a BIGINT"), row[1].as_i128().expect("a BIGINT"));
+        let (a, b) = (row[0].as_i128().expect("an integer"), row[1].as_i128().expect("an integer"));
         if a == 0 || b == 0 {
-            return Ok(Value::bigint(0));
+            return Ok(integer_value(&ty, 0));
         }
-        let result = (a / gcd_of(a, b) * b).abs();
-        i64::try_from(result)
-            .map(Value::bigint)
-            .map_err(|_| out_of_range("lcm value is out of range"))
+        let product = a
+            .checked_mul(b / typed_gcd(a, b, minimum)?)
+            .filter(|p| (minimum..=maximum).contains(p))
+            .ok_or_else(|| out_of_range("lcm value is out of range"))?;
+        Ok(integer_value(&ty, try_abs(product, minimum)?))
     })
 }
 
@@ -496,6 +552,10 @@ fn ieee_pow(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
+// `IEEEGammaOperator` and `IEEELogGammaOperator`
+unary!(ieee_gamma, x => libm::tgamma(x));
+unary!(ieee_lgamma, x => libm::lgamma(x));
+
 /// `BindIEEEFloatingUnary` / `BindIEEEFloatingBinary`: with `ieee_floating_point_ops` on, the function of this name
 /// and arity gives NaN and infinities where it would otherwise raise.
 pub fn ieee_variant(name: &str, arity: usize) -> Option<ScalarCallback> {
@@ -513,6 +573,8 @@ pub fn ieee_variant(name: &str, arity: usize) -> Option<ScalarCallback> {
         ("log2", 1) => ieee_log2,
         ("log", 2) => ieee_log_base,
         ("pow" | "power" | "**" | "^", 2) => ieee_pow,
+        ("gamma", 1) => ieee_gamma,
+        ("lgamma", 1) => ieee_lgamma,
         _ => return None,
     })
 }
@@ -564,7 +626,13 @@ pub fn math_functions() -> Vec<ScalarFunctionSet> {
     pi_set.add(ScalarFunction::new("pi", vec![], LogicalType::DOUBLE, pi));
     sets.push(pi_set);
     let mut round = ScalarFunctionSet::new("round");
-    for ty in [LogicalType::BIGINT, LogicalType::HUGEINT] {
+    for ty in [
+        LogicalType::TINYINT,
+        LogicalType::SMALLINT,
+        LogicalType::INTEGER,
+        LogicalType::BIGINT,
+        LogicalType::HUGEINT,
+    ] {
         round.add(ScalarFunction::new(
             "round",
             vec![ty.clone(), LogicalType::INTEGER],
@@ -603,12 +671,9 @@ pub fn math_functions() -> Vec<ScalarFunctionSet> {
     ] {
         for name in names {
             let mut set = ScalarFunctionSet::new(name);
-            set.add(ScalarFunction::new(
-                name,
-                vec![LogicalType::BIGINT, LogicalType::BIGINT],
-                LogicalType::BIGINT,
-                callback,
-            ));
+            for ty in [LogicalType::BIGINT, LogicalType::HUGEINT] {
+                set.add(ScalarFunction::new(name, vec![ty.clone(), ty.clone()], ty, callback));
+            }
             sets.push(set);
         }
     }

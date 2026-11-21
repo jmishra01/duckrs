@@ -38,7 +38,7 @@ fn number(value: &Value) -> Option<f64> {
     }
 }
 
-const STRING_FUNCTIONS: [&str; 22] = [
+pub(crate) const STRING_FUNCTIONS: [&str; 22] = [
     "hive_partition_component",
     "parse_filename",
     "parse_path",
@@ -63,7 +63,9 @@ const STRING_FUNCTIONS: [&str; 22] = [
     "path_join",
 ];
 
-const OTHER_FUNCTIONS: [&str; 52] = [
+pub(crate) const OTHER_FUNCTIONS: [&str; 56] = [
+    "decimal_division",
+    "create_sort_key",
     "finalize",
     "combine",
     "gamma",
@@ -71,6 +73,7 @@ const OTHER_FUNCTIONS: [&str; 52] = [
     "nextafter",
     "fmod",
     "factorial",
+    "binom",
     "even",
     "time_bucket",
     "normalized_interval",
@@ -114,6 +117,7 @@ const OTHER_FUNCTIONS: [&str; 52] = [
     "map_contains",
     "map_concat",
     "cast_to_type",
+    "replace_type",
     "can_cast_implicitly",
     "from_binary",
 ];
@@ -128,14 +132,12 @@ pub fn is_extra_function(name: &str) -> bool {
 fn separators(row: &[Value], at: usize) -> Result<&'static [char]> {
     match row.get(at) {
         None => Ok(&['/', '\\']),
+        // `GetSeparator`: anything else, NULL too, is both slashes
+        Some(value) if value.is_null() => Ok(&['/', '\\']),
         Some(value) => match value.try_to_string()?.as_str() {
             "system" | "forward_slash" => Ok(&['/']),
             "backslash" => Ok(&['\\']),
-            "both_slash" => Ok(&['/', '\\']),
-            other => Err(invalid(format!(
-                "Invalid separator: {other}. Valid separators are: 'system', 'both_slash', 'backslash', \
-                 'forward_slash'"
-            ))),
+            _ => Ok(&['/', '\\']),
         },
     }
 }
@@ -146,10 +148,15 @@ fn parse_filename(args: &DataChunk, result: &mut Vector) -> Result<()> {
             return Ok(Value::null(LogicalType::VARCHAR));
         }
         let path = text(&row[0])?;
-        let (trim, separator) = match row.get(1).map(|v| v.data()) {
-            Some(ValueData::Bool(trim)) => (*trim, 2),
-            Some(_) => (false, 1),
-            None => (false, 1),
+        // `GetPathOptionArguments`: (path, trim_extension, separator), or one of the two
+        let as_bool = |value: &Value| -> Result<bool> {
+            Ok(!value.is_null()
+                && crate::execution::parquet::cast_value(value, &LogicalType::BOOLEAN)? == Value::boolean(true))
+        };
+        let (trim, separator) = match row.len() {
+            3 => (as_bool(&row[1])?, 2),
+            2 if row[1].logical_type().id() == LogicalTypeId::Boolean => (as_bool(&row[1])?, 2),
+            _ => (false, 1),
         };
         let split = separators(row, separator)?;
         let name = path.rsplit(split).next().unwrap_or_default();
@@ -179,6 +186,7 @@ fn parse_path(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
+/// `TrimPathFunction<true>`: up to the first separator (a leading one is kept), or nothing.
 fn parse_dirname(args: &DataChunk, result: &mut Vector) -> Result<()> {
     row_wise(args, result, |row| {
         if row[0].is_null() {
@@ -186,17 +194,16 @@ fn parse_dirname(args: &DataChunk, result: &mut Vector) -> Result<()> {
         }
         let path = text(&row[0])?;
         let split = separators(row, 1)?;
-        let parts: Vec<&str> = path.split(split).filter(|p| !p.is_empty()).collect();
-        if path.starts_with(split) && parts.len() <= 1 {
-            return Ok(Value::varchar(&path[..1]));
-        }
-        if parts.len() <= 1 {
-            return Ok(Value::varchar(""));
-        }
-        Ok(Value::varchar(parts[parts.len() - 2]))
+        let end = match path.find(split) {
+            Some(0) => 1,
+            Some(at) => at,
+            None => 0,
+        };
+        Ok(Value::varchar(&path[..end]))
     })
 }
 
+/// `ParseDirpathFunction`: up to the last separator, or the separator that is the whole path.
 fn parse_dirpath(args: &DataChunk, result: &mut Vector) -> Result<()> {
     row_wise(args, result, |row| {
         if row[0].is_null() {
@@ -204,12 +211,12 @@ fn parse_dirpath(args: &DataChunk, result: &mut Vector) -> Result<()> {
         }
         let path = text(&row[0])?;
         let split = separators(row, 1)?;
-        let trimmed = path.trim_end_matches(split);
-        Ok(match trimmed.rfind(split) {
-            Some(0) => Value::varchar(&path[..1]),
-            Some(at) => Value::varchar(trimmed[..at].trim_end_matches(split)),
-            None => Value::varchar(""),
-        })
+        let end = match path.rfind(split) {
+            Some(0) if path.len() == 1 => 1,
+            Some(at) => at,
+            None => 0,
+        };
+        Ok(Value::varchar(&path[..end]))
     })
 }
 
@@ -275,7 +282,8 @@ fn over_text(args: &DataChunk, result: &mut Vector, f: fn(&str) -> Result<Value>
 fn strip_accents(args: &DataChunk, result: &mut Vector) -> Result<()> {
     over_text(args, result, |input| {
         Ok(Value::varchar(
-            input.nfd().filter(|c| !is_combining_mark(*c)).collect::<String>(),
+            // `utf8proc_remove_accents`: decompose, strip the marks, compose again
+            input.nfd().filter(|c| !is_combining_mark(*c)).nfc().collect::<String>(),
         ))
     })
 }
@@ -606,9 +614,11 @@ fn url_decode(args: &DataChunk, result: &mut Vector) -> Result<()> {
                 }
             }
         }
-        String::from_utf8(out)
-            .map(Value::varchar)
-            .map_err(|_| invalid("Failed to decode string: invalid UTF-8"))
+        String::from_utf8(out).map(Value::varchar).map_err(|_| {
+            invalid(format!(
+                "Failed to decode string \"{input}\" using URL decoding - decoded value is invalid UTF8"
+            ))
+        })
     })
 }
 
@@ -618,12 +628,30 @@ fn unary_double(args: &DataChunk, result: &mut Vector, f: fn(f64) -> f64) -> Res
     })
 }
 
+/// `GammaOperator`: zero has no gamma.
 fn gamma(args: &DataChunk, result: &mut Vector) -> Result<()> {
-    unary_double(args, result, libm::tgamma)
+    row_wise(args, result, |row| {
+        let ValueData::Double(x) = *row[0].data() else {
+            return Ok(Value::null(LogicalType::DOUBLE));
+        };
+        if x == 0.0 {
+            return Err(Error::new(ErrorKind::OutOfRange, "cannot take gamma of zero"));
+        }
+        Ok(Value::double(libm::tgamma(x)))
+    })
 }
 
+/// `LogGammaOperator`: zero has no log gamma.
 fn lgamma(args: &DataChunk, result: &mut Vector) -> Result<()> {
-    unary_double(args, result, libm::lgamma)
+    row_wise(args, result, |row| {
+        let ValueData::Double(x) = *row[0].data() else {
+            return Ok(Value::null(LogicalType::DOUBLE));
+        };
+        if x == 0.0 {
+            return Err(Error::new(ErrorKind::OutOfRange, "cannot take log gamma of zero"));
+        }
+        Ok(Value::double(libm::lgamma(x)))
+    })
 }
 
 fn even(args: &DataChunk, result: &mut Vector) -> Result<()> {
@@ -655,11 +683,72 @@ fn nextafter(args: &DataChunk, result: &mut Vector) -> Result<()> {
 }
 
 fn fmod(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    let float = result.logical_type().id() == LogicalTypeId::Float;
     row_wise(args, result, |row| {
         let (Some(x), Some(y)) = (number(&row[0]), number(&row[1])) else {
-            return Ok(Value::null(LogicalType::DOUBLE));
+            return Ok(Value::null(if float { LogicalType::FLOAT } else { LogicalType::DOUBLE }));
         };
-        Ok(Value::double(x % y))
+        if float {
+            let (x, y) = (x as f32, y as f32);
+            let remainder = x % y;
+            let floored = if remainder == 0.0 {
+                0.0
+            } else if (remainder < 0.0) != (y < 0.0) {
+                remainder + y
+            } else {
+                remainder
+            };
+            return Ok(Value::float(floored));
+        }
+        // `FlooredModuloOperator`: the remainder with the sign of the divisor, and a zero that is positive
+        let remainder = x % y;
+        let floored = if remainder == 0.0 {
+            0.0
+        } else if (remainder < 0.0) != (y < 0.0) {
+            remainder + y
+        } else {
+            remainder
+        };
+        Ok(Value::double(floored))
+    })
+}
+
+// Ported from `BinomOperator` of duckdb/extension/core_functions/scalar/math/numeric.cpp @ rust-port-baseline
+/// `binom(n, k)`: the binomial coefficient, with the common factors taken out before each multiplication.
+fn binom(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    fn gcd(mut a: i128, mut b: i128) -> i128 {
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        a.abs()
+    }
+    row_wise(args, result, |row| {
+        let (Some(n), Some(k)) = (row[0].as_i128(), row[1].as_i128()) else {
+            return Ok(Value::null(LogicalType::HUGEINT));
+        };
+        if n < 0 || k < 0 {
+            return Err(Error::new(
+                ErrorKind::OutOfRange,
+                "binom with negative input is undefined",
+            ));
+        }
+        if n < k {
+            return Ok(Value::hugeint(0));
+        }
+        let k = k.min(n - k);
+        let mut ret: i128 = 1;
+        for i in 1..=k {
+            let (mut numerator, mut denominator) = (n - k + i, i);
+            let divisor = gcd(numerator, denominator);
+            numerator /= divisor;
+            denominator /= divisor;
+            let divisor = gcd(ret, denominator);
+            ret /= divisor;
+            ret = ret
+                .checked_mul(numerator)
+                .ok_or_else(|| Error::new(ErrorKind::OutOfRange, "Value out of range"))?;
+        }
+        Ok(Value::hugeint(ret))
     })
 }
 
@@ -678,7 +767,7 @@ fn factorial(args: &DataChunk, result: &mut Vector) -> Result<()> {
         for factor in 2..=n {
             product = product
                 .checked_mul(factor)
-                .ok_or_else(|| Error::new(ErrorKind::OutOfRange, "Overflow in HUGEINT multiplication"))?;
+                .ok_or_else(|| Error::new(ErrorKind::OutOfRange, "Value out of range"))?;
         }
         Ok(Value::hugeint(product))
     })
@@ -709,6 +798,16 @@ fn temporal_values(row: &[Value], child: &LogicalType, inclusive: bool) -> Resul
     if row.iter().any(Value::is_null) {
         return Ok(Value::null(LogicalType::list(child.clone())));
     }
+    // `TimestampRangeInfo::ListLength`
+    let finite = |value: &Value| match value.logical_type().id() {
+        LogicalTypeId::Date => value.as_i128().is_none_or(|days| Date(days as i32).is_finite()),
+        _ => value
+            .as_i128()
+            .is_none_or(|micros| Timestamp(micros as i64).is_finite()),
+    };
+    if !finite(&row[0]) || !finite(&row[1]) {
+        return Err(invalid("Interval infinite bounds not supported"));
+    }
     let (Some(start), Some(stop)) = (micros_of(&row[0]), micros_of(&row[1])) else {
         return Err(invalid("range needs a start and an end"));
     };
@@ -736,7 +835,11 @@ fn temporal_values(row: &[Value], child: &LogicalType, inclusive: bool) -> Resul
         if items.len() > 100_000_000 {
             return Err(invalid("Lists larger than 2^32 elements are not supported"));
         }
-        current = super::dates::add_interval(current, *step)?;
+        // the next value outside of the timestamp range ends the series
+        match super::dates::add_interval(current, *step) {
+            Ok(next) => current = next,
+            Err(_) => break,
+        }
     }
     Value::list(child.clone(), items)
 }
@@ -752,14 +855,33 @@ pub fn bind_temporal_range(
             LogicalTypeId::Date | LogicalTypeId::Timestamp | LogicalTypeId::TimestampTz
         )
     };
-    if children.len() != 3 || !temporal(&children[0].return_type) {
+    // a NULL bound takes the type of the other (`NULL` casts to any overload)
+    let bounds = &children.get(..2).unwrap_or_default();
+    let is_null = |ty: &LogicalType| ty.id() == LogicalTypeId::SqlNull;
+    if children.len() != 3
+        || !bounds.iter().any(|c| temporal(&c.return_type))
+        || !bounds
+            .iter()
+            .all(|c| temporal(&c.return_type) || is_null(&c.return_type))
+    {
         return Ok(Err(children));
     }
-    let child = if children[0].return_type.id() == LogicalTypeId::TimestampTz {
+    let child = if bounds.iter().any(|c| c.return_type.id() == LogicalTypeId::TimestampTz) {
         LogicalType::new(LogicalTypeId::TimestampTz)
     } else {
         LogicalType::TIMESTAMP
     };
+    let children = children
+        .into_iter()
+        .enumerate()
+        .map(|(i, c)| {
+            if i < 2 && is_null(&c.return_type) {
+                c.cast_to(&child, false)
+            } else {
+                c
+            }
+        })
+        .collect();
     let lower = name.to_ascii_lowercase();
     let callback: super::ScalarCallback = if lower == "generate_series" {
         temporal_series
@@ -769,47 +891,190 @@ pub fn bind_temporal_range(
     Ok(Ok(bound_function(&lower, children, LogicalType::list(child), callback)))
 }
 
-/// `time_bucket`'s origins: 2000-01-03 for days and less, 2000-01-01 for months.
-fn time_bucket_value(width: Interval, micros: i64, origin: Option<i64>, offset: Option<Interval>) -> Result<i64> {
-    let parts = i32::from(width.months != 0) + i32::from(width.days != 0 || width.micros != 0);
-    if parts != 1 {
-        return Err(invalid(
-            "Only ICU supports time_bucket with month and day or time bucket widths",
+/// A `time_bucket` input: a DATE as its days, anything else as microseconds since the epoch.
+#[derive(Clone, Copy)]
+enum Bucketed {
+    Days(i32),
+    Micros(i64),
+}
+
+impl Bucketed {
+    /// `ToBucketTimestamp`
+    fn micros(self) -> Result<i64> {
+        match self {
+            Bucketed::Days(days) => i64::from(days)
+                .checked_mul(MICROS_PER_DAY)
+                .filter(|m| Timestamp(*m).is_finite())
+                .ok_or_else(|| Error::new(ErrorKind::Conversion, "Date and time not in timestamp range")),
+            Bucketed::Micros(micros) => Ok(micros),
+        }
+    }
+
+    /// `ToBucketDate`
+    fn days(self) -> i32 {
+        match self {
+            Bucketed::Days(days) => days,
+            Bucketed::Micros(micros) => micros.div_euclid(MICROS_PER_DAY) as i32,
+        }
+    }
+}
+
+fn bucket_overflow(op: &str, ty: &str, left: impl std::fmt::Display, right: impl std::fmt::Display) -> Error {
+    let (name, sign) = if op == "+" {
+        ("addition", "+")
+    } else {
+        ("subtraction", "-")
+    };
+    Error::new(
+        ErrorKind::OutOfRange,
+        format!("Overflow in {name} of {ty} ({left} {sign} {right})!"),
+    )
+}
+
+/// `TimeBucket::EpochMonths`
+fn epoch_months(days: i32) -> i32 {
+    let (year, month, _) = Date(days).to_ymd();
+    (year - 1970) * 12 + month - 1
+}
+
+/// `TimeBucket::WidthConvertibleToMicrosCommon`
+fn bucket_micros(width: i64, ts: i64, origin: i64) -> Result<i64> {
+    let origin = origin % width;
+    let ts = ts
+        .checked_sub(origin)
+        .ok_or_else(|| bucket_overflow("-", "INT64", ts, origin))?;
+    let mut result = (ts / width) * width;
+    if ts < 0 && ts % width != 0 {
+        result = result
+            .checked_sub(width)
+            .ok_or_else(|| bucket_overflow("-", "INT64", result, width))?;
+    }
+    let result = result
+        .checked_add(origin)
+        .ok_or_else(|| bucket_overflow("+", "INT64", result, origin))?;
+    if !Timestamp(result).is_finite() {
+        return Err(Error::new(
+            ErrorKind::OutOfRange,
+            "Overflow in TIME_BUCKET: the result is not a finite TIMESTAMP",
         ));
     }
-    let shift = offset.map_or(0, |o| i64::from(o.days) * MICROS_PER_DAY + o.micros);
-    let micros = micros - shift;
-    let bucketed = if width.months != 0 {
-        if width.months < 0 {
-            return Err(Error::new(ErrorKind::OutOfRange, "Period must be greater than 0"));
-        }
-        let default_origin = Date::from_ymd(2000, 1, 1).map_or(0, |d| i64::from(d.0) * MICROS_PER_DAY);
-        let origin = origin.unwrap_or(default_origin);
-        let month_index = |value: i64| {
-            let (year, month, _) = Date(value.div_euclid(MICROS_PER_DAY) as i32).to_ymd();
-            i64::from(year) * 12 + i64::from(month) - 1
-        };
-        let months = month_index(micros) - month_index(origin);
-        let period = i64::from(width.months);
-        let bucket = months.div_euclid(period) * period + month_index(origin);
-        let (year, month) = (bucket.div_euclid(12), bucket.rem_euclid(12) + 1);
-        Date::from_ymd(year as i32, month as i32, 1).map_or(0, |d| i64::from(d.0) * MICROS_PER_DAY)
+    Ok(result)
+}
+
+/// `TimeBucket::WidthConvertibleToMonthsCommon`: the first day of the bucket.
+fn bucket_months(width: i32, ts: i32, origin: i32) -> Result<i32> {
+    let origin = origin % width;
+    let ts = ts
+        .checked_sub(origin)
+        .ok_or_else(|| bucket_overflow("-", "INT32", ts, origin))?;
+    let mut result = (ts / width) * width;
+    if ts < 0 && ts % width != 0 {
+        result = result
+            .checked_sub(width)
+            .ok_or_else(|| bucket_overflow("-", "INT32", result, width))?;
+    }
+    let result = result
+        .checked_add(origin)
+        .ok_or_else(|| bucket_overflow("+", "INT32", result, origin))?;
+    let borrow = result < 0 && result % 12 != 0;
+    let year = if borrow {
+        1970 + result / 12 - 1
     } else {
-        let period = i64::from(width.days) * MICROS_PER_DAY + width.micros;
-        if period <= 0 {
-            return Err(Error::new(ErrorKind::OutOfRange, "Period must be greater than 0"));
-        }
-        let default_origin = Date::from_ymd(2000, 1, 3).map_or(0, |d| i64::from(d.0) * MICROS_PER_DAY);
-        let origin = origin.unwrap_or(default_origin);
-        (micros - origin).div_euclid(period) * period + origin
+        1970 + result / 12
     };
-    Ok(bucketed + shift)
+    let month = if borrow { result % 12 + 13 } else { result % 12 + 1 };
+    Date::from_ymd(year, month, 1)
+        .map(|d| d.0)
+        .ok_or_else(|| Error::new(ErrorKind::Conversion, format!("Date out of range: {year}-{month}-1")))
+}
+
+/// `Interval::Invert`
+fn inverted(interval: Interval) -> Result<Interval> {
+    let failed = |part: &str| Error::new(ErrorKind::OutOfRange, format!("Interval {part} value out of range"));
+    if interval.days == i32::MIN {
+        return Err(failed("days"));
+    }
+    if interval.micros == i64::MIN {
+        return Err(failed("micros"));
+    }
+    if interval.months == i32::MIN {
+        return Err(failed("months"));
+    }
+    Ok(Interval {
+        months: -interval.months,
+        days: -interval.days,
+        micros: -interval.micros,
+    })
+}
+
+enum BucketArg {
+    Origin(Bucketed),
+    Offset(Interval),
+}
+
+/// `TimeBucket`: 2000-01-03 is the origin of day and time widths, 2000-01-01 of month widths.
+fn time_bucket_value(width: Interval, ts: Bucketed, arg: Option<BucketArg>) -> Result<Bucketed> {
+    const DEFAULT_ORIGIN_MICROS: i64 = 10959 * MICROS_PER_DAY;
+    const DEFAULT_ORIGIN_MONTHS: i32 = 360;
+    let unsupported = |message: &str| Error::new(ErrorKind::NotImplemented, message);
+    // `ClassifyBucketWidthErrorThrow`
+    if width.months == 0 {
+        let micros = i64::from(width.days)
+            .wrapping_mul(MICROS_PER_DAY)
+            .wrapping_add(width.micros);
+        if micros <= 0 {
+            return Err(unsupported("Period must be greater than 0"));
+        }
+        return Ok(Bucketed::Micros(match arg {
+            None => bucket_micros(micros, ts.micros()?, DEFAULT_ORIGIN_MICROS)?,
+            Some(BucketArg::Origin(origin)) => bucket_micros(micros, ts.micros()?, origin.micros()?)?,
+            Some(BucketArg::Offset(offset)) => {
+                let shifted = super::dates::add_interval(ts.micros()?, inverted(offset)?)?;
+                super::dates::add_interval(bucket_micros(micros, shifted, DEFAULT_ORIGIN_MICROS)?, offset)?
+            }
+        }));
+    }
+    if width.days != 0 || width.micros != 0 {
+        return Err(unsupported("Month intervals cannot have day or time component"));
+    }
+    if width.months < 0 {
+        return Err(unsupported("Period must be greater than 0"));
+    }
+    Ok(match arg {
+        None => Bucketed::Days(bucket_months(
+            width.months,
+            epoch_months(ts.days()),
+            DEFAULT_ORIGIN_MONTHS,
+        )?),
+        Some(BucketArg::Origin(origin)) => Bucketed::Days(bucket_months(
+            width.months,
+            epoch_months(ts.days()),
+            epoch_months(origin.days()),
+        )?),
+        Some(BucketArg::Offset(offset)) => {
+            let shifted = super::dates::add_interval(ts.micros()?, inverted(offset)?)?;
+            let first = bucket_months(
+                width.months,
+                epoch_months(Bucketed::Micros(shifted).days()),
+                DEFAULT_ORIGIN_MONTHS,
+            )?;
+            Bucketed::Micros(super::dates::add_interval(Bucketed::Days(first).micros()?, offset)?)
+        }
+    })
 }
 
 fn micros_of(value: &Value) -> Option<i64> {
     match value.logical_type().id() {
         LogicalTypeId::Date => value.as_i128().map(|days| days as i64 * MICROS_PER_DAY),
         _ => value.as_i128().map(|micros| micros as i64),
+    }
+}
+
+fn bucketed_of(value: &Value) -> Bucketed {
+    let raw = value.as_i128().unwrap_or(0);
+    match value.logical_type().id() {
+        LogicalTypeId::Date => Bucketed::Days(raw as i32),
+        _ => Bucketed::Micros(raw as i64),
     }
 }
 
@@ -851,19 +1116,22 @@ fn time_bucket(args: &DataChunk, result: &mut Vector) -> Result<()> {
         if row.get(2).is_some_and(|origin| !finite(origin)) {
             return Ok(Value::null(ty.clone()));
         }
-        let micros = micros_of(&row[1]).unwrap_or(0);
-        let (origin, offset) = match row.get(2).map(Value::data) {
-            Some(ValueData::Interval(offset)) => (None, Some(*offset)),
-            Some(_) => (micros_of(&row[2]), None),
-            None => (None, None),
+        let arg = match row.get(2).map(Value::data) {
+            Some(ValueData::Interval(offset)) => Some(BucketArg::Offset(*offset)),
+            Some(_) => Some(BucketArg::Origin(bucketed_of(&row[2]))),
+            None => None,
         };
-        let bucket = time_bucket_value(*width, micros, origin, offset)?;
+        let bucket = time_bucket_value(*width, bucketed_of(&row[1]), arg)?;
         Ok(match ty.id() {
-            LogicalTypeId::Date => Value::date(Date(bucket.div_euclid(MICROS_PER_DAY) as i32)),
+            // `FromBucketDate` and `FromBucketTimestamp`
+            LogicalTypeId::Date => Value::date(Date(bucket.days())),
             // a TIME buckets as that time on 1970-01-01, and is the time of its bucket
-            LogicalTypeId::Time => Value::time(duckrs_common::types::Time(bucket.rem_euclid(MICROS_PER_DAY))),
-            LogicalTypeId::TimestampTz => Value::timestamp_tz(Timestamp(bucket)),
-            _ => Value::timestamp(Timestamp(bucket)),
+            LogicalTypeId::Time => Value::time(duckrs_common::types::Time(match bucket {
+                Bucketed::Days(_) => 0,
+                Bucketed::Micros(micros) => micros.rem_euclid(MICROS_PER_DAY),
+            })),
+            LogicalTypeId::TimestampTz => Value::timestamp_tz(Timestamp(bucket.micros()?)),
+            _ => Value::timestamp(Timestamp(bucket.micros()?)),
         })
     })
 }
@@ -878,19 +1146,51 @@ fn timetz_byte_comparable(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
+/// `interval_t::Normalize`: carry left with non-negative remainders, then borrow right where the
+/// months or days do not fit.
+pub(crate) fn normalize_interval(value: Interval) -> Interval {
+    let mut micros = value.micros;
+    let mut carry_days = micros / MICROS_PER_DAY;
+    micros -= carry_days * MICROS_PER_DAY;
+    if micros < 0 {
+        carry_days -= 1;
+        micros += MICROS_PER_DAY;
+    }
+    let mut days = i64::from(value.days) + carry_days;
+    let mut carry_months = days / 30;
+    days -= carry_months * 30;
+    if days < 0 {
+        carry_months -= 1;
+        days += 30;
+    }
+    let months = i64::from(value.months) + carry_months;
+    // `interval_t::Borrow`
+    let borrow = |msf: i64, lsf: &mut i64, scale: i64| -> i32 {
+        let f = msf.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+        let remainder = msf - i64::from(f);
+        if remainder != 0 {
+            let max_units = i64::MAX / scale - 1;
+            *lsf = if remainder > max_units {
+                i64::MAX
+            } else if remainder < -max_units {
+                i64::MIN
+            } else {
+                *lsf + remainder * scale
+            };
+        }
+        f
+    };
+    let months = borrow(months, &mut days, 30);
+    let days = borrow(days, &mut micros, MICROS_PER_DAY);
+    Interval { months, days, micros }
+}
+
 fn normalized_interval(args: &DataChunk, result: &mut Vector) -> Result<()> {
     row_wise(args, result, |row| {
         let ValueData::Interval(value) = row[0].data() else {
             return Ok(Value::null(LogicalType::INTERVAL));
         };
-        let days = i64::from(value.days) + value.micros / MICROS_PER_DAY;
-        let micros = value.micros % MICROS_PER_DAY;
-        let months = i64::from(value.months) + days / 30;
-        Ok(Value::interval(Interval {
-            months: months as i32,
-            days: (days % 30) as i32,
-            micros,
-        }))
+        Ok(Value::interval(normalize_interval(*value)))
     })
 }
 
@@ -1076,6 +1376,28 @@ fn struct_fields(value: &Value) -> &[Value] {
 }
 
 /// A STRUCT from all its arguments: what the result type says goes where.
+/// `struct_concat` of unnamed structs: their fields one after the other.
+fn concat_tuples(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    let ty = result.logical_type().clone();
+    row_wise(args, result, |row| {
+        let mut fields = Vec::new();
+        for value in row {
+            match value.data() {
+                ValueData::Struct(values) => fields.extend(values.iter().cloned()),
+                // a NULL struct gives NULL fields
+                _ => fields.extend(
+                    value
+                        .logical_type()
+                        .struct_children()
+                        .iter()
+                        .map(|(_, ty)| Value::null(ty.clone())),
+                ),
+            }
+        }
+        Value::new(ty.clone(), ValueData::Struct(fields))
+    })
+}
+
 fn rebuild_struct(args: &DataChunk, result: &mut Vector) -> Result<()> {
     let ty = result.logical_type().clone();
     row_wise(args, result, |row| {
@@ -1116,6 +1438,37 @@ fn is_histogram_other_bin(args: &DataChunk, result: &mut Vector) -> Result<()> {
         }
         Ok(Value::boolean(super::holistic::not_distinct(&row[0], other, &ty)?))
     })
+}
+
+/// `TypeVisitor::VisitReplace`: `ty` with every type in it that is `from` made `to`.
+fn replace_type(ty: &LogicalType, from: &LogicalType, to: &LogicalType) -> LogicalType {
+    if ty == from {
+        return to.clone();
+    }
+    let replace = |t: &LogicalType| replace_type(t, from, to);
+    match ty.id() {
+        LogicalTypeId::List => LogicalType::list(replace(ty.child_type().expect("a LIST has a child"))),
+        LogicalTypeId::Array => LogicalType::array(
+            replace(ty.child_type().expect("an ARRAY has a child")),
+            ty.array_size().unwrap_or(0),
+        ),
+        LogicalTypeId::Map => LogicalType::map_from_entry(replace(ty.child_type().expect("a MAP has entries"))),
+        LogicalTypeId::Struct => LogicalType::struct_type(
+            ty.struct_children()
+                .iter()
+                .map(|(n, t)| (n.clone(), replace(t)))
+                .collect(),
+        ),
+        LogicalTypeId::Tuple => LogicalType::tuple(ty.struct_children().iter().map(|(_, t)| replace(t)).collect()),
+        LogicalTypeId::Union => LogicalType::union_type(
+            ty.struct_children()
+                .iter()
+                .skip(1)
+                .map(|(n, t)| (n.clone(), replace(t)))
+                .collect(),
+        ),
+        _ => ty.clone(),
+    }
 }
 
 /// `struct_values`: the fields of a STRUCT, as a TUPLE.
@@ -1280,6 +1633,10 @@ fn map_contains(args: &DataChunk, result: &mut Vector) -> Result<()> {
 fn map_concat(args: &DataChunk, result: &mut Vector) -> Result<()> {
     let ty = result.logical_type().clone();
     row_wise(args, result, |row| {
+        // `MapConcatFunction`: NULL when every map is
+        if row.iter().all(Value::is_null) {
+            return Ok(Value::null(ty.clone()));
+        }
         let mut entries: Vec<Value> = Vec::new();
         for map in row {
             for entry in map_entries(map) {
@@ -1313,7 +1670,8 @@ fn from_binary(args: &DataChunk, result: &mut Vector) -> Result<()> {
 
 fn state_finalize(args: &DataChunk, result: &mut Vector) -> Result<()> {
     let ty = args.column(0).logical_type().clone();
-    row_wise(args, result, |row| super::aggregates::finalize_state(&row[0], &ty))
+    let finalizer = super::aggregates::StateFinalizer::new(&ty);
+    row_wise(args, result, |row| finalizer.finalize(&row[0]))
 }
 
 fn state_combine(args: &DataChunk, result: &mut Vector) -> Result<()> {
@@ -1329,10 +1687,7 @@ fn state_combine(args: &DataChunk, result: &mut Vector) -> Result<()> {
 
 fn count_args(name: &str, children: &[BoundExpr], low: usize, high: usize) -> Result<()> {
     if children.len() < low || children.len() > high {
-        return Err(binder_error(format!(
-            "No function matches the given name and argument types of '{name}'. You might need to add explicit type \
-             casts."
-        )));
+        return Err(super::lists::no_match(name, children));
     }
     Ok(())
 }
@@ -1366,6 +1721,18 @@ fn vector_arguments(name: &str, children: Vec<BoundExpr>) -> Result<(Vec<BoundEx
         _ => Fit::No,
     };
     let fits: Vec<Fit> = children.iter().map(fit).collect();
+    // `ArrayGenericBinaryResolveTypes`: the array functions take what they are given, which has to
+    // be an array
+    if name.starts_with("array_")
+        && fits.contains(&Fit::Ambiguous)
+        && !fits.iter().all(|fit| *fit == Fit::Ambiguous)
+        && !fits.contains(&Fit::No)
+    {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("{name}: Arguments must be arrays of FLOAT or DOUBLE"),
+        ));
+    }
     if fits.contains(&Fit::No) {
         return Err(binder_error(format!(
             "No function matches the given name and argument types '{name}({})'. You might need to add explicit type \
@@ -1414,11 +1781,34 @@ pub fn bind_function(name: &str, names: &[String], mut children: Vec<BoundExpr>)
         count_args(&lower, &children, low, high)?;
         Ok(bound_function(&lower, children, ty, callback))
     };
+    // a function set with these overloads, bound as `FunctionBinder::BindScalarFunction` does
+    let overloaded = |signatures: Vec<Vec<LogicalType>>, ty: LogicalType, callback: super::ScalarCallback| {
+        let mut set = super::ScalarFunctionSet::new(&lower);
+        for arguments in signatures {
+            set.add(super::ScalarFunction::new(&lower, arguments, ty.clone(), callback));
+        }
+        super::binder::bind_scalar_function(
+            &set,
+            children.clone(),
+            false,
+            &crate::execution::expression_executor::try_evaluate_scalar,
+        )
+    };
+    let b = LogicalType::BOOLEAN;
     match lower.as_str() {
-        "parse_filename" => simple(1, 3, v, parse_filename, children),
-        "parse_path" => simple(1, 2, list_of_text, parse_path, children),
-        "parse_dirname" => simple(1, 2, v, parse_dirname, children),
-        "parse_dirpath" => simple(1, 2, v, parse_dirpath, children),
+        "parse_filename" => overloaded(
+            vec![
+                vec![v.clone()],
+                vec![v.clone(), v.clone()],
+                vec![v.clone(), b.clone()],
+                vec![v.clone(), b, v.clone()],
+            ],
+            v,
+            parse_filename,
+        ),
+        "parse_path" => overloaded(vec![vec![v.clone()], vec![v.clone(), v]], list_of_text, parse_path),
+        "parse_dirname" => overloaded(vec![vec![v.clone()], vec![v.clone(), v.clone()]], v, parse_dirname),
+        "parse_dirpath" => overloaded(vec![vec![v.clone()], vec![v.clone(), v.clone()]], v, parse_dirpath),
         "path_join" => simple(1, usize::MAX, v, path_join, children),
         "hive_partition_component" => {
             count_args(&lower, &children, 2, 2)?;
@@ -1463,7 +1853,40 @@ pub fn bind_function(name: &str, names: &[String], mut children: Vec<BoundExpr>)
         "gamma" => simple(1, 1, d.clone(), gamma, casted(children, &d)),
         "lgamma" => simple(1, 1, d.clone(), lgamma, casted(children, &d)),
         "even" => simple(1, 1, d.clone(), even, casted(children, &d)),
-        "fmod" => simple(2, 2, d.clone(), fmod, casted(children, &d)),
+        // `FmodFun`: an overload for FLOAT and one for DOUBLE
+        "fmod" => {
+            // the parameters are named x and y
+            if names.iter().any(|n| !n.is_empty()) && children.len() == 2 {
+                let position = |n: &String| match n.to_lowercase().as_str() {
+                    "x" => Some(0),
+                    "y" => Some(1),
+                    _ => None,
+                };
+                if let (Some(a), Some(b)) = (position(&names[0]), position(&names[1]))
+                    && a != b
+                    && a == 1
+                {
+                    children.swap(0, 1);
+                }
+            }
+            let mut set = super::ScalarFunctionSet::new("fmod");
+            for ty in [LogicalType::FLOAT, d.clone()] {
+                set.add(super::ScalarFunction::new("fmod", vec![ty.clone(), ty.clone()], ty, fmod));
+            }
+            super::binder::bind_scalar_function(
+                &set,
+                children,
+                false,
+                &crate::execution::expression_executor::try_evaluate_scalar,
+            )
+        }
+        "binom" => simple(
+            2,
+            2,
+            LogicalType::HUGEINT,
+            binom,
+            casted(children, &LogicalType::INTEGER),
+        ),
         "factorial" => simple(
             1,
             1,
@@ -1490,6 +1913,8 @@ pub fn bind_function(name: &str, names: &[String], mut children: Vec<BoundExpr>)
             Ok(bound_function(&lower, children, ty, time_bucket))
         }
         "normalized_interval" => simple(1, 1, LogicalType::INTERVAL, normalized_interval, children),
+        "create_sort_key" => bind_create_sort_key(children),
+        "decimal_division" => bind_decimal_division(children),
         "timetz_byte_comparable" => simple(1, 1, LogicalType::UBIGINT, timetz_byte_comparable, children),
         // their argument is a UUID
         "uuid_extract_version" | "uuid_extract_timestamp" => {
@@ -1564,8 +1989,22 @@ pub fn bind_function(name: &str, names: &[String], mut children: Vec<BoundExpr>)
         "equi_width_bins" => super::binning::bind(children),
         "is_histogram_other_bin" => simple(1, 1, LogicalType::BOOLEAN, is_histogram_other_bin, children),
         "struct_insert" | "struct_update" => {
-            if children.is_empty() || children[0].return_type.id() != LogicalTypeId::Struct {
-                return Err(binder_error(format!("{lower} expects a STRUCT as its first argument")));
+            // `StructInsertBind` and `StructUpdateBind`
+            if children.is_empty() {
+                return Err(super::lists::no_match(&lower, &children));
+            }
+            let named = names.iter().skip(1).filter(|n| !n.is_empty());
+            for (at, name) in named.clone().enumerate() {
+                if named.clone().take(at).any(|n| n.eq_ignore_ascii_case(name)) {
+                    return Err(binder_error(format!("Duplicate named argument {name} in '{lower}'")));
+                }
+            }
+            if children[0].return_type.id() != LogicalTypeId::Struct {
+                return Err(invalid(format!("The first argument to {lower} must be a STRUCT")));
+            }
+            if children.len() < 2 {
+                let verb = if lower == "struct_insert" { "insert" } else { "update" };
+                return Err(invalid(format!("Can't {verb} nothing into a STRUCT")));
             }
             let mut fields = children[0].return_type.struct_children().to_vec();
             let added: Vec<(String, BoundExpr)> = names.iter().skip(1).cloned().zip(children.drain(1..)).collect();
@@ -1601,16 +2040,44 @@ pub fn bind_function(name: &str, names: &[String], mut children: Vec<BoundExpr>)
                 ));
             }
             let mut fields: Vec<(String, LogicalType)> = Vec::new();
-            for child in &children {
-                if child.return_type.id() != LogicalTypeId::Struct {
-                    return Err(binder_error("struct_concat expects STRUCTs"));
+            let mut has_unnamed = false;
+            for (position, child) in children.iter().enumerate() {
+                if !matches!(child.return_type.id(), LogicalTypeId::Struct | LogicalTypeId::Tuple) {
+                    return Err(invalid(format!(
+                        "struct_concat: Argument at position \"{}\" is not a STRUCT",
+                        position + 1
+                    )));
                 }
                 for (name, ty) in child.return_type.struct_children() {
-                    if fields.iter().any(|(n, _)| n.eq_ignore_ascii_case(name)) {
-                        return Err(binder_error(format!("Duplicate struct entry name \"{name}\"")));
+                    if let Some((existing, _)) = fields
+                        .iter()
+                        .find(|(n, _)| !name.is_empty() && n.eq_ignore_ascii_case(name))
+                    {
+                        let quoted = |n: &str| format!("\"{}\"", n.replace('"', "\"\""));
+                        return Err(invalid(if existing == name {
+                            format!(
+                                "struct_concat: Arguments contain duplicate STRUCT entry {}",
+                                quoted(name)
+                            )
+                        } else {
+                            format!(
+                                "struct_concat: Arguments contain case-insensitive duplicate STRUCT entry {} and {}",
+                                quoted(name),
+                                quoted(existing)
+                            )
+                        }));
                     }
+                    has_unnamed |= name.is_empty();
                     fields.push((name.clone(), ty.clone()));
                 }
+            }
+            if has_unnamed && fields.iter().any(|(name, _)| !name.is_empty()) {
+                return Err(invalid("struct_concat: Cannot mix named and unnamed STRUCTs"));
+            }
+            // all-unnamed inputs make an unnamed TUPLE
+            if has_unnamed {
+                let ty = LogicalType::tuple(fields.into_iter().map(|(_, ty)| ty).collect());
+                return Ok(bound_function(&lower, children, ty, concat_tuples));
             }
             Ok(bound_function(
                 &lower,
@@ -1620,10 +2087,12 @@ pub fn bind_function(name: &str, names: &[String], mut children: Vec<BoundExpr>)
             ))
         }
         "struct_keys" => {
-            if children
-                .first()
-                .is_some_and(|c| !matches!(c.return_type.id(), LogicalTypeId::Struct | LogicalTypeId::Unknown))
-            {
+            if children.first().is_some_and(|c| {
+                !matches!(
+                    c.return_type.id(),
+                    LogicalTypeId::Struct | LogicalTypeId::Unknown | LogicalTypeId::SqlNull
+                )
+            }) {
                 return Err(Error::new(
                     ErrorKind::InvalidInput,
                     "struct_keys() expects a STRUCT argument",
@@ -1662,6 +2131,15 @@ pub fn bind_function(name: &str, names: &[String], mut children: Vec<BoundExpr>)
         "map_extract" | "element_at" | "map_extract_value" | "map_contains" => {
             count_args(&lower, &children, 2, 2)?;
             let map = children[0].return_type.clone();
+            // a NULL is a `MAP("NULL", "NULL")`
+            if map.id() == LogicalTypeId::SqlNull && lower != "map_contains" {
+                let ty = if lower == "map_extract_value" {
+                    LogicalType::SQLNULL
+                } else {
+                    LogicalType::list(LogicalType::SQLNULL)
+                };
+                return Ok(BoundExpr::constant(Value::null(ty)));
+            }
             let entry = map.child_type().cloned();
             let Some(entry) = entry.filter(|_| map.id() == LogicalTypeId::Map) else {
                 return Err(binder_error(format!("{lower} expects a MAP as its first argument")));
@@ -1795,6 +2273,31 @@ pub fn bind_function(name: &str, names: &[String], mut children: Vec<BoundExpr>)
         "cast_to_type" => {
             count_args(&lower, &children, 2, 2)?;
             let ty = children[1].return_type.clone();
+            if ty.id() == LogicalTypeId::SqlNull {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "cast_to_type cannot be used to cast to NULL",
+                ));
+            }
+            // a cast between collations of one type keeps the target's (`CastToTypeBind`)
+            let mut cast = children.remove(0).cast_to(&ty, false);
+            if cast.return_type.id() == ty.id() {
+                cast.return_type = ty;
+            }
+            Ok(cast)
+        }
+        // Ported from duckdb/extension/core_functions/scalar/generic/replace_type.cpp @ rust-port-baseline
+        // `replace_type(x, from, to)`: x cast to its type with every `from` in it made `to`
+        "replace_type" => {
+            count_args(&lower, &children, 3, 3)?;
+            let (from, to) = (children[1].return_type.clone(), children[2].return_type.clone());
+            if to.id() == LogicalTypeId::SqlNull {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "replace_type cannot be used to replace type with NULL",
+                ));
+            }
+            let ty = replace_type(&children[0].return_type, &from, &to);
             Ok(children.remove(0).cast_to(&ty, false))
         }
         "can_cast_implicitly" => {
@@ -1804,4 +2307,236 @@ pub fn bind_function(name: &str, names: &[String], mut children: Vec<BoundExpr>)
         }
         _ => Err(binder_error(format!("{lower} is not bound here"))),
     }
+}
+
+// Ported from duckdb/src/function/scalar/create_sort_key.cpp
+
+/// `CreateSortKeyBind`: pairs of a key and a constant sort specifier. Keys of a constant size that
+/// fit in 8 bytes (with a validity byte each) make a BIGINT, anything else a BLOB.
+fn bind_create_sort_key(children: Vec<BoundExpr>) -> Result<BoundExpr> {
+    use duckrs_common::types::PhysicalType as P;
+    count_args("create_sort_key", &children, 1, usize::MAX)?;
+    if !children.len().is_multiple_of(2) {
+        return Err(Error::new(
+            ErrorKind::Binder,
+            "Arguments to create_sort_key must be [key1, sort_specifier1, key2, sort_specifier2, ...]",
+        ));
+    }
+    let mut children = children;
+    let mut all_constant = true;
+    let mut constant_size = 0usize;
+    for (i, child) in children.iter_mut().enumerate() {
+        if i % 2 == 1 {
+            // `GetNonNullConstant`
+            if !child.is_foldable() {
+                return Err(Error::new(
+                    ErrorKind::Binder,
+                    format!(
+                        "Argument #{} in function create_sort_key must be a constant expression",
+                        i + 1
+                    ),
+                ));
+            }
+            let value = crate::execution::expression_executor::evaluate_scalar(child)?;
+            if value.is_null() {
+                return Err(Error::new(
+                    ErrorKind::Binder,
+                    format!("Argument #{} in function create_sort_key must not be NULL", i + 1),
+                ));
+            }
+            duckrs_common::sort_key::OrderModifiers::parse(&value.try_to_string()?)?;
+            *child = BoundExpr::constant(Value::varchar(value.try_to_string()?));
+            continue;
+        }
+        // `AccumulateSortKeyWidth`
+        let size = match child.return_type.physical_type() {
+            P::Bool | P::Int8 | P::UInt8 => Some(1),
+            P::Int16 | P::UInt16 => Some(2),
+            P::Int32 | P::UInt32 | P::Float => Some(4),
+            P::Int64 | P::UInt64 | P::Double => Some(8),
+            P::Int128 | P::UInt128 | P::Interval => Some(16),
+            _ => None,
+        };
+        match size {
+            Some(size) => constant_size += size + 1,
+            None => all_constant = false,
+        }
+    }
+    let ty = if all_constant && constant_size <= 8 {
+        LogicalType::BIGINT
+    } else {
+        LogicalType::BLOB
+    };
+    Ok(bound_function("create_sort_key", children, ty, create_sort_key))
+}
+
+fn create_sort_key(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    use duckrs_common::sort_key::{OrderModifiers, create_raw_sort_keys};
+    let count = args.len();
+    let columns = args.columns();
+    let mut keyed = Vec::new();
+    for pair in columns.chunks(2) {
+        let modifiers = OrderModifiers::parse(&pair[1].get_value(0).try_to_string()?)?;
+        keyed.push((&pair[0], modifiers));
+    }
+    let keys = create_raw_sort_keys(&keyed, count)?;
+    let bigint = result.logical_type().id() == LogicalTypeId::BigInt;
+    result.prepare_flat(count.max(1));
+    for (row, key) in keys.into_iter().enumerate() {
+        let value = if bigint {
+            // `FinalizeSortData`: the key bytes from the most significant one, zero-padded
+            let mut bytes = [0u8; 8];
+            bytes[..key.len()].copy_from_slice(&key);
+            Value::bigint(i64::from_be_bytes(bytes))
+        } else {
+            Value::blob(key)
+        };
+        result.set_value(row, &value)?;
+    }
+    Ok(())
+}
+
+// Ported from duckdb/src/function/scalar/operator/decimal_division.cpp
+
+/// `LogicalType::GetDecimalProperties`: a DECIMAL's width and scale, an integer's as `DECIMAL(p, 0)`.
+fn decimal_properties_of(ty: &LogicalType) -> Option<(u8, u8)> {
+    use LogicalTypeId as Id;
+    Some(match ty.id() {
+        Id::Decimal => ty.decimal_properties()?,
+        Id::Boolean => (1, 0),
+        Id::TinyInt | Id::UTinyInt => (3, 0),
+        Id::SmallInt | Id::USmallInt => (5, 0),
+        Id::Integer | Id::UInteger => (10, 0),
+        Id::BigInt => (19, 0),
+        Id::UBigInt => (20, 0),
+        Id::HugeInt | Id::UHugeInt => (38, 0),
+        _ => return None,
+    })
+}
+
+/// `DecimalDivisionResolveTypes`: `e1 / e2` as SQL Server types it, or at a given scale.
+fn bind_decimal_division(children: Vec<BoundExpr>) -> Result<BoundExpr> {
+    count_args("decimal_division", &children, 2, 3)?;
+    let mut children = children;
+    let mut properties = Vec::new();
+    for child in children.iter_mut().take(2) {
+        let ty = match child.return_type.id() {
+            LogicalTypeId::StringLiteral | LogicalTypeId::Varchar => LogicalType::decimal(18, 3),
+            _ => child.return_type.clone(),
+        };
+        let Some((width, scale)) = decimal_properties_of(&ty) else {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "decimal_division: both arguments must be DECIMAL",
+            ));
+        };
+        *child = child.clone().cast_to(&LogicalType::decimal(width, scale), false);
+        properties.push((u32::from(width), u32::from(scale)));
+    }
+    let ((p1, s1), (p2, s2)) = (properties[0], properties[1]);
+    let result_scale = match children.get(2) {
+        Some(scale) => {
+            if !scale.is_foldable() {
+                return Err(Error::new(
+                    ErrorKind::Binder,
+                    "Argument #3 in function decimal_division must be a constant expression",
+                ));
+            }
+            let value = crate::execution::expression_executor::evaluate_scalar(scale)?;
+            if value.is_null() {
+                return Err(Error::new(
+                    ErrorKind::Binder,
+                    "Argument #3 in function decimal_division must not be NULL",
+                ));
+            }
+            let scale = value.as_i128().unwrap_or(-1);
+            if !(0..=38).contains(&scale) {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("decimal_division: scale must be between 0 and 38, got {scale}"),
+                ));
+            }
+            scale as u32
+        }
+        None => 6.max(s1 + p2 + 1),
+    };
+    children.truncate(2);
+    let width = i64::from(p1) - i64::from(s1) + i64::from(s2) + i64::from(result_scale);
+    if width < 1 {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("decimal_division: scale {result_scale} produces a zero-width result for these input types"),
+        ));
+    }
+    let inaccurate = |what: &str, needed: i64| {
+        Error::new(
+            ErrorKind::OutOfRange,
+            format!(
+                "Needed {what} {needed} to accurately represent the division result, but this is out of range of \
+                 the DECIMAL type. Max {what} is 38; could not perform an accurate division. Either add a cast to \
+                 DOUBLE, or add an explicit cast to a decimal with a lower scale."
+            ),
+        )
+    };
+    if result_scale > 38 {
+        return Err(inaccurate("scale", i64::from(result_scale)));
+    }
+    if width > 38 {
+        return Err(inaccurate("width", width));
+    }
+    let ty = LogicalType::decimal(width as u8, result_scale as u8);
+    Ok(bound_function("decimal_division", children, ty, decimal_division))
+}
+
+/// `DecimalDivExecute`: the quotient at the result's scale, rounded half to even.
+fn decimal_division(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    let ty = result.logical_type().clone();
+    let (width, scale) = ty.decimal_properties().expect("a DECIMAL");
+    row_wise(args, result, |row| {
+        if row.iter().any(Value::is_null) {
+            return Ok(Value::null(ty.clone()));
+        }
+        let scale_of = |value: &Value| {
+            value
+                .logical_type()
+                .decimal_properties()
+                .map_or(0, |(_, s)| i32::from(s))
+        };
+        let exponent = scale_of(&row[1]) + i32::from(scale) - scale_of(&row[0]);
+        let (a, b) = (row[0].as_i128().unwrap_or(0), row[1].as_i128().unwrap_or(0));
+        if b == 0 {
+            return Err(invalid("decimal_division: division by zero"));
+        }
+        let factor = 10i128.pow(exponent.unsigned_abs());
+        let overflow = || Error::new(ErrorKind::OutOfRange, "Overflow in HUGEINT multiplication");
+        let (numerator, divisor) = if exponent < 0 {
+            let divisor = b.checked_mul(factor).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::OutOfRange,
+                    "decimal_division: scaled divisor overflowed DECIMAL range",
+                )
+            })?;
+            (a, divisor)
+        } else {
+            (a.checked_mul(factor).ok_or_else(overflow)?, b)
+        };
+        let negative = (numerator < 0) != (divisor < 0);
+        let (n, d) = (numerator.unsigned_abs(), divisor.unsigned_abs());
+        let (mut q, remainder) = (n / d, n % d);
+        let distance = d - remainder;
+        if remainder > distance || (remainder == distance && q % 2 == 1) {
+            q += 1;
+        }
+        let out_of_range = || {
+            Error::new(
+                ErrorKind::OutOfRange,
+                "decimal_division: result out of range for result type",
+            )
+        };
+        if q >= 10u128.pow(u32::from(width)) {
+            return Err(out_of_range());
+        }
+        let q = i128::try_from(q).map_err(|_| out_of_range())?;
+        Value::decimal(if negative { -q } else { q }, width, scale)
+    })
 }

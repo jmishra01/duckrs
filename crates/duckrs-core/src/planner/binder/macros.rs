@@ -141,7 +141,10 @@ fn replace_marked(expr: &mut Expr, arguments: &[Expr]) {
     {
         let alias = std::mem::take(&mut expr.alias);
         *expr = arguments[position.parse::<usize>().expect("a marked position")].clone();
-        expr.alias = alias;
+        // the reference's own alias, or else the argument's (which `invoke` names by its parameter)
+        if !alias.is_empty() {
+            expr.alias = alias;
+        }
     }
 }
 
@@ -497,6 +500,19 @@ impl Binder<'_> {
                     if has_parameter(body) {
                         return Err(binder_error("Parameter expressions within macro's are not supported!"));
                     }
+                    // a window function without OVER fails when it is bound, whatever its arguments
+                    let mut window = false;
+                    visit_expr_mut(&mut (**body).clone(), &mut |e| {
+                        if let ExprKind::Function(call) = &e.kind
+                            && call.name.qualification.iter().all(String::is_empty)
+                            && super::window::window_function(&call.name.name.to_lowercase()).is_some()
+                        {
+                            window = true;
+                        }
+                    });
+                    if window {
+                        return Err(binder_error("Window functions are not supported here"));
+                    }
                     let mut body = (**body).clone();
                     mark_all(&mut body, &parameters);
                     visit_expr_mut(&mut body, &mut |e| {
@@ -512,6 +528,7 @@ impl Binder<'_> {
                     binder.macro_arguments = parameters.iter().cloned().zip(nulls.iter().cloned()).collect();
                     // a macro's body may aggregate, and whether that fits shows where it is used
                     binder.aggregate_error = MACRO_AGGREGATE;
+                    binder.window_error = MACRO_AGGREGATE;
                     match binder.bind_expression(&body) {
                         // `BindCreateFunctionInfo`: what can't be bound yet is bound when it's called
                         Err(error)

@@ -6,15 +6,16 @@
 //! `FilterPushdown`: moves filters as far down the plan as they go, and turns cross products with
 //! a filter on both sides into joins. Operators it has no rule for keep the filters on top of them.
 //!
-//! `FilterCombiner` is reduced to splitting conjuncts, dropping duplicates and deciding constant
-//! filters; its transitive filters and ranges are not ported.
+//! The filters go through a `FilterCombiner` (`optimizer::filter_combiner`) where C++ pushes and
+//! generates them: after a filter operator and before each operator they reach.
 
 use super::conjunction_of;
 use super::rewriter::{
-    can_throw, contains_barrier, expressions_equal, fold_boolean, rewrite_expression, split_conjuncts,
+    can_throw, contains_barrier, expressions_equal, fold_boolean, rewrite_expression, split_conjuncts, window_can_throw,
 };
-use crate::planner::expression::{BoundExpr, BoundExprKind, BoundOperator, ColumnBinding};
+use crate::planner::expression::{BoundExpr, BoundExprKind, BoundOperator, ColumnBinding, WindowFunction};
 use crate::planner::logical::{JoinCondition, LogicalOperator, LogicalOperatorKind};
+use duckrs_common::types::LogicalType;
 use duckrs_common::value::Value;
 use duckrs_parser::ast::{ComparisonOp, JoinType};
 use std::collections::{BTreeSet, HashMap};
@@ -85,6 +86,55 @@ fn join_side(tables: &BTreeSet<usize>, left: &BTreeSet<usize>, right: &BTreeSet<
     }
 }
 
+/// `CreateAuxiliaryFilter`: for a filter `b op c` of a constant `c`, `e(b) op' e(c)` of the partition
+/// `e(b)` if `e` keeps the order of its argument, with `op'` not strict where `e` is not.
+fn auxiliary_filter(partition: &BoundExpr, filter: &BoundExpr) -> Option<BoundExpr> {
+    let BoundExprKind::Comparison { op, left, right } = &filter.kind else {
+        return None;
+    };
+    let (constant, free, op) = if left.is_foldable() {
+        (left, right, crate::optimizer::statistics::flip(*op))
+    } else if right.is_foldable() {
+        (right, left, *op)
+    } else {
+        return None;
+    };
+    let BoundExprKind::Function { function, children, .. } = &partition.kind else {
+        return None;
+    };
+    if !expressions_equal(free, &children[0]) {
+        return None;
+    }
+    // `ArgProperties`: increasing, and strictly so for these
+    let strict = matches!(function.name.as_str(), "make_date" | "make_timestamp" | "make_timestamp_ns" | "+");
+    if !strict && crate::execution::zone_map::unary_monotonicity(&function.name) != Some(true) {
+        return None;
+    }
+    let op = match op {
+        ComparisonOp::NotEqual | ComparisonOp::DistinctFrom | ComparisonOp::Equal | ComparisonOp::NotDistinctFrom => {
+            if !strict {
+                return None;
+            }
+            op
+        }
+        ComparisonOp::LessThan if !strict => ComparisonOp::LessThanOrEqual,
+        ComparisonOp::GreaterThan if !strict => ComparisonOp::GreaterThanOrEqual,
+        other => other,
+    };
+    let mut of_constant = partition.clone();
+    if let BoundExprKind::Function { children, .. } = &mut of_constant.kind {
+        children[0] = (**constant).clone();
+    }
+    Some(BoundExpr::new(
+        BoundExprKind::Comparison {
+            op,
+            left: Box::new(partition.clone()),
+            right: Box::new(of_constant),
+        },
+        LogicalType::BOOLEAN,
+    ))
+}
+
 /// `FilterPushdown::Filter`.
 #[derive(Debug, Clone)]
 struct Filter {
@@ -106,9 +156,98 @@ struct FilterPushdown {
     filters: Vec<Filter>,
 }
 
+thread_local! {
+    /// The next table index of the plan being rewritten (`Binder::GenerateTableIndex`).
+    static NEXT_TABLE_INDEX: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// `ProjectionMode::PRESERVE_COMPUTED_EXPRESSIONS`: a filter of a column a projection computes
+    /// stays above it
+    static PRESERVE_COMPUTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn generate_table_index() -> usize {
+    NEXT_TABLE_INDEX.with(|next| {
+        let index = next.get();
+        next.set(index + 1);
+        index
+    })
+}
+
+/// [`push_down`] that leaves above a projection the filters of what it computes
+/// (`ProjectionMode::PRESERVE_COMPUTED_EXPRESSIONS`).
+pub fn push_down_preserving_computed(plan: LogicalOperator) -> LogicalOperator {
+    let before = PRESERVE_COMPUTED.with(|p| p.replace(true));
+    let result = push_down(plan);
+    PRESERVE_COMPUTED.with(|p| p.set(before));
+    result
+}
+
 /// Runs the pass over a plan.
 pub fn push_down(plan: LogicalOperator) -> LogicalOperator {
-    FilterPushdown::default().rewrite(plan)
+    // the pass also runs on parts of the plan it rewrites: the outermost run numbers the new tables
+    let outermost = NEXT_TABLE_INDEX.with(|next| next.get()) == 0;
+    if outermost {
+        let first_free = super::common_subplan::max_table_index(&plan) + 1;
+        NEXT_TABLE_INDEX.with(|next| next.set(first_free));
+    }
+    let result = FilterPushdown::default().rewrite(plan);
+    if outermost {
+        NEXT_TABLE_INDEX.with(|next| next.set(0));
+    }
+    result
+}
+
+/// `CreateDummyRHS`: one row of NULLs with the columns of `op`, a projection on a dummy scan for
+/// each of its tables, side by side.
+fn dummy_rhs(op: &LogicalOperator) -> LogicalOperator {
+    let mut groups: Vec<(usize, Vec<(usize, duckrs_common::types::LogicalType)>)> = Vec::new();
+    for (binding, ty) in op.column_bindings().into_iter().zip(op.types()) {
+        match groups.iter_mut().find(|(table, _)| *table == binding.table_index) {
+            Some((_, columns)) => columns.push((binding.column_index, ty)),
+            None => groups.push((binding.table_index, vec![(binding.column_index, ty)])),
+        }
+    }
+    let mut result: Option<LogicalOperator> = None;
+    for (table_index, columns) in groups {
+        // the columns keep their bindings: a projection with each at its column index
+        let width = columns.iter().map(|(c, _)| c + 1).max().unwrap_or(0);
+        let expressions = (0..width)
+            .map(|at| {
+                let ty = columns
+                    .iter()
+                    .find(|(c, _)| *c == at)
+                    .map_or(duckrs_common::types::LogicalType::INTEGER, |(_, ty)| ty.clone());
+                BoundExpr::constant(Value::null(ty.clone())).cast_to(&ty, false)
+            })
+            .collect();
+        let projection = LogicalOperator::new(
+            LogicalOperatorKind::Projection {
+                table_index,
+                expressions,
+            },
+            vec![LogicalOperator::new(
+                LogicalOperatorKind::DummyScan {
+                    table_index: generate_table_index(),
+                },
+                Vec::new(),
+            )],
+        );
+        result = Some(match result {
+            None => projection,
+            Some(left) => LogicalOperator::new(LogicalOperatorKind::CrossProduct, vec![left, projection]),
+        });
+    }
+    result.unwrap_or_else(|| LogicalOperator::new(LogicalOperatorKind::DummyScan { table_index: generate_table_index() }, Vec::new()))
+}
+
+/// Whether a condition can hold for no row: it folds to false or NULL (`FilterResult::UNSATISFIABLE`).
+fn unsatisfiable(expr: &BoundExpr) -> bool {
+    let mut conjuncts = Vec::new();
+    split_conjuncts(expr.clone(), &mut conjuncts);
+    conjuncts.iter().any(|conjunct| {
+        conjunct.is_foldable()
+            && crate::execution::expression_executor::try_evaluate_scalar(conjunct)
+                .is_some_and(|value| value.is_null() || value == Value::boolean(false))
+    })
 }
 
 impl FilterPushdown {
@@ -129,7 +268,26 @@ impl FilterPushdown {
         true
     }
 
+    /// `PushFilters` and `GenerateFilters`: the filters through a `FilterCombiner`; false if
+    /// together they hold for no row.
+    fn combine(&mut self) -> bool {
+        if self.filters.is_empty() {
+            return true;
+        }
+        let mut combiner = super::filter_combiner::FilterCombiner::default();
+        for filter in std::mem::take(&mut self.filters) {
+            if combiner.add(filter.filter) == super::filter_combiner::FilterResult::Unsatisfiable {
+                return false;
+            }
+        }
+        self.filters = combiner.generate().into_iter().map(Filter::new).collect();
+        true
+    }
+
     fn rewrite(mut self, mut op: LogicalOperator) -> LogicalOperator {
+        if !matches!(op.kind, LogicalOperatorKind::Filter { .. }) && !self.combine() {
+            return empty_result(&op);
+        }
         // `BarrierCanPassThrough`: an operator that can remove rows keeps the barred filters on top of it
         let passes = matches!(
             op.kind,
@@ -137,6 +295,7 @@ impl FilterPushdown {
                 | LogicalOperatorKind::Projection { .. }
                 | LogicalOperatorKind::Order { .. }
                 | LogicalOperatorKind::Get { .. }
+                | LogicalOperatorKind::SecureView { .. }
         );
         if !passes && self.filters.iter().any(|f| contains_barrier(&f.filter)) {
             let (barred, rest): (Vec<Filter>, Vec<Filter>) = std::mem::take(&mut self.filters)
@@ -157,6 +316,10 @@ impl FilterPushdown {
                         return empty_result(&op);
                     }
                 }
+                // `PushdownFilter`: `GenerateFilters`
+                if !self.combine() {
+                    return empty_result(&op);
+                }
                 self.rewrite(op.children.remove(0))
             }
             LogicalOperatorKind::CrossProduct => self.pushdown_cross_product(op),
@@ -174,6 +337,7 @@ impl FilterPushdown {
                 self.pushdown_set_operation(op)
             }
             LogicalOperatorKind::Distinct { .. } => self.pushdown_distinct(op),
+            LogicalOperatorKind::Window { .. } => self.pushdown_window(op),
             LogicalOperatorKind::Order { .. } => {
                 let child = op.children.remove(0);
                 op.children.push(self.rewrite(child));
@@ -181,8 +345,28 @@ impl FilterPushdown {
             }
             LogicalOperatorKind::Limit { limit: Some(0), .. } => empty_result(&op),
             LogicalOperatorKind::Unnest { .. } => self.pushdown_unnest(op),
+            LogicalOperatorKind::SecureView { .. } => self.pushdown_secure_view(op),
             _ => self.finish_pushdown(op),
         }
+    }
+
+    /// `FilterPushdown::PushdownSecureView`: the filters go into the view, but one that could be
+    /// observed from outside (it can throw, or is volatile) goes in a barrier, which no operator
+    /// inside that removes rows lets past. The boundary stays.
+    fn pushdown_secure_view(self, mut op: LogicalOperator) -> LogicalOperator {
+        let mut inside = FilterPushdown::default();
+        for f in self.filters {
+            let mut expr = f.filter;
+            if (can_throw(&expr) || expr.is_volatile()) && !contains_barrier(&expr) {
+                expr = crate::function::wrap_in_barrier(expr);
+            }
+            if !inside.add_filter(expr) {
+                return empty_result(&op);
+            }
+        }
+        let child = op.children.remove(0);
+        op.children.push(inside.rewrite(child));
+        op
     }
 
     /// `PushdownMarkJoin` and `PushdownSingleJoin`: each left row stays, once, so what reads only
@@ -215,6 +399,113 @@ impl FilterPushdown {
             );
             **right = push_down(plan);
         }
+        self.push_final_filters(op)
+    }
+
+    /// `FilterPushdown::PushdownWindow`: a filter on columns that partition every window holds
+    /// for all rows of a partition or none, and so does one that compares a partition of every
+    /// window with constants when the windows are rankings without arguments. A filter `b op c` of
+    /// a constant `c` and an order-preserving partition `e(b)` of every window leaves a weaker copy
+    /// `e(b) op' e(c)` below (`CreateAuxiliaryFilter`), and stays.
+    fn pushdown_window(mut self, mut op: LogicalOperator) -> LogicalOperator {
+        let LogicalOperatorKind::Window { windows, .. } = &op.kind else {
+            unreachable!()
+        };
+        let mut partition_bindings: Vec<BTreeSet<ColumnBinding>> = Vec::new();
+        // the partitions `e(b)` of one argument, with how often windows have them
+        let mut partition_functions: Vec<(BoundExpr, usize)> = Vec::new();
+        for window in windows {
+            // all windows need partitions
+            if window.partitions.is_empty() {
+                return self.finish_pushdown(op);
+            }
+            for partition in &window.partitions {
+                if let BoundExprKind::Function { children, .. } = &partition.kind
+                    && children.len() == 1
+                    && !partition.is_volatile()
+                {
+                    match partition_functions.iter_mut().find(|(p, _)| expressions_equal(p, partition)) {
+                        Some((_, count)) => *count += 1,
+                        None => partition_functions.push((partition.clone(), 1)),
+                    }
+                }
+            }
+            partition_bindings.push(
+                window
+                    .partitions
+                    .iter()
+                    .filter_map(|p| match p.kind {
+                        BoundExprKind::ColumnRef { binding, depth: 0 } => Some(binding),
+                        _ => None,
+                    })
+                    .collect(),
+            );
+        }
+        if partition_bindings.is_empty() {
+            return self.finish_pushdown(op);
+        }
+        // `OnlyRanksWithoutArguments`
+        let only_ranks = windows.iter().all(|w| {
+            matches!(
+                w.function,
+                WindowFunction::RowNumber
+                    | WindowFunction::Rank
+                    | WindowFunction::DenseRank
+                    | WindowFunction::PercentRank
+                    | WindowFunction::CumeDist
+                    | WindowFunction::Ntile
+            ) && !window_can_throw(w)
+                && w.children.is_empty()
+                && w.filter.is_none()
+                && w.start_expr.is_none()
+                && w.end_expr.is_none()
+        });
+        // `ComparesWindowPartitions`
+        let compares_partitions = |filter: &BoundExpr| {
+            let Some(compared) = compared_expression(filter) else {
+                return false;
+            };
+            windows.iter().all(|w| {
+                w.partitions.iter().any(|p| match (&p.kind, &compared.kind) {
+                    (
+                        BoundExprKind::ColumnRef { binding: a, .. },
+                        BoundExprKind::ColumnRef { binding: b, .. },
+                    ) => a == b,
+                    _ => expressions_equal(p, compared),
+                })
+            })
+        };
+        let mut below = FilterPushdown::default();
+        let mut remaining = Vec::new();
+        for f in std::mem::take(&mut self.filters) {
+            let mut columns = Vec::new();
+            let mut probe = f.filter.clone();
+            visit_columns(&mut probe, &mut |e| {
+                if let BoundExprKind::ColumnRef { binding, .. } = e.kind {
+                    columns.push(binding);
+                }
+            });
+            let on_partitions = partition_bindings
+                .iter()
+                .all(|set| columns.iter().all(|b| set.contains(b)));
+            if (on_partitions || (only_ranks && compares_partitions(&f.filter))) && !f.filter.is_volatile() {
+                below.filters.push(f);
+                continue;
+            }
+            for (partition, count) in &partition_functions {
+                // a partition of every window
+                if *count != partition_bindings.len() {
+                    continue;
+                }
+                if let Some(auxiliary) = auxiliary_filter(partition, &f.filter) {
+                    below.filters.push(Filter::new(auxiliary));
+                }
+            }
+            remaining.push(f);
+        }
+        let child = op.children.remove(0);
+        op.children.push(below.rewrite(child));
+        self.filters = remaining;
         self.push_final_filters(op)
     }
 
@@ -308,6 +599,7 @@ impl FilterPushdown {
                 join_type: JoinType::Inner,
                 conditions,
                 predicate: (!predicates.is_empty()).then(|| conjunction_of(predicates)),
+                algorithm: Default::default(),
             };
             LogicalOperator::new(kind, children)
         };
@@ -361,6 +653,43 @@ impl FilterPushdown {
             }
         }
         let mut right = FilterPushdown::default();
+        // the join's conditions and the left side's filters tell filters of the right side: with
+        // `i = a` and `i = 500`, `a = 500`
+        let LogicalOperatorKind::Join {
+            conditions, predicate, ..
+        } = &op.kind
+        else {
+            unreachable!()
+        };
+        let mut combiner = super::filter_combiner::FilterCombiner::default();
+        for condition in conditions {
+            combiner.add(BoundExpr::new(
+                BoundExprKind::Comparison {
+                    op: condition.comparison,
+                    left: Box::new(condition.left.clone()),
+                    right: Box::new(condition.right.clone()),
+                },
+                duckrs_common::types::LogicalType::BOOLEAN,
+            ));
+        }
+        if let Some(predicate) = predicate {
+            let mut conjuncts = Vec::new();
+            split_conjuncts(predicate.clone(), &mut conjuncts);
+            for conjunct in conjuncts {
+                combiner.add(conjunct);
+            }
+        }
+        for f in &left.filters {
+            combiner.add(f.filter.clone());
+        }
+        // only a comparison join (with conditions here) does this, not `LogicalAnyJoin`
+        let generated = if conditions.is_empty() { Vec::new() } else { combiner.generate() };
+        for generated in generated {
+            let generated = Filter::new(generated);
+            if join_side(&generated.tables, &left_tables, &right_tables) == JoinSide::Right {
+                right.filters.push(generated);
+            }
+        }
         let LogicalOperatorKind::Join { predicate, .. } = &mut op.kind else {
             unreachable!()
         };
@@ -381,15 +710,35 @@ impl FilterPushdown {
         }
         let right_child = op.children.remove(1);
         let left_child = op.children.remove(0);
+        // a LEFT join on a condition that holds for no row: each left row with NULLs on the right
+        let LogicalOperatorKind::Join { predicate, .. } = &op.kind else {
+            unreachable!()
+        };
+        if predicate.as_ref().is_some_and(unsatisfiable) {
+            let dummy = dummy_rhs(&right_child);
+            let product = LogicalOperator::new(LogicalOperatorKind::CrossProduct, vec![left.rewrite(left_child), dummy]);
+            return add_filter_operator(product, remaining.into_iter().map(|f| f.filter).collect());
+        }
         op.children = vec![left.rewrite(left_child), right.rewrite(right_child)];
         add_filter_operator(op, remaining.into_iter().map(|f| f.filter).collect())
     }
 
     /// `FilterPushdown::PushdownSemiAntiJoin`: the output is the left side's, filters and all.
     fn pushdown_semi_anti_join(self, mut op: LogicalOperator) -> LogicalOperator {
+        // a right row that matches a left row passes what the filters tell of the right side
+        let mut right = FilterPushdown::default();
+        if let LogicalOperatorKind::Join { conditions, .. } = &op.kind
+            && !conditions.is_empty()
+            && !self.filters.is_empty()
+        {
+            let filters: Vec<BoundExpr> = self.filters.iter().map(|f| f.filter.clone()).collect();
+            for generated in super::filter_pullup::join_filters(conditions, &filters, false) {
+                right.filters.push(Filter::new(generated));
+            }
+        }
         let right_child = op.children.remove(1);
         let left_child = op.children.remove(0);
-        op.children = vec![self.rewrite(left_child), push_down(right_child)];
+        op.children = vec![self.rewrite(left_child), right.rewrite(right_child)];
         op
     }
 
@@ -406,6 +755,7 @@ impl FilterPushdown {
         let projected = expressions.clone();
         let mut below = FilterPushdown::default();
         let mut remaining = Vec::new();
+        let mut split = Vec::new();
         let mut barred = Vec::new();
         for mut f in self.filters {
             // a barrier goes below only if all the others do, so that it is evaluated after them
@@ -421,21 +771,39 @@ impl FilterPushdown {
             });
             // copying a subquery would run it twice, and below the projection an entry that can
             // fail would run ahead of the filters there
-            let stays = can_throw(&f.filter)
+            // `stays_on_top`: volatile, or a filter that can throw
+            let on_top = can_throw(&f.filter)
                 || columns.iter().any(|b| {
                     let entry = projected.get(b.column_index);
-                    b.table_index != table_index
-                        || entry.is_none_or(|e| e.is_volatile() || contains_subquery(e) || can_throw(e))
+                    b.table_index != table_index || entry.is_none_or(|e| e.is_volatile() || contains_subquery(e))
                 });
-            if stays {
+            // `splits_off`: what reads a computed column is evaluated once, below the filter, where
+            // the projection computes it as it did
+            let preserve = PRESERVE_COMPUTED.with(std::cell::Cell::get);
+            if !on_top
+                && preserve
+                && columns.iter().any(|b| {
+                    projected
+                        .get(b.column_index)
+                        .is_some_and(|e| !matches!(e.kind, BoundExprKind::ColumnRef { .. }))
+                })
+            {
+                split.push(f.filter);
+                continue;
+            }
+            if on_top {
                 remaining.push(f.filter);
                 continue;
             }
             let mut filter = f.filter;
             replace_columns(&mut filter, &mut |e| {
                 if let BoundExprKind::ColumnRef { binding, .. } = e.kind {
-                    // the filter reads what the projection reads, by its own name
-                    *e = projected[binding.column_index].clone();
+                    // `ReplaceProjectionBindings`: what the projection reads, by the column's name if it has one
+                    let mut copy = projected[binding.column_index].clone();
+                    if !e.alias.is_empty() {
+                        copy.alias = e.alias.clone();
+                    }
+                    *e = copy;
                 }
             });
             if !below.add_filter(filter) {
@@ -449,11 +817,12 @@ impl FilterPushdown {
                     columns.push(binding);
                 }
             });
+            // a projection removes no rows, so what it computes may throw below the barrier too
             let stays = !remaining.is_empty()
+                || !split.is_empty()
                 || columns.iter().any(|b| {
                     let entry = projected.get(b.column_index);
-                    b.table_index != table_index
-                        || entry.is_none_or(|e| e.is_volatile() || contains_subquery(e) || can_throw(e))
+                    b.table_index != table_index || entry.is_none_or(|e| e.is_volatile() || contains_subquery(e))
                 });
             if stays {
                 remaining.push(f.filter);
@@ -467,6 +836,9 @@ impl FilterPushdown {
                 }
             });
             below.filters.push(Filter::new(filter));
+        }
+        if !split.is_empty() {
+            return split_projection(op, below, split, remaining);
         }
         let child = op.children.remove(0);
         op.children.push(below.rewrite(child));
@@ -502,7 +874,7 @@ impl FilterPushdown {
     /// `FilterPushdown::PushdownDistinct`. DISTINCT ON picks a row of each group, so what it picks
     /// changes with a filter below it.
     fn pushdown_distinct(mut self, mut op: LogicalOperator) -> LogicalOperator {
-        let LogicalOperatorKind::Distinct { targets } = &op.kind else {
+        let LogicalOperatorKind::Distinct { targets, .. } = &op.kind else {
             unreachable!()
         };
         if targets.len() != op.children[0].column_bindings().len() {
@@ -571,6 +943,45 @@ fn side_of_disjunction(expr: &BoundExpr, side: &BTreeSet<usize>) -> Option<Bound
     ))
 }
 
+/// `FilterCombiner::GetComparedExpression`: the one side that is not constant of a comparison,
+/// or the first child of BETWEEN and IN.
+fn compared_expression(filter: &BoundExpr) -> Option<&BoundExpr> {
+    if filter.is_volatile() {
+        return None;
+    }
+    let (children, first_only): (Vec<&BoundExpr>, bool) = match &filter.kind {
+        BoundExprKind::Comparison { op, left, right }
+            if matches!(
+                op,
+                ComparisonOp::Equal
+                    | ComparisonOp::NotEqual
+                    | ComparisonOp::LessThan
+                    | ComparisonOp::LessThanOrEqual
+                    | ComparisonOp::GreaterThan
+                    | ComparisonOp::GreaterThanOrEqual
+            ) =>
+        {
+            (vec![&**left, &**right], false)
+        }
+        BoundExprKind::Between { input, lower, upper } => (vec![&**input, &**lower, &**upper], true),
+        BoundExprKind::Operator {
+            op: BoundOperator::In,
+            children,
+        } => (children.iter().collect(), true),
+        _ => return None,
+    };
+    let mut compared = None;
+    for (i, child) in children.into_iter().enumerate() {
+        if !child.is_foldable() {
+            if compared.is_some() || (first_only && i != 0) {
+                return None;
+            }
+            compared = Some(child);
+        }
+    }
+    compared
+}
+
 fn contains_subquery(expr: &BoundExpr) -> bool {
     matches!(expr.kind, BoundExprKind::Subquery { .. }) || expr.children().into_iter().any(contains_subquery)
 }
@@ -586,6 +997,101 @@ fn replace_set_operation_bindings(filter: &mut BoundExpr, table_index: usize, bi
 }
 
 /// `FilterPushdown::AddLogicalFilter`.
+/// `FilterPushdown::SplitProjection`: the columns the `split` filters read are computed by a
+/// projection of their own below them, which passes on what the others read.
+fn split_projection(
+    mut op: LogicalOperator,
+    below: FilterPushdown,
+    mut split: Vec<BoundExpr>,
+    remaining: Vec<BoundExpr>,
+) -> LogicalOperator {
+    let LogicalOperatorKind::Projection {
+        table_index,
+        expressions,
+    } = &mut op.kind
+    else {
+        unreachable!()
+    };
+    let table_index = *table_index;
+    let mut referenced = vec![false; expressions.len()];
+    for filter in &mut split {
+        visit_columns(filter, &mut |e| {
+            if let BoundExprKind::ColumnRef { binding, depth: 0 } = e.kind
+                && binding.table_index == table_index
+                && let Some(r) = referenced.get_mut(binding.column_index)
+            {
+                *r = true;
+            }
+        });
+    }
+    if referenced.iter().all(|r| *r) {
+        let child = op.children.remove(0);
+        op.children.push(below.rewrite(child));
+        let mut all = remaining;
+        all.extend(split);
+        return add_filter_operator(op, all);
+    }
+    let lower_index = generate_table_index();
+    let mut lower_expressions: Vec<BoundExpr> = Vec::new();
+    let mut lower_positions = vec![None; expressions.len()];
+    for (at, expr) in expressions.iter_mut().enumerate() {
+        if !referenced[at] {
+            continue;
+        }
+        lower_positions[at] = Some(lower_expressions.len());
+        let column = BoundExpr::column_ref(
+            ColumnBinding::new(lower_index, lower_expressions.len()),
+            expr.return_type.clone(),
+            expr.alias.clone(),
+        );
+        lower_expressions.push(std::mem::replace(expr, column));
+    }
+    // `AddPassThroughColumns`
+    let mut pass_through: Vec<(ColumnBinding, usize)> = Vec::new();
+    for (at, expr) in expressions.iter_mut().enumerate() {
+        if referenced[at] {
+            continue;
+        }
+        expr.walk_mut(&mut |e| {
+            if let BoundExprKind::ColumnRef { binding, depth: 0 } = &mut e.kind {
+                let position = match pass_through.iter().find(|(b, _)| b == binding) {
+                    Some((_, position)) => *position,
+                    None => {
+                        let position = lower_expressions.len();
+                        pass_through.push((*binding, position));
+                        let mut copy = BoundExpr::column_ref(*binding, e.return_type.clone(), e.alias.clone());
+                        copy.alias.clone_from(&e.alias);
+                        lower_expressions.push(copy);
+                        position
+                    }
+                };
+                *binding = ColumnBinding::new(lower_index, position);
+            }
+        });
+    }
+    // `ReplaceFilterBindings`
+    for filter in &mut split {
+        replace_columns(filter, &mut |e| {
+            if let BoundExprKind::ColumnRef { binding, depth: 0 } = &mut e.kind
+                && binding.table_index == table_index
+                && let Some(Some(position)) = lower_positions.get(binding.column_index)
+            {
+                *binding = ColumnBinding::new(lower_index, *position);
+            }
+        });
+    }
+    let child = op.children.remove(0);
+    let lower = LogicalOperator::new(
+        LogicalOperatorKind::Projection {
+            table_index: lower_index,
+            expressions: lower_expressions,
+        },
+        vec![below.rewrite(child)],
+    );
+    op.children.push(add_filter_operator(lower, split));
+    add_filter_operator(op, remaining)
+}
+
 fn add_filter_operator(op: LogicalOperator, mut expressions: Vec<BoundExpr>) -> LogicalOperator {
     // the barred filters run after the others
     expressions.sort_by_key(contains_barrier);
@@ -599,11 +1105,7 @@ fn add_filter_operator(op: LogicalOperator, mut expressions: Vec<BoundExpr>) -> 
 pub(super) fn condition_expression(condition: JoinCondition) -> BoundExpr {
     BoundExpr::new(
         BoundExprKind::Comparison {
-            op: if condition.null_safe {
-                ComparisonOp::NotDistinctFrom
-            } else {
-                ComparisonOp::Equal
-            },
+            op: condition.comparison,
             left: Box::new(condition.left),
             right: Box::new(condition.right),
         },
@@ -646,7 +1148,7 @@ fn extract_join_conditions(
                 conditions.push(JoinCondition {
                     left: (**l).clone(),
                     right: (**r).clone(),
-                    null_safe,
+                    comparison: JoinCondition::equality(null_safe),
                     filter: None,
                 });
                 continue;
@@ -718,7 +1220,7 @@ fn mark_to_semi(op: &mut LogicalOperator, reads: &HashMap<ColumnBinding, usize>)
     let join_type = if expressions.iter().any(is_marker) {
         JoinType::Semi
     } else if expressions.iter().any(is_not_marker)
-        && conditions.iter().all(|condition| condition.null_safe)
+        && conditions.iter().all(|condition| condition.null_safe())
         && predicate.as_ref().is_none_or(never_null)
     {
         JoinType::Anti
@@ -731,6 +1233,7 @@ fn mark_to_semi(op: &mut LogicalOperator, reads: &HashMap<ColumnBinding, usize>)
         join_type,
         conditions,
         predicate,
+        algorithm: Default::default(),
     };
     if expressions.is_empty() {
         *op = op.children.remove(0);

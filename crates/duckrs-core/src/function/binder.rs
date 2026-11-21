@@ -143,13 +143,46 @@ pub fn bind_scalar_function(
     is_operator: bool,
     fold: &dyn Fn(&BoundExpr) -> Option<Value>,
 ) -> Result<BoundExpr> {
+    // `IntegerNegateBind`: the negation of a type's minimum is of the next wider type
+    if set.name == "-"
+        && let [child] = children.as_mut_slice()
+        && let Some(value) = match &child.kind {
+            BoundExprKind::Constant(value) => Some(value.clone()),
+            // `TryGetConstant`: a foldable argument counts as the constant it folds to
+            _ if child.is_foldable() => fold(child),
+            _ => None,
+        }
+        && !value.is_null()
+    {
+        let (minimum, wider) = match child.return_type.id() {
+            LogicalTypeId::TinyInt => (i128::from(i8::MIN), LogicalType::SMALLINT),
+            LogicalTypeId::SmallInt => (i128::from(i16::MIN), LogicalType::INTEGER),
+            LogicalTypeId::Integer => (i128::from(i32::MIN), LogicalType::BIGINT),
+            LogicalTypeId::BigInt => (i128::from(i64::MIN), LogicalType::HUGEINT),
+            _ => (0, LogicalType::SQLNULL),
+        };
+        if wider.id() != LogicalTypeId::SqlNull && value.as_i128() == Some(minimum) {
+            *child = child.clone().cast_to(&wider, false);
+        }
+    }
     let arguments: Vec<LogicalType> = children.iter().map(expression_return_type).collect();
     let function = select_function(set, &arguments)?;
     check_scalar_constant_parameters(&function.name, &children)?;
     // `FunctionNullHandling::SPECIAL_HANDLING`: the function decides what a NULL argument means
     let special_nulls = matches!(
         function.name.as_str(),
-        "string_split" | "str_split" | "string_to_array" | "split" | "stats" | "__internal_barrier" | "vector_type"
+        "string_split"
+            | "str_split"
+            | "string_to_array"
+            | "split"
+            | "stats"
+            | "__internal_barrier"
+            | "vector_type"
+            | "regexp_extract"
+            | "parse_filename"
+            | "parse_path"
+            | "parse_dirname"
+            | "parse_dirpath"
     );
     if special_nulls {
         let function = match function.resolve_types {
@@ -177,7 +210,9 @@ pub fn bind_scalar_function(
     // if any of the arguments are NULL, the function is replaced with a NULL constant
     if children.iter().any(|c| c.return_type.id() == LogicalTypeId::SqlNull) {
         // untyped NULLs never go through type resolution
-        let incomplete = function.return_type.id() == LogicalTypeId::Decimal && !function.return_type.has_params();
+        // (`||` and `constant_or_null` give ANY until their types are resolved)
+        let incomplete = function.return_type.id() == LogicalTypeId::Decimal && !function.return_type.has_params()
+            || matches!(function.name.as_str(), "||" | "constant_or_null");
         return Ok(BoundExpr::constant(if incomplete {
             Value::sql_null()
         } else {
@@ -194,7 +229,7 @@ pub fn bind_scalar_function(
     for child in &mut children {
         if let BoundExprKind::Constant(value) = &child.kind {
             if value.is_null() {
-                return Ok(BoundExpr::constant(Value::null(function.return_type.clone())));
+                return Ok(BoundExpr::constant(Value::null(folded_type(&function.return_type, &children))));
             }
             continue;
         }
@@ -204,7 +239,7 @@ pub fn bind_scalar_function(
         // an argument that cannot be evaluated stays, so that its error surfaces at execution
         if let Some(value) = fold(child) {
             if value.is_null() {
-                return Ok(BoundExpr::constant(Value::null(function.return_type.clone())));
+                return Ok(BoundExpr::constant(Value::null(folded_type(&function.return_type, &children))));
             }
             let alias = std::mem::take(&mut child.alias);
             *child = BoundExpr::constant(value).with_alias(alias);
@@ -267,6 +302,18 @@ pub fn inside_try<T>(f: impl FnOnce() -> T) -> T {
     result
 }
 
+/// The type a call folded to NULL has: a VARCHAR keeps the collation of its arguments, as
+/// `PropagateReturnCollation` gives the call itself.
+fn folded_type(return_type: &LogicalType, children: &[BoundExpr]) -> LogicalType {
+    if return_type.id() != LogicalTypeId::Varchar || return_type.alias().is_some() || return_type.collation().is_some() {
+        return return_type.clone();
+    }
+    children
+        .iter()
+        .find_map(|c| (c.return_type.id() == LogicalTypeId::Varchar).then(|| c.return_type.collation()).flatten())
+        .map_or_else(|| return_type.clone(), LogicalType::varchar_collation)
+}
+
 /// The bind callbacks of the scalar functions with a parameter that has to be constant.
 fn check_scalar_constant_parameters(name: &str, children: &[BoundExpr]) -> Result<()> {
     // `ParseRegexOptions` on the options of the regex functions
@@ -307,7 +354,13 @@ fn check_scalar_constant_parameters(name: &str, children: &[BoundExpr]) -> Resul
 /// The bind callbacks of the aggregates with a parameter that has to be constant.
 fn check_constant_parameters(name: &str, children: &mut [BoundExpr]) -> Result<()> {
     match (name, children) {
+        // `StringAggBind`: of VARCHARs, to which anything else is cast
+        ("string_agg" | "listagg" | "group_concat", [input]) => {
+            *input = input.clone().cast_to(&LogicalType::VARCHAR, false);
+            Ok(())
+        }
         ("string_agg" | "listagg" | "group_concat", [input, separator]) => {
+            *input = input.clone().cast_to(&LogicalType::VARCHAR, false);
             if constant_parameter(name, separator, 1, true)?.is_some_and(|value| value.is_null()) {
                 *input = BoundExpr::constant(Value::null(LogicalType::VARCHAR));
             }
@@ -326,9 +379,82 @@ fn check_constant_parameters(name: &str, children: &mut [BoundExpr]) -> Result<(
             constant_parameter(name, max, 2, true)?;
             Ok(())
         }
-        ("quantile_cont" | "quantile_disc" | "quantile", [_]) => Err(binder_error(
+        // `BindApproxQuantile` + `CheckApproxQuantile`: fractions in [0, 1], kept as FLOAT
+        ("approx_quantile", [input, parameter]) => {
+            // `GetNonNullConstant`
+            let Some(value) = constant_parameter(name, parameter, 1, false)? else {
+                return Ok(());
+            };
+            let as_float = |v: &Value| -> Result<f32> {
+                if v.is_null() {
+                    return Err(binder_error(
+                        "APPROXIMATE QUANTILE parameter cannot be NULL".to_string(),
+                    ));
+                }
+                let cast = crate::execution::parquet::cast_value(v, &LogicalType::FLOAT)?;
+                let ValueData::Float(q) = cast.data() else {
+                    return Err(binder_error(
+                        "APPROXIMATE QUANTILE parameter cannot be NULL".to_string(),
+                    ));
+                };
+                if q.is_nan() {
+                    return Err(binder_error("APPROXIMATE QUANTILE parameter cannot be NaN".to_string()));
+                }
+                if !(0.0..=1.0).contains(q) {
+                    return Err(binder_error(
+                        "APPROXIMATE QUANTILE can only take parameters in range [0, 1]".to_string(),
+                    ));
+                }
+                Ok(*q)
+            };
+            let list = matches!(parameter.return_type.id(), LogicalTypeId::List | LogicalTypeId::Array);
+            let fractions = match value.data() {
+                ValueData::List(items) if list => {
+                    let floats = items
+                        .iter()
+                        .map(|i| as_float(i).map(Value::float))
+                        .collect::<Result<Vec<_>>>()?;
+                    Value::list(LogicalType::FLOAT, floats)?
+                }
+                _ => Value::float(as_float(&value)?),
+            };
+            *parameter = BoundExpr::constant(fractions);
+            let target = super::holistic::approx_quantile_type(&expression_return_type(input), list)?;
+            *input = input.clone().cast_to(&target, false);
+            Ok(())
+        }
+        // quantile_cont takes its fraction, quantile_disc has an overload without one (for deserializing)
+        (_, arguments @ [_]) | (_, arguments @ [_, _, _, ..])
+            if name == "quantile_cont" || (arguments.len() > 2 && matches!(name, "quantile_disc" | "quantile")) =>
+        {
+            let types: Vec<String> = arguments.iter().map(|c| expression_return_type(c).to_string()).collect();
+            Err(binder_error(format!(
+                "No function matches the given name and argument types '{name}({})'. You might need to add \
+                 explicit type casts.",
+                types.join(", ")
+            )))
+        }
+        ("quantile_disc" | "quantile", [_]) => Err(binder_error(
             "QUANTILE requires a range argument between [0, 1]".to_string(),
         )),
+        // the fraction is a number or a list of them: no overload takes a STRUCT; and quantile_cont has
+        // no INTERVAL overload (`GetContinuousQuantileTypes`)
+        ("quantile_cont" | "quantile_disc" | "quantile", [input, parameter])
+            if matches!(parameter.return_type.id(), LogicalTypeId::Struct | LogicalTypeId::Tuple)
+                || (name == "quantile_cont"
+                    && (input.return_type.is_nested()
+                        || matches!(
+                            input.return_type.id(),
+                            LogicalTypeId::Interval | LogicalTypeId::Varchar | LogicalTypeId::Blob
+                        ))) =>
+        {
+            Err(binder_error(format!(
+                "No function matches the given name and argument types '{name}({}, {})'. You might need to add \
+                 explicit type casts.",
+                expression_return_type(input),
+                expression_return_type(parameter)
+            )))
+        }
         ("quantile_cont" | "quantile_disc" | "quantile", [_, parameter]) => {
             match constant_parameter(name, parameter, 1, false)? {
                 Some(value) => check_quantile_parameter(&value),
@@ -336,6 +462,59 @@ fn check_constant_parameters(name: &str, children: &mut [BoundExpr]) -> Result<(
             }
         }
         _ => Ok(()),
+    }
+}
+
+/// `BindReservoirQuantile`: the quantile (0.5 by default) and the sample size (8192 by default) are
+/// constants. duckrs keeps every row, so the quantile is exact and the sample size only checked.
+fn reservoir_quantile_parameters(children: &mut Vec<BoundExpr>) -> Result<()> {
+    const NAME: &str = "reservoir_quantile";
+    if children.len() == 1 {
+        children.push(BoundExpr::constant(Value::double(0.5)));
+    }
+    if children.len() == 3 {
+        let size = children.pop().expect("three arguments");
+        if let Some(value) = constant_parameter(NAME, &size, 2, false)? {
+            let size = crate::execution::parquet::cast_value(&value, &LogicalType::INTEGER)?
+                .as_i128()
+                .unwrap_or(0);
+            if size <= 0 {
+                return Err(binder_error(
+                    "Size of the RESERVOIR_QUANTILE sample must be bigger than 0".to_string(),
+                ));
+            }
+        }
+    }
+    let [_, quantile] = children.as_slice() else {
+        return Ok(());
+    };
+    // `CheckReservoirQuantile`
+    let Some(value) = constant_parameter(NAME, quantile, 1, true)? else {
+        return Ok(());
+    };
+    let check = |value: &Value| -> Result<()> {
+        if value.is_null() {
+            return Err(binder_error(
+                "RESERVOIR_QUANTILE QUANTILE parameter cannot be NULL".to_string(),
+            ));
+        }
+        let cast = crate::execution::parquet::cast_value(value, &LogicalType::DOUBLE)?;
+        let ValueData::Double(quantile) = *cast.data() else {
+            return Ok(());
+        };
+        if quantile.is_nan() {
+            return Err(binder_error("RESERVOIR_QUANTILE parameter cannot be NaN".to_string()));
+        }
+        if !(0.0..=1.0).contains(&quantile) {
+            return Err(binder_error(
+                "RESERVOIR_QUANTILE can only take parameters in the range [0, 1]".to_string(),
+            ));
+        }
+        Ok(())
+    };
+    match value.data() {
+        ValueData::List(items) => items.iter().try_for_each(check),
+        _ => check(&value),
     }
 }
 
@@ -354,7 +533,7 @@ fn histogram_bin_arguments(name: &str, mut children: Vec<BoundExpr>) -> Result<V
     let stringy = |t: &LogicalType| {
         matches!(
             t.id(),
-            LogicalTypeId::Varchar | LogicalTypeId::StringLiteral | LogicalTypeId::SqlNull
+            LogicalTypeId::Varchar | LogicalTypeId::StringLiteral | LogicalTypeId::SqlNull | LogicalTypeId::Enum
         )
     };
     let common = element
@@ -394,7 +573,21 @@ pub fn bind_aggregate_function(
     distinct: bool,
 ) -> Result<BoundAggregate> {
     let mut children = children;
+    if set.name == "reservoir_quantile" {
+        reservoir_quantile_parameters(&mut children)?;
+    }
     check_constant_parameters(&set.name, &mut children)?;
+    // `GetAverageAggregate`'s stub of TIMESTAMP_S, TIMESTAMP_MS and DATE: averaged as a TIMESTAMP,
+    // which holds every value they have, rather than widened to TIMESTAMP_NS
+    if matches!(set.name.as_str(), "avg" | "mean")
+        && let [input] = children.as_mut_slice()
+        && matches!(
+            input.return_type.id(),
+            LogicalTypeId::TimestampSec | LogicalTypeId::TimestampMs | LogicalTypeId::Date
+        )
+    {
+        *input = input.clone().cast_to(&LogicalType::TIMESTAMP, false);
+    }
     if matches!(set.name.as_str(), "histogram" | "histogram_exact") && children.len() == 2 {
         children = histogram_bin_arguments(&set.name, children)?;
     }
@@ -432,6 +625,7 @@ pub fn bind_aggregate_function(
         distinct,
         order_by: Vec::new(),
         distinct_key: None,
+        distinct_order: Vec::new(),
     })
 }
 

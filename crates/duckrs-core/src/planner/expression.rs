@@ -52,6 +52,19 @@ pub enum BoundOperator {
     Coalesce,
     /// the argument, with NULL for the rows that fail
     Try,
+    /// `OPERATOR_HAS_ERROR`: whether evaluating the argument fails, per row
+    HasError,
+    /// `COMPARE_IN`: whether the first argument equals one of the others. The binder only keeps a
+    /// list that `InClauseRewriter` can turn into a MARK join; it spells out the others as `=` ORs
+    In,
+    /// `COMPARE_NOT_IN`
+    NotIn,
+}
+
+impl BoundOperator {
+    pub fn is_in(self) -> bool {
+        matches!(self, BoundOperator::In | BoundOperator::NotIn)
+    }
 }
 
 /// What a subquery asks of its rows (`SubqueryType`).
@@ -135,6 +148,8 @@ pub enum BoundExprKind {
     JoinFilter {
         child: Box<BoundExpr>,
         filter: Arc<crate::execution::join_filter::JoinFilter>,
+        /// a NULL of `child` passes: it is a value a cast failed on, for the query to fail on
+        keep_null: bool,
     },
     /// `BoundCastExpression` to the expression's return type.
     Cast { child: Box<BoundExpr>, try_cast: bool },
@@ -198,6 +213,9 @@ pub struct BoundAggregate {
     pub order_by: Vec<(BoundExpr, OrderModifiers)>,
     /// what DISTINCT tells rows apart by, if not the argument itself: its collated value
     pub distinct_key: Option<BoundExpr>,
+    /// the `ORDER BY` keys (by position) that are not arguments: DISTINCT tells rows apart by
+    /// them too (`MultiStageAggregateRewriter::GetOrderExpressions`)
+    pub distinct_order: Vec<usize>,
 }
 
 /// The functions that give something else on each call (`FunctionStability::VOLATILE`).
@@ -471,7 +489,14 @@ impl fmt::Display for BoundExpr {
     /// `Expression::ToString`, as far as error messages need it.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.kind {
-            BoundExprKind::Constant(value) if value.is_null() => f.write_str("NULL"),
+            // `Value::ToSQLString`: a NULL with its type, unless it has none
+            BoundExprKind::Constant(value) if value.is_null() => {
+                if value.logical_type().id() == duckrs_common::types::LogicalTypeId::SqlNull {
+                    f.write_str("NULL")
+                } else {
+                    write!(f, "NULL::{}", value.logical_type())
+                }
+            }
             BoundExprKind::Constant(value) => {
                 use duckrs_common::types::LogicalTypeId as T;
                 let text = value.try_to_string().unwrap_or_default();
@@ -495,7 +520,16 @@ impl fmt::Display for BoundExpr {
                     _ => f.write_str(&text),
                 }
             }
-            BoundExprKind::ColumnRef { .. } | BoundExprKind::Reference(_) => f.write_str(&self.alias),
+            _ if !self.alias.is_empty()
+                && matches!(self.kind, BoundExprKind::ColumnRef { .. } | BoundExprKind::Reference(_)) =>
+            {
+                f.write_str(&self.alias)
+            }
+            // `ColumnBinding::ToString` and `BoundReferenceExpression::ToString` without an alias
+            BoundExprKind::ColumnRef { binding, .. } => {
+                write!(f, "#[{}.{}]", binding.table_index, binding.column_index)
+            }
+            BoundExprKind::Reference(index) => write!(f, "#{index}"),
             BoundExprKind::JoinFilter { child, .. } => write!(f, "optional: Dynamic Filter ({child})"),
             BoundExprKind::Cast { child, try_cast } => {
                 let name = if *try_cast { "TRY_CAST" } else { "CAST" };
@@ -511,7 +545,14 @@ impl fmt::Display for BoundExpr {
                 [child] if *is_operator => write!(f, "{}{child}", function.name),
                 _ => {
                     let args: Vec<String> = children.iter().map(|c| c.to_string()).collect();
-                    write!(f, "{}({})", function.name, args.join(", "))
+                    // `KeywordHelper::WriteOptionallyQuoted`: a name that is no identifier is quoted
+                    let plain = function.name.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_')
+                        && function.name.chars().all(|c| c.is_alphanumeric() || c == '_');
+                    if plain {
+                        write!(f, "{}({})", function.name, args.join(", "))
+                    } else {
+                        write!(f, "\"{}\"({})", function.name.replace('"', "\"\""), args.join(", "))
+                    }
                 }
             },
             BoundExprKind::Conjunction { and, children } => {
@@ -527,6 +568,12 @@ impl fmt::Display for BoundExpr {
                     BoundOperator::IsNotNull => write!(f, "({all} IS NOT NULL)"),
                     BoundOperator::Coalesce => write!(f, "COALESCE({all})"),
                     BoundOperator::Try => write!(f, "TRY({all})"),
+                    BoundOperator::HasError => write!(f, "has_error({all})"),
+                    BoundOperator::In | BoundOperator::NotIn => {
+                        let list: Vec<&str> = parts[1..].iter().map(String::as_str).collect();
+                        let keyword = if *op == BoundOperator::In { "IN" } else { "NOT IN" };
+                        write!(f, "({} {keyword} ({}))", parts[0], list.join(", "))
+                    }
                 }
             }
             BoundExprKind::Between { input, lower, upper } => write!(f, "({input} BETWEEN {lower} AND {upper})"),
@@ -538,7 +585,83 @@ impl fmt::Display for BoundExpr {
                 write!(f, " ELSE {else_expr} END")
             }
             BoundExprKind::Subquery { .. } => f.write_str("SUBQUERY"),
+            // `BoundFunctionExpression::ToString` of a lambda function: the list, the lambda with the
+            // names of its parameters, and the initial value
+            BoundExprKind::ListLambda {
+                kind,
+                list,
+                initial,
+                body,
+                ..
+            } => {
+                let name = match kind {
+                    LambdaKind::Transform => "list_apply",
+                    LambdaKind::Filter => "list_filter",
+                    LambdaKind::Reduce => "list_reduce",
+                };
+                let mut names: Vec<String> = Vec::new();
+                let slots = if *kind == LambdaKind::Reduce { 3 } else { 2 };
+                for slot in 0..slots {
+                    let mut found = None;
+                    body.clone().walk_mut(&mut |e| {
+                        if let BoundExprKind::Reference(at) = e.kind
+                            && at == slot
+                            && found.is_none()
+                            && !e.alias.is_empty()
+                        {
+                            found = Some(e.alias.clone());
+                        }
+                    });
+                    match found {
+                        Some(name) => names.push(name),
+                        None if slot == 0 => names.push("x".to_string()),
+                        None => break,
+                    }
+                }
+                write!(f, "{name}({list}, lambda {}: {body}", names.join(", "))?;
+                if let Some(initial) = initial {
+                    write!(f, ", {initial}")?;
+                }
+                f.write_str(")")
+            }
             _ => write!(f, "{:?}", self.kind),
         }
+    }
+}
+
+/// `x IN (a, b, ...)` as `x = a OR x = b ...`, and `x NOT IN (...)` as the NOT of that, of the
+/// `children` of an IN: the input, then the values.
+pub fn in_as_comparisons(negated: bool, children: &[BoundExpr]) -> BoundExpr {
+    let input = &children[0];
+    let comparisons = children[1..]
+        .iter()
+        .map(|value| {
+            BoundExpr::new(
+                BoundExprKind::Comparison {
+                    op: ComparisonOp::Equal,
+                    left: Box::new(input.clone()),
+                    right: Box::new(value.clone()),
+                },
+                LogicalType::BOOLEAN,
+            )
+        })
+        .collect();
+    let result = BoundExpr::new(
+        BoundExprKind::Conjunction {
+            and: false,
+            children: comparisons,
+        },
+        LogicalType::BOOLEAN,
+    );
+    if negated {
+        BoundExpr::new(
+            BoundExprKind::Operator {
+                op: BoundOperator::Not,
+                children: vec![result],
+            },
+            LogicalType::BOOLEAN,
+        )
+    } else {
+        result
     }
 }

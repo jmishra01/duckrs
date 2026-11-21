@@ -22,7 +22,7 @@ fn is_unnamed(ty: &LogicalType) -> bool {
 }
 
 /// `StructBoundCastData::GetFieldMapping`: for each target field, the source field it takes.
-fn field_mapping(source: &LogicalType, target: &LogicalType) -> Result<Vec<Option<usize>>> {
+pub(crate) fn field_mapping(source: &LogicalType, target: &LogicalType) -> Result<Vec<Option<usize>>> {
     let (from, to) = (source.struct_children(), target.struct_children());
     if is_unnamed(source) || is_unnamed(target) {
         if from.len() != to.len() {
@@ -88,9 +88,17 @@ fn string_to_nested(input: &[u8], target: &LogicalType, mode: CastMode) -> Resul
         LogicalTypeId::List | LogicalTypeId::Array => {
             let child = target.child_type().expect("a child type");
             let parts = split_list(input).ok_or_else(error)?;
+            // a child type with an alias (JSON) casts as the type it is of: the items are of the alias
             let items = parts
                 .into_iter()
-                .map(|p| cast_value(&varchar_part(p), child, mode))
+                .map(|p| {
+                    let item = cast_value(&varchar_part(p), child, mode)?;
+                    if item.logical_type() != child && item.logical_type().id() == child.id() {
+                        item.reinterpret(child)
+                    } else {
+                        Ok(item)
+                    }
+                })
                 .collect::<Result<Vec<_>>>()?;
             if let Some(size) = target.array_size().filter(|_| target.id() == LogicalTypeId::Array)
                 && items.len() != size as usize
@@ -109,8 +117,17 @@ fn string_to_nested(input: &[u8], target: &LogicalType, mode: CastMode) -> Resul
             let entries = split_map(input).ok_or_else(error)?;
             let mut items = Vec::with_capacity(entries.len());
             for (key, value) in entries {
-                let key = cast_value(&varchar_part(Some(key)), &fields[0].1, mode)?;
+                // keys of type NULL are NULL: "Map keys can not be NULL."
+                let null_keys = fields[0].1.id() == LogicalTypeId::SqlNull;
+                let key = if null_keys {
+                    Value::sql_null()
+                } else {
+                    cast_value(&varchar_part(Some(key)), &fields[0].1, mode)?
+                };
                 if key.is_null() {
+                    if null_keys && mode == CastMode::Strict {
+                        return Err(Error::new(ErrorKind::InvalidInput, "Map keys can not be NULL."));
+                    }
                     return Err(error());
                 }
                 let value = cast_value(&varchar_part(value), &fields[1].1, mode)?;
@@ -228,7 +245,7 @@ fn struct_matches_union(source: &LogicalType, target: &LogicalType) -> bool {
             .iter()
             .zip(&to[1..])
             .all(|((from_name, from_type), (to_name, to_type))| {
-                from_name == to_name && (from_type == to_type || *from_type == LogicalType::VARCHAR)
+                from_name.eq_ignore_ascii_case(to_name) && (from_type == to_type || *from_type == LogicalType::VARCHAR)
             })
 }
 
@@ -238,7 +255,14 @@ fn struct_to_union(fields: &[Value], target: &LogicalType, mode: CastMode) -> Re
     let casted = fields
         .iter()
         .zip(target.struct_children())
-        .map(|(field, (_, ty))| cast_value(field, ty, mode))
+        .map(|(field, (_, ty))| {
+            let value = cast_value(field, ty, mode)?;
+            // a VARCHAR is a JSON as it is: the value takes the member's type
+            if value.logical_type() != ty {
+                return Value::new(ty.clone(), value.data().clone());
+            }
+            Ok(value)
+        })
         .collect::<Result<Vec<_>>>()?;
     let Some(tag) = casted[0].as_i128() else {
         return Err(error("One or more rows in the produced UNION have a NULL tag"));
@@ -290,7 +314,8 @@ fn union_to_union(value: &Value, fields: &[Value], target: &LogicalType, mode: C
         return Some(Ok(Value::null(target.clone())));
     };
     let tag = tag as usize;
-    let member = cast_inner(&fields[tag + 1], &to[tags[tag]].1, mode);
+    // the member is cast strictly: a TRY_CAST that fails on it loses the whole UNION
+    let member = cast_inner(&fields[tag + 1], &to[tags[tag]].1, CastMode::Strict);
     Some(match member {
         // a TRY_CAST that fails on the member loses the whole UNION
         Err(_) if mode == CastMode::Try => Ok(Value::null(target.clone())),
@@ -308,6 +333,16 @@ pub(super) fn cast_value(value: &Value, target: &LogicalType, mode: CastMode) ->
 
 fn cast_inner(value: &Value, target: &LogicalType, mode: CastMode) -> Result<Value> {
     use LogicalTypeId as L;
+    // there is no TYPE to VARIANT cast: only a NULL casts
+    if target.id() == L::Variant && super::cast::contains_type(value.logical_type()) {
+        if value.is_null() {
+            return Ok(Value::null(target.clone()));
+        }
+        return Err(super::cast::conversion_error(format!(
+            "Unimplemented type for cast ({} -> VARIANT)",
+            value.logical_type()
+        )));
+    }
     if value.is_null() {
         // `ToUnionMemberCast` keeps the tag of a NULL of a member's type: the member is NULL
         let source = value.logical_type();

@@ -18,18 +18,25 @@ pub mod generic;
 pub(crate) mod geometry;
 pub(crate) mod holistic;
 mod holistic_states;
+mod hyperloglog;
+// the whole of C++'s TDigest is ported; approx_quantile uses part of it
 pub mod json;
 pub mod json_serialize;
 mod lists;
 pub(crate) mod math;
 pub mod nested;
 mod nested_casts;
+pub(crate) use nested_casts::field_mapping as struct_field_mapping;
 pub(crate) mod operators;
 mod printf;
 pub(crate) mod regexp;
 mod remap_struct;
 mod string_nested;
 mod strings;
+pub(crate) mod strptime;
+#[allow(dead_code)]
+mod std_heap;
+mod tdigest;
 pub mod test_all_types;
 pub mod test_vector_types;
 pub(crate) mod time_casts;
@@ -63,6 +70,10 @@ pub struct ScalarFunction {
     pub null_on_zero: bool,
     /// `ieee_floating_point_ops = false` (`BindBinaryFloatingPoint`): a zero divisor is an error
     pub error_on_zero: bool,
+    /// `FunctionErrors::CANNOT_ERROR`, set where the arguments or their statistics show it
+    pub cannot_error: bool,
+    /// `RandomLocalState` of `random()`: its engine, seeded from the client's when first run
+    pub random: Option<Arc<parking_lot::Mutex<Option<crate::execution::random_engine::RandomEngine>>>>,
 }
 
 impl ScalarFunction {
@@ -80,6 +91,23 @@ impl ScalarFunction {
             resolve_types: None,
             null_on_zero: false,
             error_on_zero: false,
+            cannot_error: false,
+            random: None,
+        }
+    }
+
+    /// This overload, known not to fail (`SetErrorMode(FunctionErrors::CANNOT_ERROR)`).
+    pub fn infallible(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            arguments: self.arguments.clone(),
+            return_type: self.return_type.clone(),
+            function: self.function,
+            resolve_types: self.resolve_types,
+            null_on_zero: self.null_on_zero,
+            error_on_zero: self.error_on_zero,
+            cannot_error: true,
+            random: self.random.clone(),
         }
     }
 
@@ -93,6 +121,8 @@ impl ScalarFunction {
             resolve_types: self.resolve_types,
             null_on_zero: null,
             error_on_zero: !null,
+            cannot_error: self.cannot_error,
+            random: self.random.clone(),
         }
     }
 
@@ -158,6 +188,13 @@ fn sequence_functions() -> Vec<ScalarFunctionSet> {
     set.add(function("setval", vec![name, value, is_called]));
     sets.push(set);
     sets
+}
+
+fn has_error_function(_: &DataChunk, _: &mut Vector) -> Result<()> {
+    Err(duckrs_common::Error::new(
+        duckrs_common::ErrorKind::Internal,
+        "has_error is bound as the HAS_ERROR operator and never executes as a function",
+    ))
 }
 
 /// `constant_or_null`: the first argument, or NULL where one of the others is.
@@ -253,10 +290,20 @@ pub fn typeof_constant(argument: &LogicalType) -> Value {
 /// numeric ones (`NumericStats`), which is what duckrs keeps. The others (strings, nested
 /// types, VARIANT) have statistics of more kinds than duckrs works out.
 pub fn stats_supported(ty: &LogicalType) -> bool {
-    matches!(
-        ty.id(),
-        LogicalTypeId::SqlNull | LogicalTypeId::Geometry | LogicalTypeId::Varchar | LogicalTypeId::Blob
-    ) || crate::optimizer::statistics::has_ordered_statistics(ty)
+    match ty.id() {
+        // the statistics of any child at least know its NULLs
+        LogicalTypeId::List | LogicalTypeId::Array | LogicalTypeId::Struct => true,
+        _ => {
+            matches!(
+                ty.id(),
+                LogicalTypeId::SqlNull
+                    | LogicalTypeId::Geometry
+                    | LogicalTypeId::Varchar
+                    | LogicalTypeId::Blob
+                    | LogicalTypeId::Variant
+            ) || crate::optimizer::statistics::has_ordered_statistics(ty)
+        }
+    }
 }
 
 /// `stats(expression)`: the statistics of its argument, which the statistics propagator works
@@ -296,7 +343,9 @@ fn stats_function() -> ScalarFunctionSet {
 fn vector_type_function() -> ScalarFunctionSet {
     fn run(args: &DataChunk, result: &mut Vector) -> Result<()> {
         use duckrs_common::vector::VectorType;
-        let name = match args.columns()[0].vector_type() {
+        let argument = &args.columns()[0];
+        let name = match argument.vector_type() {
+            VectorType::Flat if argument.is_shredded() => "SHREDDED_VECTOR",
             VectorType::Flat => "FLAT_VECTOR",
             VectorType::Constant => "CONSTANT_VECTOR",
             VectorType::Dictionary => "DICTIONARY_VECTOR",
@@ -324,12 +373,19 @@ fn vector_type_function() -> ScalarFunctionSet {
     set
 }
 
+fn barrier(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    *result = args.columns()[0].clone();
+    Ok(())
+}
+
+/// `ExpressionBarrier::Wrap`.
+pub(crate) fn wrap_in_barrier(expr: crate::planner::expression::BoundExpr) -> crate::planner::expression::BoundExpr {
+    let ty = expr.return_type.clone();
+    nested::bound_function("__internal_barrier", vec![expr], ty, barrier)
+}
+
 /// `BarrierFun`: its argument, unchanged; optimizations keep what is in it together.
 fn barrier_function() -> ScalarFunctionSet {
-    fn barrier(args: &DataChunk, result: &mut Vector) -> Result<()> {
-        *result = args.columns()[0].clone();
-        Ok(())
-    }
     fn resolve(function: &ScalarFunction, arguments: &[LogicalType]) -> Result<ScalarFunction> {
         Ok(ScalarFunction::new(
             function.name.clone(),
@@ -437,6 +493,15 @@ impl BuiltinFunctions {
             }
             let set = constant_or_null_function();
             functions.scalar.insert(set.name.clone(), set);
+            // `HasErrorFun`: listed in the catalog, bound as the HAS_ERROR operator
+            let mut has_error = ScalarFunctionSet::new("has_error");
+            has_error.add(ScalarFunction::new(
+                "has_error",
+                vec![LogicalType::new(LogicalTypeId::Any)],
+                LogicalType::BOOLEAN,
+                has_error_function,
+            ));
+            functions.scalar.insert(has_error.name.clone(), has_error);
             let typeof_set = typeof_function();
             functions.scalar.insert(typeof_set.name.clone(), typeof_set);
             let barrier_set = barrier_function();

@@ -130,6 +130,17 @@ fn array_slice(args: &DataChunk, result: &mut Vector) -> Result<()> {
                 "Slicing with steps is not supported for strings",
             ));
         }
+        if ty.id() == LogicalTypeId::Blob {
+            // `BlobSliceOperations`: bytes, not characters
+            let ValueData::Bytes(bytes) = row[0].data() else {
+                return Ok(Value::null(ty.clone()));
+            };
+            let (begin, end) = clamp_slice(slice_bound(&row[1]), slice_bound(&row[2]), bytes.len() as i64);
+            return Value::new(
+                ty.clone(),
+                ValueData::Bytes(bytes[begin as usize..end as usize].to_vec()),
+            );
+        }
         let characters: Vec<char> = text_of(&row[0]).chars().collect();
         let (begin, end) = clamp_slice(slice_bound(&row[1]), slice_bound(&row[2]), characters.len() as i64);
         Ok(Value::varchar(
@@ -142,12 +153,21 @@ fn bind_array_slice(children: Vec<BoundExpr>) -> Result<BoundExpr> {
     if !(3..=4).contains(&children.len()) {
         return Err(no_match("array_slice", &children));
     }
+    let stepped = children.len() == 4;
     let mut children = children.into_iter();
     let input = as_list(children.next().expect("checked"));
     let ty = input.return_type.clone();
+    if stepped && matches!(ty.id(), LogicalTypeId::Varchar | LogicalTypeId::Blob) {
+        return Err(Error::new(
+            ErrorKind::NotImplemented,
+            "Slice with steps has not been implemented for string types, you can consider rewriting your query as \
+             follows:\n SELECT array_to_string((str_split(string, '')[begin:end:step], '');",
+        ));
+    }
     let return_type = match ty.id() {
         LogicalTypeId::List => ty,
         LogicalTypeId::Varchar => LogicalType::VARCHAR,
+        LogicalTypeId::Blob => LogicalType::BLOB,
         LogicalTypeId::SqlNull => return Ok(BoundExpr::constant(Value::sql_null())),
         _ => return Err(binder_error("ARRAY_SLICE can only operate on LISTs and VARCHARs")),
     };
@@ -167,10 +187,9 @@ fn bind_array_slice(children: Vec<BoundExpr>) -> Result<BoundExpr> {
                 return Err(binder_error("The upper and lower bounds of the slice must be a BIGINT"));
             }
             arguments.push(bound);
-        } else if bound.return_type.is_numeric() || bound.return_type.id() == LogicalTypeId::SqlNull {
-            arguments.push(bound.cast_to(&LogicalType::BIGINT, false));
         } else {
-            return Err(binder_error("The upper and lower bounds of the slice must be a BIGINT"));
+            // anything else is cast to the BIGINT the bounds are (`ArraySliceResolveTypes`)
+            arguments.push(bound.cast_to(&LogicalType::BIGINT, false));
         }
     }
     Ok(bound_function("array_slice", arguments, return_type, array_slice))
@@ -243,13 +262,22 @@ fn list_concat(args: &DataChunk, result: &mut Vector) -> Result<()> {
 }
 
 fn array_to_string(args: &DataChunk, result: &mut Vector) -> Result<()> {
-    strict_rows(args, result, |row| {
+    row_wise(args, result, |row| {
+        if row[0].is_null() {
+            return Ok(Value::null(LogicalType::VARCHAR));
+        }
+        // `string_agg` with a NULL separator joins with a comma
+        let separator = if row[1].is_null() {
+            ",".to_string()
+        } else {
+            text_of(&row[1])
+        };
         let parts = items_of(&row[0])
             .iter()
             .filter(|v| !v.is_null())
             .map(Value::try_to_string)
             .collect::<Result<Vec<_>>>()?;
-        Ok(Value::varchar(parts.join(&text_of(&row[1]))))
+        Ok(Value::varchar(parts.join(&separator)))
     })
 }
 
@@ -259,12 +287,13 @@ fn list_sort(args: &DataChunk, result: &mut Vector) -> Result<()> {
     strict_rows(args, result, |row| {
         let option = |index: usize, default: &str| row.get(index).map_or(default.to_string(), text_of).to_uppercase();
         let modifiers = OrderModifiers {
-            order: if option(1, "ASC") == "DESC" {
+            // `EnumUtil::FromString`: both spellings of each
+            order: if matches!(option(1, "ASC").as_str(), "DESC" | "DESCENDING") {
                 OrderType::Descending
             } else {
                 OrderType::Ascending
             },
-            nulls: if option(2, "NULLS FIRST") == "NULLS LAST" {
+            nulls: if matches!(option(2, "NULLS FIRST").as_str(), "NULLS LAST" | "NULLS_LAST") {
                 NullOrder::NullsLast
             } else {
                 NullOrder::NullsFirst
@@ -613,6 +642,9 @@ fn setseed(args: &DataChunk, result: &mut Vector) -> Result<()> {
         }
         // xorshift never leaves zero
         *RANDOM_STATE.lock() = seed.to_bits() | 1;
+        // `SetSeedFunction`: the seed in [-1, 1] spread over the 32 bit integers
+        let half_max = f64::from(u32::MAX / 2);
+        crate::execution::random_engine::client_set_seed(((seed + 1.0) * half_max) as u32 as u64);
     }
     *result = Vector::constant_null(LogicalType::SQLNULL);
     Ok(())
@@ -691,6 +723,10 @@ fn range_list(args: &DataChunk, result: &mut Vector, generate_series: bool) -> R
     let ty = result.logical_type().clone();
     strict_rows(args, result, |row| {
         let values: Vec<i128> = row.iter().filter_map(Value::as_i128).collect();
+        // `ListLength`: a step of 0 is no values (the table function refuses it)
+        if values.get(2) == Some(&0) {
+            return Value::new(ty.clone(), ValueData::List(Vec::new()));
+        }
         let (start, count, increment) = range_parameters(&values, generate_series)?;
         if count >= 1 << 32 {
             return Err(Error::new(
@@ -714,8 +750,9 @@ fn list_generate_series(args: &DataChunk, result: &mut Vector) -> Result<()> {
 }
 
 /// Whether `name` is the `unnest` of a select list.
+/// `IsUnnestFunction`: UNNEST, or UNLIST.
 pub fn is_unnest(name: &str) -> bool {
-    name.eq_ignore_ascii_case("unnest")
+    name.eq_ignore_ascii_case("unnest") || name.eq_ignore_ascii_case("unlist")
 }
 
 /// Whether `expr` is an unnest the select node has yet to take out of its expressions.
@@ -763,6 +800,8 @@ pub fn is_generic_function(name: &str) -> bool {
             "array_slice"
                 | "list_slice"
                 | "len"
+                | "char_length"
+                | "character_length"
                 | "array_length"
                 | "cardinality"
                 | "concat"
@@ -834,7 +873,16 @@ pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
     if lower.starts_with("map_") && null_map_argument(&children)
         || lower == "cardinality" && null_map_argument(&children)
     {
-        return Ok(BoundExpr::constant(Value::sql_null()));
+        // a NULL is a `MAP("NULL", "NULL")`: the functions fold to a NULL of their return type
+        let ty = match lower.as_str() {
+            "map_keys" | "map_values" => LogicalType::list(LogicalType::SQLNULL),
+            "map_entries" => LogicalType::list(LogicalType::struct_type(vec![
+                ("key".to_string(), LogicalType::SQLNULL),
+                ("value".to_string(), LogicalType::SQLNULL),
+            ])),
+            _ => LogicalType::SQLNULL,
+        };
+        return Ok(BoundExpr::constant(Value::null(ty)));
     }
     let single = |children: &[BoundExpr]| match children {
         [child] => Ok(child.clone()),
@@ -882,7 +930,7 @@ pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
                 array_length_of_dimension,
             ))
         }
-        "len" | "array_length" | "length" => {
+        "len" | "array_length" | "length" | "char_length" | "character_length" => {
             let child = as_list(single(&children)?);
             let id = child.return_type.id();
             if id == LogicalTypeId::Bit && lower == "length" {
@@ -950,6 +998,10 @@ pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
             Ok(bound_function("concat_ws", children, LogicalType::VARCHAR, concat_ws))
         }
         "list_concat" | "array_concat" | "list_cat" | "array_cat" => {
+            // all NULL arguments make a NULL
+            if !children.is_empty() && children.iter().all(|c| c.return_type.id() == LogicalTypeId::SqlNull) {
+                return Ok(BoundExpr::constant(Value::sql_null()));
+            }
             let mut element = LogicalType::SQLNULL;
             for child in &children {
                 if is_list(&child.return_type) {
@@ -992,12 +1044,28 @@ pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
             bind_generic_function("list_concat", arguments)
         }
         "array_to_string" => {
-            if children.len() != 2 || !is_list(&children[0].return_type) {
+            let untyped = children
+                .first()
+                .is_some_and(|c| c.return_type.id() == LogicalTypeId::SqlNull);
+            if children.len() != 2 || !(untyped || is_list(&children[0].return_type)) {
                 return Err(no_match(&lower, &children));
             }
             let mut children = children.into_iter();
-            let list = as_list(children.next().expect("checked"));
-            let separator = children.next().expect("checked").cast_to(&LogicalType::VARCHAR, false);
+            let list = children.next().expect("checked");
+            // the macro casts its argument to `VARCHAR[]`
+            let list = if untyped {
+                list.cast_to(&LogicalType::list(LogicalType::VARCHAR), false)
+            } else {
+                as_list(list)
+            };
+            let separator = children.next().expect("checked");
+            // the macro's `string_agg` takes its separator at bind time
+            if !separator.is_foldable() {
+                return Err(binder_error(
+                    "Argument #2 in function string_agg must be a constant expression",
+                ));
+            }
+            let separator = separator.cast_to(&LogicalType::VARCHAR, false);
             Ok(bound_function(
                 &lower,
                 vec![list, separator],
@@ -1009,6 +1077,10 @@ pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
             let Some(first) = children.first().filter(|_| children.len() <= 3).cloned() else {
                 return Err(no_match(&lower, &children));
             };
+            // `ListNormalSortBind`: a VARIANT matches `LIST(ANY)` uncast, and is refused
+            if first.return_type.id() == LogicalTypeId::Variant {
+                return Err(binder_error("list_sort can only operate on LISTs"));
+            }
             // a NULL takes the `LIST(ANY)` parameter as a list of NULLs
             let child = if first.return_type.id() == LogicalTypeId::SqlNull {
                 first.cast_to(&LogicalType::list(LogicalType::SQLNULL), false)
@@ -1058,6 +1130,15 @@ pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
             if children.is_empty() {
                 return Err(no_match(&lower, &children));
             }
+            // `PUSH_COMBINABLE_COLLATIONS`: the arguments hash as they compare
+            let children = children
+                .into_iter()
+                .map(|child| {
+                    let ty = child.return_type.clone();
+                    let kind = crate::planner::collation::CollationType::CombinableCollations;
+                    Ok(crate::planner::collation::push_collation(child, &ty, "", kind)?.0)
+                })
+                .collect::<Result<Vec<_>>>()?;
             Ok(bound_function("hash", children, LogicalType::UBIGINT, hash_function))
         }
         "repeat" => {
@@ -1082,7 +1163,15 @@ pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
                 Ok(bound) => return Ok(bound),
                 Err(children) => children,
             };
-            if children.is_empty() || children.len() > 3 {
+            // a VARCHAR (not a literal) does not cast to BIGINT implicitly
+            let castable = |c: &BoundExpr| {
+                !c.return_type.is_nested()
+                    && !matches!(
+                        super::binder::expression_return_type(c).id(),
+                        LogicalTypeId::Varchar | LogicalTypeId::Blob
+                    )
+            };
+            if children.is_empty() || children.len() > 3 || !children.iter().all(castable) {
                 return Err(no_match(&lower, &children));
             }
             let children = children
@@ -1136,6 +1225,13 @@ pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
             let [text, length, fill] = children.as_slice() else {
                 return Err(no_match(&lower, &children));
             };
+            // default NULL handling: a NULL constant argument makes the call a NULL constant
+            if children.iter().any(|c| {
+                c.is_foldable()
+                    && crate::execution::expression_executor::evaluate_scalar(c).is_ok_and(|v| v.is_null())
+            }) {
+                return Ok(BoundExpr::constant(Value::null(LogicalType::VARCHAR)));
+            }
             let args = vec![
                 text.clone().cast_to(&LogicalType::VARCHAR, false),
                 length.clone().cast_to(&LogicalType::INTEGER, false),
@@ -1173,7 +1269,16 @@ pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
             if !children.is_empty() {
                 return Err(no_match("random", &children));
             }
-            Ok(bound_function("random", children, LogicalType::DOUBLE, random))
+            let mut function = super::ScalarFunction::new("random", Vec::new(), LogicalType::DOUBLE, random);
+            function.random = Some(std::sync::Arc::new(parking_lot::Mutex::new(None)));
+            Ok(BoundExpr::new(
+                BoundExprKind::Function {
+                    function: std::sync::Arc::new(function),
+                    children,
+                    is_operator: false,
+                },
+                LogicalType::DOUBLE,
+            ))
         }
         "sleep_ms" => {
             let child = single(&children)?.cast_to(&LogicalType::BIGINT, false);
@@ -1454,13 +1559,19 @@ fn sign(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
-fn interval_out_of_range() -> Error {
-    Error::new(ErrorKind::OutOfRange, "Interval value out of range")
-}
-
 /// `to_years` and the like, for a unit of `months`, `days` or `micros`.
-fn to_interval(args: &DataChunk, result: &mut Vector, months: i64, days: i64, micros: i64) -> Result<()> {
+fn to_interval(args: &DataChunk, result: &mut Vector, months: i64, days: i64, micros: i64, unit: &str) -> Result<()> {
     strict_rows(args, result, |row| {
+        // `To*Operator`: "Interval value <n> <unit> out of range"
+        let interval_out_of_range = || {
+            Error::new(
+                ErrorKind::OutOfRange,
+                format!(
+                    "Interval value {} {unit} out of range",
+                    row[0].try_to_string().unwrap_or_default()
+                ),
+            )
+        };
         let number = |factor: i64| -> Result<i64> {
             match row[0].data() {
                 ValueData::Double(v) => {
@@ -1486,7 +1597,8 @@ fn to_interval(args: &DataChunk, result: &mut Vector, months: i64, days: i64, mi
 macro_rules! interval_function {
     ($($name:ident: $months:expr, $days:expr, $micros:expr;)*) => {$(
         fn $name(args: &DataChunk, result: &mut Vector) -> Result<()> {
-            to_interval(args, result, $months, $days, $micros)
+            let unit = stringify!($name).trim_start_matches("to_");
+            to_interval(args, result, $months, $days, $micros, unit)
         }
     )*};
 }

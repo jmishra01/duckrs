@@ -7,7 +7,7 @@ use super::super::{Transformer, not_implemented, parser_error};
 use super::{COMPRESSIONS, apply_collation};
 use crate::ast::*;
 use crate::matcher::ParseNode;
-use duckrs_common::{Error, ErrorKind, Result};
+use duckrs_common::Result;
 
 /// `IsSimpleDefaultValue`: a constant, possibly cast (but not TRY_CAST).
 fn is_simple_default(expr: &Expr) -> bool {
@@ -313,12 +313,7 @@ impl Transformer<'_> {
                         .iter()
                         .find(|(n, _)| *n == requested)
                         .map(|(_, display)| *display)
-                        .ok_or_else(|| {
-                            Error::new(
-                                ErrorKind::Conversion,
-                                format!("Enum value: '{requested}' not found in CompressionType"),
-                            )
-                        })?;
+                        .ok_or_else(|| super::unrecognized_compression(&requested))?;
                     entry.column.compression = Some(name);
                 }
             }

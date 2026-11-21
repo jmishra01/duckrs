@@ -96,10 +96,13 @@ fn can_cast_bignum(text: &[u8]) -> bool {
     integer_text(text).is_some()
 }
 
-/// `TryDoubleCast`, strictly: no sign of plus, and no leading zeros.
+/// `TryDoubleCast`, strictly: no sign of plus, no leading zeros and no digit separators.
 fn can_cast_double(text: &str, ty: &LogicalType) -> bool {
     let trimmed = text.trim_start_matches(|c: char| c.is_ascii() && is_space(c as u8));
     let bytes = trimmed.as_bytes();
+    if bytes.contains(&b'_') {
+        return false;
+    }
     match bytes {
         [] | [b'+', ..] => return false,
         [b'0', next, ..] if next.is_ascii_digit() => return false,

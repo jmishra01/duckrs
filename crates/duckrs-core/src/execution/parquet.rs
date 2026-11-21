@@ -62,14 +62,21 @@ pub struct ParquetScanData {
     pub hive_overrides: Vec<(usize, String)>,
     /// the name the function was called by, which EXPLAIN shows (`read_parquet`, `parquet_scan`)
     pub function_name: String,
+    /// the arguments of the call, which tell two calls apart (`LogicalGet::parameters`)
+    pub arguments: String,
     /// `table_filters`: conditions on one column each, over the columns of [`Self::output_types`]
     pub filters: Vec<crate::planner::expression::BoundExpr>,
     /// by output column, those the operators above read (`projection_ids`), once unused columns are known
     pub projected: Option<Vec<bool>>,
     /// `ExtraOperatorInfo::file_filters`: the filters that left files out, as text
     pub file_filters: String,
+    /// the order the binder read the columns in (`column_ids`), which EXPLAIN lists them in
+    pub column_order: crate::execution::multi_file::ColumnOrder,
     /// `ExtraOperatorInfo::total_files`: how many files there were before that
     pub total_files: Option<usize>,
+    /// the fields of columns pushed into the scan (`IsPushdownExtract`): the output column they are of, and
+    /// what gives them; they are output columns after all others
+    pub extracts: Vec<(usize, Arc<crate::planner::logical::PushedExtract>)>,
 }
 
 impl ParquetScanData {
@@ -119,6 +126,7 @@ impl ParquetScanData {
         }
         types.extend(self.hive.iter().map(|(_, ty)| ty.clone()));
         types.extend(crate::execution::multi_file::virtual_types(&self.virtual_columns));
+        types.extend(self.extracts.iter().map(|(_, e)| e.expression.return_type.clone()));
         types
     }
 }
@@ -1085,6 +1093,7 @@ fn row_groups_to_scan(
                     min: (!value.is_null()).then(|| value.clone()),
                     max: (!value.is_null()).then_some(value),
                     unknown: false,
+                    ..Default::default()
                 })
             };
             !crate::execution::zone_map::never_true(&zone, filter)
@@ -1363,6 +1372,12 @@ fn batch_chunk(
         for row in 0..count {
             vector.set_value(row, &array_value(array, row, file_type)?)?;
         }
+        // a VARIANT the file has shredded into a `typed_value` reads as a SHREDDED_VECTOR
+        if file_type.id() == LogicalTypeId::Variant
+            && array.as_struct_opt().is_some_and(|group| group.column_by_name("typed_value").is_some())
+        {
+            vector.set_shredded();
+        }
         if file_type == ty {
             columns.push(vector);
         } else if file_type.id() == LogicalTypeId::Varchar && ty.id() == LogicalTypeId::Blob {
@@ -1518,6 +1533,15 @@ impl PhysicalOperator for PhysicalParquetScan {
                             if matched != chunk.len() {
                                 chunk.slice(&sel, matched);
                             }
+                        }
+                        // the pushed fields, of the columns they are of
+                        if !self.scan.extracts.is_empty() {
+                            let mut columns: Vec<_> = (0..chunk.column_count()).map(|c| chunk.column(c).clone()).collect();
+                            for (base, extract) in &self.scan.extracts {
+                                let input = DataChunk::from_columns(vec![chunk.column(*base).clone()], chunk.len());
+                                columns.push(crate::execution::expression_executor::execute(&extract.expression, &input)?);
+                            }
+                            chunk = DataChunk::from_columns(columns, chunk.len());
                         }
                         return Ok(Some(chunk));
                     }
@@ -2475,6 +2499,51 @@ fn statistics_text(stats: &Statistics) -> (Option<String>, Option<String>, Optio
     )
 }
 
+/// `ParquetReader::GetPartitionStats` of the one file of a scan: per row group, its rows, the zone of each column
+/// of the file, and whether all the columns' bounds are exact (`ParquetPartitionRowGroup::MinMaxIsExact`).
+pub fn partition_statistics(scan: &ParquetScanData) -> Option<Vec<(u64, Vec<Option<crate::catalog::ColumnZone>>, bool)>> {
+    let [file] = scan.files.as_slice() else {
+        return None;
+    };
+    let (metadata, _) = read_metadata(file).ok()?;
+    let leaves: Vec<Option<usize>> = (0..scan.names.len())
+        .map(|column| statistics_leaf(scan, &metadata, column))
+        .collect();
+    let groups = metadata
+        .row_groups()
+        .iter()
+        .map(|group| {
+            let zones = leaves
+                .iter()
+                .enumerate()
+                .map(|(at, leaf)| group_zone(scan, &metadata, group, (*leaf)?, at).filter(|z| !z.unknown))
+                .collect();
+            let exact = leaves.iter().all(|leaf| {
+                leaf.and_then(|leaf| group.column(leaf).statistics())
+                    .is_some_and(|s| s.min_is_exact() && s.max_is_exact())
+            });
+            (group.num_rows().max(0) as u64, zones, exact)
+        })
+        .collect();
+    Some(groups)
+}
+
+/// `MultiFileFunction::MultiFileCardinality`'s `max_cardinality`: the rows of the row groups of each
+/// file it opened (`ReadSingleParquetFileCardinality`; the footer's total is not what the scan
+/// reads), which is the one file, or all of them with `union_by_name`.
+pub fn scan_max_cardinality(scan: &ParquetScanData) -> Option<u64> {
+    if scan.files.is_empty() || (scan.files.len() > 1 && !scan.union_by_name) {
+        return None;
+    }
+    scan.files.iter().try_fold(0u64, |total, file| {
+        let (metadata, _) = read_metadata(file).ok()?;
+        metadata
+            .row_groups()
+            .iter()
+            .try_fold(total, |total, group| total.checked_add(u64::try_from(group.num_rows()).ok()?))
+    })
+}
+
 /// `ParquetMultiFileInfo::GetCardinality`: the rows of the one file, or of the first for each file, at least 1000
 /// (there are no file sizes to tell more by).
 pub fn scan_cardinality(scan: &ParquetScanData) -> Option<u64> {
@@ -2511,6 +2580,7 @@ pub fn scan_statistics(scan: &ParquetScanData) -> Vec<Option<crate::catalog::Col
                 continue;
             };
             let mut stats = crate::catalog::ColumnStatistics {
+                variant: None,
                 min: None,
                 max: None,
                 can_be_null: false,
@@ -2518,6 +2588,7 @@ pub fn scan_statistics(scan: &ParquetScanData) -> Vec<Option<crate::catalog::Col
                 geometry: None,
                 strings: None,
                 distinct: None,
+                children: Vec::new(),
             };
             let mut bounds_known = true;
             let mut usable = true;

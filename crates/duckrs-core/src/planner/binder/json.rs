@@ -56,6 +56,8 @@ impl Binder<'_> {
         let mut filename = None;
         let mut hive_options = super::copy::HiveOptions::default();
         let mut union_by_name = false;
+        // `maximum_sample_files`: the files `DetectStructure` samples
+        let mut maximum_sample_files = 32usize;
         for argument in &args {
             let value = self.constant_argument(&argument.expr)?;
             if argument.name.is_empty() {
@@ -162,10 +164,11 @@ impl Binder<'_> {
                 "compression" => compression = Compression::parse(&value.try_to_string()?)?,
                 // -1 (`DConstants::INVALID_INDEX`): no objects become MAPs
                 "map_inference_threshold" => map_inference = number()? != -1,
-                "maximum_object_size"
-                | "field_appearance_threshold"
-                | "maximum_sample_files"
-                | "convert_strings_to_integers" => {}
+                "maximum_sample_files" => {
+                    let files = number()?;
+                    maximum_sample_files = if files < 0 { usize::MAX } else { files as usize };
+                }
+                "maximum_object_size" | "field_appearance_threshold" | "convert_strings_to_integers" => {}
                 "union_by_name" => union_by_name = is_true(&value, &option)?,
                 "case_insensitive_keys" => formats.case_insensitive = is_true(&value, &option)?,
                 "hive_partitioning" | "hive_types" | "hive_type" | "hive_types_autocast" | "hive_type_autocast" => {
@@ -208,30 +211,48 @@ impl Binder<'_> {
                 "When auto_detect=false, read_json requires columns to be specified through the \"columns\" parameter.",
             ));
         }
+        let mut cardinality_per_file = None;
         let (names, types, use_records) = if objects {
             (vec!["json".to_string()], vec![json_type()], false)
         } else if let Some(columns) = columns {
+            // `JSONScan::AutoDetect` still samples the first file when the format or `records` is left to it
+            if (format == JsonFormat::Auto || records.is_none())
+                && let Some(path) = files.first()
+            {
+                let data = read_file(path, compression)?;
+                let (found, detected) = read_records(&data, format);
+                let size = std::fs::metadata(path).map_or(data.len() as u64, |m| m.len());
+                cardinality_per_file =
+                    crate::execution::json_scan::estimate_per_file(&data, &found, detected, size, sample_size);
+            }
             let (names, types): (Vec<_>, Vec<_>) = columns.into_iter().unzip();
             (names, types, records.unwrap_or(true))
         } else {
             let mut sampled: Vec<Json> = Vec::new();
-            for path in &files {
+            // `DetectStructure`: up to `sample_size` records of each of the first files
+            for (at, path) in files.iter().enumerate().take(maximum_sample_files.max(1)) {
+                let mut taken = 0;
                 let data = read_file(path, compression)?;
-                let (found, _) = read_records(&data, format);
+                let (found, detected) = read_records(&data, format);
+                if at == 0 {
+                    let size = std::fs::metadata(path).map_or(data.len() as u64, |m| m.len());
+                    cardinality_per_file =
+                        crate::execution::json_scan::estimate_per_file(&data, &found, detected, size, sample_size);
+                }
                 for record in found {
                     match record {
                         Ok((record, _)) => sampled.push(record),
                         Err(_) if ignore_errors => {}
                         Err(error) => return Err(record_error(path, &data, &error)),
                     }
-                    if sampled.len() >= sample_size {
+                    taken += 1;
+                    if taken >= sample_size {
                         break;
                     }
                 }
-                if sampled.len() >= sample_size || !(union_by_name || sampled.is_empty()) {
-                    break;
-                }
             }
+            // the schema of the sampled files is combined either way; union_by_name changes how files are read
+            let _ = union_by_name;
             let references: Vec<&Json> = sampled.iter().collect();
             let structure = infer_with(&references, formats.case_insensitive);
             let ty = structure.logical_type_with(maximum_depth, map_inference);
@@ -278,6 +299,7 @@ impl Binder<'_> {
             output_names.push(key.clone());
             output_types.push(ty.clone());
         }
+        let name_for_explain = name.clone();
         let alias = if table_ref.alias.is_empty() {
             name
         } else {
@@ -312,6 +334,12 @@ impl Binder<'_> {
             filename: filename.is_some(),
             hive,
             virtual_columns,
+            function_name: name_for_explain,
+            projection: None,
+            column_order: self.column_order(table_index),
+            file_filters: String::new(),
+            total_files: None,
+            cardinality_per_file,
         };
         Ok(LogicalOperator::new(
             LogicalOperatorKind::JsonScan {

@@ -295,10 +295,20 @@ fn timestamp_to_nanos(micros: Timestamp, nanos: i32) -> Option<i64> {
     if !micros.is_finite() {
         return Some(micros.0);
     }
-    micros
-        .0
-        .checked_mul(NANOS_PER_MICRO)?
-        .checked_add(i64::from(nanos))
+    let whole = micros.0;
+    let nanos = i64::from(nanos);
+    // `Timestamp::TryCombineUnits`: a negative value may start from the next whole microsecond
+    whole
+        .checked_mul(NANOS_PER_MICRO)
+        .and_then(|w| w.checked_add(nanos))
+        .or_else(|| {
+            if whole >= 0 {
+                return None;
+            }
+            (whole + 1)
+                .checked_mul(NANOS_PER_MICRO)?
+                .checked_add(nanos - NANOS_PER_MICRO)
+        })
         .filter(|v| *v != i64::MAX && *v != -i64::MAX)
 }
 

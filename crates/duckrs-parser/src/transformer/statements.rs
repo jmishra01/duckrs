@@ -35,6 +35,41 @@ const COMPRESSIONS: &[(&str, &str)] = &[
     ("dict_fsst", "DICT_FSST"),
 ];
 
+/// `EnumUtil::FromString<CompressionType>` of a name it does not know: the closest names as candidates
+/// (`StringUtil::StringToEnum`).
+pub(crate) fn unrecognized_compression(requested: &str) -> Error {
+    const NAMES: &[&str] = &[
+        "AUTO",
+        "UNCOMPRESSED",
+        "CONSTANT",
+        "RLE",
+        "DICTIONARY",
+        "PFOR",
+        "BITPACKING",
+        "FSST",
+        "CHIMP",
+        "PATAS",
+        "ALP",
+        "ALPRD",
+        "ZSTD",
+        "ROARING",
+        "EMPTY",
+        "DICT_FSST",
+    ];
+    use duckrs_common::string_util::{candidates_message, similarity_rating, top_n_strings};
+    let scores = NAMES
+        .iter()
+        .map(|name| (name.to_string(), similarity_rating(name, requested)))
+        .collect();
+    Error::new(
+        ErrorKind::NotImplemented,
+        format!(
+            "Enum value: unrecognized value \"{requested}\" for enum \"CompressionType\"\n{}",
+            candidates_message(&top_n_strings(scores), "Candidates")
+        ),
+    )
+}
+
 /// Type names that resolve to VARCHAR (`DefaultTypeGenerator`).
 const VARCHAR_NAMES: &[&str] = &["varchar", "bpchar", "string", "char", "nvarchar", "text"];
 
@@ -1303,12 +1338,7 @@ impl Transformer<'_> {
                         .iter()
                         .find(|(n, _)| *n == requested)
                         .map(|(_, display)| *display)
-                        .ok_or_else(|| {
-                            Error::new(
-                                ErrorKind::Conversion,
-                                format!("Enum value: '{requested}' not found in CompressionType"),
-                            )
-                        })?;
+                        .ok_or_else(|| unrecognized_compression(&requested))?;
                     result.column.compression = Some(name);
                 }
                 "ForeignKeyConstraint" => {
@@ -1339,7 +1369,8 @@ impl Transformer<'_> {
         if let Some(mut expr) = generated {
             if has_subquery(&expr) {
                 return Err(parser_error(format!(
-                    "Expression of generated column {name} contains a subquery, which isn't allowed"
+                    "Expression of generated column {} contains a subquery, which isn't allowed",
+                    sql_quoted_identifier(&name)
                 )));
             }
             if let Some(ty) = &column_type {

@@ -100,3 +100,26 @@ pub fn bind_virtual_columns(names: &[String]) -> (Vec<VirtualColumn>, Vec<(Strin
         .collect();
     (columns, bound)
 }
+
+/// The order in which the binder first read the columns of a scan (`LogicalGet::column_ids`): the
+/// columns a scan with projection pushdown outputs come in this order.
+#[derive(Debug, Clone, Default)]
+pub struct ColumnOrder(std::sync::Arc<std::sync::Mutex<Vec<usize>>>);
+
+impl ColumnOrder {
+    /// The binder read column `column` of the scan.
+    pub fn note(&self, column: usize) {
+        let mut order = self.0.lock().expect("not poisoned");
+        if !order.contains(&column) {
+            order.push(column);
+        }
+    }
+
+    /// `columns` in the order the binder read them, those it did not read last.
+    pub fn arrange(&self, columns: &[usize]) -> Vec<usize> {
+        let order = self.0.lock().expect("not poisoned");
+        let mut arranged: Vec<usize> = order.iter().copied().filter(|c| columns.contains(c)).collect();
+        arranged.extend(columns.iter().copied().filter(|c| !order.contains(c)));
+        arranged
+    }
+}

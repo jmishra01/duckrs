@@ -47,4 +47,4 @@ unsafe_op_in_unsafe_fn = "deny"
 undocumented_unsafe_blocks = "warn"
 
 [profile.release]
-debug = 1
+debug = "line-tables-only"

@@ -161,8 +161,21 @@ fn approx_equal(actual: f64, expected: f64) -> bool {
     (actual - expected).abs() <= epsilon
 }
 
+/// The casts skip one `_` between two digits (`TryCastToInteger`, `fast_float`).
+fn without_separators(s: &str) -> Option<std::borrow::Cow<'_, str>> {
+    if !s.contains('_') {
+        return Some(std::borrow::Cow::Borrowed(s));
+    }
+    let bytes = s.as_bytes();
+    let separated = bytes.iter().enumerate().all(|(i, b)| {
+        *b != b'_' || (i > 0 && bytes[i - 1].is_ascii_digit() && bytes.get(i + 1).is_some_and(u8::is_ascii_digit))
+    });
+    separated.then(|| std::borrow::Cow::Owned(s.replace('_', "")))
+}
+
 fn parse_double(s: &str) -> Option<f64> {
-    let t = s.trim();
+    let t = without_separators(s.trim())?;
+    let t = t.as_ref();
     match t.to_ascii_lowercase().as_str() {
         "nan" | "-nan" => Some(f64::NAN),
         "inf" | "infinity" => Some(f64::INFINITY),
@@ -173,7 +186,8 @@ fn parse_double(s: &str) -> Option<f64> {
 
 /// Parses a string into an integer the way a VARCHAR -> integer cast does: decimals round.
 fn parse_integer(s: &str) -> Option<i128> {
-    let t = s.trim();
+    let t = without_separators(s.trim())?;
+    let t = t.as_ref();
     if let Ok(i) = t.parse::<i128>() {
         return Some(i);
     }
@@ -182,7 +196,8 @@ fn parse_integer(s: &str) -> Option<i128> {
 
 /// Parses a decimal string into an integer scaled by 10^scale, rounding half away from zero.
 fn parse_scaled(s: &str, scale: u8) -> Option<i128> {
-    let t = s.trim();
+    let t = without_separators(s.trim())?;
+    let t = t.as_ref();
     let (negative, digits) = match t.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, t.strip_prefix('+').unwrap_or(t)),

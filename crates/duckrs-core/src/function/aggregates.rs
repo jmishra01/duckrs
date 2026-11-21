@@ -23,6 +23,8 @@ pub enum AggregateKind {
     CountStar,
     Count,
     SumInteger,
+    /// `sum_no_overflow` of INTEGER or BIGINT: an `int64_t` accumulator (`IntegerSumOperation`)
+    SumNoOverflow,
     SumDouble,
     SumDecimal,
     SumBignum,
@@ -143,6 +145,8 @@ pub(super) fn aggregate_functions() -> Vec<AggregateFunctionSet> {
         for ty in [
             LogicalType::TIMESTAMP,
             LogicalType::new(LogicalTypeId::TimestampTz),
+            LogicalType::new(LogicalTypeId::TimestampNs),
+            LogicalType::new(LogicalTypeId::TimestampTzNs),
             LogicalType::TIME,
         ] {
             overloads.push((
@@ -172,7 +176,31 @@ pub(super) fn aggregate_functions() -> Vec<AggregateFunctionSet> {
         AggregateFunctionSet::new("sum", sum()),
         AggregateFunctionSet::new("avg", avg()),
         AggregateFunctionSet::new("mean", avg()),
-        AggregateFunctionSet::new("sum_no_overflow", sum()),
+        // `SumNoOverflowFun`: INTEGER, BIGINT and DECIMAL
+        AggregateFunctionSet::new(
+            "sum_no_overflow",
+            vec![
+                (vec![LogicalType::INTEGER], LogicalType::HUGEINT, SumNoOverflow),
+                (vec![LogicalType::BIGINT], LogicalType::HUGEINT, SumNoOverflow),
+                (vec![decimal()], decimal(), SumDecimal),
+            ],
+        ),
+        AggregateFunctionSet::new(
+            "variant_group_object",
+            vec![(
+                vec![LogicalType::VARCHAR, LogicalType::new(LogicalTypeId::Variant)],
+                LogicalType::new(LogicalTypeId::Variant),
+                AggregateKind::Holistic(super::holistic::Holistic::VariantGroupObject),
+            )],
+        ),
+        AggregateFunctionSet::new(
+            "decimal_average",
+            vec![(
+                vec![decimal()],
+                decimal(),
+                AggregateKind::Holistic(super::holistic::Holistic::DecimalAverage),
+            )],
+        ),
         AggregateFunctionSet::new("min", with_count(unary(Min), super::holistic::Holistic::MinN)),
         AggregateFunctionSet::new("max", with_count(unary(Max), super::holistic::Holistic::MaxN)),
         AggregateFunctionSet::new("list", unary(List)),
@@ -232,7 +260,11 @@ fn holistic_functions() -> Vec<AggregateFunctionSet> {
         of(&["quantile_cont"], quantile(QuantileCont)),
         of(&["quantile_disc", "quantile"], quantile(QuantileDisc)),
         of(
-            &["approx_quantile", "reservoir_quantile"],
+            &["approx_quantile"],
+            vec![(vec![any(), any()], any(), kind(ApproxQuantile))],
+        ),
+        of(
+            &["reservoir_quantile"],
             vec![(vec![any(), any()], any(), kind(QuantileDisc))],
         ),
         of(&["mad"], {
@@ -276,11 +308,17 @@ fn holistic_functions() -> Vec<AggregateFunctionSet> {
         of(&["arg_max_null"], vec![(vec![any(), any()], any(), kind(ArgMaxNull))]),
         of(
             &["arg_min_nulls_last"],
-            vec![(vec![any(), any()], any(), kind(ArgMinNullsLast))],
+            vec![
+                (vec![any(), any()], any(), kind(ArgMinNullsLast)),
+                (vec![any(), any(), any()], any(), kind(ArgMinNullsLastN)),
+            ],
         ),
         of(
             &["arg_max_nulls_last"],
-            vec![(vec![any(), any()], any(), kind(ArgMaxNullsLast))],
+            vec![
+                (vec![any(), any()], any(), kind(ArgMaxNullsLast)),
+                (vec![any(), any(), any()], any(), kind(ArgMaxNullsLastN)),
+            ],
         ),
         of(
             &["combine_aggr"],
@@ -376,7 +414,17 @@ impl AggregateKind {
         use AggregateKind::*;
         matches!(
             self,
-            CountStar | Count | SumInteger | SumDouble | SumDecimal | AvgInteger | AvgDouble | AvgDecimal | Min | Max
+            CountStar
+                | Count
+                | SumInteger
+                | SumNoOverflow
+                | SumDouble
+                | SumDecimal
+                | AvgInteger
+                | AvgDouble
+                | AvgDecimal
+                | Min
+                | Max
         )
     }
 
@@ -386,7 +434,9 @@ impl AggregateKind {
         match self {
             Holistic(_) => AggregateState::Rows(Vec::new()),
             CountStar | Count => AggregateState::Count(0),
-            SumInteger | SumDecimal | AvgInteger | AvgDecimal => AggregateState::Integer { sum: 0, count: 0 },
+            SumInteger | SumNoOverflow | SumDecimal | AvgInteger | AvgDecimal => {
+                AggregateState::Integer { sum: 0, count: 0 }
+            }
             SumDouble | AvgDouble => AggregateState::Double { sum: 0.0, count: 0 },
             Min | Max => AggregateState::Extreme(None),
             First | Last | AnyValue | SumBignum => AggregateState::Value(None),
@@ -430,7 +480,7 @@ pub fn state_layout(kind: AggregateKind, arguments: &[LogicalType], result: &Log
         // `int64_t`
         CountStar | Count => LogicalType::BIGINT,
         // `OptionalStateType<T>`
-        SumInteger | SumDecimal => sum_type(),
+        SumInteger | SumNoOverflow | SumDecimal => sum_type(),
         SumDouble => LogicalType::DOUBLE,
         // `StructStateType<uint64_t, T>`
         AvgInteger | AvgDecimal => avg(sum_type()),
@@ -456,8 +506,17 @@ fn is_avg(kind: AggregateKind) -> bool {
 /// `AggregateStateSerialization::SerializeStates`: a state as a value of its layout
 /// ([`state_layout`]); an unset optional state is NULL, and so is an empty list.
 fn state_to_value(kind: AggregateKind, state: &AggregateState, ty: &LogicalType) -> Result<Value> {
+    state_to_value_of(kind, state, ty, &ty.state_layout())
+}
+
+/// [`state_to_value`] with the layout of `ty` worked out already, for many states of one type.
+fn state_to_value_of(
+    kind: AggregateKind,
+    state: &AggregateState,
+    ty: &LogicalType,
+    layout: &LogicalType,
+) -> Result<Value> {
     use AggregateState as S;
-    let layout = ty.state_layout();
     let value = match state {
         S::Count(n) => Value::bigint(*n),
         S::Integer { sum, count } if is_avg(kind) => {
@@ -472,7 +531,7 @@ fn state_to_value(kind: AggregateKind, state: &AggregateState, ty: &LogicalType)
             ("value".into(), Value::double(*sum)),
         ]),
         S::Integer { count: 0, .. } | S::Double { count: 0, .. } => Value::null(layout.clone()),
-        S::Integer { sum, .. } => integer_of(*sum, &layout)?,
+        S::Integer { sum, .. } => integer_of(*sum, layout)?,
         S::Double { sum, .. } => Value::double(*sum),
         S::Extreme(Some(extreme)) => extreme.1.clone(),
         // any_value skips NULLs, so its state is still unset after one
@@ -488,7 +547,7 @@ fn state_to_value(kind: AggregateKind, state: &AggregateState, ty: &LogicalType)
             AggregateKind::Holistic(super::holistic::Holistic::Sorted) => {
                 Value::new(layout.clone(), ValueData::List(rows.clone()))?
             }
-            AggregateKind::Holistic(holistic) => super::holistic_states::from_rows(holistic, rows, &layout)?,
+            AggregateKind::Holistic(holistic) => super::holistic_states::from_rows(holistic, rows, layout)?,
             _ => return Err(state_failure()),
         },
         S::Exported(value) => Value::clone(value),
@@ -516,6 +575,11 @@ fn integer_of(value: i128, ty: &LogicalType) -> Result<Value> {
 /// `AggregateStateSerialization::DeserializeStates`: the state a value of its layout holds. A
 /// NULL state, and a NULL field, leave the empty state as it is.
 fn value_to_state(kind: AggregateKind, value: &Value, ty: &LogicalType) -> Result<AggregateState> {
+    value_to_state_of(kind, value, &ty.state_layout())
+}
+
+/// [`value_to_state`] with the layout of the state type worked out already, for many values of one type.
+fn value_to_state_of(kind: AggregateKind, value: &Value, layout: &LogicalType) -> Result<AggregateState> {
     use AggregateKind::*;
     use AggregateState as S;
     let mut state = kind.initial_state();
@@ -523,7 +587,7 @@ fn value_to_state(kind: AggregateKind, value: &Value, ty: &LogicalType) -> Resul
         return Ok(state);
     }
     // the value of the state, as a value of its layout rather than of the state type
-    let value = &Value::new(ty.state_layout(), value.data().clone())?;
+    let value = &Value::new(layout.clone(), value.data().clone())?;
     if let Holistic(_) = kind {
         return Ok(S::Exported(Box::new(value.clone())));
     }
@@ -772,22 +836,55 @@ pub fn write_state(kind: AggregateKind, state: &AggregateState, ty: &LogicalType
 
 /// `finalize`: the result of the aggregate from a state.
 pub fn finalize_state(value: &Value, ty: &LogicalType) -> Result<Value> {
-    if !ty.aggregate_state_orders().is_empty() {
-        return finalize_sorted(value, ty);
+    StateFinalizer::new(ty).finalize(value)
+}
+
+/// [`finalize_state`] for the values of one state type, as `finalize(state)` takes them a vector at a time: the
+/// aggregate the type names and the layout of its states are found once, when the first value needs them.
+pub struct StateFinalizer<'a> {
+    ty: &'a LogicalType,
+    /// the aggregate, its result type and the layout of its states
+    resolved: std::cell::OnceCell<(Arc<AggregateFunction>, LogicalType, LogicalType)>,
+}
+
+impl<'a> StateFinalizer<'a> {
+    pub fn new(ty: &'a LogicalType) -> Self {
+        Self {
+            ty,
+            resolved: std::cell::OnceCell::new(),
+        }
     }
-    let (.., arguments, _) = ty.aggregate_state_info().ok_or_else(state_failure)?;
-    let (function, result) = resolve_state(ty)?;
-    if value.is_null() {
-        return Ok(Value::null(result));
+
+    pub fn finalize(&self, value: &Value) -> Result<Value> {
+        let ty = self.ty;
+        if !ty.aggregate_state_orders().is_empty() {
+            return finalize_sorted(value, ty);
+        }
+        let (.., arguments, _) = ty.aggregate_state_info().ok_or_else(state_failure)?;
+        let (function, result, layout) = match self.resolved.get() {
+            Some(resolved) => resolved,
+            None => {
+                let (function, result) = resolve_state(ty)?;
+                self.resolved.get_or_init(|| (function, result, ty.state_layout()))
+            }
+        };
+        if value.is_null() {
+            return Ok(Value::null(result.clone()));
+        }
+        // a state of C++'s layout of an aggregate duckrs computes from its rows, with what its arguments were bound to
+        if let AggregateKind::Holistic(holistic) = function.kind
+            && ty.is_aggregate_state()
+        {
+            let layout = Value::new(layout.clone(), value.data().clone())?;
+            return super::holistic_states::finalize(holistic, &layout, result, ty.aggregate_state_constants());
+        }
+        let state = if ty.is_aggregate_state() {
+            value_to_state_of(function.kind, value, layout)?
+        } else {
+            read_state(function.kind, value, ty)?
+        };
+        function.finalize(&state, result, arguments.first())
     }
-    // a state of C++'s layout of an aggregate duckrs computes from its rows, with what its arguments were bound to
-    if let AggregateKind::Holistic(holistic) = function.kind
-        && ty.is_aggregate_state()
-    {
-        let layout = Value::new(ty.state_layout(), value.data().clone())?;
-        return super::holistic_states::finalize(holistic, &layout, &result, ty.aggregate_state_constants());
-    }
-    function.finalize(&read_state(function.kind, value, ty)?, &result, arguments.first())
 }
 
 /// `SortedAggregateFunction::Finalize` of an exported state: the buffered rows sorted by their keys, then given to
@@ -1023,6 +1120,17 @@ pub fn repeat_state(state: &Value, times: i128, ty: &LogicalType) -> Result<Valu
     Ok(result)
 }
 
+/// A constant parameter of `to_aggregate_state`, as a value of the type of its argument in the signature (what the
+/// argument is bound to: string_agg's separator is a VARCHAR, approx_quantile's fraction a FLOAT).
+fn constant_of(value: Value, argument: Option<&LogicalType>) -> Result<Value> {
+    match argument {
+        Some(ty) if ty.id() != LogicalTypeId::Any && value.logical_type() != ty => {
+            crate::execution::parquet::cast_value(&value, ty)
+        }
+        _ => Ok(value),
+    }
+}
+
 /// `ExportAggregateFunction::Bind`: the aggregate gives its state.
 pub fn export_state(
     function: &AggregateFunction,
@@ -1071,7 +1179,8 @@ pub fn export_state(
                 .map(|(bound, declared)| {
                     // the aggregates duckrs computes from their rows bind their ANY parameters to the types they get,
                     // as C++'s binds of them do
-                    let holistic = matches!(function.kind, AggregateKind::Holistic(_));
+                    let holistic = matches!(function.kind, AggregateKind::Holistic(_))
+                        && function.kind != AggregateKind::Holistic(super::holistic::Holistic::ApproxCountDistinct);
                     if declared.id() == LogicalTypeId::Any && !holistic {
                         declared
                     } else {
@@ -1372,10 +1481,8 @@ pub fn bind_to_aggregate_state(
         // `CreateSortedAggregateStateType`: the buffered rows as given, the arguments read as the signature's types
         let constants = constants
             .into_iter()
-            .map(|c| {
-                c.map(|v| crate::execution::parquet::cast_value(&v, &LogicalType::VARCHAR))
-                    .transpose()
-            })
+            .enumerate()
+            .map(|(at, c)| c.map(|v| constant_of(v, argument_types.get(at))).transpose())
             .collect::<Result<Vec<_>>>()?;
         let constants = if constants.iter().any(Option::is_some) {
             constants
@@ -1409,10 +1516,8 @@ pub fn bind_to_aggregate_state(
     let constants = if constants.iter().any(Option::is_some) {
         constants
             .into_iter()
-            .map(|c| {
-                c.map(|v| crate::execution::parquet::cast_value(&v, &LogicalType::VARCHAR))
-                    .transpose()
-            })
+            .enumerate()
+            .map(|(at, c)| c.map(|v| constant_of(v, argument_types.get(at))).transpose())
             .collect::<Result<_>>()?
     } else {
         Vec::new()
@@ -1563,6 +1668,23 @@ impl AggregateFunction {
                     }
                 }
             }
+            // the `int64_t` sum: an addition past it fails as the repeated combine of a constant does
+            SumNoOverflow => {
+                match input.physical_type() {
+                    PhysicalType::Int32 => add_integers::<i32>(input, count, rows, states)?,
+                    _ => add_integers::<i64>(input, count, rows, states)?,
+                }
+                for &(_, group) in rows {
+                    if let AggregateState::Integer { sum, .. } = &states[group]
+                        && i64::try_from(*sum).is_err()
+                    {
+                        return Err(Error::new(
+                            ErrorKind::OutOfRange,
+                            "Overflow in repeated aggregate state combine",
+                        ));
+                    }
+                }
+            }
             SumInteger | SumDecimal | AvgInteger | AvgDecimal => match input.physical_type() {
                 PhysicalType::Bool => add_integers::<bool>(input, count, rows, states)?,
                 PhysicalType::Int16 => add_integers::<i16>(input, count, rows, states)?,
@@ -1656,6 +1778,28 @@ impl AggregateFunction {
         Ok(())
     }
 
+    /// [`finalize`](Self::finalize) of each of `states`, stored in `column` from its first row on. An exported
+    /// state's layout is worked out once for all of them, rather than once for each state.
+    pub fn finalize_into(
+        &self,
+        states: &[AggregateState],
+        return_type: &LogicalType,
+        input: Option<&LogicalType>,
+        column: &mut Vector,
+    ) -> Result<()> {
+        if self.export.is_some() && return_type.is_aggregate_state() {
+            let layout = return_type.state_layout();
+            for (row, state) in states.iter().enumerate() {
+                column.set_value(row, &state_to_value_of(self.kind, state, return_type, &layout)?)?;
+            }
+            return Ok(());
+        }
+        for (row, state) in states.iter().enumerate() {
+            column.set_value(row, &self.finalize(state, return_type, input)?)?;
+        }
+        Ok(())
+    }
+
     /// `finalize`: the result of a state, of the bound `return_type`.
     pub fn finalize(
         &self,
@@ -1679,7 +1823,7 @@ impl AggregateFunction {
                 Value::new(return_type.clone(), ValueData::List(values.clone()))?
             }
             (_, AggregateState::Integer { count: 0, .. } | AggregateState::Double { count: 0, .. }) => null(),
-            (SumInteger, AggregateState::Integer { sum, .. }) => Value::hugeint(*sum),
+            (SumInteger | SumNoOverflow, AggregateState::Integer { sum, .. }) => Value::hugeint(*sum),
             (SumDecimal, AggregateState::Integer { sum, .. }) => {
                 let max_width = duckrs_common::types::decimal::MAX_WIDTH;
                 let (_, scale) = return_type.decimal_properties().expect("a DECIMAL result");

@@ -235,14 +235,14 @@ pub(super) fn extract_join_conditions(
             conditions.push(JoinCondition {
                 left: *first,
                 right: *second,
-                null_safe,
+                comparison: JoinCondition::equality(null_safe),
                 filter: None,
             });
         } else if only(&first, &right_tables, &left_tables) && only(&second, &left_tables, &right_tables) {
             conditions.push(JoinCondition {
                 left: *second,
                 right: *first,
-                null_safe,
+                comparison: JoinCondition::equality(null_safe),
                 filter: None,
             });
         } else {
@@ -398,6 +398,17 @@ impl Binder<'_> {
 
         let left_aliases = left_context.aliases();
         let right_aliases = right_context.aliases();
+        let extends = |context: &BindContext, set: &mut std::collections::HashSet<usize>| {
+            set.extend(context.bindings.iter().map(|b| b.table_index));
+        };
+        // a positional join NULL-extends the shorter side, whichever it is
+        let positional = join.ref_type == JoinRefType::Positional;
+        if positional || matches!(join.join_type, JoinType::Left | JoinType::Outer) {
+            extends(&right_context, &mut self.null_extended);
+        }
+        if positional || matches!(join.join_type, JoinType::Right | JoinType::Outer) {
+            extends(&left_context, &mut self.null_extended);
+        }
         self.bind_context.using_columns.extend(new_sets);
         self.bind_context.add_context(left_context);
         self.bind_context.add_context(right_context);
@@ -490,6 +501,7 @@ impl Binder<'_> {
                 join_type: join.join_type,
                 conditions,
                 predicate,
+                algorithm: Default::default(),
             },
             vec![left, right],
         ))
@@ -603,6 +615,7 @@ impl Binder<'_> {
                     join_type,
                     conditions,
                     predicate: residual,
+                    algorithm: Default::default(),
                 },
                 vec![left, right],
             ));

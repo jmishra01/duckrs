@@ -787,11 +787,26 @@ impl<'a> Replay<'a> {
             unreachable!("CREATE TABLE without a query binds to CreateTable");
         };
         let table_key = key(&(table.schema.clone(), table.name.clone()));
+        let (comment, column_comments) = (table.comment.clone(), table.column_comments.clone());
+        let mut columns = columns;
+        for column in &mut columns {
+            column.comment = column_comments
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(&column.name))
+                .map(|(_, c)| c.clone());
+        }
         let disk = Arc::new(DiskTable::new(self.buffer.clone(), table)?);
         let entry = schema
             .create_table(&name, columns, generated, constraints, on_conflict)?
             .expect("OnCreateConflict::Error fails or creates");
+        *entry.comment.lock() = comment;
         entry.set_source(disk.clone());
+        // the deleted rows of the file are known only by scanning it
+        let ids = crate::catalog::TableSource::row_ids(&*disk);
+        let stored: usize = ids.stored_groups().iter().map(|&(_, rows)| rows).sum();
+        entry
+            .unloaded_deletes
+            .store(stored > ids.len(), std::sync::atomic::Ordering::Relaxed);
         entry.reset_log();
         self.disk.insert(table_key, disk);
         Ok(())
@@ -850,24 +865,52 @@ impl<'a> Replay<'a> {
                 name,
                 query,
                 aliases,
+                comment,
+                column_comments,
+                secure,
             } => {
                 let schema = self.catalog.schema_for(Some(&schema))?;
-                schema.create_view(&name, *query, aliases, OnCreateConflict::Error, Vec::new())?;
+                schema.create_view(&name, *query, aliases, OnCreateConflict::Error, Vec::new(), secure)?;
+                if comment.is_some() || !column_comments.is_empty() {
+                    schema.set_view_comments(&name, comment, column_comments);
+                }
             }
             StoredEntry::Macro {
                 schema,
                 name,
                 table_macro,
                 macros,
+                comment,
             } => {
                 let schema = self.catalog.schema_for(Some(&schema))?;
                 schema.create_macro(&name, table_macro, macros, OnCreateConflict::Error)?;
+                if comment.is_some() {
+                    schema.set_macro_comment(&name, table_macro, comment);
+                }
             }
-            StoredEntry::Sequence { schema, name, data } => self.create_sequence(&schema, &name, data)?,
-            StoredEntry::Type { schema, name, ty } => {
+            StoredEntry::Sequence {
+                schema,
+                name,
+                data,
+                comment,
+            } => {
+                self.create_sequence(&schema, &name, data)?;
+                if comment.is_some() {
+                    self.catalog.schema_for(Some(&schema))?.set_sequence_comment(&name, comment);
+                }
+            }
+            StoredEntry::Type {
+                schema,
+                name,
+                ty,
+                comment,
+            } => {
                 // `ReplayCreateType` takes IGNORE_ON_CONFLICT: a type can be logged twice
                 let schema = self.catalog.schema_for(Some(&schema))?;
                 schema.create_type(&name, ty, OnCreateConflict::Ignore)?;
+                if comment.is_some() {
+                    schema.set_type_comment(&name, comment);
+                }
             }
             StoredEntry::Trigger { schema, trigger } => {
                 let schema = self.catalog.schema_for(Some(&schema))?;

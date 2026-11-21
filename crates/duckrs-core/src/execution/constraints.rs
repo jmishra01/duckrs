@@ -191,8 +191,14 @@ pub fn verify_checks(table: &TableCatalogEntry, chunk: &DataChunk) -> Result<()>
 }
 
 /// The keys of `rows`, for each UNIQUE and PRIMARY KEY in the order of `table.constraints`. The
-/// rows from `first_new_row` on are the ones of the statement that is running.
-fn build_keys(table: &TableCatalogEntry, rows: &ColumnDataCollection, first_new_row: usize) -> Result<Vec<UniqueKeys>> {
+/// rows from `first_new_row` on are the ones of the statement that is running. A DEFERRED key only
+/// fails when `deferred_too`, at a commit: until then its keys can repeat.
+fn build_keys(
+    table: &TableCatalogEntry,
+    rows: &ColumnDataCollection,
+    first_new_row: usize,
+    deferred_too: bool,
+) -> Result<Vec<UniqueKeys>> {
     let mut indexes = Vec::new();
     for key in table.keys() {
         let mut index = new_keys(table, &key);
@@ -201,8 +207,14 @@ fn build_keys(table: &TableCatalogEntry, rows: &ColumnDataCollection, first_new_
             for (row, row_key) in keys_of(&key, chunk)?.into_iter().enumerate() {
                 if let Some(row_key) = row_key
                     && let Some(existing) = index.insert(&row_key, position + row)?
+                    && (deferred_too || !key.deferred)
                 {
-                    return Err(duplicate_key(&key, chunk, row, existing >= first_new_row)?);
+                    return Err(duplicate_key(
+                        &key,
+                        chunk,
+                        row,
+                        key.deferred || existing >= first_new_row,
+                    )?);
                 }
             }
             position += chunk.len();
@@ -265,7 +277,39 @@ pub(crate) fn index_tree(table: &TableCatalogEntry, key: &TableKey) -> Result<In
 
 /// Fails if `rows` break a key of `table`.
 pub(crate) fn check_all_keys(table: &TableCatalogEntry, rows: &ColumnDataCollection) -> Result<()> {
-    build_keys(table, rows, 0).map(drop)
+    build_keys(table, rows, 0, true).map(drop)
+}
+
+/// That the DEFERRED keys of `table` hold among `rows`, as a commit checks them, or among those
+/// whose position `among` takes.
+pub(crate) fn check_deferred_keys(
+    table: &TableCatalogEntry,
+    rows: &ColumnDataCollection,
+    among: impl Fn(usize) -> bool,
+) -> Result<()> {
+    for key in table.keys().into_iter().filter(|key| key.deferred) {
+        let mut index = new_keys(table, &key);
+        if let Some(deleted) = &*table.deleted_before_key.lock() {
+            for chunk in deleted.chunks() {
+                for row_key in keys_of(&key, chunk)?.into_iter().flatten() {
+                    index.insert(&row_key, usize::MAX)?;
+                }
+            }
+        }
+        let mut position = 0;
+        for chunk in rows.chunks() {
+            for (row, row_key) in keys_of(&key, chunk)?.into_iter().enumerate() {
+                if let Some(row_key) = row_key
+                    && among(position + row)
+                    && index.insert(&row_key, position + row)?.is_some()
+                {
+                    return Err(duplicate_key(&key, chunk, row, true)?);
+                }
+            }
+            position += chunk.len();
+        }
+    }
+    Ok(())
 }
 
 /// The key maps of `table`, of which `rows` are the rows.
@@ -277,7 +321,7 @@ pub(crate) fn current_keys<'a>(
     if keys.is_none() {
         *keys = match table.inherited_keys(rows.len()) {
             Some(inherited) => Some(inherited),
-            None => Some(build_keys(table, rows, usize::MAX)?),
+            None => Some(build_keys(table, rows, usize::MAX, false)?),
         };
     }
     Ok(keys)
@@ -288,7 +332,7 @@ pub(super) fn index_of(table: &TableCatalogEntry, columns: &[usize]) -> usize {
     table
         .keys()
         .iter()
-        .position(|key| key.columns == columns)
+        .position(|key| !key.deferred && key.columns == columns)
         .expect("the binder found this key")
 }
 
@@ -332,7 +376,7 @@ fn check_foreign_keys(table: &Arc<TableCatalogEntry>, chunk: &DataChunk, own: &[
                 let rows = parent.rows()?;
                 let mut keys = parent.unique_keys.lock();
                 if keys.is_none() {
-                    *keys = Some(build_keys(parent, &rows, usize::MAX)?);
+                    *keys = Some(build_keys(parent, &rows, usize::MAX, false)?);
                 }
                 let keys = keys.as_ref().expect("just built");
                 verify_referenced(foreign_key, &keys[position(parent)], chunk, parent)?;
@@ -383,6 +427,7 @@ fn append_keys(
         for (row, row_key) in keys_of(key, chunk)?.into_iter().enumerate() {
             if let Some(row_key) = row_key
                 && let Some(existing) = index.insert(&row_key, next_row + row)?
+                && !key.deferred
             {
                 return Err(duplicate_key(key, chunk, row, existing >= first_new_row)?);
             }
@@ -468,7 +513,7 @@ pub fn verify_chunked_key_update(
     rows: &ColumnDataCollection,
     batches: &[(DataChunk, DataChunk)],
 ) -> Result<()> {
-    for key in table.keys() {
+    for key in table.keys().into_iter().filter(|key| !key.deferred) {
         let mut present = HashSet::new();
         for chunk in rows.chunks() {
             present.extend(keys_of(&key, chunk)?.into_iter().flatten());
@@ -496,7 +541,7 @@ pub fn verify_key_update(
     changed: &ColumnDataCollection,
 ) -> Result<()> {
     // the updated rows are the last ones: they moved there
-    let keys = build_keys(table, rewritten, rewritten.len() - changed.len())?;
+    let keys = build_keys(table, rewritten, rewritten.len() - changed.len(), false)?;
     for chunk in changed.chunks() {
         check_foreign_keys(table, chunk, &keys)?;
     }

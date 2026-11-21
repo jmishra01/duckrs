@@ -251,17 +251,37 @@ pub fn enum_type_from(values: Vec<String>) -> Result<LogicalType> {
 }
 
 /// The type of a type parameter, for `TypeParametersToString`.
-fn type_parameter_type(expr: &Expr) -> &'static str {
+fn type_parameter_type(expr: &Expr) -> String {
     match &expr.kind {
         ExprKind::Constant(literal) => match literal.kind {
-            LiteralKind::Integer => "INTEGER",
-            LiteralKind::String => "VARCHAR",
-            LiteralKind::Null => "NULL",
-            _ => "DECIMAL",
+            LiteralKind::Integer => "INTEGER".to_string(),
+            LiteralKind::String => "VARCHAR".to_string(),
+            LiteralKind::Null => "NULL".to_string(),
+            LiteralKind::Boolean => "BOOLEAN".to_string(),
+            // the DECIMAL a number literal reads as: all its digits, and those after the point
+            _ => {
+                let text = literal.text.trim_start_matches('-');
+                let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
+                let whole = whole.trim_start_matches('0');
+                let width = (whole.len() + fraction.len()).max(1);
+                format!("DECIMAL({width},{})", fraction.len())
+            }
         },
         // a negative number is a parenthesized expression here
-        _ => "INTEGER",
+        _ => "INTEGER".to_string(),
     }
+}
+
+/// `CastArgument`: a NULL type parameter is refused by its name.
+fn null_type_parameter(type_name: &str, names: &[&str], children: &[Expr]) -> Result<()> {
+    for (child, name) in children.iter().zip(names) {
+        if matches!(&child.kind, ExprKind::Constant(literal) if literal.kind == LiteralKind::Null) {
+            return Err(binder_error(format!(
+                "Type parameter \"{name}\" for type \"{type_name}\" cannot be NULL"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// `ColumnQualifier::SQLValueFunctionName`: what these words call when no column has their name.
@@ -309,12 +329,8 @@ impl Binder<'_> {
             ));
         }
         let name = name.try_to_string()?;
-        if name.is_empty() {
-            return Err(Error::new(
-                ErrorKind::Parser,
-                "Zero-length identifier in qualified name",
-            ));
-        }
+        // `QualifiedName::TryParse` of the name
+        parse_qualified_name(&name)?;
         let upper = name.to_uppercase();
         let parameter = |(alias, value): &(String, Value)| -> Result<String> {
             let text = match value.logical_type().id() {
@@ -365,31 +381,82 @@ impl Binder<'_> {
     }
 
     pub fn bind_type(&self, target: &CastType) -> Result<LogicalType> {
-        let (original, children): (&str, &[Expr]) = match target {
-            CastType::Resolved(ty) if ty.contains_unbound() => return self.bind_named_type(ty),
-            CastType::Resolved(ty) => return Ok(ty.clone()),
-            CastType::Builtin(name) => (&**name, &[]),
-            CastType::Parsed(expr) => match &expr.kind {
-                ExprKind::Type(TypeExpr { name, children }) => {
-                    if !name.qualification.is_empty() {
-                        let schema = self.schema_of(name)?;
-                        return self
-                            .catalog
-                            .get_type(schema.as_deref(), None, &name.name)?
-                            .ok_or_else(|| {
-                                Error::new(
+        let (original, children): (&str, &[Expr]) =
+            match target {
+                CastType::Resolved(ty) if ty.contains_unbound() => return self.bind_named_type(ty),
+                CastType::Resolved(ty) => return Ok(ty.clone()),
+                CastType::Builtin(name) => (&**name, &[]),
+                CastType::Parsed(expr) => match &expr.kind {
+                    ExprKind::Type(TypeExpr { name, children }) => {
+                        if !name.qualification.is_empty() {
+                            let schema = self.schema_of(name)?;
+                            // `Catalog::LookupEntry`: a missing schema is a missing type, except that a nested
+                            // schema path is named
+                            let found = self.catalog.get_type(schema.as_deref(), None, &name.name).or_else(|error| {
+                            if error.kind != ErrorKind::Catalog || !error.message.starts_with("Schema with name") {
+                                return Err(error);
+                            }
+                            if name.qualification.len() >= 2 {
+                                let schema = name.qualification.join(".");
+                                return Err(Error::new(
+                                    ErrorKind::Catalog,
+                                    format!(
+                                        "Type with name \"{schema}.{}\" does not exist because schema \"{schema}\" \
+                                         does not exist.",
+                                        name.name
+                                    ),
+                                ));
+                            }
+                            Ok(None)
+                        })?;
+                            if let Some(ty) = found {
+                                return Ok(ty);
+                            }
+                            // `catalog.type`: a name that is no schema can be a database
+                            if let [catalog] = name.qualification.as_slice() {
+                                // without a session (a stored definition) the database is this one
+                                let attached = if catalog.eq_ignore_ascii_case(&self.catalog.name)
+                                    || self.session.as_ref().is_none_or(|s| s.database.eq_ignore_ascii_case(catalog))
+                                {
+                                    self.catalog.get_type(Some("main"), None, &name.name)?
+                                } else {
+                                    self.session
+                                        .as_ref()
+                                        .and_then(|session| (session.attached_catalog)(catalog))
+                                        .map(|attached| attached.get_type(Some("main"), None, &name.name))
+                                        .transpose()?
+                                        .flatten()
+                                };
+                                if let Some(ty) = attached {
+                                    return Ok(ty);
+                                }
+                            }
+                            // the built-in types are found in `main` too
+                            let in_main = name
+                                .qualification
+                                .iter()
+                                .rev()
+                                .find(|q| !q.is_empty())
+                                .is_some_and(|q| q.eq_ignore_ascii_case("main"));
+                            if !in_main || builtin_type(&name.name.to_lowercase()).is_none() {
+                                return Err(Error::new(
                                     ErrorKind::Catalog,
                                     format!("Type with name {} does not exist!", name.name),
-                                )
-                            });
+                                ));
+                            }
+                        }
+                        (name.name.as_str(), children.as_slice())
                     }
-                    (name.name.as_str(), children.as_slice())
-                }
-                _ => return Err(crate::unported(format!("type expression {expr}"))),
-            },
-        };
+                    _ => return Err(crate::unported(format!("type expression {expr}"))),
+                },
+            };
         let name = original.to_lowercase();
         if let Some(ty) = self.catalog.get_type(None, self.search_schema.as_deref(), &name)? {
+            if !children.is_empty() {
+                return Err(binder_error(format!(
+                    "Type \"{original}\" does not take any type parameters"
+                )));
+            }
             return Ok(ty);
         }
         if name == "json" {
@@ -401,7 +468,20 @@ impl Binder<'_> {
                 .map(|candidate| (similarity_rating(candidate, &name), *candidate))
                 .max_by(|a, b| a.0.total_cmp(&b.0))
                 .filter(|(score, _)| *score > 0.7);
-            let hint = closest.map_or_else(String::new, |(_, type_name)| format!("\nDid you mean \"{type_name}\"?"));
+            // `CreateMissingEntryException`: a type of that name in a schema off the search path
+            let mut elsewhere: Vec<String> = self
+                .catalog
+                .schemas()
+                .iter()
+                .filter(|schema| schema.get_type(&name).is_some())
+                .map(|schema| format!("{}.{original}", schema.name))
+                .collect();
+            elsewhere.sort();
+            let hint = if elsewhere.is_empty() {
+                closest.map_or_else(String::new, |(_, type_name)| format!("\nDid you mean \"{type_name}\"?"))
+            } else {
+                format!("\nDid you mean \"{}\"?", elsewhere.join(" or "))
+            };
             return Err(Error::new(
                 ErrorKind::Catalog,
                 format!("Type with name {original} does not exist!{hint}"),
@@ -410,13 +490,16 @@ impl Binder<'_> {
         match id {
             LogicalTypeId::Decimal => {
                 let rejected = || {
-                    let types: Vec<&str> = children.iter().map(type_parameter_type).collect();
+                    let types: Vec<String> = children.iter().map(type_parameter_type).collect();
                     binder_error(format!(
                         "Type \"DECIMAL\" does not accept type parameters ({})\nCandidates:\n    DECIMAL\n    \
                          DECIMAL(width UTINYINT, scale UTINYINT := 0)",
                         types.join(", ")
                     ))
                 };
+                if children.len() <= 2 {
+                    null_type_parameter("DECIMAL", &["width", "scale"], children)?;
+                }
                 let (width, scale) = match children {
                     [] => (18, 3),
                     [w] => (type_parameter(w).ok_or_else(rejected)?, 0),
@@ -450,8 +533,32 @@ impl Binder<'_> {
                 crate::planner::collation::test_collation(&literal.text)?;
                 Ok(LogicalType::varchar_collation(&literal.text))
             }
+            // `RegisterFloatConstructors`: FLOAT(precision) is a FLOAT or a DOUBLE
+            LogicalTypeId::Float if name == "float" && children.len() == 1 => {
+                null_type_parameter("FLOAT", &["precision"], children)?;
+                let Some(precision) = type_parameter(&children[0]) else {
+                    return Err(binder_error(format!(
+                        "Type \"FLOAT\" does not accept type parameters ({})",
+                        type_parameter_type(&children[0])
+                    )));
+                };
+                match precision {
+                    ..1 => Err(binder_error("precision for type float must be at least 1 bit")),
+                    1..=24 => Ok(LogicalType::FLOAT),
+                    25..=53 => Ok(LogicalType::DOUBLE),
+                    _ => Err(binder_error("precision for type float must be less than 54 bits")),
+                }
+            }
             // the width of a VARCHAR is accepted and ignored
             LogicalTypeId::Varchar if children.len() <= 1 => Ok(LogicalType::VARCHAR),
+            LogicalTypeId::Varchar => {
+                let types: Vec<String> = children.iter().map(type_parameter_type).collect();
+                Err(binder_error(format!(
+                    "Type \"{}\" does not accept type parameters ({})",
+                    name.to_uppercase(),
+                    types.join(", ")
+                )))
+            }
             LogicalTypeId::List
             | LogicalTypeId::Array
             | LogicalTypeId::Map
@@ -466,7 +573,7 @@ impl Binder<'_> {
                             values.push(literal.text.clone())
                         }
                         _ => {
-                            let types: Vec<&str> = children.iter().map(type_parameter_type).collect();
+                            let types: Vec<String> = children.iter().map(type_parameter_type).collect();
                             return Err(binder_error(format!(
                                 "Type \"ENUM\" does not accept type parameters ({})",
                                 types.join(", ")
@@ -484,7 +591,7 @@ impl Binder<'_> {
             // `BindGeometryType`: the CRS, as the catalog of coordinate systems identifies it
             LogicalTypeId::Geometry if !children.is_empty() => {
                 let [child] = children else {
-                    let types: Vec<&str> = children.iter().map(type_parameter_type).collect();
+                    let types: Vec<String> = children.iter().map(type_parameter_type).collect();
                     return Err(binder_error(format!(
                         "Type \"GEOMETRY\" does not accept type parameters ({})",
                         types.join(", ")
@@ -514,7 +621,6 @@ impl Binder<'_> {
                 }
             }
             _ if !children.is_empty() => Err(crate::unported(format!("type parameters for {}", name.to_uppercase()))),
-            LogicalTypeId::Type => Err(crate::unported(format!("the {} type", name.to_uppercase()))),
             id => Ok(LogicalType::new(id)),
         }
     }
@@ -524,7 +630,7 @@ impl Binder<'_> {
         let upper = name.to_uppercase();
         let child_type = |expr: &Expr| self.bind_type(&CastType::Parsed(Box::new(expr.clone())));
         let rejected = || {
-            let types: Vec<&str> = children.iter().map(type_parameter_type).collect();
+            let types: Vec<String> = children.iter().map(type_parameter_type).collect();
             binder_error(format!(
                 "Type \"{upper}\" does not accept type parameters ({})",
                 types.join(", ")
@@ -587,6 +693,23 @@ impl Binder<'_> {
         let (mut own, mut outer) = (false, false);
         for argument in &function.args {
             visit_expr_mut(&mut argument.expr.clone(), &mut |e| {
+                // the parameters of a lambda in the arguments are none of the query's columns
+                if let ExprKind::Lambda { lhs, expr, .. } = &mut e.kind {
+                    let mut parameters = Vec::new();
+                    visit_expr_mut(lhs, &mut |p| {
+                        if let ExprKind::ColumnRef(names) = &p.kind {
+                            parameters.push(names[0].clone());
+                        }
+                    });
+                    visit_expr_mut(expr, &mut |inner| {
+                        if let ExprKind::ColumnRef(names) = &inner.kind
+                            && parameters.iter().any(|p| p.eq_ignore_ascii_case(&names[0]))
+                        {
+                            inner.kind = ExprKind::Default;
+                        }
+                    });
+                    **lhs = Expr::from(ExprKind::Default);
+                }
                 if let ExprKind::ColumnRef(names) = &e.kind {
                     if self.bind_context.bind_column_ref(names).is_ok() {
                         own = true;
@@ -600,6 +723,18 @@ impl Binder<'_> {
     }
 
     /// `Binder::BindCorrelatedColumns`: a column of a query around this one.
+    /// Where the fields of a struct start in `names`: after a column of this query, or else of a
+    /// query around it (`ExpressionBinder::BindQualifiedColumnName` on the outer binders).
+    fn struct_field_start(&self, names: &[String]) -> Option<usize> {
+        if let Some(start) = self.bind_context.struct_field_start(names) {
+            return Some(start);
+        }
+        if self.bind_context.bind_column_ref(names).is_ok() {
+            return None;
+        }
+        self.outer_contexts.iter().rev().find_map(|context| context.struct_field_start(names))
+    }
+
     fn bind_outer_column(&mut self, names: &[String]) -> Option<BoundExpr> {
         for context in self.outer_contexts.iter().rev() {
             let Ok((binding, ty, name)) = context.bind_column_ref(names) else {
@@ -656,6 +791,38 @@ impl Binder<'_> {
         let mut rewritten = subquery.clone();
         // aggregates of this query's columns stand in the subquery under a name of their own
         let mut outer_aggregates: Vec<(String, Expr, LogicalType)> = Vec::new();
+        // `BaseSelectBinder::TryBindGroup` at depth > 0: an expression of the subquery that is a
+        // group of this query stands for the group
+        let group_expressions = std::mem::take(&mut self.subquery_group_expressions);
+        if group_expressions && let Some(state) = self.aggregates.as_ref() {
+            let keys: Vec<Expr> = state.group_map.iter().map(|(key, _)| key.clone()).collect();
+            let mut found: Vec<Expr> = Vec::new();
+            visit_query_node_exprs_mut(&mut rewritten.node, &mut |e| {
+                if matches!(e.kind, ExprKind::ColumnRef(_) | ExprKind::Constant(_)) {
+                    return;
+                }
+                let mut qualified = e.clone();
+                self.qualify_column_names(&mut qualified);
+                let qualified = without_aliases(&qualified);
+                if let Some(key) = keys.iter().find(|key| **key == qualified) {
+                    let at = match found.iter().position(|f| f == key) {
+                        Some(at) => at,
+                        None => {
+                            found.push(key.clone());
+                            found.len() - 1
+                        }
+                    };
+                    let alias = std::mem::take(&mut e.alias);
+                    *e = Expr::column(vec![format!("__outer_aggregate_group_{at}")]);
+                    e.alias = alias;
+                }
+            });
+            for (at, key) in found.into_iter().enumerate() {
+                let ty = self.bind_expression(&key)?.return_type;
+                outer_aggregates.push((format!("__outer_aggregate_group_{at}"), key, ty));
+            }
+        }
+        let bound_columns = self.aggregates.as_ref().map(|state| state.bound_columns.len());
         let (binder, bound) = loop {
             let mut context = self.bind_context.clone();
             if !outer_aggregates.is_empty() {
@@ -716,7 +883,9 @@ impl Binder<'_> {
                 [alias, name] if alias == "__outer_aggregates" => vec![name.clone()],
                 _ => column.names,
             };
+            let outer = std::mem::replace(&mut self.binding_correlated, true);
             let bound = self.bind_expression(&Expr::from(ExprKind::ColumnRef(names)));
+            self.binding_correlated = outer;
             match bound {
                 Ok(bound) => correlated.push(bound),
                 Err(error) => {
@@ -727,6 +896,21 @@ impl Binder<'_> {
             bindings.push(column.binding);
         }
         self.alias_fallback.truncate(fallback_size);
+        // a correlated column that is no group: try again with the expressions of the groups
+        if !group_expressions
+            && let (Some(before), Some(state)) = (bound_columns, self.aggregates.as_mut())
+            && state.bound_columns.len() > before
+            && !state.group_map.is_empty()
+        {
+            let added = state.bound_columns.split_off(before);
+            self.subquery_group_expressions = true;
+            let retried = self.bind_subquery(subquery, subquery_type, parsed_child, comparison);
+            self.subquery_group_expressions = false;
+            if retried.is_ok() {
+                return retried;
+            }
+            self.aggregates.as_mut().expect("checked above").bound_columns.extend(added);
+        }
         let child = child.map(|c| self.bind_expression(c)).transpose()?;
         let columns = bound.types.len();
         let row_width = child
@@ -846,13 +1030,263 @@ impl Binder<'_> {
 
     /// `ExpressionBinder::Bind`.
     pub(super) fn bind_expression(&mut self, expr: &Expr) -> Result<BoundExpr> {
-        let bound = self.bind_expression_inner(expr)?;
+        // `TryRewriteQualifiedCountStar`, wherever an aggregate can be
+        if super::star::is_qualified_count_star(expr) {
+            let mut rewritten = expr.clone();
+            self.rewrite_qualified_count_star(&mut rewritten);
+            return self.bind_expression(&rewritten);
+        }
+        // a comparison operator called as a function is the comparison
+        if let ExprKind::Function(function) = &expr.kind
+            && function.name.qualification.iter().all(String::is_empty)
+            && let [left, right] = function.args.as_slice()
+            && left.name.is_empty()
+            && right.name.is_empty()
+            && !function.distinct
+            && function.order_by.is_empty()
+            && function.filter.is_none()
+        {
+            use duckrs_parser::ast::ComparisonOp as C;
+            let op = match function.name.name.to_uppercase().as_str() {
+                "=" | "==" => Some(C::Equal),
+                "!=" | "<>" => Some(C::NotEqual),
+                "<" => Some(C::LessThan),
+                ">" => Some(C::GreaterThan),
+                "<=" => Some(C::LessThanOrEqual),
+                ">=" => Some(C::GreaterThanOrEqual),
+                "IS DISTINCT FROM" => Some(C::DistinctFrom),
+                "IS NOT DISTINCT FROM" => Some(C::NotDistinctFrom),
+                _ => None,
+            };
+            if let Some(op) = op {
+                let mut comparison = Expr::comparison(op, left.expr.clone(), right.expr.clone());
+                comparison.alias = if expr.alias.is_empty() { expr.to_string() } else { expr.alias.clone() };
+                return self.bind_expression(&comparison);
+            }
+        }
+        // `BindHasError`: the built-in has_error is the HAS_ERROR operator over its argument
+        if let ExprKind::Function(function) = &expr.kind
+            && function.name.name.eq_ignore_ascii_case("has_error")
+            && self.is_builtin_has_error(&function.name)?
+        {
+            if function.distinct || function.filter.is_some() || !function.order_by.is_empty() {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "Function has_error is a Scalar Function. \"DISTINCT\", \"FILTER\", and \"ORDER BY\" are \
+                     only applicable to window and aggregate functions.",
+                ));
+            }
+            if function.args.len() != 1 {
+                return Err(binder_error("Wrong number of arguments provided to HAS_ERROR expression"));
+            }
+            if !function.args[0].name.is_empty() {
+                return Err(binder_error("Named arguments are not supported in HAS_ERROR expression"));
+            }
+            // `TryBindSubqueryErrors`: ORDER BY and DISTINCT of a subquery leave no room for the error flag
+            let mut modified = false;
+            duckrs_parser::transformer::visit_expr_mut(&mut function.args[0].expr.clone(), &mut |e: &mut Expr| {
+                if let ExprKind::Subquery { subquery, .. } = &e.kind {
+                    modified |= subquery
+                        .node
+                        .modifiers
+                        .iter()
+                        .any(|m| matches!(m, ast::ResultModifier::Order(_) | ast::ResultModifier::Distinct(_)));
+                }
+            });
+            if modified {
+                return Err(binder_error(
+                    "TRY over a subquery with result modifiers is only supported when the subquery is the direct \
+                     argument of TRY",
+                ));
+            }
+            let outer = std::mem::replace(&mut self.inside_try, true);
+            let child = crate::function::binder::inside_try(|| self.bind_expression(&function.args[0].expr));
+            self.inside_try = outer;
+            let child = child?;
+            if child.is_volatile() {
+                return Err(binder_error("HAS_ERROR can not be used in combination with a volatile function"));
+            }
+            let mut bound = BoundExpr::new(
+                BoundExprKind::Operator {
+                    op: BoundOperator::HasError,
+                    children: vec![child],
+                },
+                LogicalType::BOOLEAN,
+            );
+            if !expr.alias.is_empty() {
+                bound = bound.with_alias(expr.alias.clone());
+            }
+            return Ok(bound);
+        }
+        if let ExprKind::Function(function) = &expr.kind
+            && function.name.name.eq_ignore_ascii_case("switch")
+            && function.name.qualification.iter().all(String::is_empty)
+            && (1..=3).contains(&function.args.len())
+        {
+            return self.bind_switch(function);
+        }
+        if matches!(expr.kind, ExprKind::Window(_)) {
+            let mut rewritten = expr.clone();
+            if self.rewrite_window_count_star(&mut rewritten) {
+                return self.bind_expression(&rewritten);
+            }
+        }
+        // `ExpressionBinder::TryBindLambdaOrJson`: a function that takes no lambda and is given an
+        // arrow binds the arrow as JSON's `->`; when that fails too, both failures are told
+        let arrow_argument = |e: &Expr| {
+            matches!(
+                e.kind,
+                ExprKind::Lambda {
+                    syntax: ast::LambdaSyntax::Arrow,
+                    ..
+                }
+            )
+        };
+        let not_lambda_call = match &expr.kind {
+            ExprKind::Function(function) => {
+                !super::lambda::is_lambda_function(&function.name.name)
+                    && function.args.iter().any(|a| arrow_argument(&a.expr))
+            }
+            ExprKind::Operator {
+                op: ast::OperatorType::ArrayConstructor,
+                children,
+            } => children.iter().any(arrow_argument),
+            _ => false,
+        };
+        let bound = match self.bind_expression_inner(expr) {
+            Err(error) if not_lambda_call && error.kind == ErrorKind::Binder => {
+                return Err(binder_error(format!(
+                    "failed to bind function, either: This scalar function does not support lambdas!\n or: {}",
+                    error.message
+                )));
+            }
+            bound => bound?,
+        };
+        // `BindMapContainsExpression`: with a collation on the key or the map's keys, the key is
+        // looked for among the keys as a list: list_contains(map_keys(m), key)
+        if let (ExprKind::Function(call), BoundExprKind::Function { function, children, .. }) = (&expr.kind, &bound.kind)
+            && function.name == "map_contains"
+            && let [map, key] = children.as_slice()
+            && let [map_argument, key_argument] = call.args.as_slice()
+        {
+            fn has_collation(ty: &LogicalType) -> bool {
+                match ty.id() {
+                    LogicalTypeId::Varchar => ty.alias().is_none() && ty.collation().is_some_and(|c| !c.is_empty()),
+                    LogicalTypeId::List | LogicalTypeId::Array => ty.child_type().is_some_and(has_collation),
+                    _ => false,
+                }
+            }
+            let map_key = (map.return_type.id() == LogicalTypeId::Map)
+                .then(|| map.return_type.child_type().and_then(|entry| entry.struct_children().first().map(|(_, t)| t.clone())))
+                .flatten();
+            if has_collation(&key.return_type) || map_key.as_ref().is_some_and(has_collation) {
+                let keys = Expr::from(ExprKind::Function(ast::FunctionExpr::new(
+                    "map_keys",
+                    vec![map_argument.expr.clone()],
+                )));
+                let mut rewritten = ast::FunctionExpr::new("list_contains", vec![keys, key_argument.expr.clone()]);
+                rewritten.name.qualification.clear();
+                let mut rewritten = Expr::from(ExprKind::Function(rewritten));
+                rewritten.alias.clone_from(&expr.alias);
+                return self.bind_expression(&rewritten);
+            }
+        }
         if matches!(expr.kind, ExprKind::Function(_) | ExprKind::Operator { .. })
             && matches!(bound.kind, BoundExprKind::Function { .. })
         {
             return self.function_collations(bound);
         }
         Ok(bound)
+    }
+
+    /// Whether `name` resolves to the built-in has_error: a macro of the same name shadows it, unless
+    /// the system catalog is named.
+    fn is_builtin_has_error(&self, name: &ast::QualifiedName) -> Result<bool> {
+        let parts: Vec<&str> = name.qualification.iter().filter(|q| !q.is_empty()).map(String::as_str).collect();
+        if parts.first().is_some_and(|c| c.eq_ignore_ascii_case("system")) {
+            return Ok(true);
+        }
+        if !matches!(parts.as_slice(), [] | ["main"]) {
+            return Ok(false);
+        }
+        Ok(self.find_macro(name, false)?.is_none())
+    }
+
+    /// `SwitchFun`: `switch([key,] cases [, default])` over a constant MAP of cases, as the CASE
+    /// expression `SwitchBindExpression` makes of it.
+    fn bind_switch(&mut self, function: &FunctionExpr) -> Result<BoundExpr> {
+        let arguments = function
+            .args
+            .iter()
+            .map(|a| self.bind_expression(&a.expr))
+            .collect::<Result<Vec<_>>>()?;
+        let is_map = |e: &BoundExpr| e.return_type.id() == LogicalTypeId::Map;
+        let map_index = match arguments.len() {
+            3 => 1,
+            2 if is_map(&arguments[1]) => 1,
+            _ => 0,
+        };
+        if !is_map(&arguments[map_index]) {
+            let types: Vec<String> = arguments
+                .iter()
+                .map(|a| crate::function::binder::expression_return_type(a).to_string())
+                .collect();
+            return Err(binder_error(format!(
+                "No function matches the given name and argument types 'switch({})'. You might need to add \
+                 explicit type casts.",
+                types.join(", ")
+            )));
+        }
+        let cases = &arguments[map_index];
+        if !cases.is_foldable() {
+            return Err(binder_error("SWITCH expected a constant map for the cases"));
+        }
+        let cases_value = evaluate_scalar(cases)?;
+        let ValueData::List(entries) = cases_value.data() else {
+            return Err(binder_error("SWITCH expected a constant map for the cases"));
+        };
+        if entries.is_empty() {
+            return Err(binder_error("No values provided for SWITCH expression"));
+        }
+        let parts = cases.return_type.child_type().expect("an entry type").struct_children().to_vec();
+        let return_type = parts[1].1.clone();
+        let base = (map_index == 1).then(|| arguments[0].clone());
+        // the template `K` of the key and the cases' keys
+        if let Some(base) = &base {
+            let (key_type, case_type) = (crate::function::binder::expression_return_type(base), parts[0].1.clone());
+            if crate::function::nested::deduce_template(&key_type, &case_type).is_none() {
+                return Err(binder_error(format!(
+                    "No function matches the given name and argument types 'switch({key_type}, {}, ..)'. You might \
+                     need to add explicit type casts.\n\tCannot deduce template type 'K', it was inferred to be:\n  \
+                     - '{key_type}', from first occurrence\n  - '{case_type}', which is incompatible with the \
+                     previously inferred type",
+                    cases.return_type
+                )));
+            }
+        }
+        let mut checks = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let ValueData::Struct(fields) = entry.data() else {
+                continue;
+            };
+            let key = BoundExpr::constant(fields[0].clone());
+            let when = match &base {
+                Some(base) => bind_comparison(ComparisonOp::Equal, base.clone(), key)?,
+                None => key.cast_to(&LogicalType::BOOLEAN, false),
+            };
+            checks.push((when, BoundExpr::constant(fields[1].clone())));
+        }
+        let else_expr = match arguments.get(map_index + 1) {
+            Some(default) => default.clone().cast_to(&return_type, false),
+            None => BoundExpr::constant(Value::null(return_type.clone())),
+        };
+        Ok(BoundExpr::new(
+            BoundExprKind::Case {
+                checks,
+                else_expr: Box::new(else_expr),
+            },
+            return_type,
+        ))
     }
 
     /// `PushArgumentCollations` and `PropagateReturnCollation` of `FunctionBinder`: the
@@ -866,6 +1300,35 @@ impl Binder<'_> {
         // `ListSortBindData`: the elements sort by their collated values, a list of them after the
         // options, and keep their own
         if matches!(function.name.as_str(), "list_sort" | "array_sort") && children.len() <= 3 {
+            // `ListNormalSortBind`: `ResolveOrder` and `ResolveNullOrder` fill in the options
+            // that are not given, from the settings
+            let option = |text: &str| BoundExpr::constant(Value::varchar(text));
+            let given = match children.get(1).map(|c| &c.kind) {
+                None => Some(ast::OrderType::Default),
+                Some(BoundExprKind::Constant(value)) if !value.is_null() => {
+                    match value.try_to_string().unwrap_or_default().to_uppercase().as_str() {
+                        "ASC" => Some(ast::OrderType::Ascending),
+                        "DESC" => Some(ast::OrderType::Descending),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            if let Some(order) = given
+                && children.len() < 3
+            {
+                let modifiers = self.options.resolve_order(order, ast::NullOrder::Default);
+                if children.len() < 2 {
+                    children.push(option(match modifiers.order {
+                        duckrs_common::sort_key::OrderType::Descending => "DESC",
+                        _ => "ASC",
+                    }));
+                }
+                children.push(option(match modifiers.nulls {
+                    duckrs_common::sort_key::NullOrder::NullsLast => "NULLS LAST",
+                    _ => "NULLS FIRST",
+                }));
+            }
             let ty = children[0].return_type.clone();
             let (keys, collated) = push_collation(
                 children[0].clone(),
@@ -874,7 +1337,6 @@ impl Binder<'_> {
                 CollationType::AllCollations,
             )?;
             if collated {
-                let option = |text: &str| BoundExpr::constant(Value::varchar(text));
                 if children.len() < 2 {
                     children.push(option("ASC"));
                 }
@@ -946,9 +1408,17 @@ impl Binder<'_> {
         let args = binding
             .names
             .iter()
-            .map(|column| ast::FunctionArgument {
-                name: column.clone(),
-                expr: Expr::column(vec![binding.alias.clone(), column.clone()]),
+            .map(|column| {
+                // by the schema too, where the alias alone names more than one table
+                let mut path = match (schema, &binding.schema) {
+                    (Some(_), Some(own)) => vec![own.clone()],
+                    _ => Vec::new(),
+                };
+                path.extend([binding.alias.clone(), column.clone()]);
+                ast::FunctionArgument {
+                    name: column.clone(),
+                    expr: Expr::column(path),
+                }
             })
             .collect();
         let mut function = ast::FunctionExpr::new("struct_pack", Vec::new());
@@ -1067,17 +1537,15 @@ impl Binder<'_> {
                 let types = std::cell::RefCell::new(self.child_binder());
                 return crate::function::json::bind_function("->", children, &|name| types.borrow_mut().csv_type(name));
             }
-            ExprKind::ColumnRef(names) if self.table_function_argument => {
-                BoundExpr::constant(Value::varchar(names.join(".")))
-            }
+            // a lambda's parameter is one before a name of a table function's argument is its text
             ExprKind::ColumnRef(names) if !self.lambda_scopes.is_empty() && self.is_lambda_parameter(names) => {
                 return Ok(self.bind_lambda_parameter(names)?.expect("just checked"));
             }
-            ExprKind::ColumnRef(names) if self.bind_context.struct_field_start(names).is_some() => {
-                let start = self
-                    .bind_context
-                    .struct_field_start(names)
-                    .expect("checked by the guard");
+            ExprKind::ColumnRef(names) if self.table_function_argument => {
+                BoundExpr::constant(Value::varchar(names.join(".")))
+            }
+            ExprKind::ColumnRef(names) if self.struct_field_start(names).is_some() => {
+                let start = self.struct_field_start(names).expect("checked by the guard");
                 let column = ast::Expr::from(ExprKind::ColumnRef(names[..start].to_vec()));
                 let mut bound = self.bind_expression(&column)?;
                 for field in &names[start..] {
@@ -1101,8 +1569,14 @@ impl Binder<'_> {
                         )));
                     }
                     let key = BoundExpr::constant(Value::varchar(field.clone()));
+                    // `v.key` of a VARIANT is its variant_extract, which struct_extract itself refuses
+                    let name = if bound.return_type.id() == LogicalTypeId::Variant {
+                        "array_extract"
+                    } else {
+                        "struct_extract"
+                    };
                     let children = vec![bound, key];
-                    bound = bind_nested_function("struct_extract", vec![String::new(); 2], children)?;
+                    bound = bind_nested_function(name, vec![String::new(); 2], children)?;
                 }
                 bound.with_alias(names.last().expect("a name").clone())
             }
@@ -1206,6 +1680,9 @@ impl Binder<'_> {
                 if mode == Some(ColumnMode::SelectList) {
                     self.aggregates.as_mut().unwrap().bound_columns.push(name.clone());
                 }
+                if let Some(order) = self.column_orders.get(&binding.table_index) {
+                    order.note(binding.column_index);
+                }
                 BoundExpr::column_ref(binding, ty, name)
             }
             ExprKind::Positional(position) => {
@@ -1235,6 +1712,10 @@ impl Binder<'_> {
                     child
                 };
                 if child.return_type.id() != LogicalTypeId::Varchar || child.return_type.alias().is_some() {
+                    // `BindSelectNode`: of a position, the select list entry is no VARCHAR
+                    if expr.alias == super::statements::ORDER_POSITION_COLLATE {
+                        return Err(binder_error("COLLATE can only be applied to varchar columns"));
+                    }
                     return Err(binder_error("collations are only supported for type varchar"));
                 }
                 crate::planner::collation::test_collation(collation)?;
@@ -1253,7 +1734,13 @@ impl Binder<'_> {
                 children,
             } => {
                 // what a TRY catches at runtime does not fail its binding either
-                let child = crate::function::binder::inside_try(|| self.bind_expression(&children[0]))?;
+                let outer = std::mem::replace(&mut self.inside_try, true);
+                let child = crate::function::binder::inside_try(|| self.bind_expression(&children[0]));
+                self.inside_try = outer;
+                let child = child?;
+                if child.is_volatile() {
+                    return Err(binder_error("TRY can not be used in combination with a volatile function"));
+                }
                 let ty = child.return_type.clone();
                 BoundExpr::new(
                     BoundExprKind::Operator {
@@ -1287,15 +1774,17 @@ impl Binder<'_> {
                 op: op @ (OperatorType::ArrayExtract | OperatorType::StructExtract),
                 children,
             } => {
-                let name = if *op == OperatorType::StructExtract {
-                    "struct_extract"
-                } else {
-                    "array_extract"
-                };
                 let bound = children
                     .iter()
                     .map(|c| self.bind_expression(c))
                     .collect::<Result<Vec<_>>>()?;
+                // `BindOperatorExpression`: `.key` of a VARIANT is its variant_extract
+                let variant = bound.first().is_some_and(|b| b.return_type.id() == LogicalTypeId::Variant);
+                let name = if *op == OperatorType::StructExtract && !variant {
+                    "struct_extract"
+                } else {
+                    "array_extract"
+                };
                 bind_nested_function(name, vec![String::new(); bound.len()], bound)?
             }
             ExprKind::Operator {
@@ -1407,11 +1896,24 @@ impl Binder<'_> {
                     let equal = Expr::comparison(ComparisonOp::Equal, left.expr.clone(), right.expr.clone());
                     return self.bind_case(&[(equal, Expr::constant(Literal::null()))], &left.expr);
                 }
+                // `BindBetweenFun`: the function BETWEEN binds to is internal
+                if function.name.name.eq_ignore_ascii_case("__between") && function.args.len() == 3 {
+                    for argument in &function.args {
+                        self.bind_expression(&argument.expr)?;
+                    }
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        "Between function cannot be called directly",
+                    ));
+                }
                 if function.name.name.eq_ignore_ascii_case("if") {
                     let [condition, then, otherwise] = function.args.as_slice() else {
                         return Err(binder_error("if expects three arguments"));
                     };
                     return self.bind_case(&[(condition.expr.clone(), then.expr.clone())], &otherwise.expr);
+                }
+                if is_unnest(&function.name.name) && !self.lambda_scopes.is_empty() {
+                    return Err(binder_error("UNNEST in lambda expressions is not supported"));
                 }
                 if is_unnest(&function.name.name) && function.args.len() > 1 {
                     // the levels the options ask for, as one UNNEST each
@@ -1462,6 +1964,40 @@ impl Binder<'_> {
                         .iter()
                         .map(|a| self.bind_expression(&a.expr))
                         .collect::<Result<Vec<_>>>()?;
+                    // `BindMinMax` under `default_collation`: the strings compare collated
+                    let lower = function.name.name.to_ascii_lowercase();
+                    let default = self.default_collation();
+                    let aggregate_name = |at: usize| match children.get(at).map(|c| &c.kind) {
+                        Some(BoundExprKind::Constant(value)) => value.try_to_string().ok(),
+                        _ => None,
+                    };
+                    let min_max = matches!(lower.as_str(), "list_max" | "list_min" | "array_max" | "array_min")
+                        || matches!(
+                            lower.as_str(),
+                            "list_aggr" | "list_aggregate" | "array_aggr" | "array_aggregate" | "aggregate"
+                        ) && children.len() == 2
+                            && aggregate_name(1)
+                                .is_some_and(|n| n.eq_ignore_ascii_case("min") || n.eq_ignore_ascii_case("max"));
+                    if min_max
+                        && !default.is_empty()
+                        && let Some(list) = children.first()
+                        && list.return_type.id() == LogicalTypeId::List
+                        && list
+                            .return_type
+                            .child_type()
+                            .is_some_and(|c| c.id() == LogicalTypeId::Varchar && c.collation().is_none())
+                    {
+                        // the aggregate's name carries the collation to `list_aggr`
+                        let collated = LogicalType::VARCHAR.with_collation(Some(&default));
+                        let name = aggregate_name(1).unwrap_or_else(|| lower[lower.len() - 3..].to_string());
+                        let list = list.clone();
+                        drop(children);
+                        let which = BoundExpr::constant(Value::varchar(name).reinterpret(&collated)?);
+                        // `arg_max` returns the item, which has no collation
+                        let mut bound = bind_generic_function("list_aggr", vec![list, which])?;
+                        bound.return_type = bound.return_type.with_collation(None);
+                        return Ok(bound);
+                    }
                     return bind_generic_function(&function.name.name, children);
                 }
                 if ["st_crs", "st_setcrs"]
@@ -1533,6 +2069,48 @@ impl Binder<'_> {
                     }
                     return Ok(BoundExpr::constant(type_value(&child.return_type)));
                 }
+                if function.name.name.eq_ignore_ascii_case("invoke")
+                    && function.name.qualification.is_empty()
+                    && function.args.first().is_some_and(|a| !matches!(a.expr.kind, ExprKind::Lambda { .. }))
+                {
+                    return Err(binder_error("Invalid lambda expression passed to 'invoke' function."));
+                }
+                // `invoke(lambda x, y: body, a, b)`: the body with the arguments for its parameters
+                if function.name.name.eq_ignore_ascii_case("invoke")
+                    && function.name.qualification.is_empty()
+                    && let Some(first) = function.args.first()
+                    && let ExprKind::Lambda { lhs, expr: body, .. } = &first.expr.kind
+                {
+                    fn names(lhs: &Expr, out: &mut Vec<String>) {
+                        match &lhs.kind {
+                            ExprKind::ColumnRef(n) => out.push(n[0].clone()),
+                            ExprKind::Function(f) => f.args.iter().for_each(|a| names(&a.expr, out)),
+                            ExprKind::Operator { children, .. } => children.iter().for_each(|c| names(c, out)),
+                            _ => {}
+                        }
+                    }
+                    let mut parameters = Vec::new();
+                    names(lhs, &mut parameters);
+                    // an argument is known by its parameter's name in the body (what `alias(x)` gives)
+                    let arguments: Vec<Expr> = function.args[1..]
+                        .iter()
+                        .zip(&parameters)
+                        .map(|(a, name)| a.expr.clone().with_alias(name.clone()))
+                        .collect();
+                    if parameters.len() != function.args.len() - 1 {
+                        return Err(binder_error(format!(
+                            "The number of lambda parameters does not match the number of arguments passed to the \
+                             'invoke' function, expected {}{}, got {}.",
+                            if parameters.len() > function.args.len() - 1 { "at least " } else { "" },
+                            parameters.len(),
+                            function.args.len() - 1
+                        )));
+                    }
+                    let mut body = (**body).clone();
+                    super::macros::replace_in_expr(&mut body, &parameters, &arguments);
+                    body.alias = expr.alias.clone();
+                    return self.bind_expression(&body);
+                }
                 // `make_type(name, ...)`: the type the name and its parameters make, as a TYPE
                 if function.name.name.eq_ignore_ascii_case("make_type") && function.name.qualification.is_empty() {
                     return self.bind_make_type(function);
@@ -1553,7 +2131,45 @@ impl Binder<'_> {
                         .iter()
                         .map(|a| self.bind_expression(&a.expr))
                         .collect::<Result<Vec<_>>>()?;
-                    return crate::function::extras::bind_function(&function.name.name, &names, children);
+                    // a parameter's type is only known when the statement runs (`ParameterNotResolvedException`)
+                    let preparing = self.parameters.as_ref().is_some_and(|p| p.values.is_none());
+                    let typed_by_argument = matches!(
+                        function.name.name.to_lowercase().as_str(),
+                        "cast_to_type" | "replace_type" | "struct_concat" | "struct_insert" | "struct_update"
+                    );
+                    if preparing
+                        && typed_by_argument
+                        && children.iter().any(|c| c.return_type.id() == LogicalTypeId::SqlNull)
+                    {
+                        return Ok(BoundExpr::constant(Value::sql_null()));
+                    }
+                    let mut bound = crate::function::extras::bind_function(&function.name.name, &names, children)?;
+                    // `BindIEEEFloatingUnary` of the functions bound here
+                    if self.options.ieee_floating_point_ops
+                        && let BoundExprKind::Function {
+                            function: bound_function,
+                            children,
+                            ..
+                        } = &mut bound.kind
+                        && let Some(callback) =
+                            crate::function::math::ieee_variant(&bound_function.name, children.len())
+                    {
+                        *bound_function = Arc::new(crate::function::ScalarFunction::new(
+                            bound_function.name.clone(),
+                            bound_function.arguments.clone(),
+                            bound_function.return_type.clone(),
+                            callback,
+                        ));
+                    }
+                    // `BindBinaryFloatingPoint` of fmod and fdiv: a zero divisor is an error without IEEE semantics,
+                    // or NULL with error_on_division_by_zero off
+                    if matches!(function.name.name.to_lowercase().as_str(), "fmod" | "fdiv")
+                        && !self.options.ieee_floating_point_ops
+                        && let BoundExprKind::Function { function, .. } = &mut bound.kind
+                    {
+                        *function = Arc::new(function.with_zero_check(!self.options.error_on_division_by_zero));
+                    }
+                    return Ok(bound);
                 }
                 if crate::function::json_serialize::is_serialize_function(&function.name.name) {
                     let names: Vec<String> = function.args.iter().map(|a| a.name.clone()).collect();
@@ -1588,6 +2204,30 @@ impl Binder<'_> {
                         .iter()
                         .map(|a| self.bind_expression(&a.expr))
                         .collect::<Result<Vec<_>>>()?;
+                    // a parameter as the key: its value is only known when the statement runs
+                    // (`ParameterNotResolvedException`)
+                    let preparing = self.parameters.as_ref().is_some_and(|p| p.values.is_none());
+                    if preparing
+                        && function.name.name.eq_ignore_ascii_case("union_extract")
+                        && function
+                            .args
+                            .get(1)
+                            .is_some_and(|a| matches!(a.expr.kind, ExprKind::Parameter(_)))
+                    {
+                        return Ok(BoundExpr::constant(Value::sql_null()));
+                    }
+                    // an ENUM parameter: its type is only known when the statement runs
+                    if preparing
+                        && ["enum_code", "enum_first", "enum_last", "enum_range"]
+                            .iter()
+                            .any(|n| function.name.name.eq_ignore_ascii_case(n))
+                        && function
+                            .args
+                            .first()
+                            .is_some_and(|a| matches!(a.expr.kind, ExprKind::Parameter(_)))
+                    {
+                        return Ok(BoundExpr::constant(Value::sql_null()));
+                    }
                     return bind_nested_function(&function.name.name, names, children);
                 }
                 // `AliasFun`: the name of its argument
@@ -1596,9 +2236,35 @@ impl Binder<'_> {
                     && let [argument] = function.args.as_slice()
                     && argument.name.is_empty()
                 {
-                    self.bind_expression(&argument.expr)?;
-                    let name = super::statements::expression_name(&argument.expr);
-                    return Ok(BoundExpr::constant(Value::varchar(name)));
+                    let bound = self.bind_expression(&argument.expr)?;
+                    // `AliasFunction`: the call's own alias, if it has one
+                    let name = if !expr.alias.is_empty() {
+                        expr.alias.clone()
+                    } else if argument.expr.alias.is_empty() {
+                        // `Expression::GetName`: a bound column is named by its column, unqualified
+                        let mut unqualified = argument.expr.clone();
+                        visit_expr_mut(&mut unqualified, &mut |e: &mut Expr| {
+                            if let ExprKind::ColumnRef(names) = &mut e.kind
+                                && names.len() > 1
+                            {
+                                *names = vec![names.last().expect("a name").clone()];
+                            }
+                        });
+                        super::statements::expression_name(&unqualified)
+                    } else {
+                        argument.expr.alias.clone()
+                    };
+                    // the argument is evaluated all the same: its errors surface (a constant one folds)
+                    if bound.is_foldable() && crate::execution::expression_executor::evaluate_scalar(&bound).is_ok() {
+                        return Ok(BoundExpr::constant(Value::varchar(name)));
+                    }
+                    let name = BoundExpr::constant(Value::varchar(name));
+                    return Ok(crate::function::nested::bound_function(
+                        "alias",
+                        vec![bound, name],
+                        LogicalType::VARCHAR,
+                        alias_function,
+                    ));
                 }
                 // the macros of the system catalog (`DefaultFunctionGenerator`), where no function has
                 // the name
@@ -1625,9 +2291,135 @@ impl Binder<'_> {
                     ));
                 }
                 let Some(set) = BuiltinFunctions::get().scalar(&function.name.name) else {
+                    // `ExpressionBinder::BindFunction`: a table function, used as a scalar one
+                    const TABLE_FUNCTIONS: &[&str] = &[
+                        "read_csv",
+                        "read_csv_auto",
+                        "sniff_csv",
+                        "read_parquet",
+                        "parquet_scan",
+                        "parquet_metadata",
+                        "parquet_schema",
+                        "read_json",
+                        "read_json_auto",
+                        "read_ndjson",
+                        "read_ndjson_auto",
+                        "read_json_objects",
+                        "read_text",
+                        "read_blob",
+                        "glob",
+                        "query",
+                        "query_table",
+                        "summary",
+                        "repeat_row",
+                        "test_all_types",
+                        "test_vector_types",
+                        "pragma_table_info",
+                        "pragma_show",
+                        "pragma_storage_info",
+                        "pragma_metadata_info",
+                        "duckdb_settings",
+                        "duckdb_extensions",
+                        "duckdb_temporary_files",
+                        "duckdb_memory",
+                        "duckdb_logs",
+                        "duckdb_functions",
+                        "duckdb_keywords",
+                        "duckdb_types",
+                        "duckdb_sequences",
+                        "duckdb_databases",
+                        "duckdb_schemas",
+                        "duckdb_tables",
+                        "duckdb_views",
+                        "duckdb_columns",
+                        "duckdb_indexes",
+                        "duckdb_constraints",
+                        "duckdb_dependencies",
+                        "duckdb_optimizers",
+                        "pragma_version",
+                        "pragma_platform",
+                        "pragma_user_agent",
+                        "pragma_database_size",
+                    ];
+                    // `ExpressionBinder::BindWindow` of a window function written without OVER
+                    if function.name.qualification.iter().all(String::is_empty)
+                        && super::window::window_function(&function.name.name.to_lowercase()).is_some()
+                    {
+                        return Err(binder_error("Window functions are not supported here"));
+                    }
+                    if function.name.qualification.iter().all(String::is_empty)
+                        && TABLE_FUNCTIONS.contains(&function.name.name.to_lowercase().as_str())
+                    {
+                        return Err(binder_error(format!(
+                            "Function {} is a table function but it was used as a scalar function. This function \
+                             has to be called in a FROM clause (similar to a table).",
+                            function.name.name
+                        )));
+                    }
+                    // `CatalogException::MissingEntry`: the most similar function of the catalog
+                    let functions = BuiltinFunctions::get();
+                    let mut best: Option<(f64, String)> = None;
+                    let names = functions
+                        .scalar_sets()
+                        .into_iter()
+                        .map(|set| set.name.clone())
+                        .chain(functions.aggregate_sets().into_iter().map(|set| set.name.clone()))
+                        .chain(
+                            crate::function::extras::STRING_FUNCTIONS
+                                .iter()
+                                .chain(crate::function::extras::OTHER_FUNCTIONS.iter())
+                                .map(|name| name.to_string()),
+                        );
+                    // the functions bound by name, and the macros of the system catalog
+                    const BOUND_BY_NAME: &[&str] = &["nullif", "if", "write_log", "current_setting", "getvariable"];
+                    let names = names
+                        .chain(BOUND_BY_NAME.iter().map(|name| name.to_string()))
+                        .chain(
+                            crate::catalog::defaults::default_macro_names()
+                                .filter(|(_, _, table_macro)| !table_macro)
+                                .map(|(_, name, _)| name.to_string()),
+                        );
+                    for name in names {
+                        let score = duckrs_common::string_util::similarity_rating(&name, &function.name.name);
+                        if score > best.as_ref().map_or(0.0, |(b, _)| *b) {
+                            best = Some((score, name));
+                        }
+                    }
+                    // `SimilarEntriesInSchemas`: each schema's best, ties kept
+                    let mut found: Vec<(f64, String)> = best.into_iter().collect();
+                    for schema in self.catalog.schemas() {
+                        let mut schema_best: Option<(f64, String)> = None;
+                        for entry in schema.macro_entries(false) {
+                            let score = duckrs_common::string_util::similarity_rating(&entry.name, &function.name.name);
+                            if score > schema_best.as_ref().map_or(0.0, |(b, _)| *b) {
+                                schema_best = Some((score, entry.name.clone()));
+                            }
+                        }
+                        let Some((score, name)) = schema_best else { continue };
+                        match found.first().map(|(b, _)| *b) {
+                            Some(b) if score < b => {}
+                            Some(b) if score > b => found = vec![(score, name)],
+                            _ if found.iter().any(|(_, n)| n == &name) => {}
+                            _ => found.push((score, name)),
+                        }
+                    }
+                    // `CMUtils::Bind`: they are in the catalog in C++, for (de)serialization only
+                    let lower = function.name.name.to_ascii_lowercase();
+                    if lower.starts_with("__internal_compress_") || lower.starts_with("__internal_decompress_") {
+                        return Err(binder_error(
+                            "Compressed materialization functions are for internal use only!".to_string(),
+                        ));
+                    }
+                    let mut suggestions: Vec<String> = found.into_iter().map(|(_, name)| name).collect();
+                    suggestions.sort();
+                    let hint = if suggestions.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\nDid you mean \"{}\"?", suggestions.join(" or "))
+                    };
                     return Err(Error::new(
                         ErrorKind::Catalog,
-                        format!("Scalar Function with name {} does not exist!", function.name.name),
+                        format!("Scalar Function with name {} does not exist!{hint}", function.name.name),
                     ));
                 };
                 if function.filter.is_some() || !function.order_by.is_empty() || function.distinct {
@@ -1650,14 +2442,67 @@ impl Binder<'_> {
                             !format.is_foldable() && format.return_type.id() != LogicalTypeId::Unknown
                         } =>
                     {
-                        let name = if set.name == "strftime" { "strftime" } else { "strptime" };
-                        return Err(binder_error(format!("{name} format must be a constant")));
+                        // `BindScalarFunctionInput::GetConstant` of the named "format" parameter
+                        return Err(binder_error(format!(
+                            "The format argument in function {} must be a constant expression",
+                            set.name
+                        )));
+                    }
+                    // `StrpTimeFunction::Bind`: the format decides the type of the result
+                    ("strptime" | "try_strptime", [_, format]) if format.is_foldable() => {
+                        let ty = match try_evaluate_scalar(format) {
+                            Some(value) => crate::function::dates::strptime_return_type(&value)?,
+                            None => None,
+                        };
+                        let mut call =
+                            bind_scalar_function(set, children, function.is_operator, &|e| try_evaluate_scalar(e))?;
+                        if let Some(ty) = ty {
+                            call.return_type = ty;
+                        }
+                        call
                     }
                     // `RegexpExtractAllStruct` / `RegexExtractBind`: a list of group names makes a STRUCT
                     ("regexp_extract" | "regexp_extract_all", [_, _, groups, ..])
                         if children.len() <= 4 && groups.return_type.id() == LogicalTypeId::List =>
                     {
                         crate::function::regexp::bind_regexp_struct(&set.name, children)?
+                    }
+                    // a string literal group fits `(.., INTEGER, VARCHAR)` as well as `(.., VARCHAR[], VARCHAR)`
+                    ("regexp_extract", [_, _, _, _])
+                        if matches!(
+                            &function.args[2].expr.kind,
+                            ExprKind::Constant(literal) if literal.kind == LiteralKind::String
+                        ) =>
+                    {
+                        let types: Vec<String> = children
+                            .iter()
+                            .map(|c| crate::function::binder::expression_return_type(c).to_string())
+                            .collect();
+                        return Err(binder_error(format!(
+                            "Could not choose a best candidate function for the function call \
+                             \"regexp_extract({})\". In order to select one, please add explicit type casts.\n\
+                             \tCandidate functions:\n\tregexp_extract(VARCHAR, VARCHAR, INTEGER, VARCHAR) -> \
+                             VARCHAR\n\tregexp_extract(VARCHAR, VARCHAR, VARCHAR[], VARCHAR) -> STRUCT\n",
+                            types.join(", ")
+                        )));
+                    }
+                    // `RegexExtractBind`: the third argument is a constant, the group or the options
+                    ("regexp_extract", [_, _, group]) if !group.is_foldable() => {
+                        return Err(binder_error(
+                            "Argument #3 in function regexp_extract must be a constant expression",
+                        ));
+                    }
+                    ("regexp_extract", [_, _, options])
+                        if matches!(
+                            options.return_type.id(),
+                            LogicalTypeId::Varchar | LogicalTypeId::StringLiteral
+                        ) =>
+                    {
+                        let mut children = children;
+                        let options = children.pop().expect("three arguments");
+                        children.push(BoundExpr::constant(Value::integer(0)));
+                        children.push(options);
+                        bind_scalar_function(set, children, function.is_operator, &|e| try_evaluate_scalar(e))?
                     }
                     // `OperatorAddFun`: list_concat is an overload of `+`
                     ("+", [left, right])
@@ -1690,9 +2535,16 @@ impl Binder<'_> {
                                     callback,
                                 ));
                             }
-                            if checked && let BoundExprKind::Function { function, .. } = &mut bound.kind {
-                                let floating =
-                                    matches!(function.return_type.id(), LogicalTypeId::Float | LogicalTypeId::Double);
+                            // `BindIntervalDivide`: an INTERVAL divided by zero, whatever the IEEE setting
+                            if set.name == "/"
+                                && let BoundExprKind::Function { function, .. } = &mut bound.kind
+                                && function.return_type.id() == LogicalTypeId::Interval
+                            {
+                                *function = Arc::new(function.with_zero_check(!self.options.error_on_division_by_zero));
+                            } else if checked && let BoundExprKind::Function { function, .. } = &mut bound.kind {
+                                // (`//` of floats is `BindDivisionByZero`, as for integers)
+                                let floating = set.name != "//"
+                                    && matches!(function.return_type.id(), LogicalTypeId::Float | LogicalTypeId::Double);
                                 let null = !self.options.error_on_division_by_zero;
                                 if !floating && null {
                                     *function = Arc::new(function.with_zero_check(true));
@@ -1732,7 +2584,16 @@ impl Binder<'_> {
                 BoundExpr::constant(value.cloned().unwrap_or_else(Value::sql_null))
             }
             ExprKind::Star(_) => return Err(binder_error("STAR expression is not supported here")),
-            ExprKind::Default => return Err(binder_error("DEFAULT is not allowed here!")),
+            ExprKind::Default => {
+                // `WhereBinder`, `GroupBinder` and `TableFunctionBinder` name their clause
+                let clause = ["WHERE clause", "GROUP BY clause", "Table function", "DEFAULT value"]
+                    .into_iter()
+                    .find(|clause| self.aggregate_error == format!("{clause} cannot contain aggregates!"));
+                return Err(binder_error(match clause {
+                    Some(clause) => format!("{clause} cannot contain DEFAULT clause"),
+                    None => "DEFAULT is not allowed here!".to_string(),
+                }));
+            }
             ExprKind::Window(window) => return self.bind_window(window),
             other => {
                 let name = format!("{other:?}");
@@ -1800,44 +2661,58 @@ fn builtin_qualification(qualification: &[String]) -> bool {
     }
 }
 
-/// `QualifiedName::TryParse`: the dot-separated, optionally double-quoted parts of a name.
-fn parse_qualified_name(input: &str) -> Result<Vec<String>> {
-    let error = |what: &str| {
-        Error::new(
-            ErrorKind::Parser,
-            format!("Zero-length {what} in qualified name! (input: {input})"),
-        )
-    };
+/// `QualifiedName::TryParse`: the dot-separated parts of a name, each either fully double-quoted
+/// (a doubled quote is one quote) or not quoted at all.
+pub(super) fn parse_qualified_name(input: &str) -> Result<Vec<String>> {
+    let error = |message: &str| Err(Error::new(ErrorKind::Parser, format!("{message} (input: {input})")));
+    let bytes = input.as_bytes();
     let mut parts = Vec::new();
-    let mut current = String::new();
-    let mut quoted = false;
-    let mut chars = input.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '"' if quoted && chars.peek() == Some(&'"') => {
-                chars.next();
-                current.push('"');
-            }
-            '"' if quoted => {
-                if current.is_empty() {
-                    return Err(error("delimited identifier"));
+    let mut idx = 0;
+    // `TryParseComponents`
+    while idx < bytes.len() {
+        let mut entry = Vec::new();
+        if bytes[idx] == b'"' {
+            // `StringUtil::TryParseQuotedString`
+            let mut closed = None;
+            let mut i = idx + 1;
+            while i < bytes.len() {
+                if bytes[i] != b'"' {
+                    entry.push(bytes[i]);
+                } else if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                    entry.push(b'"');
+                    i += 1;
+                } else {
+                    closed = Some(i + 1);
+                    break;
                 }
-                quoted = false;
+                i += 1;
             }
-            '"' if current.is_empty() => quoted = true,
-            '.' if !quoted => parts.push(std::mem::take(&mut current)),
-            _ => current.push(c),
+            let Some(next) = closed else {
+                return error("Unterminated quote in qualified name!");
+            };
+            idx = next;
+            if entry.is_empty() {
+                return error("Zero-length delimited identifier in qualified name!");
+            }
+            if idx < bytes.len() && bytes[idx] != b'.' {
+                return error("Unexpected character after a quoted identifier in a qualified name!");
+            }
+        } else {
+            while idx < bytes.len() && bytes[idx] != b'.' {
+                if bytes[idx] == b'"' {
+                    return error("Unexpected quote in the middle of a qualified name component!");
+                }
+                entry.push(bytes[idx]);
+                idx += 1;
+            }
+        }
+        parts.push(String::from_utf8_lossy(&entry).into_owned());
+        if idx < bytes.len() {
+            idx += 1;
         }
     }
-    if quoted {
-        return Err(Error::new(
-            ErrorKind::Parser,
-            format!("Unterminated quote in qualified name! (input: {input})"),
-        ));
-    }
-    parts.push(current);
-    if parts.iter().any(String::is_empty) {
-        return Err(error("identifier"));
+    if parts.is_empty() || parts.iter().any(String::is_empty) {
+        return error("Zero-length identifier in qualified name!");
     }
     Ok(parts)
 }
@@ -1890,12 +2765,14 @@ impl Binder<'_> {
     pub(super) fn try_bind_group(&self, expr: &Expr) -> Option<BoundExpr> {
         let group = self.find_group(expr)?;
         let state = self.aggregates.as_ref()?;
+        // `BindGroup` names the reference after the expression (`GetName`)
+        let name = super::statements::expression_name(expr);
         if let Some((_, aggregate)) = state.collated_groups.iter().find(|(g, _)| *g == group) {
             let return_type = state.aggregates[*aggregate].return_type.clone();
             let first = BoundExpr::column_ref(
                 ColumnBinding::new(state.aggregate_index, *aggregate),
                 return_type.clone(),
-                expr.alias.clone(),
+                name.clone(),
             );
             if state.grouping_set_count <= 1 {
                 return Some(first);
@@ -1904,7 +2781,7 @@ impl Binder<'_> {
             let collated = BoundExpr::column_ref(
                 ColumnBinding::new(state.group_index, group),
                 state.groups[group].return_type.clone(),
-                expr.alias.clone(),
+                name.clone(),
             );
             let is_null = BoundExpr::new(
                 BoundExprKind::Operator {
@@ -1922,13 +2799,13 @@ impl Binder<'_> {
                     },
                     return_type,
                 )
-                .with_alias(expr.alias.clone()),
+                .with_alias(name.clone()),
             );
         }
         Some(BoundExpr::column_ref(
             ColumnBinding::new(state.group_index, group),
             state.groups[group].return_type.clone(),
-            expr.alias.clone(),
+            name.clone(),
         ))
     }
 
@@ -1994,6 +2871,13 @@ impl Binder<'_> {
                 .iter()
                 .position(|(a, _)| a.eq_ignore_ascii_case(name))
         {
+            // (the aggregates of this query that a subquery reads are no aliases of the query)
+            if self.binding_correlated && !name.starts_with("__outer_aggregate") {
+                return Err(binder_error(format!(
+                    "Having clause cannot reference alias {} in correlated subquery",
+                    sql_quoted_identifier(name)
+                )));
+            }
             let (alias, aliased) = self.alias_fallback.remove(position);
             let bound = self.bind_expression(&aliased);
             self.alias_fallback.insert(position, (alias, aliased));
@@ -2003,6 +2887,12 @@ impl Binder<'_> {
         if !state.force_aggregates {
             return Err(binder_error(format!(
                 "column {} must appear in the GROUP BY clause or be used in an aggregate function",
+                sql_quoted_identifier(&column)
+            )));
+        }
+        if self.binding_correlated {
+            return Err(binder_error(format!(
+                "Having clause cannot reference column {} in correlated subquery and group by all",
                 sql_quoted_identifier(&column)
             )));
         }
@@ -2036,6 +2926,17 @@ impl Binder<'_> {
                 .unwrap_or_else(crate::catalog::default_schema);
             return Ok(Some(BoundExpr::constant(Value::varchar(schema))));
         }
+        // `IndexKeyFun`
+        if name == "index_key" && function.name.qualification.iter().all(String::is_empty) {
+            return self.bind_index_key(function).map(Some);
+        }
+        // `VersionFun`: the version of the library
+        if name == "version" && function.args.is_empty() && function.name.qualification.iter().all(String::is_empty) {
+            return Ok(Some(BoundExpr::constant(Value::varchar(format!(
+                "v{}",
+                env!("CARGO_PKG_VERSION")
+            )))));
+        }
         if name == "current_query"
             && function.args.is_empty()
             && let Some(session) = &self.session
@@ -2045,8 +2946,15 @@ impl Binder<'_> {
         // `CurrentSchemasBind`: the schemas that were set, or with `include_implicit` the whole search path
         if name == "current_schemas" && function.args.len() == 1 {
             let argument = self.bind_expression(&function.args[0].expr)?;
-            if argument.return_type.id() != LogicalTypeId::Boolean {
+            // `CurrentSchemasResolveTypes`: a NULL takes the BOOLEAN parameter
+            if !matches!(argument.return_type.id(), LogicalTypeId::Boolean | LogicalTypeId::SqlNull) {
                 return Err(binder_error("current_schemas requires a boolean input"));
+            }
+            // `BindFunctionInput::GetConstant`
+            if !argument.is_foldable() {
+                return Err(binder_error(
+                    "The include_implicit argument in function current_schemas must be a constant expression",
+                ));
             }
             let value = crate::execution::expression_executor::evaluate_scalar(&argument)?;
             let list_type = LogicalType::list(LogicalType::VARCHAR);
@@ -2122,9 +3030,21 @@ impl Binder<'_> {
 
     /// `BaseSelectBinder::BindAggregate`.
     fn bind_aggregate(&mut self, function: &FunctionExpr) -> Result<BoundExpr> {
+        // `InaccessibleLambdaBindings`: the parameters of the lambdas around the aggregate are not
+        // values of the rows it aggregates
+        let before = std::mem::replace(&mut self.inaccessible_lambdas, self.lambda_scopes.len());
+        let result = self.bind_aggregate_call(function);
+        self.inaccessible_lambdas = before;
+        result
+    }
+
+    fn bind_aggregate_call(&mut self, function: &FunctionExpr) -> Result<BoundExpr> {
         if self.aggregate_of_outer_query(function) {
             self.pending_outer_aggregate = Some(function.clone());
             return Err(crate::unported("aggregates of the columns of an outer query"));
+        }
+        if self.inside_try {
+            return Err(binder_error("aggregates are not allowed inside the TRY expression"));
         }
         let Some(state) = self.aggregates.as_mut() else {
             return Err(binder_error(self.aggregate_error));
@@ -2167,7 +3087,9 @@ impl Binder<'_> {
         }
         let mut order_by = Vec::with_capacity(function.order_by.len());
         for node in &function.order_by {
-            if matches!(&node.expr.kind, ExprKind::Constant(literal) if literal.kind != LiteralKind::Integer) {
+            if !self.options.order_by_non_integer_literal
+                && matches!(&node.expr.kind, ExprKind::Constant(literal) if literal.kind != LiteralKind::Integer)
+            {
                 return Err(binder_error(
                     "ORDER BY non-integer literal has no effect.\n* SET order_by_non_integer_literal=true to allow \
                      this behavior.\n\nPerhaps you misplaced ORDER BY; ORDER BY must appear after all regular \
@@ -2185,13 +3107,20 @@ impl Binder<'_> {
                 order_by.clear();
             }
         }
-        if function.distinct
-            && !order_by.iter().all(|(order, _)| {
-                children
-                    .iter()
-                    .any(|child| format!("{:?}", child.kind) == format!("{:?}", order.kind))
-            })
-        {
+        // `BaseSelectBinder::IsFunctionallyDependent`: the ORDER BY of a DISTINCT aggregate is
+        // made of its arguments and constants
+        fn functionally_dependent(expr: &BoundExpr, arguments: &[String]) -> bool {
+            if expr.is_volatile() {
+                return false;
+            }
+            if expr.is_foldable() || arguments.contains(&format!("{:?}", expr.kind)) {
+                return true;
+            }
+            let children = expr.children();
+            !children.is_empty() && children.into_iter().all(|child| functionally_dependent(child, arguments))
+        }
+        let arguments: Vec<String> = children.iter().map(|child| format!("{:?}", child.kind)).collect();
+        if function.distinct && !order_by.iter().all(|(order, _)| functionally_dependent(order, &arguments)) {
             return Err(binder_error(
                 "In a DISTINCT aggregate, ORDER BY expressions must appear in the argument list",
             ));
@@ -2230,6 +3159,32 @@ impl Binder<'_> {
                 children.insert(1, collated);
             }
         }
+        // `ArgMinMaxBase::Bind` and `ArgMinMaxNBind`: the rows compare by the collated key
+        else if matches!(
+            set.name.as_str(),
+            "arg_min"
+                | "argmin"
+                | "min_by"
+                | "arg_max"
+                | "argmax"
+                | "max_by"
+                | "arg_min_null"
+                | "arg_max_null"
+                | "arg_min_nulls_last"
+                | "arg_max_nulls_last"
+        ) && children.len() >= 2
+            && !function.export_state
+        {
+            let key = children[1].clone();
+            let ty = key.return_type.clone();
+            children[1] = crate::planner::collation::push_collation(
+                key,
+                &ty,
+                &self.default_collation(),
+                crate::planner::collation::CollationType::AllCollations,
+            )?
+            .0;
+        }
         // `FunctionBinder::BindAggregateFunction`: a DISTINCT count counts collated values
         let children = if function.distinct && set.name == "count" {
             children
@@ -2262,6 +3217,17 @@ impl Binder<'_> {
         }
         // the keys as written, which an exported ordered state buffers
         let written_order: Vec<(BoundExpr, duckrs_common::sort_key::OrderModifiers)> = order_by.clone();
+        if aggregate.distinct {
+            let arguments: Vec<String> = aggregate.children.iter().map(|c| format!("{c:?}")).collect();
+            let mut seen: Vec<String> = Vec::new();
+            for (at, (expr, _)) in written_order.iter().enumerate() {
+                let text = format!("{expr:?}");
+                if !arguments.contains(&text) && !seen.contains(&text) {
+                    seen.push(text);
+                    aggregate.distinct_order.push(at);
+                }
+            }
+        }
         // `BindAggregate`: the rows are ordered as the collation of their sort keys says
         aggregate.order_by = order_by
             .into_iter()
@@ -2300,6 +3266,7 @@ impl Binder<'_> {
                     crate::function::holistic::Holistic::StringAgg
                         | crate::function::holistic::Holistic::QuantileCont
                         | crate::function::holistic::Holistic::QuantileDisc
+                        | crate::function::holistic::Holistic::ApproxQuantile
                 )
             );
             let constants: Vec<Option<Value>> = if takes_constants && arguments.len() > 1 {
@@ -2374,13 +3341,14 @@ impl Binder<'_> {
         state.inside_aggregate = false;
         // equal aggregates are computed once
         let key = format!(
-            "{:?}{:?}{:?}{}{:?}{:?}",
+            "{:?}{:?}{:?}{}{:?}{:?}{:?}",
             aggregate.function,
             aggregate.children,
             aggregate.filter,
             aggregate.distinct,
             aggregate.order_by,
-            aggregate.distinct_key
+            aggregate.distinct_key,
+            aggregate.distinct_order
         );
         let index = match state.aggregate_keys.iter().position(|k| *k == key) {
             Some(index) => index,
@@ -2533,6 +3501,30 @@ impl Binder<'_> {
             .collate_compared(&originals, sides)?
             .try_into()
             .expect("three sides");
+        // a column can be copied cheaply: two comparisons, which the optimizers handle more easily, and
+        // which the filter combiner folds into a BETWEEN again where both remain
+        if matches!(input.kind, BoundExprKind::ColumnRef { .. }) {
+            let compare = |op, left: BoundExpr, right: BoundExpr| {
+                BoundExpr::new(
+                    BoundExprKind::Comparison {
+                        op,
+                        left: Box::new(left),
+                        right: Box::new(right),
+                    },
+                    LogicalType::BOOLEAN,
+                )
+            };
+            return Ok(BoundExpr::new(
+                BoundExprKind::Conjunction {
+                    and: true,
+                    children: vec![
+                        compare(ComparisonOp::GreaterThanOrEqual, input.clone(), lower),
+                        compare(ComparisonOp::LessThanOrEqual, input, upper),
+                    ],
+                },
+                LogicalType::BOOLEAN,
+            ));
+        }
         Ok(BoundExpr::new(
             BoundExprKind::Between {
                 input: Box::new(input),
@@ -2578,47 +3570,25 @@ impl Binder<'_> {
         Ok((bound, max_type))
     }
 
-    /// `x IN (a, b)` as `x = a OR x = b`, which has its three-valued logic.
+    /// `x IN (a, b)`, which stays an IN through the filter pushdown; `InClauseRewriter` spells out
+    /// the short lists left after it.
     fn bind_in(&mut self, children: &[Expr], negated: bool) -> Result<BoundExpr> {
         let name = if negated { "NOT IN" } else { "IN" };
         let (bound, max_type) = self.resolve_coalesce_type(children, Some(name))?;
         // `BindExpression(OperatorExpression)`: the children compare with the collation of their type
-        let mut bound = bound
+        let bound = bound
             .into_iter()
             .map(|child| self.collate(child, &max_type))
             .collect::<Result<Vec<_>>>()?;
-        let input = bound.remove(0);
-        let comparisons = bound
-            .into_iter()
-            .map(|value| {
-                BoundExpr::new(
-                    BoundExprKind::Comparison {
-                        op: ComparisonOp::Equal,
-                        left: Box::new(input.clone()),
-                        right: Box::new(value),
-                    },
-                    LogicalType::BOOLEAN,
-                )
-            })
-            .collect();
-        let result = BoundExpr::new(
-            BoundExprKind::Conjunction {
-                and: false,
-                children: comparisons,
-            },
-            LogicalType::BOOLEAN,
-        );
-        Ok(if negated {
-            BoundExpr::new(
-                BoundExprKind::Operator {
-                    op: BoundOperator::Not,
-                    children: vec![result],
-                },
-                LogicalType::BOOLEAN,
-            )
+        let op = if negated {
+            BoundOperator::NotIn
         } else {
-            result
-        })
+            BoundOperator::In
+        };
+        Ok(BoundExpr::new(
+            BoundExprKind::Operator { op, children: bound },
+            LogicalType::BOOLEAN,
+        ))
     }
 }
 
@@ -2838,6 +3808,26 @@ fn alias_subquery_error(name: &str) -> Error {
     ))
 }
 
+/// `Value::TYPE`: a type as a value of the TYPE type, which keeps it serialized.
+pub(crate) fn type_value(ty: &LogicalType) -> Value {
+    let bytes = duckrs_common::serializer::BinarySerializer::serialize(
+        ty,
+        duckrs_common::serializer::SerializationOptions::default(),
+    );
+    Value::new(LogicalType::new(LogicalTypeId::Type), ValueData::Bytes(bytes)).expect("TYPE is stored as bytes")
+}
+
+/// An identifier as SQL spells it: quoted unless it needs no quotes.
+fn quote_identifier(name: &str) -> String {
+    let plain = name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if plain {
+        name.to_string()
+    } else {
+        format!("\"{}\"", name.replace('"', "\"\""))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2858,22 +3848,11 @@ mod tests {
     }
 }
 
-/// `Value::TYPE`: a type as a value of the TYPE type, which keeps it serialized.
-pub(crate) fn type_value(ty: &LogicalType) -> Value {
-    let bytes = duckrs_common::serializer::BinarySerializer::serialize(
-        ty,
-        duckrs_common::serializer::SerializationOptions::default(),
-    );
-    Value::new(LogicalType::new(LogicalTypeId::Type), ValueData::Bytes(bytes)).expect("TYPE is stored as bytes")
-}
-
-/// An identifier as SQL spells it: quoted unless it needs no quotes.
-fn quote_identifier(name: &str) -> String {
-    let plain = name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-    if plain {
-        name.to_string()
-    } else {
-        format!("\"{}\"", name.replace('"', "\"\""))
+/// `AliasFunction`: the name it was bound with, for every row.
+fn alias_function(args: &duckrs_common::vector::DataChunk, result: &mut duckrs_common::vector::Vector) -> Result<()> {
+    let name = args.column(1).get_value(0);
+    for row in 0..args.len() {
+        result.set_value(row, &name)?;
     }
+    Ok(())
 }

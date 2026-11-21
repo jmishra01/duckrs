@@ -615,7 +615,7 @@ fn fallback_format(d: f64, exp10: &mut i32) -> Vec<u8> {
             upper = Some(upper_store);
         }
         denominator.assign_pow10(*exp10);
-        denominator.shift_left(1);
+        denominator.shift_left(shift);
     } else if *exp10 < 0 {
         numerator.assign_pow10(-*exp10);
         lower = numerator.clone();

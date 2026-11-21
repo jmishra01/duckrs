@@ -5,7 +5,8 @@
 //! parser, binder, planner and executor.
 
 mod dml_cte;
-mod explain;
+pub(crate) mod explain;
+mod text_tree_renderer;
 mod triggers;
 pub(crate) use triggers::body_dependencies as trigger_body_dependencies;
 mod export;
@@ -220,7 +221,7 @@ impl DatabaseInstance {
             views.push(name);
         }
         for view in views {
-            schema.create_view(&view, query.clone(), Vec::new(), OnCreateConflict::Error, Vec::new())?;
+            schema.create_view(&view, query.clone(), Vec::new(), OnCreateConflict::Error, Vec::new(), false)?;
         }
         Ok(Arc::new(db))
     }
@@ -399,7 +400,11 @@ impl DatabaseInstance {
     fn has_foreign_indexes(&self) -> bool {
         self.catalog.schemas().iter().any(|schema| {
             schema.tables_and_views().iter().any(|entry| match entry {
-                TableOrView::Table(table) => table.indexes.read().iter().any(|index| index.index_type != "ART"),
+                TableOrView::Table(table) => table
+                    .indexes
+                    .read()
+                    .iter()
+                    .any(|index| !index.index_type.eq_ignore_ascii_case("ART")),
                 TableOrView::View(_) => false,
             })
         })
@@ -459,7 +464,31 @@ impl DatabaseInstance {
         )
         .and_then(|value| value.as_i128())
         .map_or(4096, |length| length as usize);
+        let variant_minimum_shredding_size = settings::current_value(
+            "variant_minimum_shredding_size",
+            &self.settings.read(),
+            &SettingValues::default(),
+        )
+        .and_then(|value| value.as_i128())
+        .map_or(30000, |size| size as i64);
+        // `ForceVariantShredding::SetGlobal`: the type, each level of which can also hold what does not fit it
+        let force_variant_shredding = settings::current_value(
+            "debug_force_variant_shredding",
+            &self.settings.read(),
+            &SettingValues::default(),
+        )
+        .and_then(|value| value.try_to_string().ok())
+        .filter(|name| !name.is_empty());
+        let force_variant_shredding = match force_variant_shredding {
+            Some(name) => {
+                let ty = crate::planner::binder::Binder::new(&self.catalog).type_from_name(&name)?;
+                Some(duckrs_common::variant_shredding::forced_shredding_type(&ty))
+            }
+            None => None,
+        };
         let options = storage::writer::CheckpointOptions {
+            variant_minimum_shredding_size,
+            force_variant_shredding: force_variant_shredding.as_ref(),
             zstd_min_string_length,
             storage_version: file.storage_version,
             keep_free_blocks: self.catalog.has_forks(),
@@ -517,6 +546,50 @@ impl DatabaseInstance {
 
 /// Pragmas that only switch DuckDB's debug verification, profiling, progress output or
 /// checkpointing, none of which changes a result; duckrs runs them as no-ops.
+/// The pragma functions C++ registers (`PragmaFunctions` and `PragmaQueries`).
+const PRAGMA_FUNCTIONS: &[&str] = &[
+    "table_info",
+    "storage_info",
+    "metadata_info",
+    "show_tables",
+    "show_tables_expanded",
+    "show_databases",
+    "database_list",
+    "collations",
+    "show",
+    "version",
+    "extension_versions",
+    "platform",
+    "database_size",
+    "functions",
+    "import_database",
+    "copy_database",
+    "user_agent",
+    "enable_profile",
+    "enable_profiling",
+    "disable_profile",
+    "disable_profiling",
+    "enable_verification",
+    "disable_verification",
+    "verify_parallelism",
+    "disable_verify_parallelism",
+    "enable_object_cache",
+    "disable_object_cache",
+    "enable_optimizer",
+    "disable_optimizer",
+    "force_checkpoint",
+    "enable_progress_bar",
+    "disable_progress_bar",
+    "enable_print_progress_bar",
+    "disable_print_progress_bar",
+    "enable_checkpoint_on_shutdown",
+    "disable_checkpoint_on_shutdown",
+    "json_execute_serialized_sql",
+    "add_parquet_key",
+    "tpch",
+    "tpcds",
+];
+
 const NO_OP_PRAGMAS: &[&str] = &[
     "force_checkpoint",
     "enable_verification",
@@ -650,6 +723,26 @@ fn for_each_table_name(statement: &mut Statement, f: &mut impl FnMut(&mut Qualif
         },
         _ => {}
     }
+}
+
+/// `Catalog::LookupEntry` of an entry whose schema is missing: a table, or anything in a nested
+/// schema, names the schema; another entry is just missing.
+fn missing_schema(error: Error, kind: &str, name: &QualifiedName) -> Error {
+    if error.kind != ErrorKind::Catalog || !error.message.starts_with("Schema with name") {
+        return error;
+    }
+    let schemas: Vec<&String> = name.qualification.iter().filter(|q| !q.is_empty()).collect();
+    if kind == "Table" || schemas.len() > 1 {
+        let schema = schemas.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(".");
+        return Error::new(
+            ErrorKind::Catalog,
+            format!(
+                "{kind} with name \"{schema}.{}\" does not exist because schema \"{schema}\" does not exist.",
+                name.name
+            ),
+        );
+    }
+    missing_entry(kind, &name.name)
 }
 
 /// The names of the `$name` parameters in the text of a statement, outside of string literals and
@@ -791,6 +884,8 @@ pub struct ClientContext {
     home: Arc<DatabaseInstance>,
     /// identifies the connection among the database's connections
     id: u64,
+    /// the statement ran side-effecting CTEs before what is planned now, which its statistics don't see
+    after_dml_ctes: bool,
     /// the transaction BEGIN started (`TransactionContext`); without one, each statement is its
     /// own (auto-commit)
     transaction: Option<ActiveTransaction>,
@@ -850,6 +945,8 @@ struct ActiveTransaction {
     attached: Vec<Arc<DatabaseInstance>>,
     /// `MetaTransaction::modified_database`: the one database it wrote to
     modified: Option<Arc<DatabaseInstance>>,
+    /// `MetaTransaction::start_timestamp`, in microseconds since the epoch: what `now()` says
+    started: i64,
 }
 
 impl ActiveTransaction {
@@ -937,6 +1034,7 @@ impl ClientContext {
             home: db.clone(),
             db,
             id,
+            after_dml_ctes: false,
             transaction: None,
             settings: SettingValues::default(),
             prepared_statements: HashMap::new(),
@@ -1010,6 +1108,7 @@ impl ClientContext {
         let (db, session) = (self.home.clone(), self.settings.clone());
         let (list_db, list_session) = (self.home.clone(), self.settings.clone());
         let files_db = self.home.clone();
+        let attached_db = self.home.clone();
         Arc::new(SessionValues {
             database: self.db.name.clone(),
             log_manager: self.home.log_manager.clone(),
@@ -1073,6 +1172,16 @@ impl ClientContext {
                     .map(|file| std::fs::canonicalize(&file.path).unwrap_or_else(|_| file.path.clone()))
                     .collect()
             }),
+            attached_catalog: Box::new(move |name: &str| {
+                if name.eq_ignore_ascii_case(&attached_db.name) {
+                    return Some(attached_db.catalog.clone());
+                }
+                attached_db
+                    .attached
+                    .read()
+                    .get(&name.to_lowercase())
+                    .map(|database| database.catalog.clone())
+            }),
         })
     }
 
@@ -1093,11 +1202,43 @@ impl ClientContext {
         if let Ok(threshold) = self.setting_text("dynamic_or_filter_threshold").parse() {
             options.dynamic_or_filter_threshold = threshold;
         }
+        crate::execution::join_filter::set_in_filter_threshold(options.dynamic_or_filter_threshold);
+        crate::execution::join_filter::set_enabled(options.join_filter_pushdown);
+        crate::execution::set_streaming_windows(self.setting_text("enable_optimizer") != "false");
+        if let Ok(threshold) = self.setting_text("approximate_join_order_threshold").parse() {
+            options.approximate_join_order_threshold = threshold;
+        }
+        options.force_no_cross_product = self.setting_text("debug_force_no_cross_product") == "true";
+        options.threads = self.thread_count();
+        options.side_effects = self.after_dml_ctes;
+        if let Ok(rows) = self.setting_text("late_materialization_max_rows").parse() {
+            options.late_materialization_options.max_rows = rows;
+        }
+        options.late_materialization_options.preserve_insertion_order =
+            self.setting_text("preserve_insertion_order") != "false";
+        if let Ok(threshold) = self.setting_text("scalar_aggregate_merge_threshold").parse() {
+            options.scalar_aggregate_merge_threshold = threshold;
+        }
+        if let Ok(threshold) = self.setting_text("perfect_ht_threshold").parse() {
+            options.perfect_ht_threshold = threshold;
+        }
+        if let Ok(threshold) = self.setting_text("nested_loop_join_threshold").parse() {
+            options.range_joins.nested_loop_join_threshold = threshold;
+        }
+        if let Ok(threshold) = self.setting_text("merge_join_threshold").parse() {
+            options.range_joins.merge_join_threshold = threshold;
+        }
+        options.range_joins.prefer_range_joins = self.setting_text("prefer_range_joins") == "true";
         options
     }
 
     fn bind_options(&self) -> BindOptions {
         BindOptions {
+            local_file_system_disabled: self
+                .setting_text("disabled_filesystems")
+                .split(',')
+                .any(|f| f == "LocalFileSystem"),
+            parser: self.parser_options(),
             transaction_id: self
                 .transaction
                 .as_ref()
@@ -1125,6 +1266,7 @@ impl ClientContext {
             file_access: self.file_access(),
             error_on_division_by_zero: self.setting_text("error_on_division_by_zero") != "false",
             ieee_floating_point_ops: self.setting_text("ieee_floating_point_ops") != "false",
+            order_by_non_integer_literal: self.setting_text("order_by_non_integer_literal") == "true",
         }
     }
 
@@ -1139,6 +1281,15 @@ impl ClientContext {
         if let Some(depth) = self.setting("max_expression_depth").and_then(|v| v.as_i128()) {
             options.max_expression_depth = depth as usize;
         }
+        options.integer_division = self.setting_text("integer_division") == "true";
+        options.regex_full_match = self
+            .setting_text("regex_match_operator_semantics")
+            .eq_ignore_ascii_case("full");
+        options.identifier_case = match self.setting_text("preserve_identifier_case").to_lowercase().as_str() {
+            "lowercase" => duckrs_parser::matcher::IdentifierCase::Lower,
+            "uppercase" => duckrs_parser::matcher::IdentifierCase::Upper,
+            _ => duckrs_parser::matcher::IdentifierCase::Preserve,
+        };
         options
     }
 
@@ -1220,10 +1371,17 @@ impl ClientContext {
             self.pending_profile = None;
             let profiler = profiled.map(|_| Arc::new(crate::execution::profiler::OperatorProfiler::default()));
             let outcome = crate::execution::profiler::with_profiler(profiler.clone(), || {
-                crate::logging::with_file_logging(&target, || match self.verification_statement(statement) {
-                    Ok(Some(replacement)) => self.run_statement(&replacement),
-                    Ok(None) => self.run_statement(statement),
-                    Err(error) => Err(error),
+                crate::logging::with_file_logging(&target, || {
+                    let old_casting = crate::function::cast_rules::set_old_implicit_casting(
+                        self.setting_text("old_implicit_casting") == "true",
+                    );
+                    let result = match self.verification_statement(statement) {
+                        Ok(Some(replacement)) => self.run_statement(&replacement),
+                        Ok(None) => self.run_statement(statement),
+                        Err(error) => Err(error),
+                    };
+                    crate::function::cast_rules::set_old_implicit_casting(old_casting);
+                    result
                 })
             });
             self.end_statement_logging();
@@ -1377,6 +1535,7 @@ impl ClientContext {
                     forks: Vec::new(),
                     attached: Vec::new(),
                     modified: None,
+                    started: crate::execution::temporary::now_micros(),
                 });
                 if self
                     .setting_text("immediate_transaction_mode")
@@ -1603,6 +1762,32 @@ impl ClientContext {
     /// Runs one statement within the current transaction, or as a transaction of its own
     /// (`ClientContext::PendingStatementOrPreparedStatementInternal` + `CleanupInternal`).
     fn run_statement(&mut self, statement: &Statement) -> Result<MaterializedQueryResult> {
+        // `FileSystem::GetHomeDirectory` of this connection
+        crate::execution::file_system::set_home_directory(Some(self.setting_text("home_directory")));
+        crate::execution::file_system::set_file_search_path(&self.setting_text("file_search_path"));
+        // `Binder::BindCreateSchema`: the system catalog (and its pg_catalog and information_schema)
+        // takes no entries
+        let created = match statement {
+            Statement::Create(info) if !info.temporary && !matches!(info.kind, CreateKind::Schema { .. }) => {
+                Some(&info.name)
+            }
+            Statement::CreateTable(info) if !info.temporary => Some(&info.name),
+            _ => None,
+        };
+        if let Some(name) = created {
+            let parts: Vec<&String> = name.qualification.iter().filter(|q| !q.is_empty()).collect();
+            let system = match parts.as_slice() {
+                [catalog, ..] if catalog.eq_ignore_ascii_case("system") => true,
+                [schema] => {
+                    (schema.eq_ignore_ascii_case("pg_catalog") || schema.eq_ignore_ascii_case("information_schema"))
+                        && self.catalog().get_schema(schema).is_none()
+                }
+                _ => false,
+            };
+            if system {
+                return Err(Error::new(ErrorKind::Binder, "Cannot create entry in system catalog"));
+            }
+        }
         if let Some((database, routed)) = self.route_to_database(statement)? {
             let previous = std::mem::replace(&mut self.db, database);
             let result = self.run_statement(&routed);
@@ -1623,6 +1808,17 @@ impl ClientContext {
                 Statement::SetVariable { .. } | Statement::ResetVariable { .. } | Statement::Transaction { .. }
             )
         {
+            // a query binds the default catalog (`Catalog::GetCatalog`); other statements look up
+            // a schema of it
+            if matches!(statement, Statement::Select(_)) {
+                return Err(Error::new(
+                    ErrorKind::Binder,
+                    format!(
+                        "Catalog {} does not exist!",
+                        duckrs_parser::ast::sql_quoted_identifier(&self.db.name)
+                    ),
+                ));
+            }
             return Err(Error::new(
                 ErrorKind::Catalog,
                 format!("Catalog with name {} does not exist!", self.db.name),
@@ -1749,7 +1945,10 @@ impl ClientContext {
             }
         }
         // outside of a transaction only a commit that is made to fail needs one of these
-        let undo = (write && self.transaction.is_none() && self.commit_may_fail()).then(|| self.catalog().snapshot());
+        // as does one that writes to a table with a DEFERRED key, which its commit checks
+        let deferred = write && self.transaction.is_none() && !self.catalog().deferred_tables().is_empty();
+        let undo = (write && self.transaction.is_none() && (deferred || self.commit_may_fail()))
+            .then(|| self.catalog().snapshot());
         // what isn't a change to rows can conflict with what transactions did to the catalog
         let changes_entries = write
             && !matches!(
@@ -1811,11 +2010,23 @@ impl ClientContext {
                 transaction.apply_invalidation_policy(error.kind);
             }
         } else if self.transaction.is_none() {
-            if let Some(snapshot) = undo
-                && let Some(error) = self.forced_commit_failure()
-            {
-                self.catalog().restore(snapshot);
-                return Err(error);
+            if let Some(snapshot) = undo {
+                let failure = if deferred {
+                    self.catalog()
+                        .deferred_tables()
+                        .iter()
+                        .try_for_each(|table| {
+                            crate::execution::constraints::check_deferred_keys(table, &*table.rows()?, |_| true)
+                        })
+                        .err()
+                        .map(crate::catalog::failed_commit)
+                } else {
+                    None
+                };
+                if let Some(error) = failure.or_else(|| self.forced_commit_failure()) {
+                    self.catalog().restore(snapshot);
+                    return Err(error);
+                }
             }
             // also for a SELECT, as `nextval` is one
             self.log_commit()?;
@@ -2042,6 +2253,7 @@ impl ClientContext {
             return Err(crate::unported("ATTACH TO EXTERNAL RESOURCE"));
         }
         let path = evaluate_scalar(&bind_constant_expression(&self.catalog(), &info.path)?)?.try_to_string()?;
+        let path = crate::execution::file_system::expand_path(&path);
         let mut options = AttachOptions::default();
         let mut mode_given = false;
         // the options given as expressions, such as `TYPE getvariable('t')`, by their values
@@ -2380,6 +2592,126 @@ impl ClientContext {
         Ok(Self::success())
     }
 
+    /// Whether `info` is a COMMENT ON of an entry that is no table: a view (or a column of one),
+    /// a sequence, a type or a macro (`SetCommentInfo`, `SetColumnCommentInfo`).
+    fn comments_outside_tables(&self, info: &AlterInfo) -> Result<bool> {
+        Ok(match &info.kind {
+            AlterKind::SetComment { entry_type, .. } => {
+                matches!(*entry_type, "VIEW" | "SEQUENCE" | "TYPE" | "MACRO" | "MACRO TABLE")
+            }
+            AlterKind::SetColumnComment { .. } => {
+                let catalog = self.catalog();
+                let schema = schema_of(&info.name)?;
+                matches!(
+                    catalog.get_entry(schema.as_deref(), None, &info.name.name),
+                    Ok(TableOrView::View(_))
+                )
+            }
+            _ => false,
+        })
+    }
+
+    /// `AlterInfo` of a comment, on an entry that is no table: the entry with it takes its place.
+    fn comment_on_entry(&self, info: &AlterInfo) -> Result<MaterializedQueryResult> {
+        let catalog = self.catalog();
+        let schema_name = schema_of(&info.name)?;
+        let name = &info.name.name;
+        let text = |value: &duckrs_parser::ast::Literal| {
+            (!matches!(value.kind, LiteralKind::Null)).then(|| value.text.clone())
+        };
+        let system = || Error::new(ErrorKind::Binder, "Can not comment on System Catalog entries");
+        match &info.kind {
+            AlterKind::SetColumnComment { column, value } => {
+                let entry = catalog.get_entry(schema_name.as_deref(), None, name)?;
+                let TableOrView::View(view) = entry else {
+                    unreachable!("checked by the caller")
+                };
+                let schema = catalog.schema_for(Some(&view.schema))?;
+                // `ViewCatalogEntry::AlterEntry`: a column of the view by its name
+                let names = self.view_column_names(&view)?;
+                let Some(found) = names.iter().find(|n| n.eq_ignore_ascii_case(column)) else {
+                    return Err(Error::new(
+                        ErrorKind::Binder,
+                        format!("View \"{name}\" does not have a column with name \"{column}\""),
+                    ));
+                };
+                let mut comments: Vec<(String, String)> = view
+                    .column_comments
+                    .iter()
+                    .filter(|(n, _)| !n.eq_ignore_ascii_case(found))
+                    .cloned()
+                    .collect();
+                if let Some(comment) = text(value) {
+                    comments.push((found.clone(), comment));
+                }
+                schema.set_view_comments(&view.name, view.comment.clone(), comments);
+            }
+            AlterKind::SetComment { entry_type, value } => {
+                let comment = text(value);
+                match *entry_type {
+                    "VIEW" => {
+                        let view = match catalog.get_entry(schema_name.as_deref(), None, name) {
+                            Ok(TableOrView::View(view)) => view,
+                            _ if crate::catalog::defaults::default_view(schema_name.as_deref(), name).is_some() => {
+                                return Err(system());
+                            }
+                            _ => return Err(missing_entry("View", name)),
+                        };
+                        let schema = catalog.schema_for(Some(&view.schema))?;
+                        schema.set_view_comments(&view.name, comment, view.column_comments.clone());
+                    }
+                    "SEQUENCE" => {
+                        let schema = catalog.schema_for(schema_name.as_deref())?;
+                        if !schema.set_sequence_comment(name, comment) {
+                            return Err(missing_entry("Sequence", name));
+                        }
+                    }
+                    "TYPE" => {
+                        let schema = catalog.schema_for(schema_name.as_deref())?;
+                        if !schema.set_type_comment(name, comment) {
+                            return Err(missing_entry("Type", name));
+                        }
+                    }
+                    _ => {
+                        let table_macro = *entry_type == "MACRO TABLE";
+                        let schema = catalog.schema_for(schema_name.as_deref())?;
+                        if !schema.set_macro_comment(name, table_macro, comment) {
+                            let builtin = crate::function::BuiltinFunctions::get();
+                            if builtin.scalar(name).is_some()
+                                || builtin.aggregate(name).is_some()
+                                || crate::catalog::defaults::default_macro(schema_name.as_deref(), name, table_macro)
+                                    .is_some()
+                            {
+                                return Err(system());
+                            }
+                            let kind = if table_macro {
+                                "Table Macro Function"
+                            } else {
+                                "Macro Function"
+                            };
+                            return Err(missing_entry(kind, name));
+                        }
+                    }
+                }
+            }
+            _ => unreachable!("checked by the caller"),
+        }
+        Ok(Self::success())
+    }
+
+    /// The names of the columns of a view, as binding its query gives them.
+    fn view_column_names(&self, view: &crate::catalog::ViewCatalogEntry) -> Result<Vec<String>> {
+        let catalog = self.catalog();
+        let mut binder = Binder::with_options(&catalog, self.bind_options());
+        binder.session = Some(self.session_values());
+        let bound = binder.bind(&Statement::Select(view.query.clone()))?;
+        let mut names = bound.names;
+        for (name, alias) in names.iter_mut().zip(&view.aliases) {
+            name.clone_from(alias);
+        }
+        Ok(names)
+    }
+
     /// `EXPLAIN (SQL)` (`LogicalExplain::CreateSQLResult`).
     fn explain_sql(&mut self, statement: &Statement) -> Result<MaterializedQueryResult> {
         let supported = match statement {
@@ -2430,6 +2762,7 @@ impl ClientContext {
         let bound = binder.bind(statement)?;
         let modifies = !matches!(statement, Statement::Select(_));
         let plan = optimize(bound.plan, self.optimizer_options());
+        crate::optimizer::join_order::take_error()?;
         let databases: Vec<(String, Arc<crate::catalog::Catalog>)> = std::iter::once(self.db.clone())
             .chain(std::iter::once(self.home.clone()))
             .chain(self.home.attached.read().values().cloned())
@@ -2551,9 +2884,11 @@ impl ClientContext {
         let (names, types) = (bound.names.clone(), bound.types.clone());
         let logical = explain::logical_tree(&bound.plan, None);
         let mut plan = optimize(bound.plan, self.optimizer_options());
+        crate::optimizer::join_order::take_error()?;
         let optimized = plan.clone();
         let estimate = estimate_plan(&plan);
         let logical_optimized = explain::logical_tree(&plan, Some(&estimate));
+        crate::execution::join_filter::note_probe_estimates(&plan);
         resolve_column_bindings(&mut plan)?;
         let physical_plan = create_plan(plan);
         let physical = explain::physical_tree(physical_plan.as_ref(), Some(&optimized), Some(&estimate), analyze);
@@ -2578,10 +2913,18 @@ impl ClientContext {
         let ([logical, logical_optimized, physical], _, _) = self.explain_trees(statement, analyze)?;
         let logical = explain::render(&logical, format, upper);
         let logical_optimized = explain::render(&logical_optimized, format, upper);
-        let physical = explain::render(&physical, format, upper);
-        if explain_type == ExplainType::Analyze {
-            self.execute_statement(statement)?;
-        }
+        let physical = if explain_type == ExplainType::Analyze {
+            // what the joins gave the scans is known once the statement ran
+            crate::execution::join_filter::start_recording();
+            let ran = self.execute_statement(statement);
+            let recorded = crate::execution::join_filter::take_recorded();
+            ran?;
+            let mut physical = physical;
+            explain::add_dynamic_filters(&mut physical, &mut recorded.into_iter());
+            explain::render(&physical, format, upper)
+        } else {
+            explain::render(&physical, format, upper)
+        };
         let rows: Vec<(&str, String)> = if explain_type == ExplainType::Analyze {
             vec![("analyzed_plan", physical)]
         } else {
@@ -2779,8 +3122,22 @@ impl ClientContext {
                 return Ok(Self::success());
             }
             Statement::SetVariable { name, value, scope } => {
-                // `Binder::Bind(SetVariableStatement)` + `PhysicalSet`
-                let value = evaluate_scalar(&bind_constant_expression(&self.catalog(), value)?)?;
+                // `Binder::Bind(SetVariableStatement)` + `PhysicalSet`; the value binds with a
+                // `ConstantBinder`, where a name that is no SQL value function is refused
+                if crate::planner::binder::has_subquery(value) {
+                    return Err(Error::new(ErrorKind::Binder, "SET value cannot contain subqueries"));
+                }
+                let bound = bind_constant_expression(&self.catalog(), value).map_err(|error| {
+                    if error
+                        .message
+                        .contains("was not found because the FROM clause is missing")
+                    {
+                        Error::new(ErrorKind::Binder, "SET value cannot contain column names")
+                    } else {
+                        error
+                    }
+                })?;
+                let value = evaluate_scalar(&bound)?;
                 if name.eq_ignore_ascii_case("current_transaction_invalidation_policy")
                     && let Some(transaction) = &mut self.transaction
                 {
@@ -2798,16 +3155,28 @@ impl ClientContext {
                 }
                 // `EnableProfilingSetting::SetLocal`: a format the profiler knows, and profiling on
                 if name.eq_ignore_ascii_case("enable_profiling") {
-                    let format = value.try_to_string()?.to_lowercase();
-                    if !matches!(
-                        format.as_str(),
-                        "json" | "query_tree" | "query_tree_optimizer" | "no_output" | "html" | "graphviz"
-                    ) {
+                    // `LookupProfilerPrintFormat`
+                    const FORMATS: [&str; 11] = [
+                        "default",
+                        "text",
+                        "query_tree",
+                        "query_tree_optimizer",
+                        "no_output",
+                        "json",
+                        "html",
+                        "graphviz",
+                        "yaml",
+                        "mermaid",
+                        "compact",
+                    ];
+                    let given = value.try_to_string()?;
+                    let format = given.to_lowercase();
+                    if !FORMATS.contains(&format.as_str()) {
                         return Err(Error::new(
-                            ErrorKind::Parser,
+                            ErrorKind::InvalidInput,
                             format!(
-                                "Unrecognized print format {format}, supported formats: [json, query_tree, \
-                                 query_tree_optimizer, no_output, html, graphviz]"
+                                "\"{given}\" is not a valid FORMAT argument, valid options are: {}",
+                                FORMATS.join(", ")
                             ),
                         ));
                     }
@@ -2925,9 +3294,19 @@ impl ClientContext {
                     ("show_tables", []) => Some("SHOW TABLES".to_string()),
                     ("show_tables_expanded", []) => Some("SHOW ALL TABLES".to_string()),
                     ("show_databases" | "database_list", []) => Some("SELECT * FROM duckdb_databases()".to_string()),
-                    ("table_info" | "show", [table]) => {
+                    ("table_info" | "show" | "storage_info", [table]) => {
                         Some(format!("SELECT * FROM pragma_{lower}({})", pragma_argument(table)))
                     }
+                    ("version" | "platform" | "database_size" | "metadata_info", []) => {
+                        Some(format!("SELECT * FROM pragma_{lower}()"))
+                    }
+                    // `PragmaFunctionsQuery`
+                    ("functions", []) => Some(
+                        "SELECT function_name AS name, upper(function_type) AS type, parameter_types AS parameters, \
+                         varargs, return_type, has_side_effects AS side_effects FROM duckdb_functions() \
+                         WHERE function_type IN ('scalar', 'aggregate') ORDER BY 1"
+                            .to_string(),
+                    ),
                     // `PragmaCopyDatabase`
                     ("copy_database", [from, to]) => {
                         let name = |e: &Expr| {
@@ -2963,6 +3342,26 @@ impl ClientContext {
                         ),
                     ));
                 }
+                // `Binder::BindPragma`: a name no pragma function has
+                if !PRAGMA_FUNCTIONS.iter().any(|f| f.eq_ignore_ascii_case(name)) {
+                    return Err(Error::new(
+                        ErrorKind::Catalog,
+                        format!("Pragma Function with name {name} does not exist!"),
+                    ));
+                }
+                // `FunctionBinder::BindPragmaFunction`: a pragma called with the wrong arguments
+                let arity = match lower.as_str() {
+                    "table_info" | "storage_info" | "show" | "import_database" => Some(1),
+                    "copy_database" => Some(2),
+                    "metadata_info" | "json_execute_serialized_sql" | "add_parquet_key" | "tpch" | "tpcds" => None,
+                    _ => Some(0),
+                };
+                if arity.is_some_and(|arity| arity != parameters.len()) {
+                    return Err(Error::new(
+                        ErrorKind::Binder,
+                        format!("No function matches the given name and argument types '{lower}'"),
+                    ));
+                }
                 return Err(crate::unported(format!("PRAGMA {name}")));
             }
             Statement::Explain {
@@ -2991,6 +3390,25 @@ impl ClientContext {
             {
                 return self.comment_on_index(info);
             }
+            Statement::Alter(info) if self.comments_outside_tables(info)? => {
+                return self.comment_on_entry(info);
+            }
+            // `ALTER SEQUENCE ... OWNED BY` (`ChangeOwnershipInfo`)
+            Statement::Alter(info) if matches!(info.kind, AlterKind::ChangeOwnership { .. }) => {
+                let AlterKind::ChangeOwnership { owner_name, .. } = &info.kind else {
+                    unreachable!("matched above")
+                };
+                let catalog = self.catalog();
+                let schema = catalog.schema_for(schema_of(&info.name)?.as_deref())?;
+                if schema.get_sequence(&info.name.name).is_none() {
+                    if info.if_exists {
+                        return Ok(Self::success());
+                    }
+                    return Err(crate::catalog::missing_entry("Sequence", &info.name.name));
+                }
+                schema.alter_ownership(&info.name.name, owner_name)?;
+                return Ok(Self::success());
+            }
             Statement::Alter(info) => {
                 self.check_trigger_alter(info)?;
                 let catalog = self.catalog();
@@ -3008,7 +3426,7 @@ impl ClientContext {
                 {
                     check_alter_dependents(&catalog, &schema.ident(), &info.name.name)?;
                 }
-                let mut binder = Binder::new(&catalog);
+                let mut binder = Binder::with_options(&catalog, self.bind_options());
                 let alter = binder.bind_alter(info)?;
                 execute_alter(alter)?;
                 self.alter_triggers(info);
@@ -3109,7 +3527,7 @@ impl ClientContext {
                 if !options.is_empty() {
                     return Err(Error::new(
                         ErrorKind::Catalog,
-                        "WITH clause is not supported for schemas",
+                        "WITH clause is not supported for schemas in a duckdb catalog",
                     ));
                 }
                 // `Binder::ResolveCatalog`: the qualification of the new schema is its catalog, or the
@@ -3176,7 +3594,9 @@ impl ClientContext {
         let planned = profiling.map(|_| std::time::Instant::now());
         let mut optimizers = Vec::new();
         let mut plan = crate::optimizer::optimize_timed(bound.plan, self.optimizer_options(), &mut optimizers);
+        crate::optimizer::join_order::take_error()?;
         let optimized = profiling.map(|_| std::time::Instant::now());
+        crate::execution::join_filter::note_probe_estimates(&plan);
         resolve_column_bindings(&mut plan)?;
         let plan = create_plan(plan);
         let physical = profiling.map(|_| std::time::Instant::now());
@@ -3188,9 +3608,16 @@ impl ClientContext {
         }
         let memory = self.query_memory()?;
         memory.set_threads(threads);
+        // an auto-commit statement is a transaction of its own, which starts now
+        memory.set_transaction_start(
+            self.transaction
+                .as_ref()
+                .map_or_else(crate::execution::temporary::now_micros, |t| t.started),
+        );
         crate::execution::profiler::with_profiler(operator_profiler.clone(), || {
             crate::execution::temporary::with_memory(memory, || execute_plan_with(&collector, threads))
         })?;
+        crate::execution::join_filter::record(&collector);
         if let (Some(start), Some(planned), Some(optimized), Some(physical), Some(operators)) =
             (profiling, planned, optimized, physical, &operator_profiler)
         {
@@ -3425,11 +3852,21 @@ impl ClientContext {
         else {
             unreachable!("checked by the caller");
         };
-        if *secure {
-            return Err(crate::unported("CREATE SECURE VIEW"));
-        }
         let with_dependencies = self.setting_text("enable_view_dependencies") == "true";
         let catalog = self.catalog();
+        // an older file has no place for it: it would come back as a regular view
+        if *secure
+            && !info.temporary
+            && catalog
+                .storage_version()
+                .is_some_and(|version| version < duckrs_common::serializer::StorageVersion::V2_0_0)
+        {
+            return Err(Error::new(
+                ErrorKind::Binder,
+                "CREATE SECURE VIEW is only supported for storage versions v2.0.0 and higher.\nUse an in-memory \
+                 database, or ATTACH with (STORAGE_VERSION v2.0.0)",
+            ));
+        }
         let schema = catalog.schema_for(create_schema_of(info)?.as_deref())?;
         let on_conflict = on_create_conflict(info.on_conflict);
         // IF NOT EXISTS for a view that exists does not look at the query
@@ -3461,6 +3898,7 @@ impl ClientContext {
             aliases.clone(),
             on_conflict,
             dependencies,
+            *secure,
         )
     }
 
@@ -3477,13 +3915,60 @@ impl ClientContext {
         let mut binder = Binder::with_options(&catalog, self.bind_options());
         binder.session = Some(self.session_values());
         binder.bind_create_macro(&info.name.name, macros, *table_macro, &schema.ident())?;
+        // `CheckMacroStorageVersion` and `BindCreateFunctionInfo`: what an older file can't hold
+        if let Some(version) = catalog.storage_version().filter(|_| !info.temporary) {
+            use duckrs_common::serializer::StorageVersion;
+            if version < StorageVersion::V2_1_0 && macros.iter().any(|m| m.return_type.is_some()) {
+                return Err(Error::new(
+                    ErrorKind::Binder,
+                    "Macros with a declared RETURNS type are only supported for storage versions v2.1.0 and \
+                     higher.\nUse an in-memory database, ATTACH with (STORAGE_VERSION v2.1.0), or create a TEMP macro",
+                ));
+            }
+            if version < StorageVersion::V1_4_0
+                && macros
+                    .iter()
+                    .any(|m| m.parameters.iter().any(|p| p.parameter_type.is_some()))
+            {
+                return Err(Error::new(
+                    ErrorKind::Binder,
+                    "Typed macro parameters are only supported for storage versions v1.4.0 and higher.\nUse an \
+                     in-memory database, ATTACH with (STORAGE_VERSION v1.4.0), or create a TEMP macro",
+                ));
+            }
+        }
         if on_create_conflict(info.on_conflict) == OnCreateConflict::Replace {
             macro_is_free(&schema, &info.name.name)?;
+        }
+        // what is stored is the parsed body, whose lambdas `LambdaExpression::ToString` writes with the
+        // keyword: the arrow it was created with (under `lambda_syntax`) is not checked again
+        let mut macros = macros.clone();
+        let mut to_keyword = |e: &mut Expr| {
+            duckrs_parser::transformer::visit_expr_mut(e, &mut |e: &mut Expr| {
+                // only the lambda of a function that takes one: another arrow is JSON's `->`
+                if let ExprKind::Function(function) = &mut e.kind
+                    && crate::planner::binder::is_lambda_function(&function.name.name)
+                {
+                    for argument in &mut function.args {
+                        if let ExprKind::Lambda { syntax, .. } = &mut argument.expr.kind {
+                            *syntax = duckrs_parser::ast::LambdaSyntax::Keyword;
+                        }
+                    }
+                }
+            })
+        };
+        for function in &mut macros {
+            match &mut function.body {
+                duckrs_parser::ast::MacroBody::Scalar(body) => to_keyword(body),
+                duckrs_parser::ast::MacroBody::Table(body) => {
+                    duckrs_parser::transformer::visit_query_node_exprs_mut(body, &mut to_keyword)
+                }
+            }
         }
         schema.create_macro(
             &info.name.name,
             *table_macro,
-            macros.clone(),
+            macros,
             on_create_conflict(info.on_conflict),
         )
     }
@@ -3559,6 +4044,15 @@ impl ClientContext {
 
     /// `DROP TABLE`, `VIEW`, `SEQUENCE`, `MACRO` and `SCHEMA` (`Catalog::DropEntry`).
     fn drop_entry(&mut self, info: &DropInfo) -> Result<()> {
+        let internal_entry = |name: &str| {
+            Error::new(
+                ErrorKind::Catalog,
+                format!(
+                    "Cannot drop internal catalog entry {}!",
+                    duckrs_parser::ast::sql_quoted_identifier(name)
+                ),
+            )
+        };
         let catalog = self.catalog();
         let temporary = catalog.schema_for(Some(TEMP_SCHEMA))?;
         let in_temp = info.name.qualification.is_empty()
@@ -3603,8 +4097,15 @@ impl ClientContext {
                         dropped
                     }
                     Err(_) if info.if_exists => false,
-                    Err(error) => return Err(error),
+                    Err(error) => return Err(missing_schema(error, type_name, &info.name)),
                 };
+                // `Binder::Bind(DropStatement)`: the views of the system catalog are internal
+                if !dropped
+                    && kind == "VIEW"
+                    && crate::catalog::defaults::default_view(schema.as_deref(), &info.name.name).is_some()
+                {
+                    return Err(internal_entry(&info.name.name));
+                }
                 if !dropped && !info.if_exists {
                     return Err(missing_entry(type_name, &info.name.name));
                 }
@@ -3621,8 +4122,16 @@ impl ClientContext {
                             || (!table_macro && schema.drop_macro(&info.name.name, true))
                     }
                     Err(_) if info.if_exists => false,
-                    Err(error) => return Err(error),
+                    Err(error) => return Err(missing_schema(error, macro_type_name(table_macro), &info.name)),
                 };
+                // a function of the system catalog is an internal entry
+                let functions = crate::function::BuiltinFunctions::get();
+                if !dropped
+                    && schema.is_none()
+                    && (functions.scalar(&info.name.name).is_some() || functions.aggregate(&info.name.name).is_some())
+                {
+                    return Err(internal_entry(&info.name.name));
+                }
                 if !dropped && !info.if_exists {
                     return Err(missing_entry(macro_type_name(table_macro), &info.name.name));
                 }
@@ -3633,7 +4142,7 @@ impl ClientContext {
                 let dropped = match catalog.schema_for(schema.as_deref()) {
                     Ok(schema) => schema.drop_index(&info.name.name),
                     Err(_) if info.if_exists => false,
-                    Err(error) => return Err(error),
+                    Err(error) => return Err(missing_schema(error, "Index", &info.name)),
                 };
                 if !dropped && !info.if_exists {
                     return Err(missing_entry("Index", &info.name.name));
@@ -3645,7 +4154,7 @@ impl ClientContext {
                 let dropped = match catalog.schema_for(schema.as_deref()) {
                     Ok(schema) => schema.drop_sequence_checked(&info.name.name, info.cascade)?,
                     Err(_) if info.if_exists => false,
-                    Err(error) => return Err(error),
+                    Err(error) => return Err(missing_schema(error, "Sequence", &info.name)),
                 };
                 if !dropped && !info.if_exists {
                     return Err(missing_entry("Sequence", &info.name.name));
@@ -3657,8 +4166,12 @@ impl ClientContext {
                 let dropped = match catalog.schema_for(schema.as_deref()) {
                     Ok(schema) => schema.drop_type_checked(&info.name.name, info.cascade)?,
                     Err(_) if info.if_exists => false,
-                    Err(error) => return Err(error),
+                    Err(error) => return Err(missing_schema(error, "Type", &info.name)),
                 };
+                // the built-in types are internal entries of the system catalog
+                if !dropped && schema.is_none() && duckrs_parser::ast::is_builtin_type_name(&info.name.name) {
+                    return Err(internal_entry(&info.name.name));
+                }
                 if !dropped && !info.if_exists {
                     return Err(missing_entry("Type", &info.name.name));
                 }
@@ -3704,6 +4217,32 @@ impl ClientContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The text of each box of an EXPLAIN, a line per line of a box and the name of the operator
+    /// on a line of its own, as the boxes do not matter to what the tests look for.
+    fn flat_plan(plan: &str) -> String {
+        let mut out = String::new();
+        for line in plan.lines() {
+            // boxes side by side share lines, with borders between them
+            for cell in line.split(['│', '╮', '╯']) {
+                let cell = cell.trim();
+                if let Some(title) = cell.strip_prefix("╭─ ") {
+                    let name = title
+                        .split(|c: char| !c.is_ascii() || c == '\n')
+                        .next()
+                        .unwrap_or(title)
+                        .trim_end();
+                    out.push_str(name);
+                    out.push('\n');
+                } else if !cell.is_empty() && !cell.chars().all(|c| "─╭╮╰╯┬┴├┼┤ ┰┸┒┎┚┖┟┧╁┃┠".contains(c))
+                {
+                    out.push_str(cell);
+                    out.push('\n');
+                }
+            }
+        }
+        out
+    }
 
     fn run(context: &mut ClientContext, sql: &str) -> Vec<Vec<String>> {
         let result = context.query(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
@@ -5561,7 +6100,7 @@ mod tests {
             ("SELECT concat_ws(',', 'a', NULL, 'b')", "a,b"),
             ("SELECT list_concat([1], [2, 3])", "[1, 2, 3]"),
             ("SELECT array_to_string([1, NULL, 2], '-')", "1-2"),
-            ("SELECT list_sort([3, NULL, 1])", "[NULL, 1, 3]"),
+            ("SELECT list_sort([3, NULL, 1])", "[1, 3, NULL]"),
             ("SELECT array_sort([3, 1], 'DESC', 'NULLS LAST')", "[3, 1]"),
             ("SELECT map_keys(MAP {'a': 1})", "[a]"),
             ("SELECT map_values(MAP {'a': 1})", "[1]"),
@@ -5754,7 +6293,8 @@ mod tests {
         let mut context = ClientContext::new(DatabaseInstance::new());
         run(&mut context, "CREATE TABLE a AS SELECT i AS x FROM range(1000) t(i)");
         run(&mut context, "CREATE TABLE b AS SELECT i AS y FROM range(1000) t(i)");
-        let explain = |context: &mut ClientContext, sql: &str| run(context, &format!("EXPLAIN {sql}"))[0][1].clone();
+        let explain =
+            |context: &mut ClientContext, sql: &str| flat_plan(&run(context, &format!("EXPLAIN {sql}"))[0][1]);
         let query = "SELECT x FROM a, b WHERE x = y ORDER BY x LIMIT 10";
         // operators are in title case, with their details and estimates
         let plan = explain(&mut context, query);
@@ -5817,16 +6357,14 @@ mod tests {
             &mut context,
             "INSERT INTO t SELECT r, r % 10, r::VARCHAR FROM range(5000) x(r)",
         );
-        let explain = |context: &mut ClientContext, sql: &str| run(context, &format!("EXPLAIN {sql}"))[0][1].clone();
+        let explain =
+            |context: &mut ClientContext, sql: &str| flat_plan(&run(context, &format!("EXPLAIN {sql}"))[0][1]);
         // one column goes into the scan, and no operator is left
         let plan = explain(&mut context, "SELECT i FROM t WHERE j = 5");
         assert!(plan.contains("Filters: j = 5") && !plan.contains("Filter\n"), "{plan}");
         // several columns stay above it, and each conjunct goes its own way
         let plan = explain(&mut context, "SELECT i FROM t WHERE j = 5 AND i > j AND s <> '55'");
-        assert!(
-            plan.contains("Filters: j = 5\n") && plan.contains("s != '55'"),
-            "{plan}"
-        );
+        assert!(plan.contains("Filters: j = 5,\ns != '55'"), "{plan}");
         assert!(plan.contains("Filter\n") && plan.contains("i > j"), "{plan}");
         // and an OR on one column is one filter, without parentheses around all of it
         let plan = explain(&mut context, "SELECT i FROM t WHERE j = 5 OR j = 6");
@@ -5876,7 +6414,8 @@ mod tests {
         run(&mut context, "SET explain_output = 'OPTIMIZED_ONLY'");
         run(&mut context, "CREATE TABLE d (t TIMESTAMP)");
         run(&mut context, "INSERT INTO d VALUES ('2024-03-05 06:07:08.5'), (NULL)");
-        let explain = |context: &mut ClientContext, sql: &str| run(context, &format!("EXPLAIN {sql}"))[0][1].clone();
+        let explain =
+            |context: &mut ClientContext, sql: &str| flat_plan(&run(context, &format!("EXPLAIN {sql}"))[0][1]);
         // the plan is that of the function, and the value that of date_part
         let plan = explain(&mut context, "SELECT EXTRACT(year FROM t) FROM d");
         assert!(plan.contains("year(t)") && !plan.contains("date_part"), "{plan}");
@@ -5907,8 +6446,9 @@ mod tests {
         assert_eq!(run(&mut context, sql), [["45123456"]]);
         run(&mut context, "CREATE TABLE ns (t TIMESTAMP_NS)");
         run(&mut context, "INSERT INTO ns VALUES ('2020-01-01 01:23:45.123456789')");
+        // `GetTimePartFunction` has a TIMESTAMP_NS overload, so this is microsecond, exactly
         let sql = "SELECT EXTRACT(microseconds FROM t) FROM ns";
-        assert!(explain(&mut context, sql).contains("date_part"), "{sql}");
+        assert!(explain(&mut context, sql).contains("microsecond(t)"), "{sql}");
         assert_eq!(run(&mut context, sql), [["45123456"]]);
         // NULL stays, and what has no function of its own stays date_part
         assert_eq!(run(&mut context, "SELECT year(t) FROM d WHERE t IS NULL"), [["NULL"]]);
@@ -5963,7 +6503,7 @@ mod tests {
         );
         let scanned = |context: &mut ClientContext, filter: &str| {
             let sql = format!("EXPLAIN ANALYZE SELECT sum(x) FROM t WHERE {filter}");
-            let plan = run(context, &sql)[0][1].clone();
+            let plan = flat_plan(&run(context, &sql)[0][1]);
             let line = plan.lines().find(|line| line.contains("Row Groups Scanned"));
             let line = line.unwrap_or_else(|| panic!("{sql}: {plan}"));
             let count = |c: &mut ClientContext| run(c, &format!("SELECT count(*) FROM t WHERE {filter}"))[0][0].clone();
@@ -6078,7 +6618,7 @@ mod tests {
             &mut context,
             "CREATE TABLE t AS SELECT i, i % 7 AS g, CASE WHEN i % 5 = 0 THEN NULL ELSE i END AS n FROM range(200000) t(i)",
         );
-        let plan = |context: &mut ClientContext, sql: &str| run(context, &format!("EXPLAIN {sql}"))[0][1].clone();
+        let plan = |context: &mut ClientContext, sql: &str| flat_plan(&run(context, &format!("EXPLAIN {sql}"))[0][1]);
         let sorted = |context: &mut ClientContext, order: &str, limit: usize, offset: usize| {
             let rows = run(context, &format!("SELECT i FROM t ORDER BY {order}"));
             rows[offset.min(rows.len())..(offset + limit).min(rows.len())].to_vec()
@@ -6171,7 +6711,7 @@ mod tests {
             &mut context,
             "INSERT INTO b VALUES (1, 5, 's'), (1, 6, 't'), (2, 7, 'r')",
         );
-        let plan = |context: &mut ClientContext, sql: &str| run(context, &format!("EXPLAIN {sql}"))[0][1].clone();
+        let plan = |context: &mut ClientContext, sql: &str| flat_plan(&run(context, &format!("EXPLAIN {sql}"))[0][1]);
 
         let sql = "SELECT a.x, b.y FROM a JOIN b ON a.k = b.k ORDER BY a.x, b.y";
         let joined = plan(&mut context, sql);
@@ -6246,13 +6786,15 @@ mod tests {
         assert_eq!(run(&mut context, sql), [["3"]]);
         // the operator that does this stays out of plans, and it shows in the result only
         let sql = "EXPLAIN ANALYZE SELECT a.x FROM a JOIN b ON a.k = b.k JOIN d ON b.y = d.y";
-        let analyzed = run(&mut context, sql)[0][1].clone();
+        let analyzed = flat_plan(&run(&mut context, sql)[0][1]);
         assert!(
             !analyzed.contains("COLUMN_SELECT") && !analyzed.contains("Column Select"),
             "{analyzed}"
         );
         // off, a scan outputs everything
         run(&mut context, "SET disabled_optimizers = 'unused_columns'");
+        // the logical plan does not list what a scan reads
+        run(&mut context, "SET explain_output = 'PHYSICAL_ONLY'");
         let sql = "SELECT a.x FROM a JOIN b ON a.k = b.k";
         assert!(plan(&mut context, sql).contains("unused"));
     }
@@ -6268,7 +6810,7 @@ mod tests {
             &mut context,
             "INSERT INTO b VALUES (1, 'keep'), (1, 'drop'), (2, 'drop'), (NULL, 'keep'), (9, NULL)",
         );
-        let plan = |context: &mut ClientContext, sql: &str| run(context, &format!("EXPLAIN {sql}"))[0][1].clone();
+        let plan = |context: &mut ClientContext, sql: &str| flat_plan(&run(context, &format!("EXPLAIN {sql}"))[0][1]);
         // the left rows stay, with NULLs where the condition left no partner
         let sql = "SELECT a.k, b.s FROM a LEFT JOIN b ON a.k = b.k AND b.s LIKE 'k%' ORDER BY 1 NULLS LAST, 2";
         let below = plan(&mut context, sql);
@@ -6314,7 +6856,7 @@ mod tests {
             &mut context,
             "INSERT INTO b VALUES (1, 1), (1, 2), (2, 3), (9, 4), (NULL, 5)",
         );
-        let plan = |context: &mut ClientContext, sql: &str| run(context, &format!("EXPLAIN {sql}"))[0][1].clone();
+        let plan = |context: &mut ClientContext, sql: &str| flat_plan(&run(context, &format!("EXPLAIN {sql}"))[0][1]);
         let delim_gets = |plan: &str| plan.lines().filter(|line| line.contains("Delim Get")).count();
 
         // nothing filters the outer rows, so nothing of the delim join is left, and a key that the
@@ -6389,7 +6931,8 @@ mod tests {
             &mut context,
             "CREATE TABLE b AS SELECT i AS x, i::VARCHAR AS s FROM range(10) t(i)",
         );
-        let explain = |context: &mut ClientContext, sql: &str| run(context, &format!("EXPLAIN {sql}"))[0][1].clone();
+        let explain =
+            |context: &mut ClientContext, sql: &str| flat_plan(&run(context, &format!("EXPLAIN {sql}"))[0][1]);
         let filters = |plan: &str| plan.lines().filter(|line| line.contains("Filters: ")).count();
         // both tables get what they alone can tell, and the OR stays for the pairs
         let sql = "SELECT count(*) FROM a, b WHERE (a.x = 2 AND b.x = 4) OR (a.x = 0 AND b.x = 2)";
@@ -6429,7 +6972,8 @@ mod tests {
         run(&mut context, "CREATE TABLE n (j INTEGER)");
         run(&mut context, "INSERT INTO n VALUES (1), (NULL)");
         run(&mut context, "CREATE TABLE e (j INTEGER)");
-        let explain = |context: &mut ClientContext, sql: &str| run(context, &format!("EXPLAIN {sql}"))[0][1].clone();
+        let explain =
+            |context: &mut ClientContext, sql: &str| flat_plan(&run(context, &format!("EXPLAIN {sql}"))[0][1]);
         // three-valued: every combination of a NULL on the left, a NULL on the right and no rows
         let marks = |context: &mut ClientContext, right: &str| {
             let sql = format!("SELECT i IN (SELECT j FROM {right}), i NOT IN (SELECT j FROM {right}) FROM l");
@@ -6497,7 +7041,8 @@ mod tests {
         );
         run(&mut context, "CREATE TABLE mid AS SELECT i AS id FROM range(500) t(i)");
         run(&mut context, "CREATE TABLE small AS SELECT i AS id FROM range(20) t(i)");
-        let explain = |context: &mut ClientContext, sql: &str| run(context, &format!("EXPLAIN {sql}"))[0][1].clone();
+        let explain =
+            |context: &mut ClientContext, sql: &str| flat_plan(&run(context, &format!("EXPLAIN {sql}"))[0][1]);
         let at = |plan: &str, table: &str| {
             let line = format!("Table: {table}");
             let line = plan.lines().position(|text| text.trim() == line);
@@ -6605,7 +7150,8 @@ mod tests {
         run(&mut context, "SET explain_output = 'OPTIMIZED_ONLY'");
         run(&mut context, "CREATE TABLE s (i INTEGER)");
         run(&mut context, "INSERT INTO s VALUES (1), (2), (3)");
-        let explain = |context: &mut ClientContext, sql: &str| run(context, &format!("EXPLAIN {sql}"))[0][1].clone();
+        let explain =
+            |context: &mut ClientContext, sql: &str| flat_plan(&run(context, &format!("EXPLAIN {sql}"))[0][1]);
         let plan = explain(&mut context, "SELECT * FROM s WHERE i > 10");
         assert!(plan.contains("EMPTY_RESULT"), "{plan}");
         assert_eq!(run(&mut context, "SELECT count(*) FROM s WHERE i > 10"), [["0"]]);
@@ -7008,7 +7554,7 @@ mod tests {
         );
         assert_eq!(
             err(&mut context, "SELECT * FROM t"),
-            "Catalog Error: Table with name t does not exist!"
+            "Catalog Error: Table with name t does not exist!\nDid you mean \"pg_tables\"?"
         );
         run(&mut context, "CREATE TABLE t (abc INTEGER)");
         assert_eq!(

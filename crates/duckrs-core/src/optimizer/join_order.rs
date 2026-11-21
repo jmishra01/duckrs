@@ -16,45 +16,55 @@
 use super::conjunction_of;
 use super::filter_pushdown::condition_expression;
 use super::rewriter::split_conjuncts;
+use super::relation_statistics::{
+    equivalence_binding, ColumnStats, CountSource, DistinctCount, RelationStats, SemiAntiCondition, apply_direct_filter_domain,
+    estimate_distinct_cardinality, semi_anti_join_stats,
+};
 use super::statistics::{table_distinct_counts, table_statistics};
-use crate::catalog::TableCatalogEntry;
+use crate::catalog::{ColumnStatistics, TableCatalogEntry};
+use duckrs_common::types::LogicalType;
 use crate::planner::expression::{BoundExpr, BoundExprKind, BoundOperator, ColumnBinding};
 use crate::planner::logical::{COLUMN_IDENTIFIER_ROW_ID, JoinCondition, LogicalOperator, LogicalOperatorKind as K};
 use duckrs_common::value::Value;
 use duckrs_parser::ast::{ComparisonOp, JoinType};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
-/// `approximate_join_order_threshold`: from here on the order is picked greedily.
-const APPROXIMATE_THRESHOLD: usize = 12;
+thread_local! {
+    /// `approximate_join_order_threshold`: from here on the order is picked greedily.
+    static APPROXIMATE_THRESHOLD: std::cell::Cell<usize> = const { std::cell::Cell::new(12) };
+    /// `debug_force_no_cross_product`
+    static FORCE_NO_CROSS_PRODUCT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// whether `build_side_probe_side` runs, which picks the sides of SEMI and ANTI joins again
+    static BUILD_SIDES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// what the join order refused, for the client to raise
+    static ERROR: std::cell::RefCell<Option<duckrs_common::Error>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The settings of the join order for the plans optimized from here on.
+pub fn configure(approximate_threshold: usize, force_no_cross_product: bool, build_sides: bool) {
+    APPROXIMATE_THRESHOLD.with(|t| t.set(approximate_threshold));
+    FORCE_NO_CROSS_PRODUCT.with(|f| f.set(force_no_cross_product));
+    BUILD_SIDES.with(|b| b.set(build_sides));
+}
+
+/// The error the last join order ran into (`PlanEnumerator::SolveJoinOrder` throws).
+pub fn take_error() -> duckrs_common::Result<()> {
+    match ERROR.with(|e| e.borrow_mut().take()) {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
 /// Past this many pairs DPhyp gives up.
 const MAX_PAIRS: usize = 10_000;
 /// A set of relations is a mask, so there can be this many.
 const MAX_RELATIONS: usize = 63;
-/// `RelationStatisticsHelper::DEFAULT_SELECTIVITY`.
-const DEFAULT_SELECTIVITY: f64 = 0.2;
+use super::relation_statistics::DEFAULT_SELECTIVITY;
 /// `CompositeJoinPairStats::MAX_CARDINALITY_TO_DISTINCT_RATIO`: with more rows than this per value
 /// of a key column, the rows say little about how many keys there are.
 const MAX_CARDINALITY_TO_DISTINCT_RATIO: f64 = 8.0;
 /// What a recursive CTE round is assumed to hold.
 const UNKNOWN_CARDINALITY: f64 = 1000.0;
-
-/// `RelationStats`: the estimated rows of a plan, and the distinct values of its columns.
-#[derive(Debug, Clone, Default)]
-struct RelationStats {
-    cardinality: f64,
-    distinct: HashMap<ColumnBinding, f64>,
-}
-
-impl RelationStats {
-    fn scaled(mut self, cardinality: f64) -> Self {
-        self.cardinality = cardinality;
-        for distinct in self.distinct.values_mut() {
-            *distinct = distinct.min(cardinality.max(1.0));
-        }
-        self
-    }
-}
 
 fn is_binary_tree(op: &LogicalOperator) -> bool {
     match &op.kind {
@@ -112,10 +122,58 @@ fn is_movable_semi(op: &LogicalOperator) -> bool {
         })
 }
 
+/// How many SEMI and ANTI joins, RIGHT ones too, with equalities and without volatile predicates,
+/// are stacked at `op` on what they keep the rows of.
+fn semi_chain_length(op: &LogicalOperator) -> usize {
+    let K::Join {
+        join_type,
+        conditions,
+        predicate,
+        ..
+    } = &op.kind
+    else {
+        return 0;
+    };
+    let kept = match join_type {
+        JoinType::Semi | JoinType::Anti => 0,
+        JoinType::RightSemi | JoinType::RightAnti => 1,
+        _ => return 0,
+    };
+    if conditions.is_empty() || predicate.as_ref().is_some_and(BoundExpr::is_volatile) {
+        return 0;
+    }
+    1 + semi_chain_length(&op.children[kept])
+}
+
+/// A RIGHT SEMI or RIGHT ANTI join as the SEMI or ANTI join it was.
+fn unflip_semi(op: &mut LogicalOperator) {
+    let K::Join {
+        join_type, conditions, ..
+    } = &mut op.kind
+    else {
+        return;
+    };
+    *join_type = match join_type {
+        JoinType::RightSemi => JoinType::Semi,
+        JoinType::RightAnti => JoinType::Anti,
+        _ => return,
+    };
+    for condition in conditions {
+        std::mem::swap(&mut condition.left, &mut condition.right);
+    }
+    op.children.swap(0, 1);
+}
+
 /// Whether `op` is an operator of a tree of joins, or filters on such a tree.
 fn is_tree(op: &LogicalOperator) -> bool {
     match &op.kind {
-        K::Filter { expressions } => !expressions.iter().any(BoundExpr::is_volatile) && is_tree(&op.children[0]),
+        // a barrier must not end up below one of the joins (`must_remain_at_root`)
+        K::Filter { expressions } => {
+            !expressions
+                .iter()
+                .any(|e| e.is_volatile() || super::rewriter::contains_barrier(e))
+                && is_tree(&op.children[0])
+        }
         _ => is_binary_tree(op) || is_movable_semi(op),
     }
 }
@@ -255,6 +313,18 @@ fn bare_column(expr: &BoundExpr) -> Option<ColumnBinding> {
     }
 }
 
+/// An ON-clause equality between two columns (`JoinEqualityGroups::AddEquality`).
+fn residual_equality(conjunct: &BoundExpr) -> Option<(ColumnBinding, ColumnBinding)> {
+    match &conjunct.kind {
+        BoundExprKind::Comparison {
+            op: ComparisonOp::Equal | ComparisonOp::NotDistinctFrom,
+            left,
+            right,
+        } => bare_column(left).zip(bare_column(right)),
+        _ => None,
+    }
+}
+
 /// `ApplyJoinPairCap`: what a join on several keys divides by, for that of its keys on their own.
 /// A composite key has at most as many values as the smaller side has rows, where it is unique.
 fn composite_denominator(domains: &[f64], left_rows: f64, right_rows: f64) -> Option<f64> {
@@ -265,37 +335,121 @@ fn composite_denominator(domains: &[f64], left_rows: f64, right_rows: f64) -> Op
     (applies && cap > 0.0 && cap <= largest * MAX_CARDINALITY_TO_DISTINCT_RATIO).then_some(cap)
 }
 
-/// `CardinalityEstimator`, for one tree.
+/// A predicate of the tree as `CardinalityEstimator` sees it: an edge between the relations its
+/// sides read (`FilterInfoWithTotalDomains`).
+#[derive(Debug, Clone)]
+struct Edge {
+    /// the relations it reads
+    set: u64,
+    /// the relations of its two sides
+    left: u64,
+    right: u64,
+    /// the equivalence class of an equality of two columns
+    class: Option<usize>,
+    /// the comparison it makes, `None` for something else
+    op: Option<ComparisonOp>,
+    /// for an equality of a column of each of two relations: those two (`GetEqualityJoinPair`)
+    pair: Option<u64>,
+}
+
+impl Edge {
+    fn is_equality(&self) -> bool {
+        self.class.is_some()
+    }
+}
+
+/// `RelationsSetToStats`: a domain and the edges over it.
+#[derive(Debug)]
+struct DomainGroup {
+    /// `GetDistinctCount`
+    distinct: f64,
+    /// whether that count comes from statistics, not from row counts
+    reliable: bool,
+    edges: Vec<Edge>,
+}
+
+impl DomainGroup {
+    /// `IsSelectivityOnlyGroup`: only comparisons other than equalities.
+    fn selectivity_only(&self) -> bool {
+        !self.edges.is_empty() && self.edges.iter().all(|e| !e.is_equality() && e.op.is_some_and(|op| !matches!(op, ComparisonOp::Equal | ComparisonOp::NotDistinctFrom)))
+    }
+}
+
+/// `CompositeJoinPairStats`.
+#[derive(Debug, Default, Clone, Copy)]
+struct PairStats {
+    first_distinct: f64,
+    max_distinct: f64,
+    has_distinct: bool,
+}
+
+impl PairStats {
+    fn register(&mut self, distinct: f64) {
+        if !self.has_distinct {
+            self.first_distinct = distinct;
+            self.has_distinct = true;
+        }
+        self.max_distinct = self.max_distinct.max(distinct);
+    }
+
+    fn can_apply_cap(&self, cap: f64) -> bool {
+        self.has_distinct && self.max_distinct > 0.0 && cap <= self.max_distinct * MAX_CARDINALITY_TO_DISTINCT_RATIO
+    }
+}
+
+#[derive(PartialEq)]
+enum EdgeKind {
+    InnerEquivalence,
+    NonEquality,
+    RedundantTransitive,
+    Other,
+}
+
+/// `SelectivityState`.
+#[derive(Default)]
+struct SelectivityState {
+    subgraphs: Vec<(u64, f64)>,
+    applied_classes: HashSet<usize>,
+    pair_stats: Vec<(u64, PairStats)>,
+    capped: HashSet<u64>,
+    unused_domains: HashSet<u64>,
+}
+
+/// `CardinalityEstimator`, for one tree: the product of the relations' rows times the selectivity
+/// of the predicates among them.
 struct Estimator {
     cardinalities: Vec<f64>,
-    /// per equivalence class: the relations in it and its total domain
-    classes: Vec<(u64, f64)>,
-    /// per pair of relations joined on several keys: the two, and the classes of those keys
-    composites: Vec<(u64, Vec<usize>)>,
-    /// per predicate outside of the classes: its relations and what it divides the size by
-    denominators: Vec<(u64, f64)>,
+    /// sorted as `SortTdoms` sorts them
+    groups: Vec<DomainGroup>,
+    /// the relations of the predicates that are not comparisons of two sides
+    residuals: Vec<u64>,
+    /// pairs of relations with equalities in several classes (`HasDirectCompositeEquality`)
+    composites: HashSet<u64>,
     estimates: HashMap<u64, f64>,
 }
 
 impl Estimator {
     fn new(relations: &[RelationStats], predicates: &[Predicate], relation_of: &HashMap<ColumnBinding, usize>) -> Self {
-        let distinct_of = |binding: &ColumnBinding| {
-            relation_of.get(binding).map(|&relation| {
-                let stats = &relations[relation];
-                stats
-                    .distinct
-                    .get(binding)
-                    .copied()
-                    .unwrap_or(stats.cardinality)
-                    .max(1.0)
-            })
+        // a column's distinct values, and whether statistics say so rather than the row count
+        let distinct_of = |binding: &ColumnBinding| -> Option<DistinctCount> {
+            relation_of
+                .get(binding)
+                .map(|&relation| relations[relation].column(binding).total)
         };
-        let domain_of = |expr: &BoundExpr| {
+        // `SelectTotalDomain`, and whether it is `HasReliableDistinctCount`
+        let select = |domains: &[DistinctCount]| -> (f64, bool) {
+            match super::relation_statistics::select_total_domain(domains) {
+                Some(domain) => (domain.count.max(1.0), domain.is_reliable()),
+                None => (f64::MAX, false),
+            }
+        };
+        let domain_of_expr = |expr: &BoundExpr| -> Vec<DistinctCount> {
             let mut columns = Vec::new();
             expression_columns(expr, &mut columns);
-            columns.iter().filter_map(distinct_of).reduce(f64::max)
+            columns.iter().filter_map(distinct_of).collect()
         };
-        // the columns that equalities make equal, as a disjoint set
+        let relation_bit = |binding: &ColumnBinding| relation_of.get(binding).map(|&r| 1u64 << r);
+        // equivalence classes of columns
         let mut parents: HashMap<ColumnBinding, ColumnBinding> = HashMap::new();
         fn find(parents: &mut HashMap<ColumnBinding, ColumnBinding>, binding: ColumnBinding) -> ColumnBinding {
             let parent = *parents.entry(binding).or_insert(binding);
@@ -306,109 +460,369 @@ impl Estimator {
             parents.insert(binding, root);
             root
         }
-        let mut denominators = Vec::new();
-        for predicate in predicates {
-            if predicate.set.count_ones() < 2 {
-                continue;
-            }
+        let equality_columns = |predicate: &Predicate| -> Option<(ColumnBinding, ColumnBinding)> {
             if let BoundExprKind::Comparison { op, left, right } = &predicate.expr.kind
                 && matches!(op, ComparisonOp::Equal | ComparisonOp::NotDistinctFrom)
                 && let (Some(l), Some(r)) = (bare_column(left), bare_column(right))
                 && relation_of.contains_key(&l)
                 && relation_of.contains_key(&r)
+                && relation_of[&l] != relation_of[&r]
             {
+                return Some((l, r));
+            }
+            None
+        };
+        for predicate in predicates {
+            if let Some((l, r)) = equality_columns(predicate) {
                 let (l, r) = (find(&mut parents, l), find(&mut parents, r));
                 parents.insert(l, r);
+            }
+        }
+        let mut roots: Vec<ColumnBinding> = parents
+            .keys()
+            .copied()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|b| find(&mut parents, b))
+            .collect();
+        roots.sort_by_key(|b| (b.table_index, b.column_index));
+        roots.dedup();
+        let class_of_root: HashMap<ColumnBinding, usize> = roots.iter().enumerate().map(|(i, r)| (*r, i)).collect();
+        let mut class_groups: Vec<DomainGroup> = roots
+            .iter()
+            .map(|root| {
+                let columns: Vec<ColumnBinding> =
+                    parents.keys().copied().filter(|b| find(&mut parents.clone(), *b) == *root).collect();
+                let domains: Vec<DistinctCount> = columns.iter().filter_map(distinct_of).collect();
+                let (mut distinct, reliable) = select(&domains);
+                // `RestrictFilterDomains`: with every column of the class filtered to a finite set of
+                // values, and its domain known from statistics, the class has at most the most of those
+                let mut retained: Option<f64> = Some(0.0);
+                for column in &columns {
+                    let stats = relations[relation_of[column]].column(column);
+                    retained = match (retained, stats.evidence.filter_bound()) {
+                        (Some(r), Some(bound)) if stats.total.source != CountSource::Cardinality => Some(r.max(bound)),
+                        _ => None,
+                    };
+                }
+                if let Some(retained) = retained
+                    && !columns.is_empty()
+                {
+                    distinct = distinct.min(retained.max(1.0));
+                }
+                DomainGroup {
+                    distinct,
+                    reliable,
+                    edges: Vec::new(),
+                }
+            })
+            .collect();
+        let mut other_groups = Vec::new();
+        let mut residuals = Vec::new();
+        let mut pair_classes: HashMap<u64, HashSet<usize>> = HashMap::new();
+        for predicate in predicates {
+            if predicate.set.count_ones() < 2 {
                 continue;
             }
-            denominators.push((predicate.set, predicate_denominator(&predicate.expr, &domain_of)));
-        }
-        let mut classes: HashMap<ColumnBinding, (u64, f64)> = HashMap::new();
-        for binding in parents.keys().copied().collect::<Vec<_>>() {
-            let root = find(&mut parents, binding);
-            let class = classes.entry(root).or_insert((0, 1.0));
-            class.0 |= 1 << relation_of[&binding];
-            class.1 = class.1.max(distinct_of(&binding).unwrap_or(1.0));
-        }
-        let mut classes: Vec<_> = classes.into_iter().collect();
-        classes.sort_by_key(|(root, _)| (root.table_index, root.column_index));
-        // `HasDirectCompositeEquality`: pairs of relations with equalities in several classes
-        let mut pairs: HashMap<u64, Vec<usize>> = HashMap::new();
-        for predicate in predicates {
-            if let BoundExprKind::Comparison {
-                op: ComparisonOp::Equal | ComparisonOp::NotDistinctFrom,
-                left,
-                ..
-            } = &predicate.expr.kind
-                && let Some(column) = bare_column(left)
-                && predicate.set.count_ones() == 2
-                && relation_of.contains_key(&column)
-                && parents.contains_key(&column)
-            {
-                let root = find(&mut parents, column);
-                let class = classes
-                    .iter()
-                    .position(|(r, _)| *r == root)
-                    .expect("every root has a class");
-                let keys = pairs.entry(predicate.set).or_default();
-                if !keys.contains(&class) {
-                    keys.push(class);
+            if let Some((l, r)) = equality_columns(predicate) {
+                let class = class_of_root[&find(&mut parents, l)];
+                let (left, right) = (relation_bit(&l).expect("known"), relation_bit(&r).expect("known"));
+                let op = match &predicate.expr.kind {
+                    BoundExprKind::Comparison { op, .. } => *op,
+                    _ => unreachable!("an equality"),
+                };
+                pair_classes.entry(left | right).or_default().insert(class);
+                class_groups[class].edges.push(Edge {
+                    set: predicate.set,
+                    left,
+                    right,
+                    class: Some(class),
+                    op: Some(op),
+                    pair: Some(left | right),
+                });
+                continue;
+            }
+            // a comparison of two sides is an edge over its own domain; anything else is residual
+            match (&predicate.expr.kind, predicate.sides) {
+                (BoundExprKind::Comparison { op, left, right }, Some((left_set, right_set))) => {
+                    let mut domains = domain_of_expr(left);
+                    domains.extend(domain_of_expr(right));
+                    let (distinct, reliable) = select(&domains);
+                    other_groups.push(DomainGroup {
+                        distinct,
+                        reliable,
+                        edges: vec![Edge {
+                            set: predicate.set,
+                            left: left_set,
+                            right: right_set,
+                            class: None,
+                            op: Some(*op),
+                            pair: None,
+                        }],
+                    });
                 }
+                _ => residuals.push(predicate.set),
             }
         }
-        let mut composites: Vec<_> = pairs.into_iter().filter(|(_, keys)| keys.len() >= 2).collect();
-        composites.sort_unstable();
+        let mut groups: Vec<DomainGroup> = class_groups.into_iter().filter(|g| !g.edges.is_empty()).collect();
+        groups.extend(other_groups);
+        // `SortTdoms`: comparisons last, then by their domains, largest first
+        groups.sort_by(|a, b| {
+            a.selectivity_only()
+                .cmp(&b.selectivity_only())
+                .then(b.distinct.partial_cmp(&a.distinct).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        let composites = pair_classes.into_iter().filter(|(_, c)| c.len() >= 2).map(|(pair, _)| pair).collect();
         Self {
             cardinalities: relations.iter().map(|r| r.cardinality).collect(),
-            classes: classes.into_iter().map(|(_, class)| class).collect(),
+            groups,
+            residuals,
             composites,
-            denominators,
             estimates: HashMap::new(),
         }
     }
 
-    /// `EstimateCardinalityWithSet`: the product of the relations over what the predicates remove.
+    /// `GetNumerator`: an empty relation counts as one row here.
+    fn numerator(&self, set: u64) -> f64 {
+        (0..self.cardinalities.len())
+            .filter(|r| set & (1 << r) != 0)
+            .map(|r| if self.cardinalities[r] == 0.0 { 1.0 } else { self.cardinalities[r] })
+            .product()
+    }
+
+    /// `EstimateCardinality` of a set of relations joined by inner joins.
     fn estimate(&mut self, set: u64) -> f64 {
         if let Some(&estimate) = self.estimates.get(&set) {
             return estimate;
         }
-        let mut numerator = 1.0;
-        for (relation, cardinality) in self.cardinalities.iter().enumerate() {
-            if set & (1 << relation) != 0 {
-                numerator *= cardinality;
+        let empty = (0..self.cardinalities.len()).any(|r| set & (1 << r) != 0 && self.cardinalities[r] == 0.0);
+        let mut estimate = if empty { 0.0 } else { self.numerator(set) * self.inner_selectivity(set) };
+        // the product of many large relations leaves the range of a double before the selectivity
+        // divides it down again: work in units of the largest relation, as the equalities scale with it
+        if !empty && !(estimate.is_finite() && estimate > 0.0) {
+            let scale = self.cardinalities.iter().copied().fold(1.0, f64::max);
+            let scaled = Estimator {
+                cardinalities: self.cardinalities.iter().map(|c| c / scale).collect(),
+                groups: self
+                    .groups
+                    .iter()
+                    .map(|g| DomainGroup {
+                        distinct: g.distinct / scale,
+                        reliable: g.reliable,
+                        edges: g.edges.clone(),
+                    })
+                    .collect(),
+                residuals: self.residuals.clone(),
+                composites: self.composites.clone(),
+                estimates: HashMap::new(),
+            };
+            let rescaled = scaled.numerator(set) * scaled.inner_selectivity(set) * scale;
+            if rescaled.is_finite() {
+                estimate = rescaled;
             }
         }
-        let mut denominator = 1.0;
-        for &(relations, domain) in &self.classes {
-            let joined = (relations & set).count_ones();
-            if joined > 1 {
-                denominator *= domain.powi(joined as i32 - 1);
-            }
-        }
-        for &(relations, by) in &self.denominators {
-            if relations & !set == 0 {
-                denominator *= by;
-            }
-        }
-        // the key of a pair counts once, and its class only for one pair
-        let mut used = vec![false; self.classes.len()];
-        for (pair, keys) in &self.composites {
-            if pair & !set != 0 || keys.iter().any(|&key| used[key]) {
-                continue;
-            }
-            let rows: Vec<f64> = (0..self.cardinalities.len())
-                .filter(|relation| pair & (1 << relation) != 0)
-                .map(|relation| self.cardinalities[relation])
-                .collect();
-            let domains: Vec<f64> = keys.iter().map(|&key| self.classes[key].1).collect();
-            if let Some(cap) = composite_denominator(&domains, rows[0], rows[1]) {
-                denominator = denominator / domains.iter().product::<f64>() * cap;
-                keys.iter().for_each(|&key| used[key] = true);
-            }
-        }
-        let estimate = numerator / denominator;
         self.estimates.insert(set, estimate);
         estimate
+    }
+
+    /// `GetInnerSelectivity`: that of the edges, and the default one of each residual predicate.
+    fn inner_selectivity(&self, set: u64) -> f64 {
+        let residuals = self.residuals.iter().filter(|r| *r & !set == 0).count();
+        self.selectivity(set) * DEFAULT_SELECTIVITY.powi(residuals as i32)
+    }
+
+    /// `GetSelectivity`.
+    fn selectivity(&self, set: u64) -> f64 {
+        let mut state = SelectivityState::default();
+        for group in &self.groups {
+            for edge in &group.edges {
+                if edge.set & !set != 0 || edge.left == edge.right {
+                    continue;
+                }
+                self.process_edge(edge, group, set, &mut state);
+            }
+        }
+        // `MergeDisconnectedSelectivitySubgraphs`
+        let selectivity = if state.subgraphs.is_empty() {
+            1.0
+        } else {
+            state.subgraphs.iter().map(|s| s.1).product()
+        };
+        selectivity / (1.0 + state.unused_domains.len() as f64)
+    }
+
+    fn classify(edge: &Edge, state: &SelectivityState) -> EdgeKind {
+        if edge.class.is_some_and(|c| state.applied_classes.contains(&c)) {
+            return EdgeKind::RedundantTransitive;
+        }
+        match edge.op {
+            Some(_) if edge.is_equality() => EdgeKind::InnerEquivalence,
+            Some(_) => EdgeKind::NonEquality,
+            None => EdgeKind::Other,
+        }
+    }
+
+    /// `ProcessSelectivityEdge`.
+    fn process_edge(&self, edge: &Edge, group: &DomainGroup, set: u64, state: &mut SelectivityState) {
+        let kind = Self::classify(edge, state);
+        if state.subgraphs.len() == 1 && state.subgraphs[0].0 == set {
+            let (relations, mut selectivity) = state.subgraphs[0];
+            self.apply_caps(&mut selectivity, relations, state);
+            state.subgraphs[0].1 = selectivity;
+            if kind == EdgeKind::RedundantTransitive {
+                return;
+            }
+            if kind == EdgeKind::InnerEquivalence && self.apply_increment(&mut selectivity, edge, relations, state) {
+                state.subgraphs[0].1 = selectivity;
+                return;
+            }
+            if group.reliable {
+                state.unused_domains.insert(group.distinct.to_bits());
+            }
+            return;
+        }
+        if let Some(class) = edge.class {
+            state.applied_classes.insert(class);
+        }
+        if let Some(pair) = edge.pair {
+            match state.pair_stats.iter_mut().find(|(p, _)| *p == pair) {
+                Some((_, stats)) => stats.register(group.distinct),
+                None => {
+                    let mut stats = PairStats::default();
+                    stats.register(group.distinct);
+                    state.pair_stats.push((pair, stats));
+                }
+            }
+        }
+        let connects = |subgraph: u64| subset(edge.left, subgraph) || subset(edge.right, subgraph);
+        let mut connections = Vec::new();
+        'outer: for outer in 0..state.subgraphs.len() {
+            for inner in outer + 1..state.subgraphs.len() {
+                if connects(state.subgraphs[outer].0) && connects(state.subgraphs[inner].0) {
+                    connections = vec![outer, inner];
+                    break 'outer;
+                }
+            }
+            if connects(state.subgraphs[outer].0) {
+                connections = vec![outer];
+                break;
+            }
+        }
+        match connections.as_slice() {
+            [] => {
+                let mut selectivity = Self::edge_selectivity(1.0, edge, group);
+                let relations = edge.left | edge.right;
+                self.apply_caps(&mut selectivity, relations, state);
+                state.subgraphs.push((relations, selectivity));
+            }
+            [index] => {
+                let (relations, mut selectivity) = state.subgraphs[*index];
+                if subset(edge.left, relations) && subset(edge.right, relations) {
+                    if kind == EdgeKind::InnerEquivalence {
+                        self.apply_increment(&mut selectivity, edge, relations, state);
+                    }
+                    self.apply_caps(&mut selectivity, relations, state);
+                    state.subgraphs[*index].1 = selectivity;
+                    return;
+                }
+                let other = if subset(edge.right, relations) { edge.left } else { edge.right };
+                let mut selectivity = Self::edge_selectivity(selectivity, edge, group);
+                let relations = relations | other;
+                self.apply_caps(&mut selectivity, relations, state);
+                state.subgraphs[*index] = (relations, selectivity);
+            }
+            [into, from] => {
+                let (into_relations, into_selectivity) = state.subgraphs[*into];
+                let (from_relations, from_selectivity) = state.subgraphs[*from];
+                let mut selectivity = Self::edge_selectivity(into_selectivity * from_selectivity, edge, group);
+                let relations = into_relations | from_relations;
+                self.apply_caps(&mut selectivity, relations, state);
+                state.subgraphs[*into] = (relations, selectivity);
+                state.subgraphs.remove(*from);
+            }
+            _ => unreachable!("at most two subgraphs"),
+        }
+    }
+
+    /// `CalculateInnerJoinSelectivity` / `ApplyComparisonRatio`.
+    fn edge_selectivity(base: f64, edge: &Edge, group: &DomainGroup) -> f64 {
+        let d = if group.distinct <= 0.0 { 1.0 } else { group.distinct };
+        match edge.op {
+            None | Some(ComparisonOp::Equal | ComparisonOp::NotDistinctFrom) => base / d,
+            Some(ComparisonOp::NotEqual | ComparisonOp::DistinctFrom) => {
+                if d > 1.0 {
+                    base * (d - 1.0) / d
+                } else {
+                    base
+                }
+            }
+            // strict comparisons keep half the cross product, also of small domains
+            Some(ComparisonOp::LessThan | ComparisonOp::GreaterThan) => base / 2.0,
+            Some(ComparisonOp::LessThanOrEqual | ComparisonOp::GreaterThanOrEqual) => base * (d + 1.0) / (2.0 * d),
+        }
+    }
+
+    /// `GetJoinPairCap`: the rows of the smaller of the two relations.
+    fn pair_cap(&self, pair: u64) -> f64 {
+        let mut cap = f64::MAX;
+        for relation in (0..self.cardinalities.len()).filter(|r| pair & (1 << r) != 0) {
+            let rows = if self.cardinalities[relation] == 0.0 { 1.0 } else { self.cardinalities[relation] };
+            if rows <= 0.0 {
+                return 0.0;
+            }
+            cap = cap.min(rows);
+        }
+        if cap == f64::MAX { 0.0 } else { cap }
+    }
+
+    /// `ApplyJoinPairCap`: a pair joined on several keys is an FK/PK join at most as large as its
+    /// larger side.
+    fn apply_pair_cap(&self, selectivity: &mut f64, pair: u64, state: &mut SelectivityState) -> bool {
+        if state.capped.contains(&pair) {
+            return false;
+        }
+        let cap = self.pair_cap(pair);
+        let Some((_, stats)) = state.pair_stats.iter_mut().find(|(p, _)| *p == pair) else {
+            return false;
+        };
+        if !stats.can_apply_cap(cap) {
+            return false;
+        }
+        let first = stats.first_distinct;
+        if cap <= 0.0 || first <= 0.0 || first > cap {
+            return false;
+        }
+        if first < cap {
+            *selectivity = *selectivity * first / cap;
+            stats.first_distinct = cap;
+        }
+        state.capped.insert(pair);
+        true
+    }
+
+    /// `ApplyCompositeJoinPairCaps`.
+    fn apply_caps(&self, selectivity: &mut f64, scope: u64, state: &mut SelectivityState) {
+        let pairs: Vec<u64> = state.pair_stats.iter().map(|(p, _)| *p).collect();
+        for pair in pairs {
+            if state.capped.contains(&pair) || !subset(pair, scope) || !self.composites.contains(&pair) {
+                continue;
+            }
+            self.apply_pair_cap(selectivity, pair, state);
+        }
+    }
+
+    /// `ApplyJoinIncrement`: a further equality of a pair already capped changes nothing.
+    fn apply_increment(&self, selectivity: &mut f64, edge: &Edge, scope: u64, state: &mut SelectivityState) -> bool {
+        let Some(pair) = edge.pair.filter(|_| edge.is_equality()) else {
+            return false;
+        };
+        if !subset(pair, scope) || !self.composites.contains(&pair) {
+            return false;
+        }
+        if state.capped.contains(&pair) {
+            return true;
+        }
+        self.apply_pair_cap(selectivity, pair, state)
     }
 }
 
@@ -618,9 +1032,33 @@ impl Enumerator<'_> {
 
     fn solve(&mut self) {
         let all = (1 << self.relations) - 1;
-        if self.relations >= APPROXIMATE_THRESHOLD || !self.solve_exactly() || !self.plans.contains_key(&all) {
+        if self.relations >= APPROXIMATE_THRESHOLD.with(std::cell::Cell::get)
+            || !self.solve_exactly()
+            || !self.plans.contains_key(&all)
+        {
             self.solve_approximately();
         }
+        if FORCE_NO_CROSS_PRODUCT.with(std::cell::Cell::get) && self.uses_cross_product(all) {
+            ERROR.with(|e| {
+                *e.borrow_mut() = Some(duckrs_common::Error::new(
+                    duckrs_common::ErrorKind::InvalidInput,
+                    "Query requires a cross-product, but 'force_no_cross_product' PRAGMA is enabled",
+                ));
+            });
+        }
+    }
+
+    /// `PlanUsesCrossProduct`: a join of the plan between sets no edge connects.
+    fn uses_cross_product(&self, set: u64) -> bool {
+        let Some(node) = self.plans.get(&set) else {
+            return set.count_ones() > 1;
+        };
+        if node.left == 0 || node.right == 0 {
+            return false;
+        }
+        !(self.connected(node.left, node.right) || self.connected(node.right, node.left))
+            || self.uses_cross_product(node.left)
+            || self.uses_cross_product(node.right)
     }
 }
 
@@ -680,7 +1118,7 @@ impl Tree {
                     conditions.push(JoinCondition {
                         left: *a,
                         right: *b,
-                        null_safe: op == ComparisonOp::NotDistinctFrom,
+                        comparison: op,
                         filter: None,
                     });
                 }
@@ -695,6 +1133,7 @@ impl Tree {
                 join_type: JoinType::Inner,
                 conditions,
                 predicate: (!residual.is_empty()).then(|| conjunction_of(residual)),
+                algorithm: Default::default(),
             },
             vec![left, right],
         )
@@ -702,14 +1141,122 @@ impl Tree {
 }
 
 /// `JoinOrderOptimizer`.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct JoinOrderOptimizer {
     /// the size of what a `DelimGet` reads, by the rows it shares with its `DelimJoin`
     delim: HashMap<usize, f64>,
+    /// what the rows of a materialized CTE (or the working table of a recursive one) are, by its
+    /// data, with the bindings of its columns in order
+    ctes: HashMap<usize, (Vec<ColumnBinding>, RelationStats)>,
+}
+
+/// A filter the statistics made from the keys of a join (`CreateFilterFromJoinStats`).
+fn is_join_stats_filter(expr: &BoundExpr) -> bool {
+    expr.alias == super::statistics::JOIN_STATS_FILTER
+}
+
+/// `RelationStatisticsHelper::RebindOutputStats`: the columns of `stats`, in the order of `from`,
+/// under the bindings `to`.
+fn rebind(stats: &RelationStats, from: &[ColumnBinding], to: &[ColumnBinding]) -> RelationStats {
+    let mut result = RelationStats::new(stats.cardinality);
+    result.retention = stats.retention;
+    for (at, binding) in to.iter().enumerate() {
+        let column = from.get(at).map_or_else(|| stats.column(binding), |source| stats.column(source));
+        result.columns.insert(*binding, column);
+    }
+    result
+}
+
+/// `GetChildColumnBinding`: the first column an expression reads, unless it is volatile.
+/// A cast of a column between integral types, or a compression of it (`CompressedMaterialization`),
+/// which gives different values for different values.
+fn keeps_values_apart(expr: &BoundExpr) -> bool {
+    match &expr.kind {
+        BoundExprKind::Cast { child, try_cast: false } => {
+            matches!(child.kind, BoundExprKind::ColumnRef { .. })
+                && child.return_type.is_integral()
+                && expr.return_type.is_integral()
+        }
+        BoundExprKind::Function { function, children, .. } => {
+            (function.name.starts_with("__internal_compress_") || function.name.starts_with("__internal_decompress_"))
+                && children.first().is_some_and(|c| matches!(c.kind, BoundExprKind::ColumnRef { .. }))
+        }
+        _ => false,
+    }
+}
+
+fn child_column_binding(expr: &BoundExpr) -> Option<ColumnBinding> {
+    match &expr.kind {
+        BoundExprKind::ColumnRef { binding, depth: 0 } => Some(*binding),
+        _ if expr.is_volatile() => None,
+        _ => expr.children().into_iter().find_map(child_column_binding),
+    }
+}
+
+/// `GetEqualityDomainBounds` and `CombineColumnStats`: the equalities of a tree of INNER joins
+/// make classes of columns, all of which have no more values than the one with the fewest.
+fn narrow_equality_classes(op: &LogicalOperator, stats: &mut RelationStats) {
+    fn collect(op: &LogicalOperator, pairs: &mut Vec<(ColumnBinding, ColumnBinding)>) {
+        match &op.kind {
+            K::Join {
+                join_type: JoinType::Inner,
+                conditions,
+                ..
+            } => {
+                for condition in conditions {
+                    if let (Some(l), Some(r)) = (equivalence_binding(&condition.left), equivalence_binding(&condition.right)) {
+                        pairs.push((l, r));
+                    }
+                }
+            }
+            K::CrossProduct => {}
+            _ => return,
+        }
+        for child in &op.children {
+            collect(child, pairs);
+        }
+    }
+    let mut pairs = Vec::new();
+    collect(op, &mut pairs);
+    let mut parents: HashMap<ColumnBinding, ColumnBinding> = HashMap::new();
+    fn find(parents: &mut HashMap<ColumnBinding, ColumnBinding>, binding: ColumnBinding) -> ColumnBinding {
+        let parent = *parents.entry(binding).or_insert(binding);
+        if parent == binding {
+            return binding;
+        }
+        let root = find(parents, parent);
+        parents.insert(binding, root);
+        root
+    }
+    for (l, r) in &pairs {
+        let (l, r) = (find(&mut parents, *l), find(&mut parents, *r));
+        if l != r {
+            parents.insert(l, r);
+        }
+    }
+    let members: Vec<ColumnBinding> = parents.keys().copied().collect();
+    let mut bounds: HashMap<ColumnBinding, Option<f64>> = HashMap::new();
+    for binding in &members {
+        let root = find(&mut parents, *binding);
+        let current = stats.columns.get(binding).map(|c| c.current.count);
+        let entry = bounds.entry(root).or_insert(Some(f64::MAX));
+        // a class with a column the statistics do not have is not complete
+        *entry = match (*entry, current) {
+            (Some(bound), Some(current)) => Some(bound.min(current)),
+            _ => None,
+        };
+    }
+    for binding in members {
+        let root = find(&mut parents, binding);
+        if let (Some(Some(bound)), Some(column)) = (bounds.get(&root), stats.columns.get_mut(&binding)) {
+            column.current = DistinctCount::cardinality(column.current.count.min(*bound));
+        }
+    }
 }
 
 impl JoinOrderOptimizer {
-    /// `RelationStatisticsHelper`, without the optimizer in between.
+    /// `RelationStatisticsHelper`, without the optimizer in between: the statistics of the rows
+    /// of `op`, as `ExtractOperatorStats` has them.
     fn stats(&self, op: &LogicalOperator) -> RelationStats {
         match &op.kind {
             K::Get {
@@ -720,186 +1267,391 @@ impl JoinOrderOptimizer {
                 ..
             } => {
                 let Some(counts) = table_distinct_counts(table) else {
-                    return RelationStats {
-                        cardinality: UNKNOWN_CARDINALITY,
-                        distinct: HashMap::new(),
+                    return RelationStats::uniform(op.column_bindings(), UNKNOWN_CARDINALITY);
+                };
+                // `ExtractGetStats`
+                let base = counts.rows as f64;
+                let mut stats = RelationStats::new(base);
+                stats.retention = if base == 0.0 { 0.0 } else { 1.0 };
+                for (at, &column) in column_ids.iter().enumerate() {
+                    let count = if column == COLUMN_IDENTIFIER_ROW_ID {
+                        None
+                    } else {
+                        counts.columns.get(column).copied().flatten().filter(|&c| c > 0)
                     };
-                };
-                let distinct = column_ids
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(at, &column)| {
-                        let count = if column == COLUMN_IDENTIFIER_ROW_ID {
-                            Some(counts.rows)
-                        } else {
-                            counts.columns.get(column).copied().flatten()
-                        };
-                        Some((ColumnBinding::new(*table_index, at), count? as f64))
-                    })
-                    .collect();
-                let stats = RelationStats {
-                    cardinality: counts.rows as f64,
-                    distinct,
-                };
+                    let total = match count {
+                        Some(count) => DistinctCount::new(count as f64, CountSource::Hll),
+                        None => DistinctCount::cardinality(base),
+                    };
+                    let mut column_stats = ColumnStats::new(total);
+                    // no two rows share a row id, which a SEMI join on them (late materialization) counts on
+                    if column == COLUMN_IDENTIFIER_ROW_ID {
+                        column_stats.evidence.mark_unique();
+                    }
+                    stats.columns.insert(ColumnBinding::new(*table_index, at), column_stats);
+                }
                 let filters: Vec<BoundExpr> = filters
                     .iter()
+                    .filter(|filter| !is_join_stats_filter(filter))
                     .filter(|filter| !is_proven_not_null(filter, table, *table_index, column_ids))
                     .cloned()
                     .collect();
-                let cardinality = filter_cardinality(&filters, &stats);
-                stats.scaled(cardinality)
+                let cardinality = scan_filter_cardinality(table, *table_index, column_ids, &filters, &stats);
+                stats.apply_cardinality(cardinality);
+                for (binding, column) in stats.columns.iter_mut() {
+                    for filter in &filters {
+                        apply_direct_filter_domain(column, filter, *binding);
+                    }
+                }
+                stats.project(&op.column_bindings())
+            }
+            // a scan whose filters left out all of its files has no estimate (`LogicalGet` takes 1)
+            K::ParquetScan { scan, .. } if scan.files.is_empty() && scan.total_files.is_some() => {
+                RelationStats::uniform(op.column_bindings(), 1.0)
             }
             K::ParquetScan { table_index, scan } => {
                 let Some(rows) = crate::execution::parquet::scan_cardinality(scan) else {
-                    return RelationStats {
-                        cardinality: UNKNOWN_CARDINALITY,
-                        distinct: HashMap::new(),
-                    };
+                    return RelationStats::uniform(op.column_bindings(), UNKNOWN_CARDINALITY);
                 };
+                let base = rows as f64;
+                let mut stats = RelationStats::uniform(op.column_bindings(), base);
+                stats.retention = if base == 0.0 { 0.0 } else { 1.0 };
                 // the range of an integral column's values bounds how many distinct ones it has
-                let distinct = crate::execution::parquet::scan_statistics(scan)
-                    .into_iter()
-                    .enumerate()
-                    .filter_map(|(column, stats)| {
-                        let stats = stats?;
-                        if scan.types[column].id() == duckrs_common::types::LogicalTypeId::Decimal {
-                            return None;
+                for (column, column_stats) in crate::execution::parquet::scan_statistics(scan).into_iter().enumerate() {
+                    let Some(column_stats) = column_stats else {
+                        continue;
+                    };
+                    // `GetMinMaxDistinctCount`: integers of up to 64 bits whose span and its
+                    // successor fit 64 bits
+                    use duckrs_common::types::PhysicalType as P;
+                    if scan.types[column].id() == duckrs_common::types::LogicalTypeId::Decimal
+                        || !matches!(
+                            scan.types[column].physical_type(),
+                            P::Int8 | P::Int16 | P::Int32 | P::Int64 | P::UInt8 | P::UInt16 | P::UInt32 | P::UInt64
+                        )
+                    {
+                        continue;
+                    }
+                    let distinct = (|| {
+                        let (min, max) = (column_stats.min?.as_i128()?, column_stats.max?.as_i128()?);
+                        let span = u64::try_from(max.checked_sub(min)?).ok()?;
+                        let distinct = span.checked_add(1)?.min(rows);
+                        (rows > 0 && distinct != u64::MAX).then_some(distinct)
+                    })();
+                    if let Some(distinct) = distinct {
+                        let binding = ColumnBinding::new(*table_index, column);
+                        if stats.columns.contains_key(&binding) {
+                            let domain = DistinctCount::new(distinct as f64, CountSource::MinMax);
+                            stats.columns.insert(binding, ColumnStats::new(domain));
                         }
-                        let (min, max) = (stats.min?.as_i128()?, stats.max?.as_i128()?);
-                        let range = max.checked_sub(min)?.checked_add(1)?;
-                        Some((
-                            ColumnBinding::new(*table_index, column),
-                            (range as f64).min(rows as f64),
-                        ))
-                    })
-                    .collect();
-                let stats = RelationStats {
-                    cardinality: rows as f64,
-                    distinct,
-                };
-                let cardinality = filter_cardinality(&scan.filters, &stats);
-                stats.scaled(cardinality)
+                    }
+                }
+                let filters: Vec<BoundExpr> =
+                    scan.filters.iter().filter(|f| !is_join_stats_filter(f)).cloned().collect();
+                let cardinality = filter_cardinality(&filters, &stats);
+                stats.apply_cardinality(cardinality);
+                for (binding, column) in stats.columns.iter_mut() {
+                    for filter in &filters {
+                        apply_direct_filter_domain(column, filter, *binding);
+                    }
+                }
+                stats
             }
-            K::Range { count, .. } => RelationStats {
-                cardinality: *count as f64,
-                distinct: HashMap::new(),
-            },
-            K::EmptyResult { .. } => RelationStats::default(),
-            K::DummyScan { .. } => RelationStats {
-                cardinality: 1.0,
-                distinct: HashMap::new(),
-            },
-            K::ChunkGet { chunks, .. } => RelationStats {
-                cardinality: chunks.iter().map(|c| c.len()).sum::<usize>() as f64,
-                distinct: HashMap::new(),
-            },
-            K::ExpressionGet { expressions, .. } => RelationStats {
-                cardinality: expressions.len() as f64,
-                distinct: HashMap::new(),
-            },
-            K::DelimGet { delim, .. } => RelationStats {
-                cardinality: self
+            K::Range { count, .. } => RelationStats::uniform(op.column_bindings(), *count as f64),
+            K::EmptyResult { .. } => RelationStats::uniform(op.column_bindings(), 0.0),
+            K::DummyScan { .. } => RelationStats::uniform(op.column_bindings(), 1.0),
+            K::ChunkGet { chunks, .. } => {
+                RelationStats::uniform(op.column_bindings(), chunks.iter().map(|c| c.len()).sum::<usize>() as f64)
+            }
+            K::ExpressionGet { expressions, .. } => {
+                RelationStats::uniform(op.column_bindings(), expressions.len() as f64)
+            }
+            // `ExtractDelimGetStats`: a value per column
+            K::DelimGet { delim, .. } => {
+                let cardinality = self
                     .delim
                     .get(&(Arc::as_ptr(delim) as *const () as usize))
                     .copied()
-                    .unwrap_or(UNKNOWN_CARDINALITY),
-                distinct: HashMap::new(),
+                    .unwrap_or(UNKNOWN_CARDINALITY);
+                let mut stats = RelationStats::new(cardinality);
+                for binding in op.column_bindings() {
+                    stats.columns.insert(binding, ColumnStats::new(DistinctCount::cardinality(1.0)));
+                }
+                stats.cap_current_domains();
+                stats
+            }
+            K::MaterializedCte { .. } => {
+                let stats = self.stats(&op.children[1]);
+                stats.project(&op.column_bindings())
+            }
+            // `ReadSingleCSVFileCardinality`: a file's bytes over 5 per column of a row, 42 rows where
+            // its size is not known
+            // a scan whose filters left out all of its files has no estimate (`LogicalGet` takes 1)
+            K::CsvScan { scan, .. } if scan.files.is_empty() => RelationStats::uniform(op.column_bindings(), 1.0),
+            K::CsvScan { scan, .. } => RelationStats::uniform(
+                op.column_bindings(),
+                scan.files
+                    .iter()
+                    .map(|file| match std::fs::metadata(&file.path) {
+                        Ok(metadata) if !scan.types.is_empty() => metadata.len() / (scan.types.len() as u64 * 5),
+                        _ => 42,
+                    })
+                    .sum::<u64>() as f64,
+            ),
+            // `ReadSingleJSONFileCardinality` for each file: the estimate of the first, 42 without one
+            K::JsonScan { scan, .. } => RelationStats::uniform(
+                op.column_bindings(),
+                if scan.files.is_empty() {
+                    1.0
+                } else {
+                    (scan.cardinality_per_file.unwrap_or(42) * scan.files.len() as u64) as f64
+                },
+            ),
+            // `RebindOutputStats` of the statistics of the CTE
+            K::CteRef { data, .. } => match self.ctes.get(&(Arc::as_ptr(data) as *const () as usize)) {
+                Some((bindings, stats)) => rebind(stats, bindings, &op.column_bindings()),
+                None => RelationStats::uniform(op.column_bindings(), UNKNOWN_CARDINALITY),
             },
-            K::WorkingTable { .. } | K::RecursiveCte { .. } => RelationStats {
-                cardinality: UNKNOWN_CARDINALITY,
-                distinct: HashMap::new(),
+            K::WorkingTable { working, .. } => match self.ctes.get(&(Arc::as_ptr(working) as *const () as usize)) {
+                Some((bindings, stats)) => rebind(stats, bindings, &op.column_bindings()),
+                None => RelationStats::uniform(op.column_bindings(), UNKNOWN_CARDINALITY),
             },
+            // a recursive CTE runs its recursive part over the rows of the one before, assumed 1000 times;
+            // the statistics of one round say nothing of all of them
+            K::RecursiveCte {
+                working, recursive, ..
+            } => {
+                let anchor = self.stats(&op.children[0]);
+                let mut inner = self.clone();
+                inner.ctes.insert(
+                    Arc::as_ptr(working) as *const () as usize,
+                    (op.children[0].column_bindings(), anchor.clone()),
+                );
+                let rounds = inner.stats(recursive);
+                let cardinality = anchor.cardinality + rounds.cardinality * 1000.0;
+                RelationStats::uniform(op.column_bindings(), cardinality)
+            }
             K::Filter { expressions } => {
+                // `ExtractFilterStats`
                 let child = self.stats(&op.children[0]);
+                let expressions: Vec<BoundExpr> =
+                    expressions.iter().filter(|e| !is_join_stats_filter(e)).cloned().collect();
+                let expressions = &expressions;
                 let cardinality = filter_cardinality(expressions, &child);
-                child.scaled(cardinality)
+                let mut stats = child.project(&op.column_bindings());
+                stats.apply_cardinality(cardinality);
+                for (binding, column) in stats.columns.iter_mut() {
+                    for expr in expressions {
+                        apply_direct_filter_domain(column, expr, *binding);
+                    }
+                }
+                stats
+            }
+            K::ColumnSelect { .. } | K::Order { .. } | K::SecureView { .. } => {
+                let child = self.stats(&op.children[0]);
+                child.project(&op.column_bindings())
             }
             K::Projection {
                 table_index,
                 expressions,
             } => {
+                // `ExtractProjectionStats`
                 let child = self.stats(&op.children[0]);
-                let distinct = expressions
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(at, expr)| {
-                        let source = child.distinct.get(&bare_column(expr)?)?;
-                        Some((ColumnBinding::new(*table_index, at), *source))
-                    })
-                    .collect();
-                RelationStats {
-                    cardinality: child.cardinality,
-                    distinct,
-                }
-            }
-            K::Aggregate {
-                group_index, groups, ..
-            } => {
-                let child = self.stats(&op.children[0]);
-                if groups.is_empty() {
-                    return RelationStats {
-                        cardinality: 1.0,
-                        distinct: HashMap::new(),
+                let mut stats = RelationStats::new(child.cardinality);
+                stats.retention = child.retention;
+                for (at, expr) in expressions.iter().enumerate() {
+                    let binding = ColumnBinding::new(*table_index, at);
+                    let column = if expr.is_foldable() {
+                        ColumnStats::new(DistinctCount::new(child.cardinality.min(1.0), CountSource::Hll))
+                    } else if let Some(source) = child_column_binding(expr) {
+                        let source_column = child.column(&source);
+                        let mut column = source_column.plain();
+                        if matches!(expr.kind, BoundExprKind::ColumnRef { .. }) || keeps_values_apart(expr) {
+                            column.evidence = source_column.evidence;
+                        }
+                        column
+                    } else {
+                        ColumnStats::new(DistinctCount::cardinality(child.cardinality))
                     };
+                    stats.columns.insert(binding, column);
                 }
-                let mut distinct = HashMap::new();
-                let mut cardinality: f64 = 1.0;
-                for (at, group) in groups.iter().enumerate() {
-                    let count = bare_column(group)
-                        .and_then(|column| child.distinct.get(&column).copied())
-                        .unwrap_or(child.cardinality);
-                    cardinality = cardinality.max(count);
-                    distinct.insert(ColumnBinding::new(*group_index, at), count);
-                }
-                RelationStats {
-                    cardinality: cardinality.min(child.cardinality),
-                    distinct,
-                }
+                stats
             }
-            K::TopN { limit, .. } => {
+            K::Aggregate { .. } => self.aggregate_stats(op),
+            K::Window { table_index, .. } => {
                 let child = self.stats(&op.children[0]);
-                let cardinality = child.cardinality.min(*limit as f64);
-                child.scaled(cardinality)
+                let mut stats = child.project(&op.children[0].column_bindings());
+                for binding in op.column_bindings() {
+                    if binding.table_index == *table_index {
+                        let window = ColumnStats::new(DistinctCount::cardinality(stats.cardinality));
+                        stats.columns.insert(binding, window);
+                    }
+                }
+                stats
             }
-            K::Limit { limit, .. } => {
+            K::Distinct { targets, .. } => {
+                // `ExtractDistinctStats`
                 let child = self.stats(&op.children[0]);
-                let cardinality = limit.map_or(child.cardinality, |limit| child.cardinality.min(limit as f64));
-                child.scaled(cardinality)
+                let mut stats = child.project(&op.column_bindings());
+                stats.retention = 1.0;
+                let counts: Option<Vec<DistinctCount>> = if targets.is_empty() {
+                    Some(op.children[0].column_bindings().iter().map(|b| child.column(b).current).collect())
+                } else {
+                    targets
+                        .iter()
+                        .map(|target| match &target.kind {
+                            BoundExprKind::ColumnRef { binding, depth: 0 } => Some(child.column(binding).current),
+                            BoundExprKind::Constant(_) => {
+                                Some(DistinctCount::new(child.cardinality.min(1.0), CountSource::Hll))
+                            }
+                            _ => None,
+                        })
+                        .collect()
+                };
+                let Some(counts) = counts else {
+                    return stats;
+                };
+                stats.cardinality = estimate_distinct_cardinality(&counts, child.cardinality);
+                stats.cap_current_domains();
+                let unique = match targets.as_slice() {
+                    [] if stats.columns.len() == 1 => stats.columns.keys().next().copied(),
+                    [target] => bare_column(target),
+                    _ => None,
+                };
+                if let Some(column) = unique.and_then(|binding| stats.columns.get_mut(&binding)) {
+                    column.evidence.mark_unique();
+                }
+                stats
             }
-            K::Union { .. } => RelationStats {
-                cardinality: op.children.iter().map(|c| self.stats(c).cardinality).sum(),
-                distinct: HashMap::new(),
-            },
+            // `ExtractLimitStats`; a TOP N was an ORDER BY and a LIMIT
+            K::Limit { limit, offset, .. } => self.limit_stats(op, *limit, *offset, None),
+            K::TopN { limit, offset, .. } => self.limit_stats(op, Some(*limit), *offset, None),
+            K::LimitPercent { percent, offset } => self.limit_stats(op, None, *offset, Some(*percent)),
+            K::Union { .. } | K::ExceptIntersect { .. } => self.set_operation_stats(op),
             K::CrossProduct => {
-                let (mut left, right) = (self.stats(&op.children[0]), self.stats(&op.children[1]));
-                left.cardinality *= right.cardinality;
-                left.distinct.extend(right.distinct);
-                left
+                let (left, right) = (self.stats(&op.children[0]), self.stats(&op.children[1]));
+                let mut stats = RelationStats::new(left.cardinality * right.cardinality);
+                for (binding, column) in left.columns.iter().chain(&right.columns) {
+                    stats.columns.insert(*binding, column.plain());
+                }
+                match self.tree_cardinality(op) {
+                    Some(cardinality) => {
+                        stats.cardinality = cardinality;
+                        stats.cap_current_domains();
+                        stats
+                    }
+                    None => {
+                        stats.cap_current_domains();
+                        stats
+                    }
+                }
+            }
+            K::MarkJoin { table_index, .. } => {
+                let left = self.stats(&op.children[0]);
+                let mut stats = RelationStats::new(left.cardinality);
+                for (binding, column) in &left.columns {
+                    stats.columns.insert(*binding, column.plain());
+                }
+                let mark = DistinctCount::cardinality(left.cardinality.min(3.0));
+                stats.columns.insert(ColumnBinding::new(*table_index, 0), ColumnStats::new(mark));
+                stats.cap_current_domains();
+                stats
             }
             K::Join {
                 join_type,
                 conditions,
                 predicate,
+                ..
             } => {
-                let (mut left, right) = (self.stats(&op.children[0]), self.stats(&op.children[1]));
-                if matches!(join_type, JoinType::Semi | JoinType::Anti) {
-                    let cardinality = left.cardinality * DEFAULT_SELECTIVITY;
-                    return left.scaled(cardinality);
-                }
-                if matches!(join_type, JoinType::RightSemi | JoinType::RightAnti) {
-                    let cardinality = right.cardinality * DEFAULT_SELECTIVITY;
-                    return right.scaled(cardinality);
+                let (left, right) = (self.stats(&op.children[0]), self.stats(&op.children[1]));
+                if matches!(
+                    join_type,
+                    JoinType::Semi | JoinType::Anti | JoinType::RightSemi | JoinType::RightAnti
+                ) {
+                    let residual = predicate.as_ref().map(|p| (p, p));
+                    let mut semi_conditions: Vec<SemiAntiCondition> = conditions
+                        .iter()
+                        .map(|c| SemiAntiCondition {
+                            left: &c.left,
+                            right: &c.right,
+                            op: c.comparison,
+                        })
+                        .collect();
+                    if let Some((l, r)) = residual {
+                        semi_conditions.push(SemiAntiCondition {
+                            left: l,
+                            right: r,
+                            op: ComparisonOp::LessThan,
+                        });
+                    }
+                    return semi_anti_join_stats(&semi_conditions, *join_type, &left, &right);
                 }
                 let (left_rows, right_rows) = (left.cardinality, right.cardinality);
-                left.distinct.extend(right.distinct);
+                let mut columns: HashMap<ColumnBinding, ColumnStats> = HashMap::new();
+                for (binding, column) in left.columns.iter().chain(&right.columns) {
+                    columns.insert(*binding, column.plain());
+                }
                 let domain_of = |expr: &BoundExpr| {
-                    let mut columns = Vec::new();
-                    expression_columns(expr, &mut columns);
-                    let distinct = columns.iter().filter_map(|c| left.distinct.get(c).copied());
+                    let mut found = Vec::new();
+                    expression_columns(expr, &mut found);
+                    let distinct = found.iter().filter_map(|c| columns.get(c).map(|s| s.current.count));
                     distinct.reduce(f64::max)
                 };
+                // `GetLeftJoinSelectivity`: equalities that connect the same columns
+                // (`JoinEqualityGroups`) count once, so `a = x AND a = y` is no composite key
+                let mut parents: HashMap<ColumnBinding, ColumnBinding> = HashMap::new();
+                fn root(parents: &mut HashMap<ColumnBinding, ColumnBinding>, binding: ColumnBinding) -> ColumnBinding {
+                    let mut current = binding;
+                    while let Some(&parent) = parents.get(&current) {
+                        if parent == current {
+                            break;
+                        }
+                        current = parent;
+                    }
+                    current
+                }
+                let comparisons = conditions.iter().filter(|c| !c.is_equality()).cloned().map(condition_expression);
+                let mut conjuncts: Vec<BoundExpr> = comparisons.collect();
+                if let Some(predicate) = predicate {
+                    split_conjuncts(predicate.clone(), &mut conjuncts);
+                }
+                let mut grouped: Vec<Option<(ColumnBinding, ColumnBinding)>> = Vec::new();
+                for condition in conditions.iter().filter(|condition| condition.is_equality()) {
+                    let pair = bare_column(&condition.left).zip(bare_column(&condition.right));
+                    if let Some((l, r)) = pair {
+                        let (a, b) = (root(&mut parents, l), root(&mut parents, r));
+                        parents.entry(a).or_insert(a);
+                        parents.insert(b, a);
+                    }
+                    grouped.push(pair);
+                }
+                for (l, r) in conjuncts.iter().filter_map(residual_equality) {
+                    let (a, b) = (root(&mut parents, l), root(&mut parents, r));
+                    parents.entry(a).or_insert(a);
+                    parents.insert(b, a);
+                }
+                let mut group_roots: Vec<ColumnBinding> = Vec::new();
+                let keep: Vec<bool> = grouped
+                    .iter()
+                    .map(|pair| match pair {
+                        Some((l, _)) => {
+                            let group = root(&mut parents, *l);
+                            if group_roots.contains(&group) {
+                                false
+                            } else {
+                                group_roots.push(group);
+                                true
+                            }
+                        }
+                        None => true,
+                    })
+                    .collect();
+                // past the optimizer, the comparisons of the predicate are conditions too
                 let domains: Vec<f64> = conditions
                     .iter()
+                    .filter(|condition| condition.is_equality())
+                    .zip(keep)
+                    .filter_map(|(condition, keep)| keep.then_some(condition))
                     .map(|condition| {
                         let sides = [domain_of(&condition.left), domain_of(&condition.right)];
                         let domain = sides.into_iter().flatten().reduce(f64::max);
@@ -908,39 +1660,379 @@ impl JoinOrderOptimizer {
                     .collect();
                 let mut denominator =
                     composite_denominator(&domains, left_rows, right_rows).unwrap_or_else(|| domains.iter().product());
-                if let Some(predicate) = predicate {
-                    let mut conjuncts = Vec::new();
-                    split_conjuncts(predicate.clone(), &mut conjuncts);
-                    for conjunct in &conjuncts {
-                        denominator *= predicate_denominator(conjunct, &domain_of);
+                for conjunct in &conjuncts {
+                    // a same-side equality joins the group of an equality between the sides, and
+                    // a group of its own is a residual (`GetResidualOnSelectivity`) once
+                    if let Some(pair) = residual_equality(conjunct) {
+                        let group = root(&mut parents, pair.0);
+                        if !group_roots.contains(&group) {
+                            group_roots.push(group);
+                            denominator /= DEFAULT_SELECTIVITY;
+                        }
+                        continue;
                     }
+                    denominator *= predicate_denominator(conjunct, &domain_of);
                 }
                 let inner = left_rows * right_rows / denominator;
                 let cardinality = match join_type {
-                    JoinType::Inner => inner,
+                    // `EstimateCardinality` of all relations of the tree below
+                    JoinType::Inner => self.tree_cardinality(op).unwrap_or(inner),
                     JoinType::Left => inner.max(left_rows),
                     JoinType::Right => inner.max(right_rows),
+                    JoinType::Single | JoinType::Mark => left_rows,
                     _ => inner.max(left_rows).max(right_rows),
                 };
-                left.scaled(cardinality)
+                let mut stats = RelationStats::new(cardinality);
+                stats.columns = columns;
+                // `GetEqualityDomainBounds`: the columns of an INNER equality class have the values of
+                // the one with the fewest
+                if *join_type == JoinType::Inner {
+                    narrow_equality_classes(op, &mut stats);
+                }
+                for column in stats.columns.values_mut() {
+                    column.current.count = column.current.count.min(column.total.count);
+                }
+                stats.cap_current_domains();
+                stats
             }
             _ if !op.children.is_empty() => self.stats(&op.children[0]),
-            _ => RelationStats {
-                cardinality: UNKNOWN_CARDINALITY,
-                distinct: HashMap::new(),
-            },
+            _ => RelationStats::uniform(op.column_bindings(), UNKNOWN_CARDINALITY),
         }
+    }
+
+    /// `ExtractLimitStats`.
+    fn limit_stats(&self, op: &LogicalOperator, limit: Option<u64>, offset: u64, percent: Option<f64>) -> RelationStats {
+        let child = self.stats(&op.children[0]);
+        let mut stats = child.project(&op.column_bindings());
+        let available = if offset as f64 >= child.cardinality {
+            0.0
+        } else {
+            child.cardinality - offset as f64
+        };
+        let mut cardinality = available;
+        if let Some(limit) = limit {
+            cardinality = cardinality.min(limit as f64);
+        }
+        if let Some(percent) = percent {
+            let rows = if percent < 100.0 {
+                (child.cardinality * percent / 100.0).floor()
+            } else {
+                child.cardinality
+            };
+            cardinality = cardinality.min(rows);
+        }
+        stats.apply_cardinality(cardinality);
+        stats
+    }
+
+    /// `ExtractSetOperationStats`: the columns by position.
+    fn set_operation_stats(&self, op: &LogicalOperator) -> RelationStats {
+        let children: Vec<RelationStats> = op.children.iter().map(|c| self.stats(c)).collect();
+        let child_bindings: Vec<Vec<ColumnBinding>> = op.children.iter().map(|c| c.column_bindings()).collect();
+        let (union, except) = match &op.kind {
+            K::Union { .. } => (true, false),
+            K::ExceptIntersect { except, .. } => (false, *except),
+            _ => unreachable!(),
+        };
+        let cardinality = if union {
+            children.iter().map(|c| c.cardinality).sum()
+        } else if except {
+            children[0].cardinality
+        } else {
+            children.iter().map(|c| c.cardinality).reduce(f64::min).unwrap_or(0.0)
+        };
+        let mut stats = RelationStats::new(cardinality);
+        for (at, binding) in op.column_bindings().into_iter().enumerate() {
+            let Some(first) = child_bindings[0].get(at) else {
+                return RelationStats::uniform(op.column_bindings(), cardinality);
+            };
+            let first = children[0].column(first);
+            let (mut total, mut current) = (first.total, first.current);
+            for (child, bindings) in children.iter().zip(&child_bindings).skip(1) {
+                let Some(column) = bindings.get(at).map(|b| child.column(b)) else {
+                    return RelationStats::uniform(op.column_bindings(), cardinality);
+                };
+                if union {
+                    total = DistinctCount::cardinality(total.count + column.total.count);
+                    current = DistinctCount::cardinality(current.count + column.current.count);
+                } else if !except {
+                    total = DistinctCount::cardinality(total.count.min(column.total.count));
+                    current = DistinctCount::cardinality(current.count.min(column.current.count));
+                }
+            }
+            total.count = total.count.max(current.count);
+            stats.columns.insert(binding, ColumnStats::with(total, current));
+        }
+        stats.cap_current_domains();
+        stats
+    }
+
+    /// `ExtractAggregationStats`.
+    fn aggregate_stats(&self, op: &LogicalOperator) -> RelationStats {
+        let K::Aggregate {
+            group_index,
+            aggregate_index,
+            groupings_index,
+            groups,
+            aggregates,
+            grouping_sets,
+            grouping_functions,
+            ..
+        } = &op.kind
+        else {
+            unreachable!()
+        };
+        let child = self.stats(&op.children[0]);
+        let all_groups: BTreeSet<usize> = (0..groups.len()).collect();
+        let sets: Vec<&BTreeSet<usize>> = if grouping_sets.is_empty() {
+            vec![&all_groups]
+        } else {
+            grouping_sets.iter().collect()
+        };
+        let mut counts: Vec<DistinctCount> = Vec::new();
+        for set in &sets {
+            let mut set_counts = Vec::new();
+            for &group in set.iter() {
+                let Some(binding) = groups.get(group).and_then(|g| match &g.kind {
+                    BoundExprKind::ColumnRef { binding, depth: 0 } => Some(*binding),
+                    _ => None,
+                }) else {
+                    continue;
+                };
+                let mut count = child.column(&binding).current;
+                count.count = count.count.max(1.0);
+                set_counts.push(count);
+            }
+            if set_counts.len() > counts.len() {
+                counts = set_counts;
+            }
+        }
+        let mut cardinality = if groups.is_empty() {
+            1.0
+        } else {
+            estimate_distinct_cardinality(&counts, child.cardinality)
+        };
+        let preserves_evidence = sets.len() == 1 && sets[0].len() == groups.len();
+        if preserves_evidence && !groups.is_empty() && counts.len() == groups.len() {
+            let positions: Option<Vec<usize>> = {
+                let bindings = op.children[0].column_bindings();
+                groups
+                    .iter()
+                    .map(|g| bare_column(g).and_then(|b| bindings.iter().position(|x| *x == b)))
+                    .collect()
+            };
+            if let Some(positions) = positions
+                && let Some(union_groups) = self.union_groups(&op.children[0], positions, child.cardinality)
+            {
+                // per-arm products of the domains do not combine keys of different arms
+                cardinality = cardinality.min(union_groups);
+            }
+        }
+        // `CapGroupedAggregateCardinalityByKeyDomain`, which only ever lowers the estimate
+        if let K::Aggregate {
+            domain_cap: Some(cap), ..
+        } = &op.kind
+            && sets.len() == 1
+        {
+            cardinality = cardinality.min(*cap as f64);
+        }
+        let mut stats = RelationStats::new(cardinality);
+        for (at, group) in groups.iter().enumerate() {
+            let binding = ColumnBinding::new(*group_index, at);
+            let mut column = match group.kind {
+                BoundExprKind::ColumnRef { binding: source, depth: 0 } => {
+                    let source = child.column(&source);
+                    let mut column = source.plain();
+                    if preserves_evidence {
+                        column.evidence = source.evidence;
+                    }
+                    column
+                }
+                _ => ColumnStats::new(DistinctCount::cardinality(cardinality)),
+            };
+            if groups.len() == 1 && sets.len() == 1 && sets[0].len() == 1 && sets[0].contains(&0) {
+                column.evidence.mark_unique();
+            }
+            stats.columns.insert(binding, column);
+        }
+        for at in 0..aggregates.len() {
+            let column = ColumnStats::new(DistinctCount::cardinality(cardinality));
+            stats.columns.insert(ColumnBinding::new(*aggregate_index, at), column);
+        }
+        for at in 0..grouping_functions.len() {
+            let count = cardinality.min(grouping_sets.len().max(1) as f64);
+            let column = ColumnStats::new(DistinctCount::cardinality(count));
+            stats.columns.insert(ColumnBinding::new(*groupings_index, at), column);
+        }
+        stats.cap_current_domains();
+        stats
+    }
+
+    /// `EstimateUnionGroups`: below projections of the groups, the groups of the arms of a UNION
+    /// added up, each arm's the product of its domains.
+    fn union_groups(&self, input: &LogicalOperator, groups: Vec<usize>, maximum: f64) -> Option<f64> {
+        let mut pending: Vec<(&LogicalOperator, Vec<usize>)> = vec![(input, groups)];
+        let mut result = 0.0;
+        let mut found_union = false;
+        while let Some((mut op, mut positions)) = pending.pop() {
+            while let K::Projection { expressions, .. } = &op.kind {
+                let bindings = op.children[0].column_bindings();
+                let mapped: Option<Vec<usize>> = positions
+                    .iter()
+                    .map(|&at| {
+                        let expr = expressions.get(at)?;
+                        // through the compression of a column too
+                        let column = if keeps_values_apart(expr) { &expr.children()[0] } else { expr };
+                        match &column.kind {
+                            BoundExprKind::ColumnRef { binding, depth: 0 } => bindings.iter().position(|b| b == binding),
+                            _ => None,
+                        }
+                    })
+                    .collect();
+                let Some(mapped) = mapped else {
+                    break;
+                };
+                op = &op.children[0];
+                positions = mapped;
+            }
+            if matches!(op.kind, K::Union { .. }) {
+                found_union = true;
+                for child in &op.children {
+                    pending.push((child, positions.clone()));
+                }
+                continue;
+            }
+            if !found_union {
+                return None;
+            }
+            let stats = self.stats(op);
+            let bindings = op.column_bindings();
+            let cardinality = stats.cardinality;
+            let mut estimate = cardinality.min(1.0);
+            for at in positions {
+                let domain = bindings.get(at).map_or(1.0, |b| stats.current(b)).max(1.0);
+                if estimate > (cardinality / domain).floor() {
+                    estimate = cardinality;
+                    break;
+                }
+                estimate *= domain;
+            }
+            result += estimate.min(maximum - result);
+        }
+        Some(result)
+    }
+
+    /// The estimate of a tree of inner joins from all its relations and predicates, as the join
+    /// order optimizer has it for each set of relations (`EstimateCardinality`).
+    fn tree_cardinality(&self, op: &LogicalOperator) -> Option<f64> {
+        fn collect(op: &LogicalOperator, relations: &mut Vec<LogicalOperator>, conjuncts: &mut Vec<BoundExpr>) {
+            match &op.kind {
+                K::Join {
+                    conditions, predicate, ..
+                } if is_binary_tree(op) => {
+                    conjuncts.extend(conditions.iter().cloned().map(condition_expression));
+                    if let Some(predicate) = predicate {
+                        split_conjuncts(predicate.clone(), conjuncts);
+                    }
+                }
+                K::CrossProduct => {}
+                // the projection maps of the joins, which C++ adds once it has its estimates
+                K::ColumnSelect { .. } if is_binary_tree(&op.children[0]) => {}
+                K::Filter { expressions } if is_tree(op) && is_binary_tree(&op.children[0]) => {
+                    for expr in expressions {
+                        split_conjuncts(expr.clone(), conjuncts);
+                    }
+                }
+                _ => {
+                    relations.push(op.clone());
+                    return;
+                }
+            }
+            for child in &op.children {
+                collect(child, relations, conjuncts);
+            }
+        }
+        if !is_binary_tree(op) {
+            return None;
+        }
+        let mut relations = Vec::new();
+        let mut conjuncts = Vec::new();
+        collect(op, &mut relations, &mut conjuncts);
+        if relations.len() < 2 || relations.len() > MAX_RELATIONS {
+            return None;
+        }
+        let mut relation_of = HashMap::new();
+        for (at, relation) in relations.iter().enumerate() {
+            for binding in relation.column_bindings() {
+                relation_of.insert(binding, at);
+            }
+        }
+        let set_of = |expr: &BoundExpr| -> Option<u64> {
+            let mut columns = Vec::new();
+            expression_columns(expr, &mut columns);
+            columns
+                .iter()
+                .try_fold(0u64, |set, c| Some(set | 1 << *relation_of.get(c)?))
+        };
+        let mut on_relation: Vec<Vec<BoundExpr>> = vec![Vec::new(); relations.len()];
+        let mut predicates = Vec::new();
+        for expr in conjuncts {
+            let set = set_of(&expr).unwrap_or(0);
+            if set == 0 {
+                continue;
+            } else if set.count_ones() == 1 {
+                on_relation[set.trailing_zeros() as usize].push(expr);
+            } else {
+                let sides = match &expr.kind {
+                    BoundExprKind::Comparison { left, right, .. } => set_of(left).zip(set_of(right)),
+                    _ => None,
+                };
+                let sides = sides.filter(|(l, r)| *l != 0 && *r != 0 && l & r == 0);
+                predicates.push(Predicate {
+                    expr,
+                    set,
+                    sides,
+                    class: None,
+                });
+            }
+        }
+        add_implied_equalities(&mut predicates, &relation_of);
+        let stats: Vec<RelationStats> = relations
+            .into_iter()
+            .zip(on_relation)
+            .map(|(relation, expressions)| {
+                if expressions.is_empty() {
+                    self.stats(&relation)
+                } else {
+                    self.stats(&LogicalOperator::new(K::Filter { expressions }, vec![relation]))
+                }
+            })
+            .collect();
+        let all = (1u64 << stats.len()) - 1;
+        Some(Estimator::new(&stats, &predicates, &relation_of).estimate(all))
     }
 
     /// Remembers the size of what `DelimGet`s of a `DelimJoin` read, once its left side is known.
     fn note_delim(&mut self, op: &LogicalOperator) {
+        if let K::MaterializedCte { data, .. } = &op.kind {
+            let stats = self.stats(&op.children[0]);
+            let bindings = op.children[0].column_bindings();
+            self.ctes.insert(Arc::as_ptr(data) as *const () as usize, (bindings, stats));
+            return;
+        }
+        if let K::RecursiveCte { working, .. } = &op.kind {
+            let stats = self.stats(&op.children[0]);
+            let bindings = op.children[0].column_bindings();
+            self.ctes.insert(Arc::as_ptr(working) as *const () as usize, (bindings, stats));
+            return;
+        }
         let K::DelimJoin { delim, conditions, .. } = &op.kind else {
             return;
         };
         let stats = self.stats(&op.children[0]);
         let keys = conditions
             .iter()
-            .filter_map(|c| stats.distinct.get(&bare_column(&c.left)?).copied())
+            .filter_map(|c| Some(stats.current(&bare_column(&c.left)?)))
             .fold(1.0, f64::max)
             .min(stats.cardinality);
         self.delim.insert(Arc::as_ptr(delim) as *const () as usize, keys);
@@ -959,6 +2051,9 @@ impl JoinOrderOptimizer {
             if (2..=MAX_RELATIONS).contains(&relations.len()) && bindings.len() == columns {
                 return self.reorder(op);
             }
+        }
+        if !by_position && semi_chain_length(&op) >= 2 {
+            return self.reorder_semi_chain(op);
         }
         let inherited = by_position
             && matches!(
@@ -1047,6 +2142,81 @@ impl JoinOrderOptimizer {
         }
     }
 
+    /// Two or more SEMI and ANTI joins on one relation that is not a tree of joins: they filter
+    /// it each by its own columns, so any order gives the same rows, and the plan enumerator, for
+    /// which their right sides are relations, picks the cheapest. Build sides were chosen already;
+    /// they are chosen again for the new order.
+    fn reorder_semi_chain(&mut self, mut op: LogicalOperator) -> LogicalOperator {
+        let mut semis = Vec::new();
+        while semi_chain_length(&op) >= 1 {
+            unflip_semi(&mut op);
+            let right = op.children.pop().expect("a join has two sides");
+            let left = op.children.pop().expect("a join has two sides");
+            op.children.push(self.optimize(right, false));
+            semis.push(op);
+            op = left;
+        }
+        let relation = self.optimize(op, false);
+        semis.reverse();
+        let mut plan = self.stack_semis(relation, semis);
+        if BUILD_SIDES.with(|b| b.get()) {
+            super::build_side::choose_build_sides(&mut plan, false);
+        }
+        plan
+    }
+
+    /// Puts the SEMI and ANTI joins of one relation on it, in the order the plan enumerator would
+    /// join them in: the least rows in all, and of orders as good, the one with the most rows on
+    /// the right side of the last join (`EmitPair`'s tiebreaker).
+    fn stack_semis(&self, relation: LogicalOperator, semis: Vec<LogicalOperator>) -> LogicalOperator {
+        let build = |relation: LogicalOperator, order: &[usize], semis: &[LogicalOperator]| {
+            let mut op = relation;
+            for &at in order {
+                let mut semi = semis[at].clone();
+                semi.children.insert(0, op);
+                op = semi;
+            }
+            op
+        };
+        if semis.len() < 2 || semis.len() > 4 {
+            let order: Vec<usize> = (0..semis.len()).collect();
+            return build(relation, &order, &semis);
+        }
+        fn permutations(items: Vec<usize>) -> Vec<Vec<usize>> {
+            if items.len() <= 1 {
+                return vec![items];
+            }
+            let mut result = Vec::new();
+            for at in 0..items.len() {
+                let mut rest = items.clone();
+                let first = rest.remove(at);
+                for mut tail in permutations(rest) {
+                    tail.insert(0, first);
+                    result.push(tail);
+                }
+            }
+            result
+        }
+        let right_rows: Vec<f64> = semis.iter().map(|semi| self.stats(&semi.children[0]).cardinality).collect();
+        let mut best: Option<(f64, f64, Vec<usize>)> = None;
+        for order in permutations((0..semis.len()).collect()) {
+            let mut cost = 0.0;
+            for depth in 1..=order.len() {
+                cost += self.stats(&build(relation.clone(), &order[..depth], &semis)).cardinality;
+            }
+            let right = right_rows[*order.last().expect("two or more")];
+            let better = match &best {
+                None => true,
+                Some((best_cost, best_right, _)) => cost < *best_cost || (cost == *best_cost && right > *best_right),
+            };
+            if better {
+                best = Some((cost, right, order));
+            }
+        }
+        let (_, _, order) = best.expect("two or more");
+        build(relation, &order, &semis)
+    }
+
     fn reorder(&mut self, op: LogicalOperator) -> LogicalOperator {
         let mut relations = Vec::new();
         let mut conjuncts = Vec::new();
@@ -1102,11 +2272,13 @@ impl JoinOrderOptimizer {
             })
             .collect();
         // innermost first, as they were
-        for (columns, mut semi) in semis.into_iter().rev() {
-            let at = relation_of[&columns[0]];
+        let mut stacks: Vec<Vec<LogicalOperator>> = (0..relations.len()).map(|_| Vec::new()).collect();
+        for (columns, semi) in semis.into_iter().rev() {
+            stacks[relation_of[&columns[0]]].push(semi);
+        }
+        for (at, stack) in stacks.into_iter().enumerate() {
             let relation = std::mem::replace(&mut relations[at], LogicalOperator::new(K::CrossProduct, Vec::new()));
-            semi.children.insert(0, relation);
-            relations[at] = semi;
+            relations[at] = self.stack_semis(relation, stack);
         }
         let stats: Vec<RelationStats> = relations.iter().map(|r| self.stats(r)).collect();
         let mut estimator = Estimator::new(&stats, &predicates, &relation_of);
@@ -1217,7 +2389,8 @@ fn conjunct_rows(cardinality: f64, conjunct: &BoundExpr, child: &RelationStats) 
             if cardinality <= 0.0 {
                 return (0.0, true);
             }
-            match child.distinct.get(&column) {
+            let stats = child.column(&column);
+            match (stats.total.source != CountSource::Cardinality).then_some(stats.current.count) {
                 None => (
                     filter_fraction(
                         cardinality,
@@ -1229,8 +2402,8 @@ fn conjunct_rows(cardinality: f64, conjunct: &BoundExpr, child: &RelationStats) 
                     ),
                     true,
                 ),
-                Some(distinct) => {
-                    let domain = distinct.min(cardinality);
+                Some(current) => {
+                    let domain = current.min(cardinality);
                     if domain <= 0.0 {
                         return (cardinality, false);
                     }
@@ -1246,6 +2419,254 @@ fn conjunct_rows(cardinality: f64, conjunct: &BoundExpr, child: &RelationStats) 
     }
 }
 
+/// `IntegerRangeEstimate`: the values of an integer column of at most 64 bits the range comparisons
+/// with constants of one filter leave of those between its minimum and its maximum.
+#[derive(Default)]
+struct IntegerRange {
+    bounds: Option<(i128, i128, i128)>,
+}
+
+impl IntegerRange {
+    /// `AddBound`: false where the comparison says nothing of the range.
+    fn add_bound(&mut self, op: ComparisonOp, constant: &Value, ty: &LogicalType, column: &ColumnStatistics) -> bool {
+        use duckrs_common::types::LogicalTypeId as T;
+        if constant.is_null()
+            || constant.logical_type() != ty
+            || !matches!(
+                ty.id(),
+                T::TinyInt | T::SmallInt | T::Integer | T::BigInt | T::UTinyInt | T::USmallInt | T::UInteger | T::UBigInt
+            )
+        {
+            return false;
+        }
+        let (Some(min), Some(max)) = (column.min.as_ref().and_then(Value::as_i128), column.max.as_ref().and_then(Value::as_i128))
+        else {
+            return false;
+        };
+        let Some(value) = constant.as_i128() else {
+            return false;
+        };
+        if self.bounds.is_none() {
+            if min > max {
+                return false;
+            }
+            // a complete 64-bit interval has 2^64 values
+            self.bounds = Some((min, max, max - min + 1));
+        }
+        let (lower, upper, _) = self.bounds.as_mut().expect("just set");
+        match op {
+            ComparisonOp::LessThan => *upper = (*upper).min(value - 1),
+            ComparisonOp::LessThanOrEqual => *upper = (*upper).min(value),
+            ComparisonOp::GreaterThan => *lower = (*lower).max(value + 1),
+            ComparisonOp::GreaterThanOrEqual => *lower = (*lower).max(value),
+            _ => return false,
+        }
+        true
+    }
+
+    /// `Fraction`.
+    fn fraction(&self) -> Option<f64> {
+        let (lower, upper, count) = self.bounds?;
+        Some((upper - lower + 1).max(0) as f64 / count as f64)
+    }
+}
+
+/// `ExpressionFilter::CheckExpressionStatistics` of a filter on a column with `column` statistics.
+#[derive(PartialEq)]
+enum FilterPropagate {
+    NoPruning,
+    AlwaysTrue,
+    TrueOrNull,
+    AlwaysFalse,
+}
+
+fn check_filter_statistics(filter: &BoundExpr, column: &ColumnStatistics) -> FilterPropagate {
+    match &filter.kind {
+        BoundExprKind::Operator { op, children } if children.len() == 1 && strict_column(&children[0]).is_some() => {
+            let (null, valid) = (column.can_be_null, column.can_be_valid);
+            match (op, null, valid) {
+                (BoundOperator::IsNull, false, _) | (BoundOperator::IsNotNull, _, false) => FilterPropagate::AlwaysFalse,
+                (BoundOperator::IsNull, true, false) | (BoundOperator::IsNotNull, false, true) => FilterPropagate::AlwaysTrue,
+                _ => FilterPropagate::NoPruning,
+            }
+        }
+        BoundExprKind::Comparison { op, left, right } => {
+            let (op, constant) = match (strict_column(left), &right.kind, strict_column(right), &left.kind) {
+                (Some(_), BoundExprKind::Constant(value), _, _) => (*op, (value, &right.return_type)),
+                (_, _, Some(_), BoundExprKind::Constant(value)) => (flip(*op), (value, &left.return_type)),
+                _ => return FilterPropagate::NoPruning,
+            };
+            if constant.0.is_null() || matches!(op, ComparisonOp::DistinctFrom | ComparisonOp::NotDistinctFrom) {
+                return FilterPropagate::NoPruning;
+            }
+            if !column.can_be_valid {
+                return FilterPropagate::AlwaysFalse;
+            }
+            // `CheckComparisonStatistics`: with NULLs only an answer of false stands
+            match super::statistics::decide_with_constant(op, column, constant.0, constant.1) {
+                Some(false) => FilterPropagate::AlwaysFalse,
+                Some(true) if !column.can_be_null => FilterPropagate::AlwaysTrue,
+                _ => FilterPropagate::NoPruning,
+            }
+        }
+        _ => FilterPropagate::NoPruning,
+    }
+}
+
+/// `FilterColumn`: the column `expr` is, itself.
+fn strict_column(expr: &BoundExpr) -> Option<ColumnBinding> {
+    match &expr.kind {
+        BoundExprKind::ColumnRef { binding, depth: 0 } => Some(*binding),
+        _ => None,
+    }
+}
+
+fn flip(op: ComparisonOp) -> ComparisonOp {
+    match op {
+        ComparisonOp::LessThan => ComparisonOp::GreaterThan,
+        ComparisonOp::LessThanOrEqual => ComparisonOp::GreaterThanOrEqual,
+        ComparisonOp::GreaterThan => ComparisonOp::LessThan,
+        ComparisonOp::GreaterThanOrEqual => ComparisonOp::LessThanOrEqual,
+        other => other,
+    }
+}
+
+/// `EstimateFilterRows` with the statistics of the scanned column and its integer range.
+fn scan_conjunct_rows(
+    cardinality: f64,
+    conjunct: &BoundExpr,
+    child: &RelationStats,
+    column: Option<(&ColumnStatistics, &LogicalType)>,
+    range: &mut IntegerRange,
+) -> (f64, bool) {
+    // a BETWEEN is its two bounds, as `GenerateTableScanFilters` pushes them
+    if let BoundExprKind::Between { input, lower, upper } = &conjunct.kind {
+        let bound = |op: ComparisonOp, value: &BoundExpr| {
+            BoundExpr::new(
+                BoundExprKind::Comparison {
+                    op,
+                    left: input.clone(),
+                    right: Box::new(value.clone()),
+                },
+                LogicalType::BOOLEAN,
+            )
+        };
+        let both = BoundExpr::new(
+            BoundExprKind::Conjunction {
+                and: true,
+                children: vec![bound(ComparisonOp::GreaterThanOrEqual, lower), bound(ComparisonOp::LessThanOrEqual, upper)],
+            },
+            LogicalType::BOOLEAN,
+        );
+        return scan_conjunct_rows(cardinality, &both, child, column, range);
+    }
+    if let BoundExprKind::Conjunction { and: true, children } = &conjunct.kind {
+        let mut result = (cardinality, true);
+        for child_expr in children {
+            let (rows, modeled) = scan_conjunct_rows(cardinality, child_expr, child, column, range);
+            result = (result.0.min(rows), result.1 && modeled);
+        }
+        return result;
+    }
+    let mut pruning = FilterPropagate::NoPruning;
+    if let Some((statistics, _)) = column {
+        pruning = check_filter_statistics(conjunct, statistics);
+        match pruning {
+            FilterPropagate::AlwaysTrue => return (cardinality, true),
+            FilterPropagate::AlwaysFalse => return (0.0, true),
+            _ => {}
+        }
+    }
+    let BoundExprKind::Comparison { op, left, right } = &conjunct.kind else {
+        return conjunct_rows(cardinality, conjunct, child);
+    };
+    // `EstimateComparisonRows`
+    let (op, value) = match (strict_column(left), strict_column(right)) {
+        (Some(_), _) => (*op, right),
+        (None, Some(_)) => (flip(*op), left),
+        _ => return (cardinality, false),
+    };
+    let BoundExprKind::Constant(constant) = &value.kind else {
+        return (cardinality, false);
+    };
+    if constant.is_null() {
+        return match op {
+            ComparisonOp::NotDistinctFrom => (filter_fraction(cardinality, DEFAULT_SELECTIVITY), true),
+            ComparisonOp::DistinctFrom => (filter_fraction(cardinality, 1.0 - DEFAULT_SELECTIVITY), true),
+            _ => (0.0, true),
+        };
+    }
+    if pruning == FilterPropagate::TrueOrNull && !matches!(op, ComparisonOp::DistinctFrom | ComparisonOp::NotDistinctFrom) {
+        return (filter_fraction(cardinality, 1.0 - DEFAULT_SELECTIVITY), true);
+    }
+    match op {
+        ComparisonOp::LessThan | ComparisonOp::LessThanOrEqual | ComparisonOp::GreaterThan | ComparisonOp::GreaterThanOrEqual => {
+            if let Some((statistics, ty)) = column
+                && range.add_bound(op, constant, ty, statistics)
+            {
+                return (cardinality, true);
+            }
+            (filter_fraction(cardinality, DEFAULT_SELECTIVITY), true)
+        }
+        _ => conjunct_rows(cardinality, conjunct, child),
+    }
+}
+
+/// `ExtractGetStats`: the rows the filters of a scan leave, each estimated with the statistics of
+/// its column, and the range comparisons on one column together.
+fn scan_filter_cardinality(
+    table: &Arc<TableCatalogEntry>,
+    table_index: usize,
+    column_ids: &[usize],
+    filters: &[BoundExpr],
+    stats: &RelationStats,
+) -> f64 {
+    let base = stats.cardinality;
+    let statistics = super::statistics::table_statistics(table);
+    // the filters of each column, in the order of their first
+    let mut groups: Vec<(Option<usize>, Vec<&BoundExpr>)> = Vec::new();
+    for filter in filters {
+        fn first_column(expr: &BoundExpr, table_index: usize) -> Option<usize> {
+            match &expr.kind {
+                BoundExprKind::ColumnRef { binding, depth: 0 } if binding.table_index == table_index => {
+                    Some(binding.column_index)
+                }
+                _ => expr.children().into_iter().find_map(|child| first_column(child, table_index)),
+            }
+        }
+        let position = first_column(filter, table_index);
+        match groups.iter_mut().find(|(at, _)| *at == position) {
+            Some((_, members)) => members.push(filter),
+            None => groups.push((position, vec![filter])),
+        }
+    }
+    let mut cardinality = base;
+    let mut supported = true;
+    for (position, members) in groups {
+        let column = position.and_then(|at| column_ids.get(at)).copied().filter(|&c| c != COLUMN_IDENTIFIER_ROW_ID);
+        let column_stats = column.and_then(|c| Some((statistics.as_ref()?.get(c)?, &table.columns.get(c)?.ty)));
+        let mut range = IntegerRange::default();
+        for filter in members {
+            let (rows, modeled) = scan_conjunct_rows(base, filter, stats, column_stats, &mut range);
+            cardinality = cardinality.min(rows);
+            supported &= modeled;
+        }
+        // intersect the bounds on one column before the floor of the default selectivity
+        if let Some(fraction) = range.fraction() {
+            let rows = if fraction == 0.0 {
+                0.0
+            } else {
+                filter_fraction(base, fraction.max(DEFAULT_SELECTIVITY))
+            };
+            cardinality = cardinality.min(rows);
+        }
+    }
+    if !supported {
+        cardinality = cardinality.min(filter_fraction(base, DEFAULT_SELECTIVITY));
+    }
+    cardinality
+}
+
 /// How many rows filters leave of `child` (`EstimateFilterRows` and `ApplyFilterEstimate`): the
 /// smallest estimate of a conjunct, and the default selectivity when one is not modeled.
 fn filter_cardinality(expressions: &[BoundExpr], child: &RelationStats) -> f64 {
@@ -1256,7 +2677,7 @@ fn filter_cardinality(expressions: &[BoundExpr], child: &RelationStats) -> f64 {
     let mut cardinality = child.cardinality;
     let mut supported = true;
     for conjunct in &conjuncts {
-        let (rows, modeled) = conjunct_rows(child.cardinality, conjunct, child);
+        let (rows, modeled) = scan_conjunct_rows(child.cardinality, conjunct, child, None, &mut IntegerRange::default());
         cardinality = cardinality.min(rows);
         supported &= modeled;
     }
@@ -1281,10 +2702,38 @@ fn estimate(op: &LogicalOperator, optimizer: &mut JoinOrderOptimizer) -> PlanEst
             optimizer.note_delim(op);
         }
     }
+    // the recursive part, a round of it over the rows of the anchor, as a second child
+    if let K::RecursiveCte {
+        working, unresolved, ..
+    } = &op.kind
+    {
+        let anchor = optimizer.stats(&op.children[0]);
+        let mut inner = optimizer.clone();
+        inner.ctes.insert(
+            Arc::as_ptr(working) as *const () as usize,
+            (op.children[0].column_bindings(), anchor),
+        );
+        children.push(estimate(unresolved, &mut inner));
+    }
     PlanEstimate {
-        cardinality: optimizer.stats(op).cardinality.max(0.0).round() as u64,
+        // `CardinalityFromDouble`: truncated, and a row for what is not nothing
+        cardinality: {
+            let rows = optimizer.stats(op).cardinality.max(0.0);
+            if rows > 0.0 { rows.floor().max(1.0) as u64 } else { 0 }
+        },
         children,
     }
+}
+
+/// The estimated rows of one operator (`estimated_cardinality`), truncated as C++ keeps them.
+pub fn estimated_cardinality(op: &LogicalOperator) -> u64 {
+    let rows = JoinOrderOptimizer::default().stats(op).cardinality.max(0.0);
+    if rows > 0.0 { rows.floor().max(1.0) as u64 } else { 0 }
+}
+
+/// `RelationStatsExtractor::Extract`: the statistics of the rows of `op`.
+pub(super) fn relation_stats(op: &LogicalOperator) -> RelationStats {
+    JoinOrderOptimizer::default().stats(op)
 }
 
 /// `LogicalOperator::EstimateCardinality` for all operators of a plan.

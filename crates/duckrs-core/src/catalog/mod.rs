@@ -22,6 +22,7 @@ pub mod default_types;
 pub mod defaults;
 mod defaults_table;
 mod fork;
+pub(crate) use fork::failed_commit;
 mod row_ids;
 pub mod trigger;
 pub use fork::{CatalogVersions, Fork, RowVersions, TableOrigin, tick};
@@ -98,6 +99,8 @@ pub struct ColumnDefinition {
     pub not_null: bool,
     /// The default as it was written.
     pub default_text: Option<String>,
+    /// What `COMMENT ON COLUMN` said.
+    pub comment: Option<String>,
 }
 
 /// A generated column: not stored, only an expression over the other columns.
@@ -129,6 +132,7 @@ impl ColumnDefinition {
             default_value: None,
             not_null: false,
             default_text: None,
+            comment: None,
         }
     }
 }
@@ -167,6 +171,24 @@ pub trait TableSource: std::fmt::Debug + Send + Sync {
     /// `pragma_storage_info`: the segments, in the order that C++ lists them. Reading what fills
     /// `segment_info` takes their blocks, so that is only done on request.
     fn segments(&self, include_info: bool) -> Result<Vec<SegmentInfo>>;
+    /// Of the row group from `row_start` with `rows` rows as it is stored, how a VARIANT column of it is shredded:
+    /// the type of its typed part, or `None` when it is not; `None` when there is no such row group.
+    fn variant_shredding(&self, _row_start: u64, _rows: usize, _column: usize) -> Option<Option<LogicalType>> {
+        None
+    }
+    /// Of a row group, the field at `keys` of the VARIANT `column`, as `variant_extract` gives it, read from the
+    /// typed part where every value of it is there (`PushdownShreddedFieldExtract`); `None` where it is not.
+    fn variant_field(&self, _group: usize, _column: usize, _keys: &[String]) -> Result<Option<Vector>> {
+        Ok(None)
+    }
+    /// Whether row group `group` stores the VARIANT `column` shredded.
+    fn variant_group_shredded(&self, _group: usize, _column: usize) -> bool {
+        false
+    }
+    /// [`Self::variant_shredding`] of each row group and each of `columns`.
+    fn all_variant_shredding(&self, _columns: &[usize]) -> HashMap<(u64, usize, usize), Option<LogicalType>> {
+        HashMap::new()
+    }
 }
 
 /// A row of `pragma_storage_info`.
@@ -321,6 +343,8 @@ pub struct TableLog {
 #[derive(Debug)]
 pub struct TableCatalogEntry {
     pub schema: String,
+    /// the name of the catalog (database) of its schema
+    pub catalog: String,
     pub name: String,
     /// The columns that are stored.
     pub columns: Vec<ColumnDefinition>,
@@ -332,6 +356,9 @@ pub struct TableCatalogEntry {
     source: RwLock<Option<Arc<dyn TableSource>>>,
     /// Where they still are too if they were only read from there, for what looks at the file.
     read_from: RwLock<Option<Arc<dyn TableSource>>>,
+    /// How the last checkpoint shredded the VARIANT columns of the row groups it wrote, by the row group's first
+    /// row id, its rows and the column: the type of the typed part, or `None` when not shredded.
+    pub variant_shredding: Mutex<HashMap<(u64, usize, usize), Option<LogicalType>>>,
     /// Beyond the NOT NULLs, which are in `columns`.
     pub constraints: Vec<TableConstraint>,
     /// What the write-ahead log knows of the rows.
@@ -352,9 +379,20 @@ pub struct TableCatalogEntry {
     rewrites: std::sync::atomic::AtomicU64,
     /// What this is a copy of, for a transaction.
     origin: Option<TableOrigin>,
+    /// The committed rows that a transaction deleted before it added a DEFERRED key, whose keys its
+    /// commit still sees: C++ has them in no delete index of that key (a FIXME of its tests)
+    pub deleted_before_key: Mutex<Option<ColumnDataCollection>>,
     /// Which row is which. Rows added at the end are in here once somebody asks.
     row_ids: Mutex<Arc<RowIds>>,
     versions: Arc<Mutex<RowVersions>>,
+    /// What `COMMENT ON TABLE` said.
+    pub comment: Mutex<Option<String>>,
+    /// made by CREATE TABLE AS, whose columns depend on no type (`BindCreateTableInfo` registers
+    /// the types of the columns only when there is no query)
+    pub from_query: std::sync::atomic::AtomicBool,
+    /// `HasUnloadedDeletes`: the file had deleted rows when the database was opened, which nothing of this
+    /// process has loaded since (by deleting rows or checkpointing)
+    pub unloaded_deletes: std::sync::atomic::AtomicBool,
 }
 
 /// The statistics of a table's columns, if they are up to date. Working them out takes a scan, and
@@ -423,6 +461,14 @@ pub struct ColumnZone {
     pub has_null: bool,
     /// the bounds could not be worked out
     pub unknown: bool,
+    /// of strings, the fewest and most bytes of the values that are not NULL, if known
+    pub lengths: Option<(u64, u64)>,
+    /// of strings, whether a value has a character beyond ASCII (then its length in characters is
+    /// less than in bytes)
+    pub has_unicode: bool,
+    /// of a LIST or ARRAY, the zone of its elements, and of a MAP of its values (`ListStats` /
+    /// `ArrayStats` child statistics)
+    pub elements: Option<Box<ColumnZone>>,
 }
 
 /// How many rows a table has and how many distinct values each column holds, approximately.
@@ -448,6 +494,21 @@ pub struct ColumnStatistics {
     pub strings: Option<StringStatistics>,
     /// `distinct_count`: the approximate number of distinct values of a table's column, if known
     pub distinct: Option<u64>,
+    /// of a LIST or ARRAY its element's (`ListStats` / `ArrayStats`), of a STRUCT each field's
+    /// (`StructStats`); empty when not known
+    pub children: Vec<ColumnStatistics>,
+    /// of a VARIANT, how it is shredded (`VariantStats`); `None` when not known (`INCONSISTENT`)
+    pub variant: Option<Box<VariantStatistics>>,
+}
+
+/// `VariantStatsShreddingState`, with the type of the typed part of a shredded VARIANT and its statistics.
+#[derive(Debug, Clone)]
+pub enum VariantStatistics {
+    /// what a checkpoint that shredded nothing leaves
+    Uninitialized,
+    NotShredded,
+    Shredded(LogicalType, ColumnStatistics),
+    Inconsistent,
 }
 
 /// `StringStatsData`: what is known of the strings of a column besides their bounds.
@@ -556,6 +617,8 @@ pub struct TableKey {
     pub expressions: Option<Vec<BoundExpr>>,
     pub names: Vec<String>,
     pub primary_key: bool,
+    /// checked when committing (`ConstraintCheckMode::DEFERRED`)
+    pub deferred: bool,
 }
 
 pub use crate::execution::art::tree::UniqueKeys;
@@ -572,8 +635,15 @@ pub enum TableConstraint {
     Unique {
         columns: Vec<usize>,
         primary_key: bool,
+        /// written on the column (`UniqueConstraint::HasIndex`), which is how its SQL shows it
+        column_level: bool,
+        /// a DEFERRED key holds at commit, not after each statement
+        check_mode: duckrs_parser::ast::ConstraintCheckMode,
     },
     ForeignKey(ForeignKey),
+    /// `NotNullConstraint` of the column at this index, at its place among the others: the
+    /// column's `not_null` says the same
+    NotNull(usize),
 }
 
 /// A foreign key, on the table that has it. `columns` match `referenced_columns` one by one,
@@ -604,6 +674,15 @@ impl ReferencedTable {
 }
 
 impl TableCatalogEntry {
+    /// `GetQualifiedName(...).ToString()`: the catalog, the schema and the name; a temporary table
+    /// is in the schema `main` of the catalog `temp`.
+    pub fn qualified_name(&self) -> String {
+        if self.schema == TEMP_SCHEMA {
+            return format!("{TEMP_SCHEMA}.main.{}", self.name);
+        }
+        format!("{}.{}.{}", self.catalog, self.schema, self.name)
+    }
+
     pub fn new(
         schema: String,
         name: String,
@@ -613,12 +692,14 @@ impl TableCatalogEntry {
     ) -> Self {
         Self {
             schema,
+            catalog: DEFAULT_CATALOG.to_string(),
             name,
             columns,
             generated: Vec::new(),
             storage: RwLock::new(rows),
             source: RwLock::default(),
             read_from: RwLock::default(),
+            variant_shredding: Mutex::default(),
             log: Mutex::default(),
             constraints,
             referenced_by: Mutex::default(),
@@ -628,9 +709,13 @@ impl TableCatalogEntry {
             index_trees: Mutex::default(),
             rewrites: Default::default(),
             origin: None,
+            deleted_before_key: Mutex::default(),
             row_ids: Mutex::default(),
             versions: Arc::default(),
             row_group_rows: std::sync::atomic::AtomicUsize::new(ROW_GROUP_ROWS),
+            from_query: std::sync::atomic::AtomicBool::new(false),
+            unloaded_deletes: std::sync::atomic::AtomicBool::new(false),
+            comment: Mutex::new(None),
         }
     }
 
@@ -657,6 +742,12 @@ impl TableCatalogEntry {
 
     pub fn set_source(&self, source: Arc<dyn TableSource>) {
         self.set_row_ids(source.row_ids());
+        let variants: Vec<usize> = (0..self.columns.len())
+            .filter(|&c| self.columns[c].ty.id() == LogicalTypeId::Variant)
+            .collect();
+        if !variants.is_empty() {
+            *self.variant_shredding.lock() = source.all_variant_shredding(&variants);
+        }
         *self.source.write() = Some(source);
     }
 
@@ -680,6 +771,7 @@ impl TableCatalogEntry {
 
     /// A checkpoint put the rows in a file: what is in memory of them goes.
     pub fn leave_in_file(&self, source: Arc<dyn TableSource>) {
+        self.unloaded_deletes.store(false, std::sync::atomic::Ordering::Relaxed);
         let types = self.types();
         let ids = source.row_ids();
         let old = self.row_ids(self.row_count());
@@ -734,6 +826,19 @@ impl TableCatalogEntry {
         self.rewrites.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Whether a PRIMARY KEY or UNIQUE of the table is DEFERRED, which a commit checks.
+    pub fn has_deferred_keys(&self) -> bool {
+        self.constraints.iter().any(|constraint| {
+            matches!(
+                constraint,
+                TableConstraint::Unique {
+                    check_mode: duckrs_parser::ast::ConstraintCheckMode::Deferred,
+                    ..
+                }
+            )
+        })
+    }
+
     /// All that can have a tree, in the order that a scan tries them: the keys of constraints and
     /// then the indexes, as `TableIndexList` has them.
     pub fn scan_keys(&self) -> Vec<TableKey> {
@@ -744,13 +849,14 @@ impl TableCatalogEntry {
                 let columns = match constraint {
                     TableConstraint::Unique { columns, .. } => columns,
                     TableConstraint::ForeignKey(foreign) => &foreign.columns,
-                    TableConstraint::Check { .. } => return None,
+                    TableConstraint::Check { .. } | TableConstraint::NotNull(_) => return None,
                 };
                 Some(TableKey {
                     columns: columns.clone(),
                     expressions: None,
                     names: columns.iter().map(|c| self.columns[*c].name.clone()).collect(),
                     primary_key: false,
+                    deferred: false,
                 })
             })
             .collect();
@@ -759,6 +865,7 @@ impl TableCatalogEntry {
             expressions: Some(index.expressions.clone()),
             names: index.names.clone(),
             primary_key: false,
+            deferred: false,
         }));
         keys
     }
@@ -811,7 +918,7 @@ impl TableCatalogEntry {
             }
         }
         let keyed = self.constraints.iter().any(|constraint| match constraint {
-            TableConstraint::Check { .. } => false,
+            TableConstraint::Check { .. } | TableConstraint::NotNull(_) => false,
             TableConstraint::Unique { columns: keys, .. } => keys.iter().any(|c| columns.contains(c)),
             TableConstraint::ForeignKey(key) => key.columns.iter().any(|c| columns.contains(c)),
         });
@@ -903,11 +1010,17 @@ impl TableCatalogEntry {
             .constraints
             .iter()
             .filter_map(|constraint| match constraint {
-                TableConstraint::Unique { columns, primary_key } => Some(TableKey {
+                TableConstraint::Unique {
+                    columns,
+                    primary_key,
+                    check_mode,
+                    ..
+                } => Some(TableKey {
                     columns: columns.clone(),
                     expressions: None,
                     names: columns.iter().map(|c| self.columns[*c].name.clone()).collect(),
                     primary_key: *primary_key,
+                    deferred: *check_mode == duckrs_parser::ast::ConstraintCheckMode::Deferred,
                 }),
                 _ => None,
             })
@@ -922,6 +1035,7 @@ impl TableCatalogEntry {
                     expressions: Some(index.expressions.clone()),
                     names: index.names.clone(),
                     primary_key: false,
+                    deferred: false,
                 }),
         );
         keys
@@ -958,7 +1072,7 @@ impl TableCatalogEntry {
 }
 
 /// A view (`ViewCatalogEntry`): a query, bound anew each time the view is read.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ViewCatalogEntry {
     pub schema: String,
     pub name: String,
@@ -967,6 +1081,12 @@ pub struct ViewCatalogEntry {
     pub aliases: Vec<String>,
     /// with `enable_view_dependencies`, the tables and views (schema and name) it reads
     pub dependencies: Vec<(String, String)>,
+    /// What `COMMENT ON VIEW` said.
+    pub comment: Option<String>,
+    /// What `COMMENT ON COLUMN` said of its columns, by name.
+    pub column_comments: Vec<(String, String)>,
+    /// `ViewSecurityType::SECURE_VIEW`: the optimizer pushes nothing into it
+    pub secure: bool,
 }
 
 impl ViewCatalogEntry {
@@ -979,7 +1099,7 @@ impl ViewCatalogEntry {
 
     /// `ViewCatalogEntry::ToSQL`.
     pub fn to_sql(&self) -> String {
-        let mut sql = String::from("CREATE VIEW ");
+        let mut sql = String::from(if self.secure { "CREATE SECURE VIEW " } else { "CREATE VIEW " });
         if !self.schema.eq_ignore_ascii_case(DEFAULT_SCHEMA) {
             sql += &sql_identifier(&self.schema);
             sql.push('.');
@@ -994,11 +1114,13 @@ impl ViewCatalogEntry {
 }
 
 /// A macro with its overloads (`ScalarMacroCatalogEntry`, `TableMacroCatalogEntry`).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MacroCatalogEntry {
     pub name: String,
     pub table_macro: bool,
     pub macros: Vec<MacroFunction>,
+    /// What `COMMENT ON MACRO` said.
+    pub comment: Option<String>,
 }
 
 impl MacroCatalogEntry {
@@ -1037,7 +1159,13 @@ pub struct SequenceData {
 #[derive(Debug)]
 pub struct SequenceCatalogEntry {
     pub name: String,
-    data: Mutex<SequenceData>,
+    /// shared with the entry a `COMMENT ON SEQUENCE` replaces it by, whose counter it is
+    data: Arc<Mutex<SequenceData>>,
+    /// `ALTER SEQUENCE ... OWNED BY`: the table or sequence of its schema that owns it, which
+    /// takes it along when dropped (an ownership dependency, not transactional here)
+    owner: Mutex<Option<(&'static str, String)>>,
+    /// What `COMMENT ON SEQUENCE` said.
+    pub comment: Option<String>,
 }
 
 impl SequenceCatalogEntry {
@@ -1184,6 +1312,8 @@ impl TableOrView {
 #[derive(Debug)]
 pub struct SchemaCatalogEntry {
     pub name: String,
+    /// the name of the catalog (database) the schema is in
+    pub catalog: String,
     /// The schemas from the outermost down to this one (`GetSchemaPath`): only the name for a
     /// top-level schema
     pub path: Vec<String>,
@@ -1191,13 +1321,16 @@ pub struct SchemaCatalogEntry {
     sequences: RwLock<BTreeMap<String, Arc<SequenceCatalogEntry>>>,
     /// the scalar macros and the table macros, which can share a name
     macros: [RwLock<BTreeMap<String, Arc<MacroCatalogEntry>>>; 2],
-    /// the types of CREATE TYPE, by name
-    types: RwLock<BTreeMap<String, LogicalType>>,
+    /// the types of CREATE TYPE, by name, with what `COMMENT ON TYPE` said
+    types: RwLock<BTreeMap<String, TypeEntry>>,
     /// the triggers of the tables of the schema, by name
     triggers: RwLock<BTreeMap<String, Arc<TriggerCatalogEntry>>>,
     /// the rows of a row group of the tables of its database (`ROW_GROUP_SIZE`), shared with the catalog
     row_group_rows: Arc<std::sync::atomic::AtomicUsize>,
 }
+
+/// A type of CREATE TYPE, and its comment.
+pub(crate) type TypeEntry = (LogicalType, Option<String>);
 
 /// What to do when an entry being created already exists (`OnCreateConflict`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1237,12 +1370,13 @@ impl SchemaCatalogEntry {
 
     /// The schema at `path`, nested in the one before it if there is one.
     fn at_path(path: Vec<String>) -> Self {
-        Self::at_path_in(path, Arc::new(std::sync::atomic::AtomicUsize::new(ROW_GROUP_ROWS)))
+        Self::at_path_in(path, Arc::new(std::sync::atomic::AtomicUsize::new(ROW_GROUP_ROWS)), TEMP_SCHEMA)
     }
 
-    fn at_path_in(path: Vec<String>, row_group_rows: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+    fn at_path_in(path: Vec<String>, row_group_rows: Arc<std::sync::atomic::AtomicUsize>, catalog: &str) -> Self {
         Self {
             row_group_rows,
+            catalog: catalog.to_string(),
             name: path.last().cloned().unwrap_or_default(),
             path,
             tables: RwLock::new(BTreeMap::new()),
@@ -1254,7 +1388,7 @@ impl SchemaCatalogEntry {
     }
 
     pub fn get_type(&self, name: &str) -> Option<LogicalType> {
-        self.types.read().get(&key(name)).cloned()
+        self.types.read().get(&key(name)).map(|(ty, _)| ty.clone())
     }
 
     /// How an entry names the schema it is in: a nested one by its path, which looks it up as
@@ -1275,7 +1409,7 @@ impl SchemaCatalogEntry {
 
     /// An empty schema at the same place.
     pub(crate) fn empty_like(&self) -> Self {
-        Self::at_path_in(self.path.clone(), self.row_group_rows.clone())
+        Self::at_path_in(self.path.clone(), self.row_group_rows.clone(), &self.catalog)
     }
 
     /// `DuckSchemaEntry::CreateType`.
@@ -1293,13 +1427,36 @@ impl SchemaCatalogEntry {
                 OnCreateConflict::Replace => {}
             }
         }
-        types.insert(key(name), ty);
+        types.insert(key(name), (ty, None));
         Ok(())
+    }
+
+    /// What `COMMENT ON TYPE` said of a type.
+    pub fn type_comment(&self, name: &str) -> Option<String> {
+        self.types
+            .read()
+            .get(&key(name))
+            .and_then(|(_, comment)| comment.clone())
+    }
+
+    /// `COMMENT ON TYPE`: false if there is no such type.
+    pub fn set_type_comment(&self, name: &str, comment: Option<String>) -> bool {
+        match self.types.write().get_mut(&key(name)) {
+            Some(entry) => {
+                entry.1 = comment;
+                true
+            }
+            None => false,
+        }
     }
 
     /// The custom types, by name.
     pub fn type_entries(&self) -> Vec<(String, LogicalType)> {
-        self.types.read().iter().map(|(n, t)| (n.clone(), t.clone())).collect()
+        self.types
+            .read()
+            .iter()
+            .map(|(n, (t, _))| (n.clone(), t.clone()))
+            .collect()
     }
 
     pub fn sequence_entries(&self) -> Vec<Arc<SequenceCatalogEntry>> {
@@ -1412,10 +1569,67 @@ impl SchemaCatalogEntry {
         let mut tables = self.tables.write();
         tables.remove(&key(old_name));
         Self::register_foreign_keys(&tables, &table);
+        let new_name = table.name.clone();
         tables.insert(key(&table.name), TableOrView::Table(table));
+        drop(tables);
+        if !old_name.eq_ignore_ascii_case(&new_name) {
+            self.rename_owner("table", old_name, &new_name);
+        }
+    }
+
+    /// `COMMENT ON VIEW` and `COMMENT ON COLUMN` of a view: the view with these comments takes
+    /// its place. False if there is no such view.
+    pub fn set_view_comments(
+        &self,
+        name: &str,
+        comment: Option<String>,
+        column_comments: Vec<(String, String)>,
+    ) -> bool {
+        let mut tables = self.tables.write();
+        let Some(TableOrView::View(view)) = tables.get(&key(name)) else {
+            return false;
+        };
+        let view = ViewCatalogEntry {
+            comment,
+            column_comments,
+            ..(**view).clone()
+        };
+        tables.insert(key(name), TableOrView::View(Arc::new(view)));
+        true
+    }
+
+    /// `COMMENT ON MACRO`: the macro with the comment takes its place. False if there is none.
+    pub fn set_macro_comment(&self, name: &str, table_macro: bool, comment: Option<String>) -> bool {
+        let mut entries = self.macros[usize::from(table_macro)].write();
+        let Some(entry) = entries.get(&key(name)) else {
+            return false;
+        };
+        let entry = MacroCatalogEntry {
+            comment,
+            ..(**entry).clone()
+        };
+        entries.insert(key(name), Arc::new(entry));
+        true
+    }
+
+    /// `COMMENT ON SEQUENCE`: the sequence with the comment, and its state, takes its place.
+    pub fn set_sequence_comment(&self, name: &str, comment: Option<String>) -> bool {
+        let mut sequences = self.sequences.write();
+        let Some(sequence) = sequences.get(&key(name)) else {
+            return false;
+        };
+        let replacement = SequenceCatalogEntry {
+            name: sequence.name.clone(),
+            data: Arc::clone(&sequence.data),
+            owner: Mutex::new(sequence.owner.lock().clone()),
+            comment,
+        };
+        sequences.insert(key(name), Arc::new(replacement));
+        true
     }
 
     pub fn rename_view(&self, view: &ViewCatalogEntry, new_name: &str) -> Result<()> {
+        let old_name = view.name.clone();
         let mut tables = self.tables.write();
         tables.remove(&key(&view.name));
         let view = ViewCatalogEntry {
@@ -1424,8 +1638,14 @@ impl SchemaCatalogEntry {
             query: view.query.clone(),
             aliases: view.aliases.clone(),
             dependencies: view.dependencies.clone(),
+            comment: view.comment.clone(),
+            column_comments: view.column_comments.clone(),
+            secure: view.secure,
         };
         tables.insert(key(new_name), TableOrView::View(Arc::new(view)));
+        drop(tables);
+        // the sequences it owns stay its own
+        self.rename_owner("view", &old_name, new_name);
         Ok(())
     }
 
@@ -1470,6 +1690,7 @@ impl SchemaCatalogEntry {
             constraints,
         );
         table.generated = generated;
+        table.catalog = self.catalog.clone();
         table.row_group_rows.store(
             self.row_group_rows.load(std::sync::atomic::Ordering::Relaxed),
             std::sync::atomic::Ordering::Relaxed,
@@ -1488,6 +1709,7 @@ impl SchemaCatalogEntry {
         aliases: Vec<String>,
         on_conflict: OnCreateConflict,
         dependencies: Vec<(String, String)>,
+        secure: bool,
     ) -> Result<()> {
         let mut tables = self.tables.write();
         if Self::check_conflict(&tables, name, "View", on_conflict)? {
@@ -1497,6 +1719,9 @@ impl SchemaCatalogEntry {
                 query,
                 aliases,
                 dependencies,
+                comment: None,
+                column_comments: Vec::new(),
+                secure,
             };
             tables.insert(key(name), TableOrView::View(Arc::new(view)));
         }
@@ -1521,6 +1746,9 @@ impl SchemaCatalogEntry {
         }
         Self::check_not_referenced(&tables, existing)?;
         tables.remove(&key(name));
+        drop(tables);
+        // the sequences it owns go with it
+        self.drop_owned(if type_name == "View" { "view" } else { "table" }, name);
         Ok(true)
     }
 
@@ -1591,6 +1819,12 @@ impl SchemaCatalogEntry {
 
     /// `DuckSchemaEntry::CreateSequence`.
     pub fn create_sequence(&self, name: &str, data: SequenceData, on_conflict: OnCreateConflict) -> Result<()> {
+        // replacing drops the sequence first, which the table that owns it keeps from happening
+        if on_conflict == OnCreateConflict::Replace
+            && let Some(owner) = self.owner_of(name)
+        {
+            return Err(entries_in_use(name, "sequence", &[owner]));
+        }
         let mut sequences = self.sequences.write();
         if sequences.contains_key(&key(name)) {
             match on_conflict {
@@ -1606,15 +1840,118 @@ impl SchemaCatalogEntry {
         }
         let sequence = SequenceCatalogEntry {
             name: name.to_string(),
-            data: Mutex::new(data),
+            data: Arc::new(Mutex::new(data)),
+            owner: Mutex::new(None),
+            comment: None,
         };
         sequences.insert(key(name), Arc::new(sequence));
         Ok(())
     }
 
-    /// Drops a sequence, returning whether it existed.
+    /// Drops a sequence, returning whether it existed; the sequences it owns go with it.
     pub fn drop_sequence(&self, name: &str) -> bool {
-        self.sequences.write().remove(&key(name)).is_some()
+        let existed = self.sequences.write().remove(&key(name)).is_some();
+        if existed {
+            self.drop_owned("sequence", name);
+        }
+        existed
+    }
+
+    /// The sequences that `kind` `owner` owns: dropped along with it.
+    fn drop_owned(&self, kind: &str, owner: &str) {
+        let owned: Vec<String> = self
+            .sequences
+            .read()
+            .values()
+            .filter(|s| {
+                s.owner
+                    .lock()
+                    .as_ref()
+                    .is_some_and(|(k, o)| *k == kind && o.eq_ignore_ascii_case(owner))
+            })
+            .map(|s| s.name.clone())
+            .collect();
+        for sequence in owned {
+            self.drop_sequence(&sequence);
+        }
+    }
+
+    /// A renamed table or sequence keeps what it owns.
+    pub fn rename_owner(&self, kind: &str, old_name: &str, new_name: &str) {
+        for sequence in self.sequences.read().values() {
+            let mut owner = sequence.owner.lock();
+            if let Some((k, o)) = owner.as_mut()
+                && *k == kind
+                && o.eq_ignore_ascii_case(old_name)
+            {
+                *o = new_name.to_string();
+            }
+        }
+    }
+
+    /// `CatalogSet::AlterOwnership` + `DependencyManager::AddOwnership`: `owner_name`, a table or
+    /// else a sequence of this schema, comes to own the sequence `name`.
+    pub fn alter_ownership(&self, name: &str, owner_name: &str) -> Result<()> {
+        let dependency = |message: String| Error::new(ErrorKind::Dependency, message);
+        let Some(entry) = self.get_sequence(name) else {
+            return Err(Error::new(ErrorKind::Catalog, "Couldn't change ownership!"));
+        };
+        let owner: (&'static str, String, Option<Arc<SequenceCatalogEntry>>) =
+            match self.tables.read().get(&key(owner_name)) {
+                Some(TableOrView::Table(table)) => ("table", table.name.clone(), None),
+                Some(TableOrView::View(view)) => ("view", view.name.clone(), None),
+                None => match self.get_sequence(owner_name) {
+                    Some(sequence) => ("sequence", sequence.name.clone(), Some(sequence)),
+                    None => {
+                        return Err(Error::new(
+                            ErrorKind::Catalog,
+                            format!("CatalogElement \"{}.{owner_name}\" does not exist!", self.name),
+                        ));
+                    }
+                },
+            };
+        // the owner may not be owned itself
+        if let Some(sequence) = &owner.2
+            && let Some((_, by)) = sequence.owner.lock().as_ref()
+        {
+            return Err(dependency(format!(
+                "{} can not become the owner, it is already owned by {}",
+                sql_quoted_identifier(&owner.1),
+                sql_quoted_identifier(by)
+            )));
+        }
+        // nor may the entry own others
+        if let Some(owned) = self.sequences.read().values().find(|s| {
+            s.owner
+                .lock()
+                .as_ref()
+                .is_some_and(|(k, o)| *k == "sequence" && o.eq_ignore_ascii_case(&entry.name))
+        }) {
+            return Err(dependency(format!(
+                "{} already owns {}. Cannot have circular dependencies",
+                sql_quoted_identifier(&entry.name),
+                sql_quoted_identifier(&owned.name)
+            )));
+        }
+        let mut current = entry.owner.lock();
+        if let Some((kind, by)) = current.as_ref()
+            && !(*kind == owner.0 && by.eq_ignore_ascii_case(&owner.1))
+        {
+            return Err(dependency(format!(
+                "{} is already owned by {}",
+                sql_quoted_identifier(&entry.name),
+                sql_quoted_identifier(by)
+            )));
+        }
+        *current = Some((owner.0, owner.1));
+        Ok(())
+    }
+
+    /// The entry that owns the sequence `name`, as its kind and name, if one does.
+    fn owner_of(&self, name: &str) -> Option<(&'static str, String)> {
+        let sequence = self.get_sequence(name)?;
+        let owner = sequence.owner.lock();
+        owner.clone()
     }
 
     pub fn get_macro(&self, name: &str, table_macro: bool) -> Option<Arc<MacroCatalogEntry>> {
@@ -1646,6 +1983,7 @@ impl SchemaCatalogEntry {
             name: name.to_string(),
             table_macro,
             macros,
+            comment: None,
         };
         entries.insert(key(name), Arc::new(entry));
         Ok(())
@@ -1750,7 +2088,10 @@ impl SchemaCatalogEntry {
             .read()
             .values()
             .filter_map(|entry| match entry {
-                TableOrView::Table(table) if table.columns.iter().any(|c| mentions(&c.ty, &target, name)) => {
+                TableOrView::Table(table)
+                    if !table.from_query.load(std::sync::atomic::Ordering::Relaxed)
+                        && table.columns.iter().any(|c| mentions(&c.ty, &target, name)) =>
+                {
                     Some(table.name.clone())
                 }
                 _ => None,
@@ -1763,14 +2104,37 @@ impl SchemaCatalogEntry {
         if self.get_sequence(name).is_none() {
             return Ok(false);
         }
-        let users = self.tables_using_sequence(name);
+        let mut users: Vec<(&'static str, String)> = self
+            .tables_using_sequence(name)
+            .into_iter()
+            .map(|t| ("table", t))
+            .collect();
+        // the entry that owns it depends on it too
+        if let Some(owner) = self.owner_of(name)
+            && !users
+                .iter()
+                .any(|(k, u)| *k == owner.0 && u.eq_ignore_ascii_case(&owner.1))
+        {
+            users.push(owner);
+        }
         if !users.is_empty() && !cascade {
-            return Err(entry_in_use(name, "sequence", &users));
+            return Err(entries_in_use(name, "sequence", &users));
         }
-        for table in &users {
-            self.drop_entry(table, "Table")?;
+        for (kind, user) in &users {
+            match *kind {
+                "sequence" => {
+                    self.drop_sequence(user);
+                }
+                "view" => {
+                    self.drop_entry(user, "View")?;
+                }
+                _ => {
+                    self.drop_entry(user, "Table")?;
+                }
+            }
         }
-        Ok(self.drop_sequence(name))
+        self.drop_sequence(name);
+        Ok(true)
     }
 
     /// `DROP TYPE`: the tables that use it stop it, or go with it under CASCADE.
@@ -1875,7 +2239,7 @@ struct SchemaEntries {
     tables: BTreeMap<String, TableOrView>,
     sequences: BTreeMap<String, Arc<SequenceCatalogEntry>>,
     macros: [BTreeMap<String, Arc<MacroCatalogEntry>>; 2],
-    types: BTreeMap<String, LogicalType>,
+    types: BTreeMap<String, TypeEntry>,
     triggers: BTreeMap<String, Arc<TriggerCatalogEntry>>,
 }
 
@@ -1889,9 +2253,34 @@ impl Catalog {
         *self.storage_version.write() = Some(version);
     }
 
+    /// `VerifyConstraintCheckModeStorageVersion`: a file before v2.0.0 has no place for IMMEDIATE or
+    /// DEFERRED. The caller leaves out temporary tables.
+    pub fn check_constraint_check_mode(&self, check_mode: duckrs_parser::ast::ConstraintCheckMode) -> Result<()> {
+        if check_mode == duckrs_parser::ast::ConstraintCheckMode::Default {
+            return Ok(());
+        }
+        match self.storage_version() {
+            Some(version) if version < duckrs_common::serializer::StorageVersion::V2_0_0 => Err(Error::new(
+                ErrorKind::Binder,
+                "Explicit constraint check mode is only supported for storage versions v2.0.0 and higher.\nUse an \
+                 in-memory database, or ATTACH with (STORAGE_VERSION 'v2.0.0')",
+            )),
+            _ => Ok(()),
+        }
+    }
+
     /// `CheckTypeIsSupported`: what files before a storage version can't hold.
     pub fn check_column_type(&self, ty: &LogicalType) -> Result<()> {
         use duckrs_common::serializer::StorageVersion;
+        // a TYPE can't be stored, whatever the file
+        let mut has_type = false;
+        each_type(ty, &mut |ty: &LogicalType| has_type |= ty.id() == LogicalTypeId::Type);
+        if has_type {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "A table cannot be created with a 'TYPE' column",
+            ));
+        }
         let Some(version) = self.storage_version() else {
             return Ok(());
         };
@@ -2035,7 +2424,8 @@ impl Catalog {
             row_group_rows: Arc::new(std::sync::atomic::AtomicUsize::new(ROW_GROUP_ROWS)),
         };
         for name in [DEFAULT_SCHEMA, TEMP_SCHEMA] {
-            let schema = SchemaCatalogEntry::at_path_in(vec![name.to_string()], catalog.row_group_rows.clone());
+            let schema =
+                SchemaCatalogEntry::at_path_in(vec![name.to_string()], catalog.row_group_rows.clone(), &catalog.name);
             catalog.schemas.write().insert(key(name), Arc::new(schema));
         }
         catalog
@@ -2087,6 +2477,7 @@ impl Catalog {
             Arc::new(SchemaCatalogEntry::at_path_in(
                 path.to_vec(),
                 self.row_group_rows.clone(),
+                &self.name,
             )),
         );
         Ok(())
@@ -2159,6 +2550,21 @@ impl Catalog {
         SESSION_TEMP.with_borrow(Clone::clone)
     }
 
+    /// The tables with a DEFERRED key, which a commit checks.
+    pub(crate) fn deferred_tables(&self) -> Vec<Arc<TableCatalogEntry>> {
+        let mut found = Vec::new();
+        for schema in self.schema_map().values() {
+            for entry in schema.tables.read().values() {
+                if let TableOrView::Table(table) = entry
+                    && table.has_deferred_keys()
+                {
+                    found.push(table.clone());
+                }
+            }
+        }
+        found
+    }
+
     /// The schemas as the connection on this thread sees them.
     fn schema_map(&self) -> BTreeMap<String, Arc<SchemaCatalogEntry>> {
         let mut schemas = self.schemas.read().clone();
@@ -2215,34 +2621,60 @@ impl Catalog {
         const UNSEEN_PENALTY: f64 = 0.2;
         let searched: Vec<String> = match schema {
             Some(schema) => vec![schema.to_string()],
+            // (the search path ends in the `main` and `pg_catalog` of the system catalog)
             None => [TEMP_SCHEMA]
                 .into_iter()
                 .map(str::to_string)
                 .chain(search_first.map(str::to_string))
                 .chain(search_schemas())
+                .chain(["main".to_string(), "pg_catalog".to_string()])
                 .collect(),
         };
         let schemas = self.schemas();
-        let mut seen: Option<(f64, String)> = None;
-        let mut unseen: Vec<(f64, String)> = Vec::new();
-        for entry in &schemas {
-            let Some((score, similar)) = entry.similar_entry(name) else {
-                continue;
-            };
-            if searched.iter().any(|s| s.eq_ignore_ascii_case(&entry.name)) {
-                if seen.as_ref().is_none_or(|(best, _)| score > *best) {
-                    seen = Some((score, similar));
-                }
-                continue;
-            }
-            let qualified = format!("{}.{similar}", entry.name);
-            match unseen.first().map(|(best, _)| *best) {
-                Some(best) if score < best => {}
-                Some(best) if score > best => unseen = vec![(score, qualified)],
-                _ => unseen.push((score, qualified)),
+        // each schema's most similar entry, and those of the views of the system catalog
+        // (`CatalogSet::SimilarEntry` scores default entries without creating them)
+        let mut candidates: Vec<(String, f64, String)> = schemas
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .similar_entry(name)
+                    .map(|(score, similar)| (entry.name.clone(), score, similar))
+            })
+            .collect();
+        let mut system: Vec<(&str, f64, &str)> = Vec::new();
+        for (view_schema, view, _) in defaults_table_views() {
+            let score = similarity_rating(view, name);
+            match system.iter_mut().find(|(s, ..)| s == view_schema) {
+                Some(best) if score > best.1 => *best = (view_schema, score, view),
+                Some(_) => {}
+                None => system.push((view_schema, score, view)),
             }
         }
-        let best_seen = seen.as_ref().map_or(0.0, |(score, _)| *score);
+        candidates.extend(
+            system
+                .into_iter()
+                .map(|(s, score, v)| (s.to_string(), score, v.to_string())),
+        );
+        // `SimilarEntriesInSchemas`: the best of all, ties kept
+        let mut seen: Vec<(f64, String)> = Vec::new();
+        let mut unseen: Vec<(f64, String)> = Vec::new();
+        for (schema_name, score, similar) in candidates {
+            if score <= 0.0 {
+                continue;
+            }
+            let (list, entry) = if searched.iter().any(|s| s.eq_ignore_ascii_case(&schema_name)) {
+                (&mut seen, similar)
+            } else {
+                (&mut unseen, format!("{schema_name}.{similar}"))
+            };
+            match list.first().map(|(best, _)| *best) {
+                Some(best) if score < best => {}
+                Some(best) if score > best => *list = vec![(score, entry)],
+                _ if list.iter().any(|(_, e)| e == &entry) => {}
+                _ => list.push((score, entry)),
+            }
+        }
+        let best_seen = seen.first().map_or(0.0, |(score, _)| *score);
         let mut suggestions: Vec<String> = match unseen.first() {
             Some((score, _)) if *score == 1.0 || score - UNSEEN_PENALTY > best_seen => {
                 unseen.into_iter().map(|(_, name)| name).collect()
@@ -2327,6 +2759,16 @@ impl Catalog {
 }
 
 /// `DependencyManager::CollectDependents`: why `name` cannot be dropped.
+/// [`entry_in_use`], for dependents of any kind.
+fn entries_in_use(name: &str, kind: &str, dependents: &[(&str, String)]) -> Error {
+    let mut message = format!("Cannot drop entry \"{name}\" because there are entries that depend on it.\n");
+    for (dependent_kind, dependent) in dependents {
+        message += &format!("{dependent_kind} \"{dependent}\" depends on {kind} \"{name}\".\n");
+    }
+    message += "Use DROP...CASCADE to drop all dependents.";
+    Error::new(ErrorKind::Dependency, message)
+}
+
 fn entry_in_use(name: &str, kind: &str, tables: &[String]) -> Error {
     let mut message = format!("Cannot drop entry \"{name}\" because there are entries that depend on it.\n");
     for table in tables {
@@ -2357,6 +2799,11 @@ fn dependency_check(schemas: &BTreeMap<String, Arc<SchemaCatalogEntry>>, schema:
     }
     message += "Use DROP...CASCADE to drop all dependents.";
     Err(Error::new(ErrorKind::Dependency, message))
+}
+
+/// The views of the system catalog: (schema, name, query).
+fn defaults_table_views() -> &'static [(&'static str, &'static str, &'static str)] {
+    defaults_table::VIEWS
 }
 
 /// `CatalogException::MissingEntry`.
@@ -2391,6 +2838,9 @@ mod tests {
                 .is_none()
         );
         let err = catalog.get_table(None, "nope").unwrap_err();
-        assert_eq!(err.to_string(), "Catalog Error: Table with name nope does not exist!");
+        assert_eq!(
+            err.to_string(),
+            "Catalog Error: Table with name nope does not exist!\nDid you mean \"pg_enum\"?"
+        );
     }
 }

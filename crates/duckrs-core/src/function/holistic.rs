@@ -41,6 +41,10 @@ pub enum Holistic {
     /// `TimeTZAverageOperation`: the average instant, at +00.
     AvgTimeTz,
     Entropy,
+    /// `decimal_average`: the average at the input's scale, rounded half to even
+    DecimalAverage,
+    /// `variant_group_object(key, value)`: a VARIANT object of the rows
+    VariantGroupObject,
     ArgMin,
     ArgMax,
     /// `arg_min_null`: the row of the extreme, whether its value is NULL or not
@@ -54,6 +58,9 @@ pub enum Holistic {
     MaxN,
     ArgMinN,
     ArgMaxN,
+    /// `arg_min_nulls_last(x, by, n)`: the rows of NULL keys after all others
+    ArgMinNullsLastN,
+    ArgMaxNullsLastN,
     ApproxTopK,
     BitstringAgg,
     /// `combine_aggr`: a state of the states of its rows
@@ -80,12 +87,76 @@ pub enum Holistic {
     RegrSxx,
     RegrSyy,
     RegrSxy,
+    /// `approx_quantile`: a t-digest of the values ([`super::holistic_states`])
+    ApproxQuantile,
     /// `SortedAggregateFunction` for EXPORT_STATE: the rows of an ordered aggregate, buffered as they arrive, with
     /// their sort keys; they are sorted when the state is finalized
     Sorted,
 }
 
+/// `ApproxQuantileFun::GetFunctions`: the type of the overload `approx_quantile` of an `input` binds to, of one
+/// quantile or of a list of them. The input is cast to it, and the result is of it.
+pub fn approx_quantile_type(input: &LogicalType, list: bool) -> Result<LogicalType> {
+    use LogicalTypeId as L;
+    Ok(match input.id() {
+        L::Decimal => input.clone(),
+        L::TinyInt if list => LogicalType::new(L::TinyInt),
+        L::TinyInt | L::UTinyInt | L::SmallInt => LogicalType::SMALLINT,
+        L::USmallInt | L::Integer => LogicalType::INTEGER,
+        L::UInteger | L::BigInt => LogicalType::BIGINT,
+        L::UBigInt | L::HugeInt => LogicalType::HUGEINT,
+        L::Float if list => LogicalType::FLOAT,
+        L::Float | L::Double | L::SqlNull | L::IntegerLiteral => {
+            if input.id() == L::IntegerLiteral {
+                LogicalType::INTEGER
+            } else {
+                LogicalType::DOUBLE
+            }
+        }
+        L::Date | L::Time | L::TimeTz | L::Timestamp | L::TimestampTz => input.clone(),
+        L::TimeNs | L::TimestampNs | L::TimestampTzNs if !list => input.clone(),
+        // the list overloads have no nanoseconds: the implicit cast to the microsecond types
+        L::TimeNs => LogicalType::TIME,
+        L::TimestampNs => LogicalType::TIMESTAMP,
+        L::TimestampTzNs => LogicalType::new(L::TimestampTz),
+        // `GetApproxQuantileWidenedTimestamp`: the TIMESTAMP implementation, which keeps their range
+        L::TimestampSec | L::TimestampMs => LogicalType::TIMESTAMP,
+        _ => {
+            return Err(Error::new(
+                ErrorKind::Binder,
+                format!(
+                    "No function matches the given name and argument types 'approx_quantile({input}, {})'. You might \
+                     need to add explicit type casts.",
+                    if list { "FLOAT[]" } else { "FLOAT" }
+                ),
+            ));
+        }
+    })
+}
+
 /// The type of `quantile_cont` and `median` of a column of type `input`.
+/// `CanInterpolate`: the numbers, the temporal types and INTERVAL.
+fn can_interpolate(ty: &LogicalType) -> bool {
+    use LogicalTypeId as L;
+    ty.is_integral()
+        || matches!(
+            ty.id(),
+            L::Float
+                | L::Double
+                | L::Decimal
+                | L::Date
+                | L::Timestamp
+                | L::TimestampTz
+                | L::TimestampTzNs
+                | L::TimestampSec
+                | L::TimestampMs
+                | L::TimestampNs
+                | L::Time
+                | L::TimeTz
+                | L::Interval
+        )
+}
+
 fn interpolated_type(input: &LogicalType) -> LogicalType {
     match input.id() {
         LogicalTypeId::Date => LogicalType::TIMESTAMP,
@@ -111,16 +182,19 @@ impl Holistic {
             (Median, Some(ty)) => interpolated_type(ty),
             (QuantileCont, Some(ty)) => quantile(interpolated_type(ty)),
             (QuantileDisc, Some(ty)) => quantile(ty.clone()),
+            (ApproxQuantile, Some(ty)) => quantile(ty.clone()),
             (Histogram | HistogramBins | HistogramExact, Some(ty)) => {
                 LogicalType::map(ty.clone(), LogicalType::UBIGINT)
             }
             (
                 Mode | BitAnd | BitOr | BitXor | ArgMin | ArgMax | ArgMinNull | ArgMaxNull | ArgMinNullsLast
-                | ArgMaxNullsLast | AvgTimestamp | AvgTimeTz,
+                | ArgMaxNullsLast | AvgTimestamp | AvgTimeTz | DecimalAverage,
                 Some(ty),
             ) => ty.clone(),
             (CombineAggr, Some(ty)) => ty.clone(),
-            (MinN | MaxN | ArgMinN | ArgMaxN | ApproxTopK, Some(ty)) => LogicalType::list(ty.clone()),
+            (MinN | MaxN | ArgMinN | ArgMaxN | ArgMinNullsLastN | ArgMaxNullsLastN | ApproxTopK, Some(ty)) => {
+                LogicalType::list(ty.clone())
+            }
             _ => declared.clone(),
         }
     }
@@ -138,6 +212,11 @@ fn number(value: &Value) -> Option<f64> {
         _ if value.logical_type().id() == LogicalTypeId::Decimal => value.try_to_string().ok()?.parse().ok(),
         _ => value.as_i128().map(|v| v as f64),
     }
+}
+
+/// A number of any numeric type, as a double.
+pub(super) fn number_of(value: &Value) -> Option<f64> {
+    number(value)
 }
 
 fn numbers(rows: &[Value]) -> Vec<f64> {
@@ -234,7 +313,9 @@ fn interpolate(lo: &Value, d: f64, hi: &Value, ty: &LogicalType) -> Result<Value
                 (micros % per_day) as i64,
             )))
         }
-        (ValueData::Int64(a), ValueData::Int64(b)) if ty.id() != LogicalTypeId::Double => {
+        (ValueData::Int64(a), ValueData::Int64(b))
+            if !matches!(ty.id(), LogicalTypeId::Double | LogicalTypeId::Decimal) =>
+        {
             if a == b {
                 return Ok(lo.clone());
             }
@@ -260,7 +341,23 @@ fn interpolate(lo: &Value, d: f64, hi: &Value, ty: &LogicalType) -> Result<Value
                 return Ok(lo.clone());
             };
             let (width, scale) = ty.decimal_properties().expect("a DECIMAL");
+            // a DECIMAL stored as a HUGEINT interpolates as one, from its exact difference
+            if ty.physical_type() == duckrs_common::types::PhysicalType::Int128
+                && let Some(value) = b.checked_sub(a).and_then(|delta| a.checked_add((delta as f64 * d) as i128))
+            {
+                return Value::decimal(value, width, scale);
+            }
             Value::decimal((a as f64 + (b as f64 - a as f64) * d) as i128, width, scale)
+        }
+        // `InterpolateOperator::Operation(hugeint_t)`: the offset from the exact difference, truncated
+        _ if ty.id() == LogicalTypeId::HugeInt
+            && let (Some(a), Some(b)) = (lo.as_i128(), hi.as_i128()) =>
+        {
+            let value = b
+                .checked_sub(a)
+                .and_then(|delta| a.checked_add((delta as f64 * d) as i128))
+                .unwrap_or((a as f64 + (b as f64 - a as f64) * d) as i128);
+            Value::new(ty.clone(), ValueData::Int128(value))
         }
         _ => {
             let (Some(a), Some(b)) = (number(lo), number(hi)) else {
@@ -621,6 +718,12 @@ fn arg_extreme_nulls(rows: &[Value], ty: &LogicalType, greatest: bool, nulls_las
 }
 
 fn positive_n(value: &Value, name: &str) -> Result<usize> {
+    if value.is_null() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("Invalid input for {name}: n value cannot be NULL"),
+        ));
+    }
     let n = value.as_i128().unwrap_or(0);
     if n <= 0 {
         return Err(Error::new(
@@ -647,19 +750,45 @@ fn extremes(rows: &[Value], ty: &LogicalType, greatest: bool, value: usize, key:
     let n = positive_n(&fields(first)[count], name)?;
     let by: Vec<Value> = chosen.iter().map(|row| fields(row)[key].clone()).collect();
     let keys = sort_keys(&by, fields(first)[key].logical_type())?;
-    let mut order: Vec<usize> = (0..keys.len()).collect();
-    order.sort_by(|a, b| {
+    // C++ keeps a heap of the n rows: ties come out in the heap's order.
+    let order = super::std_heap::top_n(keys.len(), n, |a, b| {
         if greatest {
-            keys[*b].cmp(&keys[*a])
+            keys[*a] > keys[*b]
         } else {
-            keys[*a].cmp(&keys[*b])
+            keys[*a] < keys[*b]
         }
     });
     let items = order
         .into_iter()
-        .take(n)
         .map(|at| fields(chosen[at])[value].clone())
         .collect();
+    Value::new(ty.clone(), ValueData::List(items))
+}
+
+/// `arg_min_nulls_last(x, by, n)` and `arg_max_nulls_last`: the n rows of the least (or greatest)
+/// keys, those with a NULL key last.
+fn extremes_nulls_last(rows: &[Value], ty: &LogicalType, greatest: bool) -> Result<Value> {
+    let Some(first) = rows.first() else {
+        return Ok(Value::null(ty.clone()));
+    };
+    let n = positive_n(&fields(first)[2], "arg_min/arg_max")?;
+    let (valued, nulls): (Vec<&Value>, Vec<&Value>) = rows.iter().partition(|row| !fields(row)[1].is_null());
+    let mut ordered: Vec<&Value> = Vec::with_capacity(rows.len());
+    if let Some(head) = valued.first() {
+        let by: Vec<Value> = valued.iter().map(|row| fields(row)[1].clone()).collect();
+        let keys = sort_keys(&by, fields(head)[1].logical_type())?;
+        let mut order: Vec<usize> = (0..keys.len()).collect();
+        order.sort_by(|a, b| {
+            if greatest {
+                keys[*b].cmp(&keys[*a])
+            } else {
+                keys[*a].cmp(&keys[*b])
+            }
+        });
+        ordered.extend(order.into_iter().map(|at| valued[at]));
+    }
+    ordered.extend(nulls);
+    let items = ordered.into_iter().take(n).map(|row| fields(row)[0].clone()).collect();
     Value::new(ty.clone(), ValueData::List(items))
 }
 
@@ -721,6 +850,13 @@ fn bitstring(rows: &[Value], ty: &LogicalType) -> Result<Value> {
         return Ok(Value::null(ty.clone()));
     };
     let (low, high) = match given {
+        // `BitStringAggOperation::GetRange`
+        Some((low, high)) if low > high => {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!("Invalid explicit bitstring range: Minimum ({low}) > maximum ({high})"),
+            ));
+        }
         Some(range) => *range,
         None => (
             numbers.iter().map(|n| n.0).min().unwrap_or(0),
@@ -975,6 +1111,46 @@ fn bits(rows: &[Value], ty: &LogicalType, combine: fn(u128, u128) -> u128) -> Re
 /// `StateFinalize`.
 pub fn finish(kind: Holistic, rows: &[Value], ty: &LogicalType) -> Result<Value> {
     use Holistic::*;
+    // the aggregates whose state is C++'s: the rows folded and finalized as C++ updates and finalizes it, so the
+    // result is C++'s to the last bit
+    if matches!(
+        kind,
+        StddevSamp
+            | StddevPop
+            | VarSamp
+            | VarPop
+            | Sem
+            | CovarPop
+            | CovarSamp
+            | Corr
+            | Skewness
+            | Kurtosis
+            | KurtosisPop
+            | Fsum
+            | Favg
+            | Product
+            | RegrSlope
+            | RegrIntercept
+            | RegrR2
+            | RegrSxx
+            | RegrSyy
+            | RegrSxy
+            | RegrAvgX
+            | RegrAvgY
+            | ApproxCountDistinct
+            | ApproxQuantile
+    ) && let Some(layout) = super::holistic_states::layout(kind, &[], ty)
+    {
+        let state = super::holistic_states::from_rows(kind, rows, &layout)?;
+        // what the arguments after the first are, which the rows carry (approx_quantile's fractions)
+        let constants: Vec<Option<Value>> = match rows.first().map(Value::data) {
+            Some(ValueData::Struct(values)) if kind == ApproxQuantile => {
+                values.iter().map(|v| Some(v.clone())).collect()
+            }
+            _ => Vec::new(),
+        };
+        return super::holistic_states::finalize(kind, &state, ty, &constants);
+    }
     let null = || Value::null(ty.clone());
     Ok(match kind {
         StringAgg => {
@@ -989,7 +1165,8 @@ pub fn finish(kind: Holistic, rows: &[Value], ty: &LogicalType) -> Result<Value>
                     None => out = Some(text),
                     Some(joined) => {
                         match values.get(1) {
-                            Some(separator) if separator.is_null() => {}
+                            // `StringAggBind`: a NULL separator leaves the bound one, a comma
+                            Some(separator) if separator.is_null() => joined.push(','),
                             Some(separator) => *joined += &separator.try_to_string()?,
                             None => joined.push(','),
                         }
@@ -1030,7 +1207,13 @@ pub fn finish(kind: Holistic, rows: &[Value], ty: &LogicalType) -> Result<Value>
             }
         }
         Mode => mode(rows, ty)?,
-        Median | QuantileCont => quantiles(rows, ty, true)?,
+        // `MedianFunction`: a type that cannot be interpolated takes the discrete median. Its rows are
+        // its values (a STRUCT value is not the arguments of a quantile)
+        Median => {
+            let rows: Vec<Value> = rows.iter().map(|r| Value::struct_value(vec![("a0".into(), r.clone())])).collect();
+            quantiles(&rows, ty, can_interpolate(ty))?
+        }
+        QuantileCont => quantiles(rows, ty, true)?,
         QuantileDisc => quantiles(rows, ty, false)?,
         Mad if ty.id() == LogicalTypeId::Interval => temporal_mad(rows)?,
         Mad => {
@@ -1174,6 +1357,65 @@ pub fn finish(kind: Holistic, rows: &[Value], ty: &LogicalType) -> Result<Value>
             let total = keys.len() as f64;
             Value::double(counts.values().map(|c| -(c / total) * (c / total).log2()).sum())
         }
+        DecimalAverage => {
+            // `DecimalAvgOperation`: an i128 sum and a count, then round half to even
+            let mut sum: i128 = 0;
+            let mut count: u128 = 0;
+            for row in rows.iter().filter(|v| !v.is_null()) {
+                let value = row.as_i128().unwrap_or(0);
+                sum = sum.checked_add(value).ok_or_else(|| {
+                    out_of_range("decimal_average: intermediate sum overflowed HUGEINT range")
+                })?;
+                count += 1;
+            }
+            if count == 0 {
+                return Ok(null());
+            }
+            let negative = sum < 0;
+            let magnitude = sum.unsigned_abs();
+            let (mut quotient, remainder) = (magnitude / count, magnitude % count);
+            let distance = count - remainder;
+            if distance < remainder || (distance == remainder && quotient % 2 == 1) {
+                quotient += 1;
+            }
+            let signed = if negative {
+                (quotient as i128).wrapping_neg()
+            } else {
+                quotient as i128
+            };
+            let (width, scale) = ty.decimal_properties().unwrap_or((38, 0));
+            Value::decimal(signed, width, scale)?
+        }
+        VariantGroupObject => {
+            use duckrs_common::variant::VariantNode;
+            if rows.is_empty() {
+                return Ok(null());
+            }
+            let mut children: Vec<(String, VariantNode)> = Vec::with_capacity(rows.len());
+            for row in rows {
+                let values = fields(row);
+                if values[0].is_null() {
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        "variant_group_object key cannot be NULL",
+                    ));
+                }
+                let key = values[0].try_to_string()?;
+                let value = match values[1].data() {
+                    ValueData::Bytes(bytes) if !values[1].is_null() => VariantNode::decode(bytes)?,
+                    _ => VariantNode::Null,
+                };
+                children.push((key, value));
+            }
+            children.sort_by(|a, b| a.0.cmp(&b.0));
+            if let Some(pair) = children.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("variant_group_object contains duplicate key \"{}\"", pair[0].0),
+                ));
+            }
+            Value::new(ty.clone(), ValueData::Bytes(VariantNode::Object(children).encode()))?
+        }
         ArgMin => arg_extreme(rows, ty, false)?,
         ArgMax => arg_extreme(rows, ty, true)?,
         ArgMinNull => arg_extreme_nulls(rows, ty, false, false)?,
@@ -1184,6 +1426,8 @@ pub fn finish(kind: Holistic, rows: &[Value], ty: &LogicalType) -> Result<Value>
         MaxN => extremes(rows, ty, true, 0, 0, 1)?,
         ArgMinN => extremes(rows, ty, false, 0, 1, 2)?,
         ArgMaxN => extremes(rows, ty, true, 0, 1, 2)?,
+        ArgMinNullsLastN => extremes_nulls_last(rows, ty, false)?,
+        ArgMaxNullsLastN => extremes_nulls_last(rows, ty, true)?,
         ApproxTopK => top_k(rows, ty)?,
         BitstringAgg => bitstring(rows, ty)?,
         CombineAggr => {
@@ -1217,6 +1461,7 @@ pub fn finish(kind: Holistic, rows: &[Value], ty: &LogicalType) -> Result<Value>
             Value::hugeint(count as i128)
         }
         Histogram => histogram(rows, ty)?,
+        ApproxQuantile => unreachable!("computed from its t-digest above"),
         Sorted if rows.is_empty() => null(),
         Sorted => Value::new(ty.state_layout(), ValueData::List(rows.to_vec()))?,
         HistogramBins => binned_histogram(rows, ty, false)?,

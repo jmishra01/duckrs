@@ -10,6 +10,10 @@
 use super::rewriter::{can_throw, contains_barrier, split_conjuncts};
 use crate::planner::expression::{BoundExpr, BoundExprKind, ColumnBinding};
 use crate::planner::logical::{LogicalOperator, LogicalOperatorKind as K};
+use crate::planner::expression::BoundOperator;
+use duckrs_common::types::LogicalType;
+use duckrs_common::value::Value;
+use duckrs_parser::ast::ComparisonOp;
 
 /// The columns of the expression, in the query around the plan too, with `outer` for those.
 fn columns_of(expr: &BoundExpr, columns: &mut Vec<ColumnBinding>, outer: &mut bool) {
@@ -40,6 +44,221 @@ fn can_move_ignoring_errors(expr: &BoundExpr, scan: &[ColumnBinding]) -> bool {
     one_column && !outer && scan.contains(&columns[0]) && !expr.is_volatile()
 }
 
+/// A comparison with the constant on the left turned around, as `FilterCombiner` makes a table
+/// filter of the column: `5 < x` is `x > 5`.
+fn column_first(mut expr: BoundExpr) -> BoundExpr {
+    if let BoundExprKind::Comparison { op, left, right } = &mut expr.kind
+        && matches!(left.kind, BoundExprKind::Constant(_))
+        && !matches!(right.kind, BoundExprKind::Constant(_))
+    {
+        std::mem::swap(left, right);
+        *op = super::statistics::flip(*op);
+    }
+    expr
+}
+
+/// `TryPushdownPrefixFilter`: `prefix(s, 'abc')` on a column is `s >= 'abc' AND s < 'abd'`, which
+/// a scan's zone maps can use.
+fn prefix_bounds(expr: &BoundExpr) -> Option<[BoundExpr; 2]> {
+    let BoundExprKind::Function { function, children, .. } = &expr.kind else {
+        return None;
+    };
+    if !matches!(function.name.as_str(), "prefix" | "starts_with" | "^@") {
+        return None;
+    }
+    let [column, BoundExpr {
+        kind: BoundExprKind::Constant(value),
+        ..
+    }] = children.as_slice()
+    else {
+        return None;
+    };
+    if !matches!(column.kind, BoundExprKind::ColumnRef { .. }) || value.is_null() {
+        return None;
+    }
+    let prefix = value.try_to_string().ok()?;
+    if prefix.is_empty() || column.return_type.collation().is_some() {
+        return None;
+    }
+    // `Utf8Proc::FindNextLegalUTF8`: the next string of the same length, by its last character
+    let mut chars: Vec<char> = prefix.chars().collect();
+    let last = chars.pop()?;
+    let next = (u32::from(last) + 1..=u32::from(char::MAX)).find_map(char::from_u32)?;
+    chars.push(next);
+    let upper: String = chars.into_iter().collect();
+    let compare = |op, bound: String| {
+        BoundExpr::new(
+            BoundExprKind::Comparison {
+                op,
+                left: Box::new(column.clone()),
+                right: Box::new(BoundExpr::constant(duckrs_common::value::Value::varchar(bound))),
+            },
+            duckrs_common::types::LogicalType::BOOLEAN,
+        )
+    };
+    Some([
+        compare(duckrs_parser::ast::ComparisonOp::GreaterThanOrEqual, prefix),
+        compare(duckrs_parser::ast::ComparisonOp::LessThan, upper),
+    ])
+}
+
+/// What `FilterCombiner` puts into a scan for a filter.
+pub(super) enum TablePushdown {
+    /// `PUSHED_DOWN_FULLY`: these filters in place of it
+    Fully(Vec<BoundExpr>),
+    /// `PUSHED_DOWN_PARTIALLY`: an optional filter for the zone maps, and the filter stays
+    Optional(BoundExpr),
+    None,
+}
+
+fn compare(op: ComparisonOp, column: &BoundExpr, value: Value) -> BoundExpr {
+    BoundExpr::new(
+        BoundExprKind::Comparison {
+            op,
+            left: Box::new(column.clone()),
+            right: Box::new(BoundExpr::constant(value)),
+        },
+        LogicalType::BOOLEAN,
+    )
+}
+
+/// `TryPushdownDenseInFilter`: consecutive integers as `col >= min AND col <= max`.
+fn dense_range(column: &BoundExpr, values: &[Value]) -> Option<Vec<BoundExpr>> {
+    let mut numbers = Vec::with_capacity(values.len());
+    for value in values {
+        let ty = value.logical_type();
+        if !ty.is_integral() || ty == &LogicalType::UHUGEINT {
+            return None;
+        }
+        numbers.push((value.as_i128()?, value));
+    }
+    numbers.sort_by_key(|(n, _)| *n);
+    if numbers.is_empty() || !numbers.windows(2).all(|pair| pair[1].0.checked_sub(pair[0].0) == Some(1)) {
+        return None;
+    }
+    let min = numbers[0].1.clone();
+    let max = numbers[numbers.len() - 1].1.clone();
+    Some(vec![
+        compare(ComparisonOp::GreaterThanOrEqual, column, min),
+        compare(ComparisonOp::LessThanOrEqual, column, max),
+    ])
+}
+
+fn in_list(column: &BoundExpr, values: Vec<Value>) -> BoundExpr {
+    let children = std::iter::once(column.clone())
+        .chain(values.into_iter().map(BoundExpr::constant))
+        .collect();
+    BoundExpr::new(
+        BoundExprKind::Operator {
+            op: BoundOperator::In,
+            children,
+        },
+        LogicalType::BOOLEAN,
+    )
+}
+
+/// `TryPushdownInFilter` and `TryPushdownOrClause`.
+pub(super) fn table_pushdown(expr: &BoundExpr) -> TablePushdown {
+    match &expr.kind {
+        BoundExprKind::Operator {
+            op: BoundOperator::In,
+            children,
+        } => {
+            if !matches!(children[0].kind, BoundExprKind::ColumnRef { depth: 0, .. }) {
+                return TablePushdown::None;
+            }
+            let mut values = Vec::with_capacity(children.len() - 1);
+            for child in &children[1..] {
+                match &child.kind {
+                    BoundExprKind::Constant(value) if !value.is_null() => values.push(value.clone()),
+                    _ => return TablePushdown::None,
+                }
+            }
+            if values.len() == 1 {
+                let value = values.pop().expect("one value");
+                return TablePushdown::Fully(vec![compare(ComparisonOp::Equal, &children[0], value)]);
+            }
+            if let Some(range) = dense_range(&children[0], &values) {
+                return TablePushdown::Fully(range);
+            }
+            TablePushdown::Optional(expr.clone())
+        }
+        BoundExprKind::Conjunction { and: false, children } if !children.is_empty() => {
+            let mut column: Option<&BoundExpr> = None;
+            let mut equalities = Vec::new();
+            let mut only_equalities = true;
+            let mut parts = Vec::new();
+            for child in children {
+                let BoundExprKind::Comparison { op, left, right } = &child.kind else {
+                    return TablePushdown::None;
+                };
+                let (col, value, op) = match (&left.kind, &right.kind) {
+                    (BoundExprKind::ColumnRef { depth: 0, .. }, BoundExprKind::Constant(v)) => (&**left, v, *op),
+                    (BoundExprKind::Constant(v), BoundExprKind::ColumnRef { depth: 0, .. }) => {
+                        (&**right, v, super::statistics::flip(*op))
+                    }
+                    _ => return TablePushdown::None,
+                };
+                let binding = |e: &BoundExpr| match &e.kind {
+                    BoundExprKind::ColumnRef { binding, .. } => Some(*binding),
+                    _ => None,
+                };
+                match column {
+                    None => column = Some(col),
+                    Some(first) if binding(first) == binding(col) => {}
+                    Some(_) => return TablePushdown::None,
+                }
+                only_equalities &= op == ComparisonOp::Equal;
+                if value.is_null() {
+                    match op {
+                        ComparisonOp::DistinctFrom | ComparisonOp::NotDistinctFrom => {
+                            let null_op = if op == ComparisonOp::DistinctFrom {
+                                BoundOperator::IsNotNull
+                            } else {
+                                BoundOperator::IsNull
+                            };
+                            parts.push(BoundExpr::new(
+                                BoundExprKind::Operator {
+                                    op: null_op,
+                                    children: vec![col.clone()],
+                                },
+                                LogicalType::BOOLEAN,
+                            ));
+                        }
+                        // `x = NULL` in an OR passes no row
+                        _ => {}
+                    }
+                    continue;
+                }
+                if op == ComparisonOp::Equal {
+                    equalities.push(value.clone());
+                }
+                parts.push(compare(op, col, value.clone()));
+            }
+            let column = column.expect("an OR has children");
+            if only_equalities && !equalities.is_empty() {
+                if let Some(range) = dense_range(column, &equalities) {
+                    return TablePushdown::Fully(range);
+                }
+                return TablePushdown::Optional(in_list(column, equalities));
+            }
+            let optional = match parts.len() {
+                0 => return TablePushdown::None,
+                1 => parts.pop().expect("one part"),
+                _ => BoundExpr::new(
+                    BoundExprKind::Conjunction {
+                        and: false,
+                        children: parts,
+                    },
+                    LogicalType::BOOLEAN,
+                ),
+            };
+            TablePushdown::Optional(optional)
+        }
+        _ => TablePushdown::None,
+    }
+}
+
 /// Moves the filters directly on scans into them.
 pub fn push_into_scans(op: &mut LogicalOperator) {
     for child in &mut op.children {
@@ -51,6 +270,32 @@ pub fn push_into_scans(op: &mut LogicalOperator) {
     let K::Filter { expressions } = &mut op.kind else {
         return;
     };
+    // `MultiFileFunction` has no `filter_pushdown` for CSV and JSON, only `pushdown_complex_filter`, which
+    // leaves out files
+    if matches!(op.children[0].kind, K::CsvScan { .. } | K::JsonScan { .. }) {
+        let bindings = op.children[0].column_bindings();
+        let mut conjuncts = Vec::new();
+        for expr in std::mem::take(expressions) {
+            split_conjuncts(expr, &mut conjuncts);
+        }
+        match &mut op.children[0].kind {
+            K::CsvScan { scan: data, .. } => match std::sync::Arc::get_mut(data) {
+                Some(data) => prune_files(data, &bindings, &mut conjuncts),
+                None => {
+                    let mut copy = super::type_pushdown::clone_scan(data);
+                    prune_files(&mut copy, &bindings, &mut conjuncts);
+                    *data = std::sync::Arc::new(copy);
+                }
+            },
+            K::JsonScan { scan: data, .. } => prune_files(std::sync::Arc::make_mut(data), &bindings, &mut conjuncts),
+            _ => unreachable!("checked above"),
+        }
+        *expressions = conjuncts;
+        if expressions.is_empty() {
+            *op = op.children.remove(0);
+        }
+        return;
+    }
     if !matches!(op.children[0].kind, K::Get { .. } | K::ParquetScan { .. }) {
         return;
     }
@@ -59,20 +304,44 @@ pub fn push_into_scans(op: &mut LogicalOperator) {
     for expr in std::mem::take(expressions) {
         split_conjuncts(expr, &mut conjuncts);
     }
-    let filters = match &mut op.children[0].kind {
-        K::Get { filters, .. } => filters,
+    let (filters, mut optional) = match &mut op.children[0].kind {
+        K::Get {
+            filters,
+            optional_filters,
+            ..
+        } => (filters, Some(optional_filters)),
         // `MultiFileFunction` has `filter_pushdown`; these run as the file is read
         K::ParquetScan { scan: data, .. } => {
             let data = std::sync::Arc::make_mut(data);
             prune_files(data, &scan, &mut conjuncts);
-            &mut data.filters
+            (&mut data.filters, None)
         }
         _ => unreachable!("checked above"),
     };
     let (barred, conjuncts): (Vec<BoundExpr>, Vec<BoundExpr>) = conjuncts.into_iter().partition(contains_barrier);
+    // what went into the scan only as an optional filter, which stays here as well
+    let mut partial = Vec::new();
     for conjunct in conjuncts {
         if can_move_into_scan(&conjunct, &scan) {
-            filters.push(conjunct);
+            if let Some(optional) = optional.as_deref_mut() {
+                match table_pushdown(&conjunct) {
+                    TablePushdown::Fully(pushed) => {
+                        filters.extend(pushed);
+                        continue;
+                    }
+                    TablePushdown::Optional(pushed) => {
+                        optional.push(pushed);
+                        partial.push(conjunct);
+                        continue;
+                    }
+                    TablePushdown::None => {}
+                }
+            }
+            if let Some(bounds) = prefix_bounds(&conjunct) {
+                filters.extend(bounds);
+                continue;
+            }
+            filters.push(column_first(conjunct));
         } else {
             expressions.push(conjunct);
         }
@@ -81,9 +350,14 @@ pub fn push_into_scans(op: &mut LogicalOperator) {
     // no other filter it would run ahead of
     if let [only] = expressions.as_slice()
         && barred.is_empty()
+        && partial.is_empty()
         && can_move_ignoring_errors(only, &scan)
     {
-        filters.push(expressions.pop().expect("one filter"));
+        let only = expressions.pop().expect("one filter");
+        match prefix_bounds(&only) {
+            Some(bounds) => filters.extend(bounds),
+            None => filters.push(column_first(only)),
+        }
     }
     // `PushdownBarrierFilters`: into the scan, after the filters there, only if no other filter stays on top
     for conjunct in barred {
@@ -91,12 +365,13 @@ pub fn push_into_scans(op: &mut LogicalOperator) {
         let mut outer = false;
         columns_of(&conjunct, &mut columns, &mut outer);
         let one_column = !columns.is_empty() && columns.iter().all(|c| *c == columns[0]) && scan.contains(&columns[0]);
-        if expressions.is_empty() && one_column && !outer && !conjunct.is_volatile() {
+        if expressions.is_empty() && partial.is_empty() && one_column && !outer && !conjunct.is_volatile() {
             filters.push(conjunct);
         } else {
             expressions.push(conjunct);
         }
     }
+    expressions.splice(0..0, partial);
     // `TryCreateMultiColumnExpressionFilter`: a filter on several columns of a table stays, and a copy tells the
     // scan which row groups none of its rows pass in
     if let K::Get { zone_filters, .. } = &mut op.children[0].kind {
@@ -115,45 +390,106 @@ pub fn push_into_scans(op: &mut LogicalOperator) {
     }
 }
 
+/// The files of a multi-file scan, with the columns that have one value for each of them.
+pub(crate) trait FileList {
+    fn paths(&self) -> Vec<String>;
+    /// The value of output column `at` in the file at `path`, if it is the same for all its rows.
+    fn known_value(&self, at: usize, path: &str) -> Option<Value>;
+    /// Keeps the files `keep` says, as filters `file_filters` left them of `total`.
+    fn keep_files(&mut self, keep: &[bool], file_filters: &str, total: usize);
+}
+
+impl FileList for crate::execution::parquet::ParquetScanData {
+    fn paths(&self) -> Vec<String> {
+        self.files.clone()
+    }
+    fn known_value(&self, at: usize, path: &str) -> Option<Value> {
+        crate::execution::parquet::ParquetScanData::known_value(self, at, path)
+    }
+    fn keep_files(&mut self, keep: &[bool], file_filters: &str, total: usize) {
+        let mut keep = keep.iter();
+        self.files.retain(|_| keep.next().copied().unwrap_or(true));
+        self.file_filters.push_str(file_filters);
+        self.total_files = Some(total);
+    }
+}
+
+impl FileList for crate::execution::csv::CsvScanData {
+    fn paths(&self) -> Vec<String> {
+        self.files.iter().map(|file| file.path.clone()).collect()
+    }
+    fn known_value(&self, at: usize, path: &str) -> Option<Value> {
+        crate::execution::json_scan::known_value(&self.names, self.filename, &self.hive, &self.virtual_columns, at, path)
+    }
+    fn keep_files(&mut self, keep: &[bool], file_filters: &str, total: usize) {
+        // the bytes sniffing read are of the first file
+        if keep.first() == Some(&false) {
+            *self.first_data.lock().expect("not poisoned") = None;
+        }
+        let mut keep = keep.iter();
+        self.files.retain(|_| keep.next().copied().unwrap_or(true));
+        self.file_filters.push_str(file_filters);
+        self.total_files = Some(total);
+    }
+}
+
+impl FileList for crate::execution::json_scan::JsonScanData {
+    fn paths(&self) -> Vec<String> {
+        self.files.clone()
+    }
+    fn known_value(&self, at: usize, path: &str) -> Option<Value> {
+        crate::execution::json_scan::JsonScanData::known_value(self, at, path)
+    }
+    fn keep_files(&mut self, keep: &[bool], file_filters: &str, total: usize) {
+        let mut keep = keep.iter();
+        self.files.retain(|_| keep.next().copied().unwrap_or(true));
+        self.file_filters.push_str(file_filters);
+        self.total_files = Some(total);
+    }
+}
+
 /// `HivePartitioning::ApplyFiltersToFileList`: the filters that only read the hive partitions and the file name
 /// are worked out for each file, those of the files they are false for are left out, and the filters that could
 /// be worked out for every file are no longer needed.
-fn prune_files(
-    scan: &mut crate::execution::parquet::ParquetScanData,
-    bindings: &[ColumnBinding],
-    conjuncts: &mut Vec<BoundExpr>,
-) {
-    let known: Vec<usize> = (0..bindings.len()).filter(|&at| scan.is_known_per_file(at)).collect();
+fn prune_files(scan: &mut impl FileList, bindings: &[ColumnBinding], conjuncts: &mut Vec<BoundExpr>) {
+    let paths = scan.paths();
+    let Some(first) = paths.first() else {
+        return;
+    };
+    let known: Vec<ColumnBinding> = bindings
+        .iter()
+        .copied()
+        .filter(|b| scan.known_value(b.column_index, first).is_some())
+        .collect();
     if known.is_empty() || conjuncts.is_empty() {
         return;
     }
-    let mut keep = vec![true; scan.files.len()];
+    let mut keep = vec![true; paths.len()];
     let mut file_filters = String::new();
     conjuncts.retain(|conjunct| {
         let mut columns = Vec::new();
         let mut outer = false;
         columns_of(conjunct, &mut columns, &mut outer);
-        let on_known = |binding: &ColumnBinding| {
-            bindings
-                .iter()
-                .position(|b| b == binding)
-                .is_some_and(|at| known.contains(&at))
-        };
-        if columns.is_empty() || outer || conjunct.is_volatile() || !columns.iter().all(on_known) {
+        // a subquery runs with the query (in a recursive CTE, once per round): not before it
+        fn has_subquery(expr: &BoundExpr) -> bool {
+            matches!(expr.kind, BoundExprKind::Subquery { .. }) || expr.children().into_iter().any(has_subquery)
+        }
+        if columns.is_empty()
+            || outer
+            || conjunct.is_volatile()
+            || has_subquery(conjunct)
+            || !columns.iter().all(|c| known.contains(c))
+        {
             return true;
         }
         let mut preserved = false;
         let mut applied = false;
-        for (file, keep) in scan.files.iter().zip(keep.iter_mut()) {
+        for (path, keep) in paths.iter().zip(keep.iter_mut()) {
             let mut copy = conjunct.clone();
             let mut known_values = true;
             copy.walk_mut(&mut |e| {
                 if let BoundExprKind::ColumnRef { binding, depth: 0 } = &e.kind {
-                    let at = bindings
-                        .iter()
-                        .position(|b| b == binding)
-                        .expect("a column of the scan");
-                    match scan.known_value(at, file) {
+                    match scan.known_value(binding.column_index, path) {
                         Some(value) => *e = BoundExpr::constant(value),
                         None => known_values = false,
                     }
@@ -171,14 +507,11 @@ fn prune_files(
                 Some(_) => {}
             }
         }
+        // `ExtraOperatorInfo::file_filters`: the filters' texts, one after the other
         if applied {
-            file_filters.push_str(&conjunct.to_string());
+            file_filters.push_str(&crate::client::explain::filter_text(conjunct));
         }
         preserved
     });
-    let total = scan.files.len();
-    let mut keep = keep.into_iter();
-    scan.files.retain(|_| keep.next().unwrap_or(true));
-    scan.file_filters.push_str(&file_filters);
-    scan.total_files = Some(total);
+    scan.keep_files(&keep, &file_filters, paths.len());
 }

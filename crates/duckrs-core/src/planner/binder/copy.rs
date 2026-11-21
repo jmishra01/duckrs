@@ -175,6 +175,11 @@ struct CsvArguments {
 }
 
 impl Binder<'_> {
+    /// The type that `name` spells (`UnboundType::TryParseAndDefaultBind`).
+    pub(crate) fn type_from_name(&mut self, name: &str) -> Result<LogicalType> {
+        self.csv_type(name)
+    }
+
     /// The type that `name` spells, resolved as a cast to it would be.
     pub(super) fn csv_type(&mut self, name: &str) -> Result<LogicalType> {
         if name.eq_ignore_ascii_case("null") {
@@ -725,6 +730,10 @@ impl Binder<'_> {
             }
             result.files.extend(found);
         }
+        // `MultiFileReader::CreateFileList`: an empty list names no file
+        if result.files.is_empty() && !result.allow_empty {
+            return Err(Error::new(ErrorKind::Io, format!("{name} needs at least one file to read")));
+        }
         result.options.auto_detect = result.auto_detect.unwrap_or(true);
         Ok(result)
     }
@@ -969,6 +978,10 @@ impl Binder<'_> {
             types,
             filename: arguments.filename.is_some(),
             first_data: std::sync::Mutex::new(Some(first_data)),
+            projection: None,
+            column_order: self.column_order(table_index),
+            file_filters: String::new(),
+            total_files: None,
             virtual_columns,
         };
         Ok(LogicalOperator::new(
@@ -1018,6 +1031,10 @@ impl Binder<'_> {
             filename: false,
             rejects: None,
             first_data: std::sync::Mutex::new(None),
+            projection: None,
+            column_order: Default::default(),
+            file_filters: String::new(),
+            total_files: None,
             virtual_columns: Vec::new(),
         };
         Ok(LogicalOperator::new(
@@ -1299,6 +1316,8 @@ impl Binder<'_> {
             }
             None => info.file_path.clone(),
         };
+        // `FileSystem::ExpandPath`: `~` and `file:` URLs
+        let path = crate::execution::file_system::expand_path(&path);
         if !info.is_from && !path.is_empty() && self.is_attached_database_file(&path) {
             return Err(binder_error(format!(
                 "Cannot COPY to \"{path}\": the file belongs to an attached database"

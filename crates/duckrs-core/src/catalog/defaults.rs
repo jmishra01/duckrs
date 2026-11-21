@@ -91,6 +91,7 @@ fn build_macro(schema: &str, name: &str, table_macro: bool) -> Option<Arc<MacroC
         name: name.to_string(),
         table_macro: *table_macro,
         macros: macros.clone(),
+        comment: None,
     }))
 }
 

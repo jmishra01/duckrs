@@ -45,6 +45,8 @@ fn execute_table_alter(alter: BoundTableAlter) -> Result<()> {
     drop(source);
     let mut table = TableCatalogEntry::new(old.schema.clone(), alter.name, alter.columns, rows, alter.constraints);
     table.generated = alter.generated;
+    table.catalog = old.catalog.clone();
+    *table.comment.lock() = alter.comment;
     table
         .row_group_rows
         .store(old.row_group_size(), std::sync::atomic::Ordering::Relaxed);
@@ -64,13 +66,24 @@ fn execute_table_alter(alter: BoundTableAlter) -> Result<()> {
             constraints::verify_not_null(&table, chunk)?;
         }
         // a new key checks the rows as CREATE INDEX does
-        constraints::current_keys(&table, &rows).map(drop).map_err(|error| {
-            if adding_key && error.kind == ErrorKind::Constraint {
-                Error::new(ErrorKind::Constraint, "Data contains duplicates on indexed column(s)")
-            } else {
-                error
-            }
-        })?;
+        // and a DEFERRED one the rows that are committed: those of the transaction wait for its commit
+        let ids = table.row_ids(rows.len());
+        let committed = |position: usize| ids.id(position) < crate::catalog::MAX_ROW_ID;
+        let deferred = if adding_key && table.has_deferred_keys() {
+            *table.deleted_before_key.lock() = old.deleted_committed_rows()?;
+            constraints::check_deferred_keys(&table, &rows, committed)
+        } else {
+            Ok(())
+        };
+        deferred
+            .and_then(|()| constraints::current_keys(&table, &rows).map(drop))
+            .map_err(|error| {
+                if adding_key && error.kind == ErrorKind::Constraint {
+                    Error::new(ErrorKind::Constraint, "Data contains duplicates on indexed column(s)")
+                } else {
+                    error
+                }
+            })?;
     }
     if let Some(error) = alter.rejected {
         return Err(error);

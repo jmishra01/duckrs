@@ -22,7 +22,7 @@ use crate::execution::run_plan;
 use crate::execution::temporary::{self, PartitionedSpill, SpillFile};
 use crate::function::aggregates::{AggregateState, combine_states, value_keys};
 use crate::planner::expression::{BoundAggregate, BoundExpr, BoundExprKind, ColumnBinding};
-use crate::planner::logical::{BoundOrderByNode, COLUMN_IDENTIFIER_ROW_ID, CteKeyColumn, LogicalOperator, OnConflict};
+use crate::planner::logical::{BoundOrderByNode, COLUMN_IDENTIFIER_ROW_ID, COLUMN_IDENTIFIER_ROW_NUMBER, CteKeyColumn, LogicalOperator, OnConflict};
 use crate::storage::log_writer::can_serialize;
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::sort_key::{
@@ -127,6 +127,11 @@ pub trait PhysicalOperator: fmt::Debug + Send + Sync {
         Ok((self.execute(input.clone())?, OperatorResult::NeedMoreInput))
     }
 
+    /// `FinalExecute`: what the operator still has once its input is done, a chunk at a time.
+    fn final_execute(&self, _state: &mut OperatorState) -> Result<Option<DataChunk>> {
+        Ok(None)
+    }
+
     /// Whether the operator needs no more input, so that its pipeline can stop early.
     fn is_finished(&self) -> bool {
         false
@@ -201,6 +206,11 @@ pub trait PhysicalOperator: fmt::Debug + Send + Sync {
         None
     }
 
+    /// `Dynamic Filters`: what the joins above gave a table scan, once they did.
+    fn dynamic_filters(&self) -> Option<String> {
+        None
+    }
+
     /// Whether a join has rows to emit through `get_data` after its input is done
     /// (`IsSource` of RIGHT and FULL joins).
     fn has_unmatched_source(&self) -> bool {
@@ -222,6 +232,14 @@ struct TableScanState {
     /// A filtered scan of a table in its file, a row group at a time: the next group, and the chunks
     /// of the last one that are still to come.
     filtered: Option<(usize, Vec<usize>, std::collections::VecDeque<DataChunk>)>,
+    /// `ScanSamplingInfo`: the scan's random engine, and the phase of a sample of rows
+    sampling: Option<(super::random_engine::RandomEngine, f64)>,
+    /// the positions of the VARIANT fields the cursor does not read (`variant_field`), and those of the
+    /// row group of the last chunk
+    fields: Vec<usize>,
+    field_group: Option<(usize, Vec<(usize, Vector)>)>,
+    /// whether the chunks of the cursor are those of the file's row groups, in order
+    group_aligned: bool,
 }
 
 /// What a scan reads of a file. `column_ids` lists all columns for the filter and the projection to
@@ -246,6 +264,10 @@ pub struct PhysicalTableScan {
     pub prune: Option<BoundExpr>,
     /// the rows to read, in order, instead of all of them
     pub index_rows: Option<Arc<Vec<usize>>>,
+    /// a SYSTEM sample of the vectors or rows the scan reads
+    pub sample: Option<crate::planner::logical::TableSample>,
+    /// per position of `column_ids`, the field of the column it outputs in its place, if any
+    pub extracts: Vec<Option<Arc<crate::planner::logical::PushedExtract>>>,
 }
 
 impl PhysicalTableScan {
@@ -264,6 +286,9 @@ impl PhysicalTableScan {
                 if i == COLUMN_IDENTIFIER_ROW_ID {
                     return ids.vector(first_row, chunk.len());
                 }
+                if i == COLUMN_IDENTIFIER_ROW_NUMBER {
+                    return Vector::sequence(LogicalType::BIGINT, first_row as i64 + 1, 1);
+                }
                 Ok(match cursor.map(|scan| &scan.columns[position]) {
                     None => chunk.column(i).clone(),
                     Some(Ok(at)) => chunk.column(*at).clone(),
@@ -274,7 +299,82 @@ impl PhysicalTableScan {
     }
 
     /// The filter, then the columns it may be the only one to read, of a chunk that was scanned.
-    fn finish_chunk(&self, mut result: DataChunk) -> Result<Option<DataChunk>> {
+    fn finish_chunk(&self, result: DataChunk) -> Result<Option<DataChunk>> {
+        self.finish_chunk_with(result, &[], None)
+    }
+
+    /// The VARIANT columns of a chunk of the columns at `positions` that row group `group` of `source` stores
+    /// shredded, marked as such (`SHREDDED_VECTOR`).
+    fn mark_shredded(
+        &self,
+        positions: &[usize],
+        mut chunk: DataChunk,
+        group: Option<(&dyn TableSource, usize)>,
+    ) -> DataChunk {
+        let Some((source, group)) = group else {
+            return chunk;
+        };
+        for (at, &position) in positions.iter().enumerate() {
+            let column = self.column_ids[position];
+            let pushed = self.extracts.get(position).is_some_and(Option::is_some);
+            // a VARIANT a row group gives is flat, as `ColumnData::Select` gives it, and shredded if stored so
+            if !pushed
+                && self.table.columns.get(column).is_some_and(|c| c.ty.id() == duckrs_common::types::LogicalTypeId::Variant)
+            {
+                let rows = chunk.len();
+                let vector = &mut chunk.columns_mut()[at];
+                if vector.vector_type() == duckrs_common::vector::VectorType::Dictionary {
+                    vector.flatten(rows);
+                }
+                if source.variant_group_shredded(group, column) {
+                    vector.set_shredded();
+                }
+            }
+        }
+        chunk
+    }
+
+    /// The VARIANT fields at `positions` of row group `group` of `rows` rows, computed: read from the typed
+    /// part, or from the column where some value is not there.
+    fn group_fields(
+        &self,
+        source: &dyn TableSource,
+        group: usize,
+        positions: &[usize],
+        rows: usize,
+    ) -> Result<Vec<(usize, Vector)>> {
+        let mut fields = Vec::with_capacity(positions.len());
+        for &position in positions {
+            let extract = self.extracts[position].as_ref().expect("a pushed field");
+            let (keys, rest) = extract.variant_path.as_ref().expect("a field by keys");
+            let column = self.column_ids[position];
+            let (expression, input) = match source.variant_field(group, column, keys)? {
+                Some(field) => (rest, field),
+                None => (&extract.expression, source.read_group(group, &[column])?.column(0).clone()),
+            };
+            let chunk = DataChunk::from_columns(vec![input], rows);
+            fields.push((position, crate::execution::expression_executor::execute(expression, &chunk)?));
+        }
+        Ok(fields)
+    }
+
+    /// The positions of the scan's outputs that are VARIANT fields by keys, which can be read for themselves.
+    fn variant_fields(&self) -> Vec<usize> {
+        (0..self.column_ids.len())
+            .filter(|&p| {
+                self.extracts.get(p).is_some_and(|e| e.as_ref().is_some_and(|e| e.variant_path.is_some()))
+                    && self.projection.as_ref().is_some_and(|projection| projection.contains(&p))
+            })
+            .collect()
+    }
+
+    /// [`Self::finish_chunk`] of a chunk whose positions `done` have their fields already.
+    fn finish_chunk_with(
+        &self,
+        mut result: DataChunk,
+        done: &[usize],
+        group: Option<(&dyn TableSource, usize)>,
+    ) -> Result<Option<DataChunk>> {
         // the filter reads what it scans, so the columns go after that and before the slice
         let mut selected = None;
         if let Some(filter) = &self.filter {
@@ -286,14 +386,38 @@ impl PhysicalTableScan {
                 selected = Some((sel, matched));
             }
         }
-        if let Some(positions) = &self.projection {
+        let positions: Vec<usize> = match &self.projection {
+            Some(positions) => positions.clone(),
+            None => (0..result.column_count()).collect(),
+        };
+        if self.projection.is_some() {
             let columns = positions.iter().map(|&p| result.column(p).clone()).collect();
             result = DataChunk::from_columns(columns, result.len());
         }
         if let Some((sel, matched)) = selected {
             result.slice(&sel, matched);
         }
-        Ok(Some(result))
+        let result = self.extract_fields(&positions, result, done)?;
+        Ok(Some(self.mark_shredded(&positions, result, group)))
+    }
+
+    /// The fields pushed into the scan, of the columns they are of, in a chunk of the columns at `positions`.
+    fn extract_fields(&self, positions: &[usize], result: DataChunk, done: &[usize]) -> Result<DataChunk> {
+        if self.extracts.iter().all(Option::is_none) {
+            return Ok(result);
+        }
+        let mut columns = Vec::with_capacity(positions.len());
+        for (at, &position) in positions.iter().enumerate() {
+            let column = result.column(at).clone();
+            columns.push(match self.extracts.get(position) {
+                Some(Some(extract)) if !done.contains(&position) => {
+                    let input = DataChunk::from_columns(vec![column], result.len());
+                    crate::execution::expression_executor::execute(&extract.expression, &input)?
+                }
+                _ => column,
+            });
+        }
+        Ok(DataChunk::from_columns(columns, result.len()))
     }
 
     /// The next rows of an index scan that have any left after the filter: those of one chunk.
@@ -332,9 +456,15 @@ impl PhysicalTableScan {
     /// chunk of them has it (or a vector that nothing reads).
     #[allow(clippy::type_complexity, reason = "the three parts of a FileScan")]
     fn file_columns(&self) -> (Vec<usize>, Vec<LogicalType>, Vec<Result<usize, Vector>>) {
+        self.file_columns_without(&[])
+    }
+
+    /// [`Self::file_columns`], with the positions `skip` read some other way.
+    #[allow(clippy::type_complexity, reason = "the three parts of a FileScan")]
+    fn file_columns_without(&self, skip: &[usize]) -> (Vec<usize>, Vec<LogicalType>, Vec<Result<usize, Vector>>) {
         let mut used = vec![self.projection.is_none(); self.column_ids.len()];
         for &position in self.projection.iter().flatten() {
-            used[position] = true;
+            used[position] = !skip.contains(&position);
         }
         if let Some(filter) = &self.filter {
             filter.clone().walk_mut(&mut |e| {
@@ -346,7 +476,7 @@ impl PhysicalTableScan {
         let mut read = Vec::new();
         let mut columns = Vec::with_capacity(self.column_ids.len());
         for (position, &column) in self.column_ids.iter().enumerate() {
-            if column == COLUMN_IDENTIFIER_ROW_ID {
+            if column == COLUMN_IDENTIFIER_ROW_ID || column == COLUMN_IDENTIFIER_ROW_NUMBER {
                 // stands for the sequence that `get_data` makes
                 columns.push(Ok(usize::MAX));
             } else if used[position] {
@@ -381,7 +511,9 @@ impl PhysicalTableScan {
         };
         let starts = group_starts(&*source);
         let ids = self.table.row_ids(rows);
-        let (read, types, columns) = self.file_columns();
+        // the fields of VARIANTs by keys, which can be read from the typed part
+        let fields = self.variant_fields();
+        let (read, types, columns) = self.file_columns_without(&fields);
         let scan = FileScan {
             cursor: TableCursor::new(source.clone(), read.clone(), types.clone(), group_rows),
             columns,
@@ -396,6 +528,7 @@ impl PhysicalTableScan {
                 rows,
                 groups: wanted,
                 starts,
+                fields,
             }),
             groups,
         ))
@@ -447,7 +580,7 @@ impl PhysicalTableScan {
                 }
             }
             _ if positions.iter().all(|&position| {
-                self.column_ids[position] == COLUMN_IDENTIFIER_ROW_ID
+                matches!(self.column_ids[position], COLUMN_IDENTIFIER_ROW_ID | COLUMN_IDENTIFIER_ROW_NUMBER)
                     || self.table.columns[self.column_ids[position]].ty.id()
                         != duckrs_common::types::LogicalTypeId::Varchar
             }) =>
@@ -459,7 +592,7 @@ impl PhysicalTableScan {
         conjuncts.sort_by_key(|(conjunct, positions)| (positions.len(), cost(conjunct, positions)));
         let type_of = |position: usize| -> LogicalType {
             match self.column_ids[position] {
-                COLUMN_IDENTIFIER_ROW_ID => LogicalType::BIGINT,
+                COLUMN_IDENTIFIER_ROW_ID | COLUMN_IDENTIFIER_ROW_NUMBER => LogicalType::BIGINT,
                 column => self.table.columns[column].ty.clone(),
             }
         };
@@ -469,6 +602,11 @@ impl PhysicalTableScan {
                     let mut ids = ids.vector(first_row, group_rows)?;
                     ids.slice(&SelectionVector::from_vec(selection.to_vec()), selection.len());
                     Ok(ids)
+                }
+                COLUMN_IDENTIFIER_ROW_NUMBER => {
+                    let mut numbers = Vector::sequence(LogicalType::BIGINT, first_row as i64 + 1, 1)?;
+                    numbers.slice(&SelectionVector::from_vec(selection.to_vec()), selection.len());
+                    Ok(numbers)
                 }
                 column => source.fetch_rows(group, column, selection),
             }
@@ -513,6 +651,12 @@ impl PhysicalTableScan {
             Some(positions) => positions.clone(),
             None => (0..self.column_ids.len()).collect(),
         };
+        // the VARIANT fields of the rows left, of the row group's
+        let fields: Vec<usize> = self.variant_fields().into_iter().filter(|&p| fetched[p].is_none()).collect();
+        for (position, mut field) in self.group_fields(source, group, &fields, group_rows)? {
+            field.slice(&SelectionVector::from_vec(selection.clone()), selection.len());
+            fetched[position] = Some(field);
+        }
         for &position in &output {
             if fetched[position].is_none() {
                 fetched[position] = Some(fetch(position, &selection)?);
@@ -524,7 +668,8 @@ impl PhysicalTableScan {
                 .iter()
                 .map(|&position| fetched[position].as_ref().expect("fetched above").range(start, count))
                 .collect();
-            emit(DataChunk::from_columns(columns, count))?;
+            let chunk = self.extract_fields(&output, DataChunk::from_columns(columns, count), &fields)?;
+            emit(self.mark_shredded(&output, chunk, Some((source, group))))?;
         }
         Ok(())
     }
@@ -543,6 +688,8 @@ struct ParallelFileScan {
     groups: Vec<bool>,
     /// the first row of each group of the file
     starts: Vec<usize>,
+    /// the positions of fields of VARIANTs that are read for themselves (`variant_field`)
+    fields: Vec<usize>,
 }
 
 /// The first row of each group of a source: groups of a file written on threads need not be full.
@@ -572,7 +719,7 @@ impl PhysicalOperator for PhysicalTableScan {
         "TABLE_SCAN"
     }
     fn parallel_source(&self) -> Option<(SharedSourceState, usize)> {
-        if self.index_rows.is_some() || !self.filter.as_ref().is_none_or(parallel_expression) {
+        if self.index_rows.is_some() || self.sample.is_some() || !self.filter.as_ref().is_none_or(parallel_expression) {
             return None;
         }
         if let Some(source) = self.table.source() {
@@ -611,18 +758,22 @@ impl PhysicalOperator for PhysicalTableScan {
         }
         let mut group = ColumnDataCollection::new(state.types.clone());
         group.append_shared(&state.source.read_group(index, &state.read)?);
+        let fields = self.group_fields(&*state.source, index, &state.fields, group.len())?;
         for (local, chunk) in group.chunks().enumerate() {
             let first_row = group_start + local * STANDARD_VECTOR_SIZE;
             let count = chunk.len().min(state.rows.saturating_sub(first_row));
             if count == 0 {
                 break;
             }
-            let columns = self.scan_columns(chunk, &state.ids, first_row, Some(&state.scan))?;
+            let mut columns = self.scan_columns(chunk, &state.ids, first_row, Some(&state.scan))?;
+            for (position, field) in &fields {
+                columns[*position] = field.range(local * STANDARD_VECTOR_SIZE, chunk.len());
+            }
             let mut result = DataChunk::from_columns(columns, chunk.len());
             if count < chunk.len() {
                 result.slice(&SelectionVector::from_vec((0..count as u32).collect()), count);
             }
-            if let Some(result) = self.finish_chunk(result)? {
+            if let Some(result) = self.finish_chunk_with(result, &state.fields, Some((&*state.source, index)))? {
                 emit(result)?;
             }
         }
@@ -660,12 +811,40 @@ impl PhysicalOperator for PhysicalTableScan {
         let remaining = self.table.row_count();
         let groups = groups_to_scan(&self.table, &self.column_ids, self.prune.as_ref(), remaining);
         let source = self.table.source();
-        let cursor = source.clone().map(|source| self.file_scan(source));
+        // the VARIANT fields are read by row group, where the chunks are those of the file's groups
+        let group_rows = self.table.row_group_size();
+        let group_aligned = source.as_ref().is_some_and(|source| {
+            group_rows.is_multiple_of(STANDARD_VECTOR_SIZE) && TableCursor::is_aligned(&**source, group_rows)
+        });
+        let fields = if group_aligned && self.filter.is_none() {
+            self.variant_fields()
+        } else {
+            Vec::new()
+        };
+        let cursor = source.clone().map(|source| {
+            let (read, types, columns) = self.file_columns_without(&fields);
+            FileScan {
+                cursor: TableCursor::new(source, read, types, self.table.row_group_size()),
+                columns,
+            }
+        });
         let ids = self.table.row_ids(remaining);
         // a filter on a table in its file is applied while its row groups are read
         let filtered = source
             .filter(|_| self.filter.is_some() && self.index_rows.is_none())
             .map(|source| (0, group_starts(&*source), std::collections::VecDeque::new()));
+        // `TableScanState::Initialize`: a seeded sample seeds the scan's engine, and a sample of rows
+        // starts at a random phase of its own engine
+        let sampling = self.sample.as_ref().map(|sample| {
+            let seed = sample.options.seed.map_or(-1, |seed| seed as i64);
+            let engine = super::random_engine::RandomEngine::new(seed);
+            let phase = if sample.options.is_percentage {
+                0.0
+            } else {
+                super::random_engine::RandomEngine::new(seed).next_random()
+            };
+            (engine, phase)
+        });
         Box::new(TableScanState {
             ids,
             next: 0,
@@ -674,7 +853,43 @@ impl PhysicalOperator for PhysicalTableScan {
             cursor,
             next_index_row: 0,
             filtered,
+            sampling,
+            fields,
+            field_group: None,
+            group_aligned,
         })
+    }
+    fn dynamic_filters(&self) -> Option<String> {
+        let mut found: Vec<(String, Vec<String>)> = Vec::new();
+        let mut visit = |expr: &BoundExpr| {
+            if let BoundExprKind::JoinFilter {
+                child,
+                filter,
+                keep_null,
+            } = &expr.kind
+                && let Some(text) = filter.describe(child, *keep_null)
+            {
+                let name = child.to_string();
+                match found.iter_mut().find(|(n, _)| *n == name) {
+                    Some((_, texts)) => texts.push(text),
+                    None => found.push((name, vec![text])),
+                }
+            }
+        };
+        match self.filter.as_ref().map(|f| &f.kind) {
+            Some(BoundExprKind::Conjunction { and: true, children }) => children.iter().for_each(&mut visit),
+            Some(_) => visit(self.filter.as_ref().expect("matched")),
+            None => {}
+        }
+        // `TableFilterSet::PushFilter`: the filters of one column are one AND
+        let lines: Vec<String> = found
+            .into_iter()
+            .map(|(_, texts)| match texts.as_slice() {
+                [one] => one.clone(),
+                _ => format!("({})", texts.join(" AND ")),
+            })
+            .collect();
+        (!lines.is_empty()).then(|| lines.join("\n"))
     }
     fn row_groups_scanned(&self) -> Option<(usize, usize)> {
         if self.index_rows.is_some() {
@@ -693,6 +908,10 @@ impl PhysicalOperator for PhysicalTableScan {
             cursor,
             next_index_row,
             filtered,
+            sampling,
+            fields,
+            field_group,
+            group_aligned,
         } = state.downcast_mut().expect("table scan state");
         if let Some(rows) = &self.index_rows {
             return self.next_index_chunk(rows, next_index_row);
@@ -729,6 +948,35 @@ impl PhysicalOperator for PhysicalTableScan {
             let first_row = index * STANDARD_VECTOR_SIZE;
             let wanted = groups.get(index / self.table.chunks_per_row_group()).is_none_or(|g| *g);
             *next += 1;
+            // `RowGroup::Scan`: a SYSTEM sample skips whole vectors, or keeps rows of one at its rate
+            let mut sample_selection = None;
+            if let (Some(sample), Some((engine, phase))) = (&self.sample, sampling.as_mut()) {
+                let count = STANDARD_VECTOR_SIZE.min(*remaining);
+                if sample.options.is_percentage {
+                    let rate = sample.options.sample_size.parse::<f64>().unwrap_or(0.0) / 100.0;
+                    if engine.next_random() > rate {
+                        *remaining -= count;
+                        continue;
+                    }
+                } else if sample.rate <= 0.0 {
+                    *remaining -= count;
+                    continue;
+                } else if sample.rate < 1.0 {
+                    // `SystemRowsSelection`: a row is kept where the running count of the rate steps
+                    let selected: Vec<u32> = (0..count)
+                        .filter(|i| {
+                            let row = (first_row + i) as f64;
+                            (((row + 1.0) * sample.rate + *phase).floor()) > ((row * sample.rate + *phase).floor())
+                        })
+                        .map(|i| i as u32)
+                        .collect();
+                    if selected.is_empty() {
+                        *remaining -= count;
+                        continue;
+                    }
+                    sample_selection = Some(selected);
+                }
+            }
             if !wanted {
                 *remaining -= STANDARD_VECTOR_SIZE.min(*remaining);
                 continue;
@@ -743,12 +991,33 @@ impl PhysicalOperator for PhysicalTableScan {
             };
             let count = chunk.len().min(*remaining);
             *remaining -= count;
-            let columns = self.scan_columns(&chunk, ids, first_row, cursor.as_ref())?;
+            let mut columns = self.scan_columns(&chunk, ids, first_row, cursor.as_ref())?;
+            if !fields.is_empty() {
+                let per_group = self.table.chunks_per_row_group();
+                let group = index / per_group;
+                if field_group.as_ref().is_none_or(|(at, _)| *at != group) {
+                    let source = self.table.source().expect("a scan of a file");
+                    let rows = source.group_rows(group);
+                    *field_group = Some((group, self.group_fields(&*source, group, fields, rows)?));
+                }
+                let (_, group_fields) = field_group.as_ref().expect("just set");
+                let local = (index % per_group) * STANDARD_VECTOR_SIZE;
+                for (position, field) in group_fields {
+                    columns[*position] = field.range(local, chunk.len());
+                }
+            }
             let mut result = DataChunk::from_columns(columns, chunk.len());
-            if count < chunk.len() {
+            if let Some(selected) = sample_selection {
+                let kept = selected.len();
+                result.slice(&SelectionVector::from_vec(selected), kept);
+            } else if count < chunk.len() {
                 result.slice(&SelectionVector::from_vec((0..count as u32).collect()), count);
             }
-            match self.finish_chunk(result)? {
+            let source = cursor.as_ref().and_then(|_| self.table.source()).filter(|_| *group_aligned);
+            let group = source
+                .as_ref()
+                .map(|source| (&**source, index / self.table.chunks_per_row_group()));
+            match self.finish_chunk_with(result, fields, group)? {
                 Some(result) => return Ok(Some(result)),
                 None => continue,
             }
@@ -1582,7 +1851,7 @@ impl PhysicalRecursiveCte {
 
 impl PhysicalOperator for PhysicalRecursiveCte {
     fn name(&self) -> &'static str {
-        "RECURSIVE_CTE"
+        "REC_CTE"
     }
     fn types(&self) -> &[LogicalType] {
         &self.types
@@ -1640,6 +1909,93 @@ impl PhysicalOperator for PhysicalRecursiveCte {
             *self.data.lock() = self.new_rows(rows, &mut self.seen.lock())?;
             *state.downcast_mut::<usize>().expect("collection scan state") = 0;
         }
+    }
+}
+
+/// `PhysicalCTE`: the rows of its first child go into the CTE's table before its second child
+/// runs, whose CTE scans read them; its own rows are those of the second child.
+#[derive(Debug)]
+pub struct PhysicalMaterializedCte {
+    pub types: Vec<LogicalType>,
+    pub children: Vec<Box<dyn PhysicalOperator>>,
+    pub name: String,
+    pub table_index: usize,
+    /// what the CTE scans read
+    pub data: Arc<Mutex<ColumnDataCollection>>,
+    /// the rows of the first child until it is done
+    definition: Mutex<ColumnDataCollection>,
+    /// the rows of the second child
+    output: Mutex<ColumnDataCollection>,
+}
+
+impl PhysicalMaterializedCte {
+    pub fn new(
+        types: Vec<LogicalType>,
+        children: Vec<Box<dyn PhysicalOperator>>,
+        name: String,
+        table_index: usize,
+        data: Arc<Mutex<ColumnDataCollection>>,
+    ) -> Self {
+        let definition = Mutex::new(ColumnDataCollection::new(children[0].types().to_vec()));
+        let output = Mutex::new(ColumnDataCollection::new(types.clone()));
+        Self {
+            types,
+            children,
+            name,
+            table_index,
+            data,
+            definition,
+            output,
+        }
+    }
+}
+
+impl PhysicalOperator for PhysicalMaterializedCte {
+    fn name(&self) -> &'static str {
+        "CTE"
+    }
+    fn explain_details(&self) -> Vec<String> {
+        vec![
+            format!("CTE Name: {}", self.name),
+            format!("Table Index: {}", self.table_index),
+        ]
+    }
+    fn types(&self) -> &[LogicalType] {
+        &self.types
+    }
+    fn children(&self) -> &[Box<dyn PhysicalOperator>] {
+        &self.children
+    }
+    fn is_sink(&self) -> bool {
+        true
+    }
+    fn sink_children(&self) -> Vec<usize> {
+        vec![0, 1]
+    }
+    fn sink_input(&self, input: usize, chunk: &DataChunk) -> Result<()> {
+        let target = if input == 0 { &self.definition } else { &self.output };
+        let mut data = target.lock();
+        data.append(chunk);
+        check_buffered(&data)
+    }
+    fn sink(&self, chunk: &DataChunk) -> Result<()> {
+        self.sink_input(1, chunk)
+    }
+    fn finish_input(&self, input: usize) -> Result<()> {
+        if input == 0 {
+            let types = self.children[0].types().to_vec();
+            *self.data.lock() = std::mem::replace(&mut *self.definition.lock(), ColumnDataCollection::new(types));
+        }
+        Ok(())
+    }
+    fn is_source(&self) -> bool {
+        true
+    }
+    fn source_state(&self) -> SourceState {
+        Box::new(0usize)
+    }
+    fn get_data(&self, state: &mut SourceState) -> Result<Option<DataChunk>> {
+        Ok(scan_collection(&self.output, state))
     }
 }
 
@@ -1719,7 +2075,8 @@ impl PhysicalLateralJoin {
                 joined.extend(chunk.columns().iter().cloned());
                 let mut joined = DataChunk::from_columns(joined, chunk.len());
                 if let Some(predicate) = &self.predicate {
-                    let (selection, selected) = select(predicate, &joined)?;
+                    let (selection, selected) =
+                        super::expression_executor::as_join_condition(|| select(predicate, &joined))?;
                     if selected != joined.len() {
                         joined.slice(&selection, selected);
                     }
@@ -2258,6 +2615,8 @@ impl PhysicalOperator for PhysicalLimitPercent {
 pub struct PhysicalSample {
     pub types: Vec<LogicalType>,
     pub options: SampleOptions,
+    /// of a SYSTEM sample of rows, the fraction of rows it keeps
+    pub rate: f64,
     pub children: Vec<Box<dyn PhysicalOperator>>,
     pub data: Mutex<ColumnDataCollection>,
 }
@@ -2267,6 +2626,7 @@ impl PhysicalSample {
         let types = child.types().to_vec();
         Self {
             options,
+            rate: 1.0,
             data: Mutex::new(ColumnDataCollection::new(types.clone())),
             types,
             children: vec![child],
@@ -2314,9 +2674,34 @@ impl PhysicalOperator for PhysicalSample {
         });
         let size: f64 = self.options.sample_size.parse().unwrap_or(0.0);
         let mut keep = vec![false; total];
-        if self.options.is_percentage && self.options.method != SampleMethod::Reservoir {
-            for row in &mut keep {
-                *row = (next_random(&mut random) as f64 / u64::MAX as f64) * 100.0 < size;
+        if self.options.method != SampleMethod::Reservoir {
+            // `PhysicalStreamingSample`: with the engine of the seed, a die per chunk (SYSTEM) or row
+            // (BERNOULLI), or the rows where the running count of the rate steps (SYSTEM of rows)
+            let seed = self.options.seed.map_or(-1, |seed| seed as i64);
+            let mut engine = super::random_engine::RandomEngine::new(seed);
+            let percentage = size / 100.0;
+            let mut offset = 0;
+            if self.options.method == SampleMethod::System && !self.options.is_percentage {
+                let rate = self.rate.clamp(0.0, 1.0);
+                let phase = super::random_engine::RandomEngine::new(seed).next_random();
+                for (seen, row) in keep.iter_mut().enumerate() {
+                    *row = rate >= 1.0
+                        || (rate > 0.0
+                            && ((seen + 1) as f64 * rate + phase).floor() > (seen as f64 * rate + phase).floor());
+                }
+            } else {
+                for chunk in data.chunks() {
+                    let rows = offset..offset + chunk.len();
+                    offset += chunk.len();
+                    if self.options.method == SampleMethod::System {
+                        let kept = engine.next_random() <= percentage;
+                        keep[rows].iter_mut().for_each(|row| *row = kept);
+                    } else {
+                        for row in &mut keep[rows] {
+                            *row = engine.next_random() <= percentage;
+                        }
+                    }
+                }
             }
         } else {
             let wanted = if self.options.is_percentage {
@@ -2487,9 +2872,15 @@ pub struct PhysicalAggregate {
     state: Mutex<Vec<AggregateSinkState>>,
     /// the states of threads that are put together by partition when the aggregate finishes
     locals: Mutex<Vec<AggregateSinkState>>,
+    /// whether the state of a thread went into `state` (one that spilled), so that `state` has more
+    /// than what pipelines on one thread sank
+    merged_locals: AtomicBool,
     output: Mutex<Vec<DataChunk>>,
     /// where rows go past the memory limit, for an aggregate that can spill
     spill: Option<AggregateSpill>,
+    /// `PhysicalPerfectHashAggregate`, which C++ plans for groups of small integer ranges; here
+    /// only its name, as the hash table does the same work
+    pub perfect_hash: bool,
 }
 
 /// From how many groups the states of threads are put together by partition, on threads.
@@ -2682,9 +3073,11 @@ impl PhysicalAggregate {
             aggregates,
             children,
             spill: None,
+            perfect_hash: false,
             grouping_sets: sets,
             state: Mutex::new(state),
             locals: Mutex::default(),
+            merged_locals: AtomicBool::new(false),
             output: Mutex::default(),
         }
         .with_spill()
@@ -2737,6 +3130,27 @@ impl PhysicalAggregate {
             * (std::mem::size_of::<Value>() + 16)
     }
 
+    /// What the aggregates that keep their rows' values take for `rows` rows of `inputs`: a value
+    /// each, and the bytes of a string or BLOB (or BIT) past what a value holds inline.
+    fn bytes_of(&self, inputs: &[AggregateInput], rows: usize) -> usize {
+        let mut bytes = rows * self.bytes_per_row();
+        for (aggregate, input) in self.aggregates.iter().zip(inputs) {
+            let keeps = aggregate.distinct || !aggregate.order_by.is_empty() || !aggregate.function.kind.is_order_independent();
+            let Some(vector) = input.input.as_ref().filter(|_| keeps) else {
+                continue;
+            };
+            if vector.logical_type().physical_type() != duckrs_common::types::PhysicalType::Varchar {
+                continue;
+            }
+            let count = |row: usize| vector.str_at(row).map_or(0, <[u8]>::len);
+            bytes += match &input.filtered {
+                Some(filtered) => filtered.iter().map(|&row| count(row)).sum::<usize>(),
+                None => (0..rows).map(count).sum::<usize>(),
+            };
+        }
+        bytes
+    }
+
     /// Sinks `chunk` into `states`. Past the memory limit, the rows of groups the state does not
     /// have go to `target` instead.
     fn sink_chunk(
@@ -2785,7 +3199,7 @@ impl PhysicalAggregate {
         self.sink_into(&known, &inputs, states)?;
         let state = &mut states[0];
         if !state.full {
-            state.bytes += known.len() * self.bytes_per_row();
+            state.bytes += self.bytes_of(&inputs.1, known.len());
             let more = state.bytes.saturating_sub(state.reserved);
             if temporary::current().try_reserve(more) {
                 state.reserved += more;
@@ -3069,23 +3483,30 @@ impl PhysicalAggregate {
             .as_ref()
             .map(|key| execute(key, chunk))
             .transpose()?;
+        let order_vectors = aggregate
+            .order_by
+            .iter()
+            .map(|(expr, _)| execute(expr, chunk))
+            .collect::<Result<Vec<_>>>()?;
         let distinct_keys = match (aggregate.distinct, distinct_input.as_ref().or(input.as_ref())) {
             (true, Some(input)) => {
-                let unified = input.to_unified(chunk.len());
-                let keys = value_keys(input, chunk.len())?.into_iter().enumerate();
-                Some(keys.map(|(row, key)| unified.is_valid(row).then_some(key)).collect())
+                // NULL is one of the distinct values: the aggregate decides whether it counts
+                let mut keys = value_keys(input, chunk.len())?;
+                // the ORDER BY keys that are not arguments tell rows apart too
+                for &at in &aggregate.distinct_order {
+                    for (key, extra) in keys.iter_mut().zip(value_keys(&order_vectors[at], chunk.len())?) {
+                        key.extend_from_slice(&(extra.len() as u64).to_le_bytes());
+                        key.extend(extra);
+                    }
+                }
+                Some(keys.into_iter().map(Some).collect())
             }
             _ => None,
         };
         let order_keys = if aggregate.order_by.is_empty() {
             None
         } else {
-            let vectors = aggregate
-                .order_by
-                .iter()
-                .map(|(expr, _)| execute(expr, chunk))
-                .collect::<Result<Vec<_>>>()?;
-            let columns: Vec<(&Vector, OrderModifiers)> = vectors
+            let columns: Vec<(&Vector, OrderModifiers)> = order_vectors
                 .iter()
                 .zip(&aggregate.order_by)
                 .map(|(vector, (_, modifiers))| (vector, *modifiers))
@@ -3110,10 +3531,12 @@ impl PhysicalAggregate {
                 .map(|(aggregate, states)| {
                     let mut column = Vector::new(aggregate.return_type.clone(), count);
                     let input = aggregate.children.first().map(|c| &c.return_type);
-                    for (row, state) in states[group..group + count].iter().enumerate() {
-                        let value = aggregate.function.finalize(state, &aggregate.return_type, input)?;
-                        column.set_value(row, &value)?;
-                    }
+                    aggregate.function.finalize_into(
+                        &states[group..group + count],
+                        &aggregate.return_type,
+                        input,
+                        &mut column,
+                    )?;
                     Ok(column)
                 })
                 .collect()
@@ -3149,6 +3572,8 @@ impl PhysicalOperator for PhysicalAggregate {
     fn name(&self) -> &'static str {
         if self.groups.is_empty() && self.grouping_sets.len() == 1 {
             "UNGROUPED_AGGREGATE"
+        } else if self.perfect_hash {
+            "PERFECT_HASH_GROUP_BY"
         } else {
             "HASH_GROUP_BY"
         }
@@ -3209,6 +3634,7 @@ impl PhysicalOperator for PhysicalAggregate {
             self.locals.lock().push(local.remove(0));
             return Ok(());
         }
+        self.merged_locals.store(true, Ordering::Relaxed);
         let mut states = self.state.lock();
         for (state, local) in states.iter_mut().zip(local) {
             self.merge_groups(state, local)?;
@@ -3217,11 +3643,20 @@ impl PhysicalOperator for PhysicalAggregate {
     }
     fn finalize(&self) -> Result<()> {
         let mut states = self.state.lock();
-        let locals = std::mem::take(&mut *self.locals.lock());
+        let mut locals = std::mem::take(&mut *self.locals.lock());
         if !locals.is_empty() {
+            // what a pipeline on one thread sank, such as the rows a RIGHT join found no match
+            // for after its probe, is put together with the states of threads like one of them
+            let serial = !states[0].full && !self.merged_locals.load(Ordering::Relaxed);
+            if serial && states[0].group_count > 0 {
+                let types = states[0].group_values.types().to_vec();
+                locals.push(std::mem::replace(
+                    &mut states[0],
+                    AggregateSinkState::new(types, &self.aggregates),
+                ));
+            }
             let groups: usize = locals.iter().map(|l| l.group_count).sum();
-            let untouched = states[0].group_count == 0 && !states[0].full;
-            if untouched && locals.len() > 1 && groups >= PARTITIONED_MERGE_GROUPS {
+            if serial && locals.len() > 1 && groups >= PARTITIONED_MERGE_GROUPS {
                 let output = self.merge_partitioned(locals)?;
                 if let Some(spill) = &self.spill {
                     spill.spilled.store(false, Ordering::Relaxed);
@@ -3633,6 +4068,9 @@ impl PhysicalOperator for PhysicalDelete {
         let mut storage = self.table.write_storage()?;
         let mut kept = ColumnDataCollection::new(storage.types().to_vec());
         let mut deleted = ColumnDataCollection::new(storage.types().to_vec());
+        // with RETURNING, the `rowid` of each deleted row comes after its columns
+        let ids = self.table.row_ids(count);
+        let mut deleted_ids = Vec::new();
         for (index, chunk) in storage.chunks().enumerate() {
             let first_row = index * STANDARD_VECTOR_SIZE;
             let (gone, stay): (Vec<u32>, Vec<u32>) =
@@ -3640,6 +4078,9 @@ impl PhysicalOperator for PhysicalDelete {
             if gone.is_empty() {
                 kept.append(chunk);
                 continue;
+            }
+            if self.returning {
+                deleted_ids.extend(gone.iter().map(|row| ids.id(first_row + *row as usize) as i64));
             }
             for (rows, target) in [(stay, &mut kept), (gone, &mut deleted)] {
                 let count = rows.len();
@@ -3656,6 +4097,21 @@ impl PhysicalOperator for PhysicalDelete {
         let mut removed: Vec<usize> = positions.iter().copied().collect();
         removed.sort_unstable();
         self.table.rows_moved(&removed, count);
+        let deleted = if self.returning {
+            let mut with_ids = ColumnDataCollection::new(self.types.clone());
+            let mut at = 0;
+            for chunk in deleted.chunks() {
+                let mut column = Vector::new(LogicalType::BIGINT, chunk.len());
+                column.data_mut::<i64>()[..chunk.len()].copy_from_slice(&deleted_ids[at..at + chunk.len()]);
+                at += chunk.len();
+                let mut columns = chunk.columns().to_vec();
+                columns.push(column);
+                with_ids.append(&DataChunk::from_columns(columns, chunk.len()));
+            }
+            with_ids
+        } else {
+            deleted
+        };
         *self.output.lock() = changed_rows_output(&self.types, deleted, removed.len() as u64, self.returning);
         Ok(())
     }
@@ -3749,6 +4205,11 @@ impl PhysicalOperator for PhysicalUpdate {
             .filter_map(|(id, values)| Some((ids.position(*id as u64)?, values)))
             .collect();
         let moves_rows = self.table.update_moves_rows(&self.columns);
+        // C++ keeps statistics as rows are written, and an update only widens them: what is known
+        // of the rows before has to be there for the updated values to add to
+        if !moves_rows {
+            crate::optimizer::statistics::warm_statistics(&self.table);
+        }
         self.table.claim_rows(updates.keys().copied(), count, !moves_rows)?;
         let mut storage = self.table.write_storage()?;
         let mut rewritten = ColumnDataCollection::new(storage.types().to_vec());
@@ -4001,6 +4462,7 @@ impl PhysicalOperator for PhysicalCreateTableAs {
             self.on_conflict,
         )?;
         if let Some(table) = table {
+            table.from_query.store(true, std::sync::atomic::Ordering::Relaxed);
             let data = self.data.lock();
             let mut storage = table.append_storage()?;
             for chunk in data.chunks() {

@@ -11,15 +11,22 @@
 //! a join filter and read its wide columns for fewer rows. C++ always goes by rows times width;
 //! here that only decides where the rows differ in width several times over, as the estimates of
 //! joins are too rough to weigh against a small difference (TPC-H Q9 would build on all of orders).
+//!
+//! LEFT and RIGHT joins are the other joins with an inverse type: join order leaves them where they
+//! are, so the side to build on is the one with the fewest rows times width, as C++ goes by. A LEFT
+//! join whose right side costs more becomes a RIGHT join with the sides swapped (TPC-H Q13 builds on
+//! customer, not orders), and a RIGHT join whose left side costs more becomes a LEFT join.
 
 use super::join_order::{PlanEstimate, estimate_plan};
 use crate::planner::logical::{LogicalOperator, LogicalOperatorKind as K};
 use duckrs_common::types::{LogicalType, PhysicalType};
-use duckrs_parser::ast::JoinType;
+use duckrs_parser::ast::{ComparisonOp, JoinType};
 
-pub fn choose_build_sides(plan: &mut LogicalOperator) {
+/// With `prefer_range_joins`, a SEMI or ANTI join stays as it is: no range join runs RIGHT SEMI or
+/// RIGHT ANTI.
+pub fn choose_build_sides(plan: &mut LogicalOperator, prefer_range_joins: bool) {
     // an estimate reads the statistics of the tables, which a plan without such a join has no use for
-    if !has_semi_join(plan) {
+    if prefer_range_joins || !has_semi_join(plan) {
         return;
     }
     let estimate = estimate_plan(plan);
@@ -98,20 +105,20 @@ fn joins_below(op: &LogicalOperator) -> usize {
     }
 }
 
-/// `BuildProbeSideOptimizer::TryFlipJoinChildren` for inner joins, to run when the plan has the
-/// columns it will have.
+/// `BuildProbeSideOptimizer::TryFlipJoinChildren` for inner, LEFT and RIGHT joins, to run when the
+/// plan has the columns it will have.
 pub fn choose_by_width(plan: &mut LogicalOperator) {
-    fn has_inner_join(op: &LogicalOperator) -> bool {
+    fn has_flippable_join(op: &LogicalOperator) -> bool {
         let own = matches!(
             op.kind,
             K::Join {
-                join_type: JoinType::Inner,
+                join_type: JoinType::Inner | JoinType::Left | JoinType::Right,
                 ..
             }
         );
-        own || op.children.iter().any(has_inner_join)
+        own || op.children.iter().any(has_flippable_join)
     }
-    if !has_inner_join(plan) {
+    if !has_flippable_join(plan) {
         return;
     }
     let estimate = estimate_plan(plan);
@@ -132,7 +139,7 @@ fn flip_by_width(op: &mut LogicalOperator, estimate: &PlanEstimate, by_position:
         flip_by_width(child, estimate, below);
     }
     let K::Join {
-        join_type: JoinType::Inner,
+        join_type: join_type @ (JoinType::Inner | JoinType::Left | JoinType::Right),
         conditions,
         ..
     } = &mut op.kind
@@ -142,12 +149,26 @@ fn flip_by_width(op: &mut LogicalOperator, estimate: &PlanEstimate, by_position:
     if by_position || conditions.is_empty() {
         return;
     }
-    // estimates of joins are rough, and join order went by them alone: the width only overrules
-    // them where the rows to build are several times as wide (strings, mostly)
     let (left_types, right_types) = (op.children[0].types(), op.children[1].types());
-    if build_size(&right_types, 1) < MIN_WIDTH_RATIO * build_size(&left_types, 1) {
-        return;
-    }
+    let inverse = match join_type {
+        JoinType::Inner => {
+            // estimates of joins are rough, and join order went by them alone: the width only
+            // overrules them where the rows to build are several times as wide (strings, mostly)
+            if build_size(&right_types, 1) < MIN_WIDTH_RATIO * build_size(&left_types, 1) {
+                return;
+            }
+            JoinType::Inner
+        }
+        // a hash join, which builds the right side, needs an equality; the others stay as written
+        _ if !conditions
+            .iter()
+            .any(|c| matches!(c.comparison, ComparisonOp::Equal | ComparisonOp::NotDistinctFrom)) =>
+        {
+            return;
+        }
+        JoinType::Left => JoinType::Right,
+        _ => JoinType::Left,
+    };
     let left = build_size(&left_types, estimate.children[0].cardinality);
     let mut right = build_size(&right_types, estimate.children[1].cardinality);
     if joins_below(&op.children[1]) == 0 && joins_below(&op.children[0]) > 0 {
@@ -156,8 +177,10 @@ fn flip_by_width(op: &mut LogicalOperator, estimate: &PlanEstimate, by_position:
     if right <= left {
         return;
     }
+    *join_type = inverse;
     for condition in conditions {
         std::mem::swap(&mut condition.left, &mut condition.right);
+        condition.comparison = super::range_joins::flip(condition.comparison);
     }
     op.children.swap(0, 1);
 }

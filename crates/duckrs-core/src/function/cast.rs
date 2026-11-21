@@ -223,6 +223,9 @@ struct IntegerDecimal {
     result: i128,
     decimal: i128,
     decimal_digits: u32,
+    /// `HugeIntCastData`: a fraction that does not fit a HUGEINT fails the cast instead of
+    /// being cut short
+    hugeint: bool,
 }
 
 impl IntegerDecimal {
@@ -244,14 +247,18 @@ impl IntegerDecimal {
         }
     }
 
-    fn handle_decimal(&mut self, digit: u8) {
+    fn handle_decimal(&mut self, digit: u8) -> bool {
         // digits past this position cannot affect the result for any i16 exponent
         const MAX_DECIMAL_DIGITS: u32 = 32768;
-        if self.decimal_digits == MAX_DECIMAL_DIGITS || self.decimal > (i128::MAX - digit as i128) / 10 {
-            return;
+        if self.decimal_digits == MAX_DECIMAL_DIGITS {
+            return true;
+        }
+        if self.decimal > (i128::MAX - digit as i128) / 10 {
+            return !self.hugeint;
         }
         self.decimal_digits += 1;
         self.decimal = self.decimal * 10 + digit as i128;
+        true
     }
 
     fn handle_exponent(&mut self, exponent: i16, negative: bool) -> bool {
@@ -357,7 +364,9 @@ fn integer_cast_loop(buf: &[u8], negative: bool, allow_exponent: bool, state: &m
                 let start_digit = pos;
                 while pos < len && buf[pos].is_ascii_digit() {
                     if allow_exponent {
-                        state.handle_decimal(buf[pos] - b'0');
+                        if !state.handle_decimal(buf[pos] - b'0') {
+                            return false;
+                        }
                     } else {
                         // the exponent itself takes no decimals
                         return false;
@@ -491,6 +500,15 @@ fn try_cast_string_to_uhugeint(input: &[u8]) -> Option<u128> {
 
 /// `TryIntegerCast` (non-strict): the integer a string spells, rounding a fraction.
 pub fn try_cast_string_to_integer(input: &[u8]) -> Option<i128> {
+    string_to_integer(input, false)
+}
+
+/// `TryCast::Operation(string_t, hugeint_t &)`.
+pub fn try_cast_string_to_hugeint(input: &[u8]) -> Option<i128> {
+    string_to_integer(input, true)
+}
+
+fn string_to_integer(input: &[u8], hugeint: bool) -> Option<i128> {
     let mut buf = input;
     while let [first, rest @ ..] = buf {
         if !is_space(*first) {
@@ -501,7 +519,10 @@ pub fn try_cast_string_to_integer(input: &[u8]) -> Option<i128> {
     if buf.is_empty() {
         return None;
     }
-    let mut state = IntegerDecimal::default();
+    let mut state = IntegerDecimal {
+        hugeint,
+        ..IntegerDecimal::default()
+    };
     if buf[0] == b'-' {
         return integer_cast_loop(buf, true, true, &mut state).then_some(state.result);
     }
@@ -541,6 +562,18 @@ pub fn try_cast_string_to_double(input: &[u8]) -> Option<f64> {
             .any(|w| unsigned.eq_ignore_ascii_case(w))
     {
         return None;
+    }
+    // `fast_float::parse_number_string`: one underscore between two digits is skipped
+    if text.contains('_') {
+        let bytes = text.as_bytes();
+        let separated = bytes.iter().enumerate().all(|(i, b)| {
+            *b != b'_'
+                || (i > 0 && bytes[i - 1].is_ascii_digit() && bytes.get(i + 1).is_some_and(u8::is_ascii_digit))
+        });
+        if !separated {
+            return None;
+        }
+        return text.replace('_', "").parse::<f64>().ok();
     }
     text.parse::<f64>().ok()
 }
@@ -596,7 +629,8 @@ fn string_to<T: CastNumber>(source: &Vector, result: &mut Vector, count: usize, 
             try_cast_string_to_double(s)?;
             let text = std::str::from_utf8(s).ok()?;
             let text = text.trim_matches(|c: char| c.is_ascii() && is_space(c as u8));
-            text.parse::<f32>().ok().map(Number::Float)
+            // the digit separators were checked with the double
+            text.replace('_', "").parse::<f32>().ok().map(Number::Float)
         }),
         PhysicalType::Double => string_to_number::<T>(source, result, count, mode, |s| {
             try_cast_string_to_double(s).map(Number::Double)
@@ -606,6 +640,9 @@ fn string_to<T: CastNumber>(source: &Vector, result: &mut Vector, count: usize, 
             try_cast_string_to_integer(s)
                 .map(Number::Int)
                 .or_else(|| try_cast_string_to_uhugeint(s).map(Number::UHuge))
+        }),
+        PhysicalType::Int128 => string_to_number::<T>(source, result, count, mode, |s| {
+            try_cast_string_to_hugeint(s).map(Number::Int)
         }),
         _ => string_to_number::<T>(source, result, count, mode, |s| {
             try_cast_string_to_integer(s).map(Number::Int)
@@ -1039,13 +1076,28 @@ fn is_ported_scalar(ty: &LogicalType) -> bool {
     )
 }
 
+/// Whether `ty` is a TYPE or has one inside.
+pub(super) fn contains_type(ty: &LogicalType) -> bool {
+    match ty.id() {
+        LogicalTypeId::Type => true,
+        LogicalTypeId::List | LogicalTypeId::Array | LogicalTypeId::Map => {
+            ty.child_type().is_some_and(contains_type)
+        }
+        LogicalTypeId::Struct | LogicalTypeId::Tuple | LogicalTypeId::Union => {
+            ty.struct_children().iter().any(|(_, child)| contains_type(child))
+        }
+        _ => false,
+    }
+}
+
 fn unimplemented_cast(source: &LogicalType, target: &LogicalType) -> Error {
     crate::unported(format!("casting {source} to {target}"))
 }
 
 /// Whether [`cast_vector`] can cast `source` to `target`.
 pub fn has_cast(source: &LogicalType, target: &LogicalType) -> bool {
-    source == target
+    (target.id() == LogicalTypeId::Variant && contains_type(source))
+        || source == target
         || source.id() == LogicalTypeId::SqlNull
         || target.id() == LogicalTypeId::SqlNull
         || target.id() == LogicalTypeId::Varchar
@@ -1053,7 +1105,10 @@ pub fn has_cast(source: &LogicalType, target: &LogicalType) -> bool {
         || (source.id() == LogicalTypeId::Varchar && is_numeric_or_bool(target))
         || is_decimal_cast(source, target)
         || (is_ported_scalar(source) && is_ported_scalar(target))
-        || nested_casts::has_nested_cast(source, target, &is_ported_scalar)
+        || nested_casts::has_nested_cast(source, target, &|ty| {
+            // a TYPE member of a nested value casts to a VARIANT, as NULL
+            is_ported_scalar(ty) || ty.id() == LogicalTypeId::Type
+        })
 }
 
 /// `ReinterpretCast`, row by row.
@@ -1147,11 +1202,23 @@ pub fn cast_vector(source: &Vector, result: &mut Vector, count: usize, mode: Cas
     if to.id() == LogicalTypeId::Varchar {
         return to_varchar(source, result, count);
     }
-    if from.id() == LogicalTypeId::Geometry || to.id() == LogicalTypeId::Geometry {
-        return super::geometry::geometry_cast(source, result, count, mode);
+    // `CastFunctionSet` has no cast to VARIANT of what holds a TYPE: a NULL casts, a value does not
+    if to.id() == LogicalTypeId::Variant && contains_type(&from) {
+        let unified = source.to_unified(count);
+        result.prepare_flat(count.max(1));
+        for row in 0..count {
+            if unified.is_valid(row) && mode != CastMode::Try {
+                return Err(conversion_error(format!("Unimplemented type for cast ({from} -> VARIANT)")));
+            }
+            result.set_null(row, true);
+        }
+        return Ok(());
     }
     if from.id() == LogicalTypeId::Variant || to.id() == LogicalTypeId::Variant {
         return variant::variant_cast(source, result, count, mode);
+    }
+    if from.id() == LogicalTypeId::Geometry || to.id() == LogicalTypeId::Geometry {
+        return super::geometry::geometry_cast(source, result, count, mode);
     }
     if from.is_nested() || to.is_nested() {
         return nested_casts::nested_cast(source, result, count, mode);

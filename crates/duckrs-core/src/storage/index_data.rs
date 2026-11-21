@@ -81,20 +81,13 @@ impl TableIndex {
     /// `AddIndex` of a table: its keys in the order of its constraints, then its indexes. C++ reads
     /// back the first ones by position and the last ones by name.
     pub fn all_of(table: &TableCatalogEntry, block_size: usize, version: StorageVersion) -> Vec<Self> {
-        // the NOT NULL go first in what a table says of its constraints
-        let not_null = table
-            .logical_columns()
-            .iter()
-            .filter(|column| column.definition.is_some_and(|d| d.not_null))
-            .count();
         let mut indexes = Vec::new();
         for (position, constraint) in table.constraints.iter().enumerate() {
-            let position = not_null + position;
             let (kind, columns, unique) = match constraint {
-                TableConstraint::Check { .. } => continue,
-                TableConstraint::Unique { columns, primary_key } => {
-                    (if *primary_key { "PRIMARY" } else { "UNIQUE" }, columns, true)
-                }
+                TableConstraint::Check { .. } | TableConstraint::NotNull(_) => continue,
+                TableConstraint::Unique {
+                    columns, primary_key, ..
+                } => (if *primary_key { "PRIMARY" } else { "UNIQUE" }, columns, true),
                 TableConstraint::ForeignKey(key) => ("FOREIGN", &key.columns, false),
             };
             let key = TableKey {
@@ -102,6 +95,7 @@ impl TableIndex {
                 expressions: None,
                 names: Vec::new(),
                 primary_key: false,
+                deferred: false,
             };
             let name = format!("{kind}_{}_{position}", table.name);
             indexes.push(Self::new(table, name, key, unique, block_size, version));
@@ -123,6 +117,7 @@ impl TableIndex {
             expressions: Some(index.expressions.clone()),
             names: index.names.clone(),
             primary_key: false,
+            deferred: false,
         };
         Self::new(table, index.name.clone(), key, index.unique, block_size, version)
     }

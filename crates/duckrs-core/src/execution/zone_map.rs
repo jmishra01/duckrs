@@ -23,6 +23,80 @@ use duckrs_parser::ast::ComparisonOp;
 use std::cmp::Ordering;
 use std::sync::Arc;
 
+/// `StringStatsData::MAX_STRING_MINMAX_SIZE`: the bytes of the bounds of strings C++ keeps.
+pub const STRING_STATISTICS_BYTES: usize = 12;
+
+/// Functions that do not give NULL for a NULL argument (`FunctionNullHandling::SPECIAL_HANDLING`): the one
+/// value of a group with NULLs says nothing of their result. Of the others, a NULL gives NULL, which
+/// a range leaves out.
+pub(crate) const SPECIAL_NULL_HANDLING: &[&str] = &[
+    "hash",
+    "coalesce",
+    "concat",
+    "concat_ws",
+    "ifnull",
+    "nullif",
+    "list_value",
+    "array_value",
+    "struct_pack",
+    "row",
+    "map",
+    "constant_or_null",
+    "to_json",
+    "json_object",
+    "json_array",
+    "typeof",
+    "error",
+    "list_concat",
+    "array_concat",
+    "map_concat",
+    "greatest",
+    "least",
+    "list_position",
+    "list_indexof",
+    "array_position",
+    "array_indexof",
+    "list_contains",
+    "list_has",
+    "array_contains",
+    "array_has",
+    "list_filter",
+    "list_transform",
+    "list_zip",
+    "list_resize",
+    "list_intersect",
+    "array_slice",
+    "list_slice",
+    "map_entries",
+    "map_keys",
+    "map_values",
+    "map_contains",
+    "map_extract",
+    "struct_insert",
+    "struct_update",
+    "struct_contains",
+    "remap_struct",
+    "string_split",
+    "str_split",
+    "strftime",
+    "invoke",
+    "create_sort_key",
+    "stats",
+    "regexp_matches",
+    "regexp_replace",
+    "regexp_extract",
+];
+
+/// The date part `part` of `value`, if it can be worked out.
+pub(crate) fn evaluate_part(part: &str, value: &Value) -> Option<Value> {
+    let call = crate::function::dates::bind_date_function(
+        "date_part",
+        vec![BoundExpr::constant(Value::varchar(part)), BoundExpr::constant(value.clone())],
+    )
+    .ok()?;
+    try_evaluate_scalar(&call).filter(|value| !value.is_null())
+}
+
 /// `DEFAULT_ROW_GROUP_SIZE`.
 pub const ROW_GROUP_SIZE: usize = 122_880;
 /// The chunks of a row group, which all but the last chunk of a table fill.
@@ -91,7 +165,13 @@ const MONOTONE_ARGUMENTS: &[(&str, usize, bool)] = &[
 
 /// The zones of a column, by the keys in which its values sort as they do in a comparison.
 fn compute_zones(table: &TableCatalogEntry, column: usize, known: &[ColumnZone]) -> Vec<ColumnZone> {
-    if !has_ordered_statistics(&table.columns[column].ty) {
+    // intervals sort by their normalized form, as they compare
+    let ty = &table.columns[column].ty;
+    if let Some(element) = nested_element_type(ty) {
+        return compute_nested_zones(table, column, &element);
+    }
+    // UUIDs and ENUMs keep the statistics of the integers they are stored as
+    if !has_ordered_statistics(ty) && !matches!(ty.id(), LogicalTypeId::Interval | LogicalTypeId::Uuid | LogicalTypeId::Enum) {
         return Vec::new();
     }
     if let Some(source) = table
@@ -147,6 +227,18 @@ fn compute_zones(table: &TableCatalogEntry, column: usize, known: &[ColumnZone])
         };
         merge(&mut zone.min, smallest, Ordering::Less);
         merge(&mut zone.max, largest, Ordering::Greater);
+        // the lengths of strings (`StringStats` keeps the longest and whether there is unicode)
+        if vector.logical_type().id() == LogicalTypeId::Varchar {
+            for row in (0..count).filter(|&row| validity.is_valid(row)) {
+                let Ok(text) = vector.get_value(row).try_to_string() else {
+                    continue;
+                };
+                let length = text.len() as u64;
+                let (low, high) = zone.lengths.unwrap_or((length, length));
+                zone.lengths = Some((low.min(length), high.max(length)));
+                zone.has_unicode |= !text.is_ascii();
+            }
+        }
     });
     // with what can't be read there is nothing to go by, which means reading every group
     if read.is_err() {
@@ -155,8 +247,106 @@ fn compute_zones(table: &TableCatalogEntry, column: usize, known: &[ColumnZone])
     zones
 }
 
+/// Whether `value` lies outside of the bounds of `elements` (no element at all counts as outside). Of
+/// strings and blobs only the 12 bytes C++ keeps of the bounds are compared.
+fn outside_elements(value: &Value, elements: &ColumnZone) -> bool {
+    let (Some(min), Some(max)) = (&elements.min, &elements.max) else {
+        return true;
+    };
+    let cut = |v: &Value| -> Value {
+        match v.data() {
+            duckrs_common::value::ValueData::Bytes(bytes) if bytes.len() > STRING_STATISTICS_BYTES => {
+                let mut cut = bytes[..STRING_STATISTICS_BYTES].to_vec();
+                // a truncated bound stands for all strings it is a prefix of
+                if std::ptr::eq(v, max) {
+                    cut.push(0xff);
+                }
+                Value::new(v.logical_type().clone(), duckrs_common::value::ValueData::Bytes(cut)).unwrap_or_else(|_| v.clone())
+            }
+            _ => v.clone(),
+        }
+    };
+    let (min, max) = (cut(min), cut(max));
+    compare_values(ComparisonOp::LessThan, value, &min) == Some(true)
+        || compare_values(ComparisonOp::GreaterThan, value, &max) == Some(true)
+}
+
+/// The type of what the zone of a nested column's `elements` describes: the elements of a LIST or
+/// ARRAY, the values of a MAP; `None` for other types, or elements without ordered statistics.
+fn nested_element_type(ty: &LogicalType) -> Option<LogicalType> {
+    let element = match ty.id() {
+        LogicalTypeId::List | LogicalTypeId::Array => ty.child_type()?.clone(),
+        LogicalTypeId::Map => ty.child_type()?.struct_children().get(1)?.1.clone(),
+        _ => return None,
+    };
+    (has_ordered_statistics(&element) || matches!(element.id(), LogicalTypeId::Blob | LogicalTypeId::Interval)).then_some(element)
+}
+
+/// The zones of a nested column: what is NULL, and the bounds of its elements.
+fn compute_nested_zones(table: &TableCatalogEntry, column: usize, element: &LogicalType) -> Vec<ColumnZone> {
+    let mut zones: Vec<ColumnZone> = Vec::new();
+    let map = table.columns[column].ty.id() == LogicalTypeId::Map;
+    let chunks_per_group = table.chunks_per_row_group();
+    let read = table.for_each_chunk(column, |index, vector, count| {
+        if index % chunks_per_group == 0 {
+            zones.push(ColumnZone {
+                // the elements of the group are known until one is not
+                elements: Some(Box::default()),
+                ..ColumnZone::default()
+            });
+        }
+        let zone = zones.last_mut().expect("just pushed one");
+        for row in 0..count {
+            let value = vector.get_value(row);
+            if value.is_null() {
+                zone.has_null = true;
+                continue;
+            }
+            let duckrs_common::value::ValueData::List(items) = value.data() else {
+                zone.elements = None;
+                continue;
+            };
+            let Some(elements) = zone.elements.as_mut() else {
+                continue;
+            };
+            for item in items {
+                let item = match (map, item.data()) {
+                    (true, duckrs_common::value::ValueData::Struct(fields)) if fields.len() == 2 => &fields[1],
+                    (true, _) => {
+                        zone.elements = None;
+                        break;
+                    }
+                    (false, _) => item,
+                };
+                if item.is_null() {
+                    elements.has_null = true;
+                    continue;
+                }
+                if item.logical_type() != element {
+                    zone.elements = None;
+                    break;
+                }
+                if elements.min.as_ref().is_none_or(|min| compare_values(ComparisonOp::LessThan, item, min) == Some(true)) {
+                    elements.min = Some(item.clone());
+                }
+                if elements.max.as_ref().is_none_or(|max| compare_values(ComparisonOp::GreaterThan, item, max) == Some(true)) {
+                    elements.max = Some(item.clone());
+                }
+            }
+        }
+    });
+    if read.is_err() {
+        return Vec::new();
+    }
+    // the bounds of the column itself are not known, only its elements' (where those could be told)
+    for zone in &mut zones {
+        zone.unknown = zone.elements.is_none();
+    }
+    zones
+}
+
 /// `compute_zones`, once per state of the rows.
-fn zones_of(table: &TableCatalogEntry, column: usize) -> Arc<Vec<ColumnZone>> {
+pub(crate) fn zones_of(table: &TableCatalogEntry, column: usize) -> Arc<Vec<ColumnZone>> {
     let groups = row_group_count(table, table.row_count());
     let (version, known) = {
         let mut cached = table.statistics.lock();
@@ -178,6 +368,18 @@ fn zones_of(table: &TableCatalogEntry, column: usize) -> Arc<Vec<ColumnZone>> {
 }
 
 /// The argument of a call of `name` that its result follows, in order or reversed, while the others are constant.
+/// Whether a function of one argument follows the order of it (`true`) or reverses it (`false`),
+/// where its `ArgProperties` say it does either.
+pub(crate) fn unary_monotonicity(name: &str) -> Option<bool> {
+    if MONOTONE_FUNCTIONS.contains(&name) {
+        return Some(true);
+    }
+    MONOTONE_ARGUMENTS
+        .iter()
+        .find(|(function, at, _)| *function == name && *at == 0)
+        .map(|&(_, _, increasing)| increasing)
+}
+
 fn monotone_argument(name: &str, children: &[BoundExpr]) -> Option<(usize, bool)> {
     MONOTONE_ARGUMENTS
         .iter()
@@ -243,6 +445,8 @@ impl Group<'_> {
     fn column_range(&self, index: usize) -> Range {
         match self.zone(index) {
             None => Range::Unknown,
+            // a nested column: only its elements have bounds
+            Some(ColumnZone { elements: Some(_), .. }) => Range::Unknown,
             Some(ColumnZone {
                 min: Some(min),
                 max: Some(max),
@@ -277,6 +481,8 @@ impl Group<'_> {
                 let (varying, increasing) = monotone_argument(&function.name, children).expect("checked");
                 self.monotone(expr, varying, increasing)
             }
+            // a cast of NULL is NULL, whether it could convert the values or not
+            BoundExprKind::Cast { child, .. } if matches!(self.range(child), Range::Null) => Range::Null,
             BoundExprKind::Constant(value) if value.is_null() => Range::Null,
             BoundExprKind::Constant(value) => Range::Bounds(value.clone(), value.clone()),
             // `PropagateCaseExpression`: what any branch gives
@@ -291,6 +497,87 @@ impl Group<'_> {
             } => self.union(children.iter()),
             _ => Range::Unknown,
         }
+    }
+
+    /// Whether `x != a AND x != b ...` among `conjuncts` leaves no value of the range of an integer column in
+    /// the group (a NOT IN list that covers it).
+    fn excludes_every_value(&self, conjuncts: &[BoundExpr]) -> bool {
+        let mut excluded: std::collections::HashMap<usize, std::collections::HashSet<i128>> = Default::default();
+        for conjunct in conjuncts {
+            let BoundExprKind::Comparison {
+                op: ComparisonOp::NotEqual,
+                left,
+                right,
+            } = &conjunct.kind
+            else {
+                continue;
+            };
+            let (index, constant) = match (&left.kind, &right.kind) {
+                (BoundExprKind::Reference(index), BoundExprKind::Constant(c))
+                | (BoundExprKind::Constant(c), BoundExprKind::Reference(index)) => (*index, c),
+                _ => continue,
+            };
+            if let Some(value) = constant.as_i128() {
+                excluded.entry(index).or_default().insert(value);
+            }
+        }
+        excluded.into_iter().any(|(index, values)| {
+            let Some(zone) = self.zone(index) else {
+                return false;
+            };
+            let (Some(min), Some(max)) = (zone.min.as_ref(), zone.max.as_ref()) else {
+                return false;
+            };
+            if !min.logical_type().is_integral() {
+                return false;
+            }
+            let (Some(min), Some(max)) = (min.as_i128(), max.as_i128()) else {
+                return false;
+            };
+            max >= min && max - min < values.len() as i128 && (min..=max).all(|v| values.contains(&v))
+        })
+    }
+
+    /// The zone of the elements of a LIST or ARRAY column in the group, or of the values of a MAP
+    /// (also through `map_values`).
+    fn elements(&self, expr: &BoundExpr) -> Option<ColumnZone> {
+        match &expr.kind {
+            BoundExprKind::Reference(index) => self.zone(*index)?.elements.map(|zone| *zone),
+            BoundExprKind::Function { function, children, .. } if function.name == "map_values" && children.len() == 1 => {
+                self.elements(&children[0]).filter(|_| children[0].return_type.id() == LogicalTypeId::Map)
+            }
+            // `list_transform(l, x -> f(x))`: f of the elements' range, for a lambda that reads nothing else
+            BoundExprKind::ListLambda {
+                kind: crate::planner::expression::LambdaKind::Transform,
+                list,
+                captures,
+                body,
+                ..
+            } if captures.is_empty() => {
+                let inner = self.elements(list)?;
+                let zone = move |index: usize| (index == 0).then(|| inner.clone());
+                let range = Group { zone: &zone }.range(body);
+                match range {
+                    Range::Bounds(min, max) => Some(ColumnZone {
+                        min: Some(min),
+                        max: Some(max),
+                        ..ColumnZone::default()
+                    }),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The fewest and most bytes of the strings of a column in the group, and whether any is unicode.
+    fn lengths(&self, expr: &BoundExpr) -> Option<(u64, u64, bool)> {
+        let BoundExprKind::Reference(index) = &expr.kind else {
+            return None;
+        };
+        let zone = self.zone(*index)?;
+        let (low, high) = zone.lengths?;
+        Some((low, high, zone.has_unicode))
     }
 
     /// The range of what is any of `exprs`.
@@ -338,6 +625,225 @@ impl Group<'_> {
         };
         match (name, children) {
             ("coalesce", _) => self.union(children.iter()),
+            // `s || ''` and `replace(s, a, a)` are `s`
+            ("||", [input, other]) | ("||", [other, input])
+                if constant(other).and_then(|v| v.try_to_string().ok()).as_deref() == Some("") =>
+            {
+                self.range(input)
+            }
+            ("replace", [input, from, to])
+                if constant(from).is_some() && constant(from).map(|v| v.try_to_string().ok()) == constant(to).map(|v| v.try_to_string().ok()) =>
+            {
+                self.range(input)
+            }
+            // `x % c` of what is from 0 up to below `c` is itself, and otherwise from 0 up to below `c`
+            ("%", [input, divisor]) if constant(divisor).as_ref().and_then(Value::as_i128).is_some_and(|c| c > 0) => {
+                let c = constant(divisor).as_ref().and_then(Value::as_i128).expect("checked");
+                let Range::Bounds(min, max) = self.range(input) else {
+                    return self.range(input);
+                };
+                match (min.as_i128(), max.as_i128()) {
+                    (Some(low), Some(high)) if low >= 0 && high < c => Range::Bounds(min, max),
+                    (Some(low), Some(_)) if low >= 0 => {
+                        let bound = |n: i128| crate::execution::parquet::try_cast_value(&Value::hugeint(n), &expr.return_type);
+                        match (bound(0), bound(c - 1)) {
+                            (Some(zero), Some(top)) => Range::Bounds(zero, top),
+                            _ => Range::Unknown,
+                        }
+                    }
+                    _ => Range::Unknown,
+                }
+            }
+            // the lengths of strings (`StringStats`): in bytes, and in characters, which without unicode
+            // are bytes and with it at least a quarter of them
+            ("length" | "len" | "char_length" | "character_length" | "length_grapheme" | "strlen" | "octet_length", [input])
+                if self.lengths(input).is_some() =>
+            {
+                let (low, high, unicode) = self.lengths(input).expect("checked");
+                let bytes = matches!(name, "strlen" | "octet_length");
+                let low = if bytes || !unicode {
+                    low
+                } else if name == "length_grapheme" {
+                    0
+                } else {
+                    low.div_ceil(4)
+                };
+                let bound = |n: u64| crate::execution::parquet::try_cast_value(&Value::bigint(n as i64), &expr.return_type);
+                match (bound(low), bound(high)) {
+                    (Some(low), Some(high)) => Range::Bounds(low, high),
+                    _ => Range::Unknown,
+                }
+            }
+            // a needle in the prefix that all strings of the group share (of the bytes C++ keeps of the bounds)
+            // is in all of them
+            ("contains", [input, needle])
+                if constant(needle).and_then(|n| n.try_to_string().ok()).is_some_and(|needle| {
+                    let Range::Bounds(min, max) = self.range(input) else {
+                        return false;
+                    };
+                    let (Ok(min), Ok(max)) = (min.try_to_string(), max.try_to_string()) else {
+                        return false;
+                    };
+                    let shared = min
+                        .bytes()
+                        .zip(max.bytes())
+                        .take(STRING_STATISTICS_BYTES)
+                        .take_while(|(a, b)| a == b)
+                        .count();
+                    min.get(..shared).is_some_and(|prefix| prefix.contains(needle.as_str()))
+                }) =>
+            {
+                Range::Bounds(Value::boolean(true), Value::boolean(true))
+            }
+            // a needle longer than every string is in none of them
+            ("contains" | "suffix" | "ends_with", [input, needle])
+                if self.lengths(input).is_some()
+                    && constant(needle)
+                        .and_then(|n| n.try_to_string().ok())
+                        .is_some_and(|n| n.len() as u64 > self.lengths(input).expect("checked").1) =>
+            {
+                Range::Bounds(Value::boolean(false), Value::boolean(false))
+            }
+            // `upper` and `lower` work on each character: strings that share a prefix (of the 12 bytes C++
+            // keeps of the bounds) give strings that share its converted prefix
+            ("upper" | "lower" | "ucase" | "lcase", [input]) => {
+                let Range::Bounds(min, max) = self.range(input) else {
+                    return self.range(input);
+                };
+                let (Ok(min), Ok(max)) = (min.try_to_string(), max.try_to_string()) else {
+                    return Range::Unknown;
+                };
+                let shared: String = min
+                    .chars()
+                    .zip(max.chars())
+                    .take_while(|(a, b)| a == b)
+                    .map(|(a, _)| a)
+                    .scan(0, |bytes, c| {
+                        *bytes += c.len_utf8();
+                        (*bytes <= STRING_STATISTICS_BYTES).then_some(c)
+                    })
+                    .collect();
+                if shared.is_empty() || !shared.is_ascii() {
+                    return Range::Unknown;
+                }
+                let prefix = if matches!(name, "upper" | "ucase") {
+                    shared.to_ascii_uppercase()
+                } else {
+                    shared.to_ascii_lowercase()
+                };
+                let mut above = prefix.clone();
+                above.push(char::MAX);
+                Range::Bounds(Value::varchar(prefix), Value::varchar(above))
+            }
+            // comparisons of intervals go by their normalized form already
+            ("normalized_interval", [_]) => self.monotone(expr, 0, true),
+            // `substring(s, k)` of strings that share their first k - 1 characters sorts as the strings do
+            // `s[:]` is `s`, and `s[:n]` a prefix of it, which sorts as it does
+            ("array_slice" | "list_slice", [input, start, end])
+                if expr.return_type.id() == LogicalTypeId::Varchar
+                    && start.return_type.id() == LogicalTypeId::List
+                    && matches!(end.kind, BoundExprKind::Constant(_)) =>
+            {
+                if end.return_type.id() == LogicalTypeId::List {
+                    self.range(input)
+                } else {
+                    self.monotone(expr, 0, true)
+                }
+            }
+            ("substring" | "substr" | "array_slice" | "list_slice", [input, start, rest @ ..])
+                if expr.return_type.id() == LogicalTypeId::Varchar
+                    && rest.iter().all(|r| matches!(r.kind, BoundExprKind::Constant(_)))
+                    && constant(start).and_then(|v| v.as_i128()).is_some_and(|k| k >= 0)
+                    && matches!(self.range(input), Range::Bounds(ref min, ref max) if {
+                        let k = (constant(start).and_then(|v| v.as_i128()).expect("checked") as usize).max(1);
+                        match (min.try_to_string(), max.try_to_string()) {
+                            (Ok(min), Ok(max)) => {
+                                let shared = min.chars().zip(max.chars()).take_while(|(a, b)| a == b).count();
+                                // C++ knows the shared prefix only within the 12 bytes it keeps
+                                shared >= k - 1 && min.chars().count() >= k - 1 && k - 1 <= STRING_STATISTICS_BYTES
+                            }
+                            _ => false,
+                        }
+                    }) =>
+            {
+                self.monotone(expr, 0, true)
+            }
+            // a time part of values that share the larger units follows them: `hour` within a day,
+            // `minute` within an hour, `second` and the smaller ones within a minute
+            ("hour" | "minute" | "second" | "millisecond" | "microsecond" | "nanosecond", [input]) => match self.range(input) {
+                Range::Bounds(min, max) => {
+                    let larger: &[&str] = match name {
+                        "hour" => &["year", "doy"],
+                        "minute" => &["year", "doy", "hour"],
+                        _ => &["year", "doy", "hour", "minute"],
+                    };
+                    let same = larger
+                        .iter()
+                        .all(|part| super::zone_map::evaluate_part(part, &min) == super::zone_map::evaluate_part(part, &max));
+                    if same { self.monotone(expr, 0, true) } else { Range::Unknown }
+                }
+                other => other,
+            },
+            // `week` of dates in one ISO year follows them
+            ("week" | "weekofyear", [input]) => match self.range(input) {
+                Range::Bounds(min, max) => {
+                    let iso_year = |value: &Value| super::zone_map::evaluate_part("isoyear", value);
+                    match (iso_year(&min), iso_year(&max)) {
+                        (Some(a), Some(b)) if a == b => self.monotone(expr, 0, true),
+                        _ => Range::Unknown,
+                    }
+                }
+                other => other,
+            },
+            // an element of a LIST or ARRAY, or a value of a MAP, lies within what the group's elements are
+            ("array_extract" | "list_extract" | "list_element" | "map_extract_value", [input, _])
+                if self.elements(input).is_some()
+                    && (input.return_type.id() == LogicalTypeId::Map
+                        || expr.return_type == *input.return_type.child_type().expect("a nested type")) =>
+            {
+                let elements = self.elements(input).expect("checked");
+                match (elements.min, elements.max) {
+                    (Some(min), Some(max)) => Range::Bounds(min, max),
+                    _ => Range::Null,
+                }
+            }
+            // the position of a value outside of the bounds of the elements is NULL
+            ("list_position" | "list_indexof" | "array_position" | "array_indexof", [input, value])
+                if self.elements(input).is_some() && constant(value).is_some() =>
+            {
+                let elements = self.elements(input).expect("checked");
+                let value = constant(value).expect("checked");
+                let outside = outside_elements(&value, &elements);
+                if outside { Range::Null } else { Range::Unknown }
+            }
+            // a list holds no value outside of the bounds of its elements
+            ("list_contains" | "list_has" | "array_contains" | "array_has" | "contains", [input, value])
+                if self.elements(input).is_some() && constant(value).is_some() =>
+            {
+                let elements = self.elements(input).expect("checked");
+                let value = constant(value).expect("checked");
+                let outside = outside_elements(&value, &elements);
+                if outside {
+                    Range::Bounds(Value::boolean(false), Value::boolean(false))
+                } else {
+                    Range::Unknown
+                }
+            }
+            // `isnan`: NaN sorts above every number, so the bounds tell
+            ("isnan", [input]) => match self.range(input) {
+                Range::Bounds(min, max) => {
+                    let nan = |v: &Value| match v.data() {
+                        duckrs_common::value::ValueData::Float(f) => Some(f.is_nan()),
+                        duckrs_common::value::ValueData::Double(d) => Some(d.is_nan()),
+                        _ => None,
+                    };
+                    match (nan(&min), nan(&max)) {
+                        (Some(low), Some(high)) => Range::Bounds(Value::boolean(low), Value::boolean(high)),
+                        _ => Range::Unknown,
+                    }
+                }
+                other => other,
+            },
             // `PowerStats`: a power above 0 of what is never negative grows with it
             ("power" | "pow", [base, exponent])
                 if constant(exponent).is_some_and(|e| sign(&e) == Some(Ordering::Greater))
@@ -349,7 +855,8 @@ impl Group<'_> {
             // a prefix of a string sorts as the string does
             ("left" | "substring" | "substr", [_, ..])
                 if children[1..].iter().all(|c| constant(c).is_some())
-                    && (name == "left"
+                    // a negative count of `left` drops characters from the end: no prefix
+                    && ((name == "left" && constant(&children[1]).and_then(|v| v.as_i128()).is_some_and(|n| n >= 0))
                         || constant(&children[1]).and_then(|v| v.try_to_string().ok()).as_deref() == Some("1")) =>
             {
                 self.monotone(expr, 0, true)
@@ -392,13 +899,13 @@ impl Group<'_> {
                         ("-", _) => (1, false),
                         ("*", Some(Ordering::Greater)) => (1, true),
                         ("*", Some(Ordering::Less)) => (1, false),
-                        // a constant that isn't negative over divisors that are all positive: the larger the divisor,
-                        // the smaller the quotient
+                        // a constant that isn't negative over divisors that are all positive, or all negative: the
+                        // larger the divisor, the smaller the quotient
                         ("/" | "//", Some(Ordering::Greater | Ordering::Equal)) => {
-                            let Range::Bounds(min, _) = self.range(right) else {
+                            let Range::Bounds(min, max) = self.range(right) else {
                                 return Range::Unknown;
                             };
-                            if sign(&min) != Some(Ordering::Greater) {
+                            if sign(&min) != Some(Ordering::Greater) && sign(&max) != Some(Ordering::Less) {
                                 return Range::Unknown;
                             }
                             (1, false)
@@ -428,6 +935,61 @@ impl Group<'_> {
                 }
                 other => other,
             },
+            // a deterministic function of what is one value in the group: that function of it
+            _ if !expr.is_volatile() && !children.is_empty() => {
+                // a column of the group with one value and no NULL, or a constant (a NULL in the group
+                // would give the function of NULL too)
+                let mut arguments = Vec::with_capacity(children.len());
+                for child in children {
+                    match &child.kind {
+                        BoundExprKind::Constant(_) => arguments.push(child.clone()),
+                        BoundExprKind::Reference(index) => match self.zone(*index) {
+                            Some(ColumnZone {
+                                min: Some(min),
+                                max: Some(max),
+                                has_null,
+                                ..
+                            }) if (!has_null || !SPECIAL_NULL_HANDLING.contains(&name))
+                                && compare_values(ComparisonOp::Equal, &min, &max) == Some(true)
+                                // C++ keeps 12 bytes of a string bound, which do not tell a longer one
+                                && min.try_to_string().map_or(true, |text| {
+                                    min.logical_type().id() != LogicalTypeId::Varchar || text.len() <= STRING_STATISTICS_BYTES
+                                })
+                                // the sign of a floating point zero is not in the statistics
+                                && !matches!(min.data(), duckrs_common::value::ValueData::Float(f) if *f == 0.0)
+                                && !matches!(min.data(), duckrs_common::value::ValueData::Double(d) if *d == 0.0) =>
+                            {
+                                arguments.push(BoundExpr::constant(min))
+                            }
+                            // a group of only NULLs
+                            Some(ColumnZone {
+                                min: None,
+                                max: None,
+                                has_null: true,
+                                ..
+                            }) => arguments.push(BoundExpr::constant(Value::null(child.return_type.clone()))),
+                            _ => return Range::Unknown,
+                        },
+                        _ => return Range::Unknown,
+                    }
+                }
+                let BoundExprKind::Function { function, is_operator, .. } = &expr.kind else {
+                    return Range::Unknown;
+                };
+                let call = BoundExpr::new(
+                    BoundExprKind::Function {
+                        function: function.clone(),
+                        children: arguments,
+                        is_operator: *is_operator,
+                    },
+                    expr.return_type.clone(),
+                );
+                match crate::execution::expression_executor::try_evaluate_scalar(&call) {
+                    Some(value) if value.is_null() => Range::Null,
+                    Some(value) => Range::Bounds(value.clone(), value),
+                    None => Range::Unknown,
+                }
+            }
             _ => Range::Unknown,
         }
     }
@@ -488,13 +1050,67 @@ impl Group<'_> {
                     Some(max) => max.data() == &duckrs_common::value::ValueData::Bool(false),
                 })
             }
+            // an IN list as its comparisons
+            BoundExprKind::Operator {
+                op: op @ (BoundOperator::In | BoundOperator::NotIn),
+                children,
+            } if children.len() > 1 => {
+                self.never_true(&crate::planner::expression::in_as_comparisons(*op == BoundOperator::NotIn, children))
+            }
+            BoundExprKind::Operator {
+                op: BoundOperator::Not,
+                children,
+            } if children.len() == 1
+                && matches!(&children[0].kind, BoundExprKind::Operator { op: BoundOperator::In, children } if children.len() > 1) =>
+            {
+                let BoundExprKind::Operator { children, .. } = &children[0].kind else {
+                    unreachable!("checked")
+                };
+                self.never_true(&crate::planner::expression::in_as_comparisons(true, children))
+            }
+            // `NOT prefix(s, 'ab')`: every string of the group starts with it (a NULL gives NULL)
+            BoundExprKind::Operator {
+                op: BoundOperator::Not,
+                children,
+            } if children.len() == 1
+                && matches!(&children[0].kind, BoundExprKind::Function { function, children, .. }
+                    if matches!(function.name.as_str(), "prefix" | "starts_with" | "^@") && children.len() == 2) =>
+            {
+                let BoundExprKind::Function { children, .. } = &children[0].kind else {
+                    unreachable!("checked")
+                };
+                let BoundExprKind::Constant(prefix) = &children[1].kind else {
+                    return false;
+                };
+                let (Ok(prefix), Range::Bounds(min, max)) = (prefix.try_to_string(), self.range(&children[0])) else {
+                    return false;
+                };
+                let (Ok(min), Ok(max)) = (min.try_to_string(), max.try_to_string()) else {
+                    return false;
+                };
+                // C++'s string statistics keep 12 bytes of the bounds, which prove no longer prefix
+                prefix.len() <= STRING_STATISTICS_BYTES && min.starts_with(&prefix) && max.starts_with(&prefix)
+            }
+            // `NOT f(..)` of a BOOLEAN function that is true for every value of the group (NULL stays NULL)
+            BoundExprKind::Operator {
+                op: BoundOperator::Not,
+                children,
+            } if children.len() == 1
+                && matches!(children[0].kind, BoundExprKind::Function { .. })
+                && children[0].return_type.id() == LogicalTypeId::Boolean
+                && matches!(self.range(&children[0]), Range::Bounds(ref min, _) if min.data() == &duckrs_common::value::ValueData::Bool(true)) =>
+            {
+                true
+            }
             BoundExprKind::Operator {
                 op: BoundOperator::Not,
                 children,
             } if children.len() == 1 && negated(without_noop_casts(&children[0])).is_some() => {
                 self.never_true(&negated(without_noop_casts(&children[0])).expect("checked"))
             }
-            BoundExprKind::Conjunction { and: true, children } => children.iter().any(|c| self.never_true(c)),
+            BoundExprKind::Conjunction { and: true, children } => {
+                children.iter().any(|c| self.never_true(c)) || self.excludes_every_value(children)
+            }
             BoundExprKind::Conjunction { and: false, children } => children.iter().all(|c| self.never_true(c)),
             // `(x > 5) = true`: the comparison itself
             BoundExprKind::Comparison {
@@ -575,9 +1191,29 @@ impl Group<'_> {
                 // two expressions of the columns: their ranges (`PropagateComparison`)
                 _ => self.ranges_fail(*op, left, right),
             },
+            // `constant_or_null(false, ..)` is false or NULL
+            BoundExprKind::Function { function, children, .. }
+                if function.name == "constant_or_null"
+                    && matches!(&children[0].kind, BoundExprKind::Constant(v) if v.data() == &duckrs_common::value::ValueData::Bool(false)) =>
+            {
+                true
+            }
+            // a BOOLEAN function whose range in the group is only false or NULL
+            BoundExprKind::Function { function, .. }
+                if expr.return_type.id() == LogicalTypeId::Boolean
+                    && !matches!(function.name.as_str(), "prefix" | "starts_with" | "^@")
+                    && matches!(self.range(expr), Range::Null | Range::Bounds(_, _))
+                    && match self.range(expr) {
+                        Range::Null => true,
+                        Range::Bounds(_, max) => max.data() == &duckrs_common::value::ValueData::Bool(false),
+                        Range::Unknown => false,
+                    } =>
+            {
+                true
+            }
             // `prefix(s, 'ab')` / `starts_with`: s from 'ab' up to what follows all strings that start with it
             BoundExprKind::Function { function, children, .. }
-                if matches!(function.name.as_str(), "prefix" | "starts_with") && children.len() == 2 =>
+                if matches!(function.name.as_str(), "prefix" | "starts_with" | "^@") && children.len() == 2 =>
             {
                 let BoundExprKind::Constant(prefix) = &children[1].kind else {
                     return false;
@@ -614,7 +1250,11 @@ impl Group<'_> {
                 };
                 match (op, zone) {
                     (BoundOperator::IsNull, Some(zone)) => !zone.has_null,
-                    (BoundOperator::IsNotNull, Some(zone)) => zone.min.is_none(),
+                    (BoundOperator::IsNotNull, Some(zone)) => zone.min.is_none() && zone.elements.is_none(),
+                    // a function that is only NULL in the group
+                    (BoundOperator::IsNotNull, None) if children.len() == 1 => {
+                        matches!(children[0].kind, BoundExprKind::Function { .. }) && matches!(self.range(&children[0]), Range::Null)
+                    }
                     _ => false,
                 }
             }
@@ -624,7 +1264,39 @@ impl Group<'_> {
 
     /// Whether `left op right` can not hold for any two values of their ranges.
     fn ranges_fail(&self, op: ComparisonOp, left: &BoundExpr, right: &BoundExpr) -> bool {
-        let is = |op, a: &Value, b: &Value| compare_values(op, a, b) == Some(true);
+        // `StringStats`: of the bounds of strings C++ keeps a prefix, and prefixes that are the same
+        // where one was cut decide nothing
+        let cut = |value: &Value| match value.data() {
+            duckrs_common::value::ValueData::Bytes(bytes) if bytes.len() > STRING_STATISTICS_BYTES => {
+                Some(bytes[..STRING_STATISTICS_BYTES].to_vec())
+            }
+            _ => None,
+        };
+        let is = |op, a: &Value, b: &Value| {
+            let (cut_a, cut_b) = (cut(a), cut(b));
+            if cut_a.is_some() || cut_b.is_some() {
+                let bytes = |v: &Value| match v.data() {
+                    duckrs_common::value::ValueData::Bytes(bytes) => Some(bytes.clone()),
+                    _ => None,
+                };
+                let (Some(x), Some(y)) = (bytes(a), bytes(b)) else {
+                    return false;
+                };
+                let (x, y) = (x.as_slice(), y.as_slice());
+                let x = cut_a.as_deref().unwrap_or(x);
+                let y = cut_b.as_deref().unwrap_or(y);
+                if x == y {
+                    return false;
+                }
+                let order = x.cmp(y);
+                return match op {
+                    ComparisonOp::LessThan | ComparisonOp::LessThanOrEqual => order.is_lt(),
+                    ComparisonOp::GreaterThan | ComparisonOp::GreaterThanOrEqual => order.is_gt(),
+                    _ => false,
+                };
+            }
+            compare_values(op, a, b) == Some(true)
+        };
         let (Range::Bounds(l_min, l_max), Range::Bounds(r_min, r_max)) = (self.range(left), self.range(right)) else {
             return false;
         };

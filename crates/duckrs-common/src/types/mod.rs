@@ -438,6 +438,12 @@ impl StateInfo {
     fn constants_key(&self) -> String {
         format!("{:?}", self.constants)
     }
+
+    /// Whether the constants are the same, without formatting them when neither has any (most aggregates take none,
+    /// and states are compared once for each row a vector stores).
+    fn same_constants(&self, other: &Self) -> bool {
+        (self.constants.is_empty() && other.constants.is_empty()) || self.constants_key() == other.constants_key()
+    }
 }
 
 /// C++ compares the `properties` of the extension info: the function's name and its parameters. The overload and the
@@ -446,7 +452,7 @@ impl PartialEq for StateInfo {
     fn eq(&self, other: &Self) -> bool {
         self.function == other.function
             && self.arguments == other.arguments
-            && self.constants_key() == other.constants_key()
+            && self.same_constants(other)
             && self.orders == other.orders
     }
 }
@@ -481,7 +487,16 @@ impl LogicalType {
 
 impl PartialEq for LogicalType {
     fn eq(&self, other: &Self) -> bool {
-        self.id == other.id && self.significant_info() == other.significant_info()
+        if self.id != other.id {
+            return false;
+        }
+        // clones of one type share their info, which then need not be compared field by field
+        if let (Some(a), Some(b)) = (&self.info, &other.info)
+            && Arc::ptr_eq(a, b)
+        {
+            return true;
+        }
+        self.significant_info() == other.significant_info()
     }
 }
 

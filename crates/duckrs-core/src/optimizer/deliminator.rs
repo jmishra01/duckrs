@@ -11,8 +11,8 @@
 //! is the exception: it ends up a SEMI or ANTI join, whose join filter does that.
 //!
 //! This differs from C++ in three ways. Inequalities are predicates here, and
-//! `RemoveInequalityJoinWithDelimGet` moves them to the predicate of a MARK `DelimJoin` only, in a
-//! form that is never NULL. A SINGLE join stays a `DelimJoin`, as
+//! `RemoveInequalityJoinWithDelimGet` moves a `<>` to the predicate of the `DelimJoin`, keeping one
+//! equality for the hash join. A SINGLE join stays a `DelimJoin`, as
 //! that is the operator that raises the error for more than one row. And `DelimGet`s are told apart
 //! by what they read, so one that belongs to this join but sits in a place this pass does not look
 //! keeps the `DelimJoin` in place.
@@ -63,6 +63,13 @@ fn operator_at<'a>(mut op: &'a mut LogicalOperator, path: &[usize]) -> &'a mut L
     op
 }
 
+fn operator_at_ref<'a>(mut op: &'a LogicalOperator, path: &[usize]) -> &'a LogicalOperator {
+    for index in path {
+        op = &op.children[*index];
+    }
+    op
+}
+
 fn deliminate_join(root: &mut LogicalOperator, path: &[usize]) {
     let filtered = marker_is_filtered(root, path);
     let op = operator_at(root, path);
@@ -84,7 +91,7 @@ fn deliminate_join(root: &mut LogicalOperator, path: &[usize]) {
         all_removed = false;
     }
     for join in joins {
-        match remove_join_with_delim_get(root, path, &join, &delim) {
+        match remove_join_with_delim_get(root, path, &join, &delim, delim_gets) {
             Some(replacements) => replace_columns(root, &replacements),
             None => all_removed = false,
         }
@@ -221,6 +228,7 @@ fn remove_join_with_delim_get(
     path: &[usize],
     join: &[usize],
     delim: &Delim,
+    delim_gets: usize,
 ) -> Option<Vec<(ColumnBinding, ColumnBinding)>> {
     let straight = is_straight(operator_at(root, path), join);
     let absolute: Path = path.iter().chain(join).copied().collect();
@@ -229,6 +237,7 @@ fn remove_join_with_delim_get(
         join_type,
         conditions,
         predicate,
+        ..
     } = &op.kind
     else {
         return None;
@@ -275,7 +284,7 @@ fn remove_join_with_delim_get(
         }
         replacements.push((from_column, to_column));
         // the join dropped NULLs
-        if !condition.null_safe {
+        if !condition.null_safe() {
             filters.push(is_not_null(to));
         }
     }
@@ -299,8 +308,8 @@ fn remove_join_with_delim_get(
                 (false, true) => (second, left, *op),
                 _ => return None,
             };
-            let compares_nulls = matches!(op, ComparisonOp::DistinctFrom | ComparisonOp::NotDistinctFrom);
-            if compares_nulls || left.return_type != right.return_type || !seen.insert(from) {
+            // the conditions of the `DelimJoin` compare NULLs, which only `=` and `<>` can take on
+            if op != ComparisonOp::NotEqual || left.return_type != right.return_type || !seen.insert(from) {
                 return None;
             }
             replacements.push((from, column_of(to)?));
@@ -314,24 +323,44 @@ fn remove_join_with_delim_get(
     }
     // which conditions of the `DelimJoin` the inequalities take the place of
     let mut moved = Vec::new();
+    let mut mark = false;
     if !inequalities.is_empty() {
+        // `InequalityDelimJoinCanBeEliminated`
         let K::DelimJoin {
-            conditions,
-            mark_index: Some(_),
-            ..
+            conditions, join_type, ..
         } = &operator_at(root, path).kind
         else {
             return None;
         };
+        mark = *join_type == JoinType::Mark;
+        if delim_gets != 1 || !matches!(join_type, JoinType::Mark | JoinType::Semi | JoinType::Anti | JoinType::Single) {
+            return None;
+        }
         let count = conditions.len();
         let rights: Option<Vec<ColumnBinding>> = conditions.iter().map(|c| column_of(&c.right)).collect();
         let rights = rights?;
         for (column, op) in inequalities {
-            let delim_join = operator_at(root, path);
+            let delim_join = operator_at(&mut *root, path);
             let at = rights
                 .iter()
                 .position(|right| trace(delim_join, join, *right) == Some(column))?;
             moved.push((at, op));
+        }
+        // a MARK join compares NULLs, where `<>` would be true for a NULL outer value
+        // (`NotNullExpressionAnalyzer`)
+        if mark {
+            let snapshot: &LogicalOperator = root;
+            let delim_join = operator_at_ref(snapshot, path);
+            let K::DelimJoin { conditions, .. } = &delim_join.kind else {
+                unreachable!("looked at above")
+            };
+            let outer = &delim_join.children[0];
+            if !moved
+                .iter()
+                .all(|(at, _)| super::aggregate_rewriter::is_not_null(outer, &conditions[*at].left, snapshot))
+            {
+                return None;
+            }
         }
         // a hash join needs an equality
         if moved.len() >= count {
@@ -358,13 +387,8 @@ fn remove_join_with_delim_get(
     moved.sort_by_key(|(at, _)| Reverse(*at));
     for (at, op) in moved {
         let condition = conditions.remove(at);
-        // no row of the subquery compares with a NULL, and the filter above took its own NULLs out
-        conjuncts.push(is_not_null(&condition.left));
-        let op = if op == ComparisonOp::NotEqual {
-            ComparisonOp::DistinctFrom
-        } else {
-            op
-        };
+        // the other joins drop the rows that compare with a NULL, as the join they replace did
+        let op = if mark { ComparisonOp::DistinctFrom } else { op };
         conjuncts.push(BoundExpr::new(
             BoundExprKind::Comparison {
                 op,
@@ -484,6 +508,7 @@ fn to_ordinary_join(op: &mut LogicalOperator) {
             join_type,
             conditions,
             predicate,
+            algorithm: Default::default(),
         },
     };
 }

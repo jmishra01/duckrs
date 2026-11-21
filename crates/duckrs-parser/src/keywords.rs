@@ -94,6 +94,30 @@ pub fn is_reserved(word: &str) -> bool {
     categories(word) & category::RESERVED != 0
 }
 
+/// `DefaultKeywordMaps::ToList`: every keyword with its category, as `duckdb_keywords()` lists them
+/// (a type or function name keyword appears once, and a word can appear in more than one category).
+pub fn keyword_list() -> Vec<(String, &'static str)> {
+    let words = |list: &str| -> std::collections::BTreeSet<String> {
+        list.lines()
+            .map(str::trim)
+            .filter(|w| !w.is_empty())
+            .map(str::to_ascii_lowercase)
+            .collect()
+    };
+    let [reserved, unreserved, column, func, type_name, _] = LISTS.map(|(list, _)| list);
+    let type_function: std::collections::BTreeSet<String> = words(func).union(&words(type_name)).cloned().collect();
+    let groups = [
+        (words(reserved), "reserved"),
+        (words(unreserved), "unreserved"),
+        (type_function, "type_function"),
+        (words(column), "column_name"),
+    ];
+    groups
+        .into_iter()
+        .flat_map(|(set, category)| set.into_iter().map(move |word| (word, category)))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

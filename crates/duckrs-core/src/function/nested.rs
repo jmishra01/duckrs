@@ -205,7 +205,7 @@ fn map_extract(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
-pub(super) fn bound_function(
+pub(crate) fn bound_function(
     name: &str,
     children: Vec<BoundExpr>,
     return_type: LogicalType,
@@ -284,10 +284,28 @@ fn bind_array_value(children: Vec<BoundExpr>) -> Result<BoundExpr> {
 
 pub fn bind_struct_pack(names: Vec<String>, children: Vec<BoundExpr>) -> Result<BoundExpr> {
     let mut fields: Vec<(String, LogicalType)> = Vec::with_capacity(children.len());
+    // `FunctionBindError::DuplicateArgument`: a name given twice as a named argument
+    for (at, name) in names.iter().enumerate() {
+        if !name.is_empty() && names[..at].iter().any(|other| other.eq_ignore_ascii_case(name)) {
+            return Err(binder_error(format!(
+                "Duplicate named argument \"{}\" in 'struct_pack'",
+                name.replace('"', "\"\"")
+            )));
+        }
+    }
     for (name, child) in names.into_iter().zip(&children) {
         let name = if name.is_empty() { child.alias.clone() } else { name };
         if name.is_empty() {
-            return Err(binder_error("Need named argument for struct pack, e.g., a := b"));
+            // the overload takes only named arguments (`kwargs`)
+            let types: Vec<String> = children
+                .iter()
+                .map(|c| super::binder::expression_return_type(c).to_string())
+                .collect();
+            return Err(binder_error(format!(
+                "No function matches the given name and argument types 'struct_pack({})'. You might need to add \
+                 explicit type casts.",
+                types.join(", ")
+            )));
         }
         if fields.iter().any(|(n, _)| n.eq_ignore_ascii_case(&name)) {
             return Err(binder_error(format!("Duplicate struct entry name \"{name}\"")));
@@ -455,15 +473,14 @@ fn bind_enum_range_boundary(children: Vec<BoundExpr>) -> Result<BoundExpr> {
 fn bind_map(children: Vec<BoundExpr>) -> Result<BoundExpr> {
     match <[BoundExpr; 2]>::try_from(children) {
         Ok([keys, values]) => {
-            let element = |child: &BoundExpr, what: &str| match child.return_type.id() {
+            // `MapFun`: (LIST(K), LIST(V)), so anything else matches no overload
+            let no_match = || super::lists::no_match("map", &[keys.clone(), values.clone()]);
+            let element = |child: &BoundExpr| match child.return_type.id() {
                 LogicalTypeId::List | LogicalTypeId::Array => Ok(child.return_type.child_type().unwrap().clone()),
                 LogicalTypeId::SqlNull => Ok(LogicalType::SQLNULL),
-                _ => Err(binder_error(format!(
-                    "MAP {what} must be a LIST, not {}",
-                    child.return_type
-                ))),
+                _ => Err(no_match()),
             };
-            let (key, value) = (element(&keys, "keys")?, element(&values, "values")?);
+            let (key, value) = (element(&keys)?, element(&values)?);
             let keys = keys.cast_to(&LogicalType::list(key.clone()), false);
             let values = values.cast_to(&LogicalType::list(value.clone()), false);
             Ok(bound_function(
@@ -520,6 +537,11 @@ fn struct_field_by_index(ty: &LogicalType, index: i64) -> Result<usize> {
 
 /// `union_extract` with a constant key.
 fn bind_union_extract(child: BoundExpr, key: &BoundExpr) -> Result<BoundExpr> {
+    // a NULL constant folds before the bind callback resolves the return type
+    let null_constant = |e: &BoundExpr| matches!(&e.kind, BoundExprKind::Constant(value) if value.is_null());
+    if null_constant(&child) || matches!(&child.kind, BoundExprKind::Cast { child, .. } if null_constant(child)) {
+        return Ok(BoundExpr::constant(Value::sql_null()));
+    }
     let ty = child.return_type.clone();
     let BoundExprKind::Constant(key) = &key.kind else {
         return Err(binder_error("Key name for union_extract needs to be a constant string"));
@@ -546,8 +568,19 @@ fn bind_union_extract(child: BoundExpr, key: &BoundExpr) -> Result<BoundExpr> {
     ))
 }
 
+/// `struct_extract` of the field at `index` of a STRUCT.
+pub(crate) fn struct_extract_at_index(child: BoundExpr, index: usize) -> Option<BoundExpr> {
+    let member = child.return_type.struct_children().get(index)?.1.clone();
+    let index = BoundExpr::constant(Value::bigint(index as i64));
+    Some(bound_function("struct_extract", vec![child, index], member, struct_extract))
+}
+
 /// `StructExtractResolveTypes` with a constant key.
 fn bind_struct_extract(child: BoundExpr, key: BoundExpr) -> Result<BoundExpr> {
+    bind_struct_extract_with(child, key, false)
+}
+
+fn bind_struct_extract_with(child: BoundExpr, key: BoundExpr, at: bool) -> Result<BoundExpr> {
     let ty = child.return_type.clone();
     if ty.id() == LogicalTypeId::Union {
         return bind_union_extract(child, &key);
@@ -562,14 +595,22 @@ fn bind_struct_extract(child: BoundExpr, key: BoundExpr) -> Result<BoundExpr> {
     if super::json::is_json_type(&ty) {
         return super::json::bind_function("json_extract", vec![child, key], &|_| Ok(LogicalType::VARCHAR));
     }
+    // the overloads take a STRUCT, which no other type casts to
     if !matches!(ty.id(), LogicalTypeId::Struct | LogicalTypeId::Tuple) {
-        return Err(binder_error(format!(
-            "struct_extract can only be used on a STRUCT, not on {ty}"
-        )));
+        return Err(super::lists::no_match("struct_extract", &[child, key]));
     }
     if ty.struct_children().is_empty() {
         return Err(binder_error("Can't extract something from an empty struct"));
     }
+    // a foldable key (`(-1)::BIGINT`) is a constant
+    let key = if key.is_foldable() && !matches!(key.kind, BoundExprKind::Constant(_)) {
+        match crate::execution::expression_executor::evaluate_scalar(&key) {
+            Ok(value) => BoundExpr::constant(value),
+            Err(_) => key,
+        }
+    } else {
+        key
+    };
     let BoundExprKind::Constant(key) = &key.kind else {
         return Err(binder_error(
             "Argument #2 in function struct_extract must be a constant expression",
@@ -583,7 +624,7 @@ fn bind_struct_extract(child: BoundExpr, key: BoundExpr) -> Result<BoundExpr> {
         }
         struct_field_by_name(&ty, &key.try_to_string()?)?
     } else {
-        if ty.id() != LogicalTypeId::Tuple {
+        if ty.id() != LogicalTypeId::Tuple && !at {
             return Err(binder_error(
                 "struct_extract with an integer key can only be used on unnamed structs, use a string key instead",
             ));
@@ -600,6 +641,22 @@ fn bind_struct_extract(child: BoundExpr, key: BoundExpr) -> Result<BoundExpr> {
     ))
 }
 
+/// The type a template takes from two of its occurrences (`FunctionBinder` template deduction): the type
+/// both have in common, where a VARCHAR next to a type that is not a string has none.
+pub(crate) fn deduce_template(first: &LogicalType, second: &LogicalType) -> Option<LogicalType> {
+    let varchar = |t: &LogicalType| t.id() == LogicalTypeId::Varchar;
+    let stringy = |t: &LogicalType| {
+        matches!(
+            t.id(),
+            LogicalTypeId::Varchar | LogicalTypeId::StringLiteral | LogicalTypeId::SqlNull | LogicalTypeId::Enum
+        )
+    };
+    if (varchar(first) && !stringy(second)) || (varchar(second) && !stringy(first)) {
+        return None;
+    }
+    try_max_logical_type(first, second).map(|t| normalize_type(&t))
+}
+
 /// `list_extract` and `array_extract`, on anything that can be indexed.
 fn bind_extract(name: &str, child: BoundExpr, key: BoundExpr) -> Result<BoundExpr> {
     let ty = child.return_type.clone();
@@ -607,6 +664,8 @@ fn bind_extract(name: &str, child: BoundExpr, key: BoundExpr) -> Result<BoundExp
         LogicalTypeId::Struct | LogicalTypeId::Tuple | LogicalTypeId::Union | LogicalTypeId::Variant => {
             bind_struct_extract(child, key)
         }
+        // of list_extract's `(LIST, BIGINT)` and `(VARCHAR, BIGINT)`, a NULL takes the string one
+        LogicalTypeId::SqlNull if name == "list_extract" => Ok(BoundExpr::constant(Value::null(LogicalType::VARCHAR))),
         LogicalTypeId::SqlNull => Ok(BoundExpr::constant(Value::sql_null())),
         LogicalTypeId::List | LogicalTypeId::Array => {
             let element = ty.child_type().expect("a child type").clone();
@@ -616,7 +675,25 @@ fn bind_extract(name: &str, child: BoundExpr, key: BoundExpr) -> Result<BoundExp
         LogicalTypeId::Map => {
             let children = ty.child_type().expect("an entry type").struct_children();
             let (key_type, value_type) = (children[0].1.clone(), children[1].1.clone());
-            let key = key.cast_to(&key_type, false);
+            // the key of an empty map is no type to cast to: the template `K` is the key's type
+            if key_type.id() == LogicalTypeId::SqlNull {
+                return Ok(bound_function(name, vec![child, key], value_type, map_extract));
+            }
+            let arg = expression_return_type(&key);
+            let Some(common) = deduce_template(&key_type, &arg) else {
+                return Err(binder_error(format!(
+                    "No function matches the given name and argument types '{name}({ty}, {arg})'. You might need \
+                     to add explicit type casts.\n\tCannot deduce template type 'K', it was inferred to be:\n  - \
+                     '{key_type}', from first occurrence\n  - '{arg}', which is incompatible with the previously \
+                     inferred type"
+                )));
+            };
+            let child = if common == key_type {
+                child
+            } else {
+                child.cast_to(&LogicalType::map(common.clone(), value_type.clone()), false)
+            };
+            let key = key.cast_to(&common, false);
             Ok(bound_function(name, vec![child, key], value_type, map_extract))
         }
         _ if ty.physical_type() == PhysicalType::Varchar => {
@@ -627,6 +704,10 @@ fn bind_extract(name: &str, child: BoundExpr, key: BoundExpr) -> Result<BoundExp
                 LogicalType::VARCHAR,
                 string_extract,
             ))
+        }
+        // with `old_implicit_casting`, anything casts to the string overload
+        _ if super::cast_rules::implicit_cast(&ty, &LogicalType::VARCHAR) >= 0 && ty.id() != LogicalTypeId::Blob => {
+            bind_extract(name, child.cast_to(&LogicalType::VARCHAR, false), key)
         }
         _ => Err(binder_error(format!(
             "No function matches the given name and argument types '{name}({ty}, {})'. You might need to add \
@@ -667,7 +748,12 @@ pub fn bind_nested_function(name: &str, names: Vec<String>, children: Vec<BoundE
                 "union_extract" if !matches!(child.return_type.id(), LogicalTypeId::Union | LogicalTypeId::Unknown) => {
                     Err(binder_error("union_extract can only take a union parameter"))
                 }
-                "struct_extract" | "struct_extract_at" | "union_extract" => bind_struct_extract(child, key),
+                "struct_extract" | "struct_extract_at" if child.return_type.id() == LogicalTypeId::Variant => {
+                    Err(binder_error("struct_extract can only be used on a STRUCT, not on VARIANT"))
+                }
+                // `GetExtractAtFunction`: a position into any struct
+                "struct_extract_at" => bind_struct_extract_with(child, key, true),
+                "struct_extract" | "union_extract" => bind_struct_extract(child, key),
                 _ => bind_extract(&lower, child, key),
             }
         }

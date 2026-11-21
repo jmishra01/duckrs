@@ -127,7 +127,7 @@ fn flatten_expression(expr: &mut BoundExpr, left: &mut LogicalOperator, next_tab
     if matches!(
         expr.kind,
         BoundExprKind::Operator {
-            op: BoundOperator::Try,
+            op: BoundOperator::Try | BoundOperator::HasError,
             ..
         } | BoundExprKind::ListLambda { .. }
     ) {
@@ -150,8 +150,172 @@ fn is_local(expr: &BoundExpr, bindings: &[ColumnBinding]) -> bool {
     }
 }
 
-/// `PlanUncorrelatedSubquery` for `x IN (...)`, the case that gains from a join: the other kinds
-/// run once as they are. A MARK join puts whether a right row equals `x` next to each left row.
+/// `PlanReturnsExactlyOneRow`.
+fn returns_exactly_one_row(op: &LogicalOperator) -> bool {
+    match &op.kind {
+        K::Aggregate {
+            groups,
+            grouping_sets,
+            grouping_functions,
+            ..
+        } => groups.is_empty() && grouping_sets.is_empty() && grouping_functions.is_empty(),
+        K::DummyScan { .. } => true,
+        K::Limit {
+            limit: Some(1),
+            offset: 0,
+            failure: None,
+        }
+        | K::Projection { .. } => op.children.len() == 1 && returns_exactly_one_row(&op.children[0]),
+        _ => false,
+    }
+}
+
+/// `PlanUncorrelatedSubquery` for a scalar subquery: a cross product with it. Unless it returns
+/// exactly one row, an aggregate takes its first row, and with `error_on_multiple_rows` the count
+/// of its rows says whether there are too many.
+fn flatten_scalar(
+    expr: &BoundExpr,
+    raw: &LogicalOperator,
+    error_on_multiple_rows: bool,
+    left: &mut LogicalOperator,
+    next_table_index: &mut usize,
+) -> Flat<BoundExpr> {
+    let left_bindings = left.column_bindings();
+    let mut right = raw.clone();
+    let right_bindings = right.column_bindings();
+    if right_bindings.len() != 1 || right_bindings.iter().any(|b| left_bindings.contains(b)) {
+        return Err(Unsupported);
+    }
+    let ty = expr.return_type.clone();
+    let mut output = BoundExpr::column_ref(right_bindings[0], ty.clone(), "");
+    if ty.id() == duckrs_common::types::LogicalTypeId::SqlNull || !returns_exactly_one_row(raw) {
+        let functions = BuiltinFunctions::get();
+        let first = functions.aggregate("first").ok_or(Unsupported)?;
+        let mut aggregates = vec![bind_aggregate_function(first, vec![output], None, false).map_err(|_| Unsupported)?];
+        if error_on_multiple_rows {
+            let count_star = functions.aggregate("count_star").ok_or(Unsupported)?;
+            aggregates.push(bind_aggregate_function(count_star, Vec::new(), None, false).map_err(|_| Unsupported)?);
+        }
+        let aggregate_index = take_index(next_table_index);
+        let aggregate = LogicalOperator::new(
+            K::Aggregate {
+                group_index: take_index(next_table_index),
+                aggregate_index,
+                groupings_index: take_index(next_table_index),
+                groups: Vec::new(),
+                aggregates,
+                grouping_sets: Vec::new(),
+                grouping_functions: Vec::new(),
+                perfect_hash: false,
+                domain_cap: None,
+            },
+            vec![right],
+        );
+        let first_ref = BoundExpr::column_ref(ColumnBinding::new(aggregate_index, 0), ty.clone(), "");
+        if !error_on_multiple_rows {
+            right = aggregate;
+            output = first_ref;
+        } else {
+            // CASE WHEN count > 1 THEN error(...) ELSE first END
+            let count_ref = BoundExpr::column_ref(ColumnBinding::new(aggregate_index, 1), LogicalType::BIGINT, "");
+            let count_check = BoundExpr::new(
+                BoundExprKind::Comparison {
+                    op: ComparisonOp::GreaterThan,
+                    left: Box::new(count_ref),
+                    right: Box::new(BoundExpr::constant(Value::bigint(1))),
+                },
+                LogicalType::BOOLEAN,
+            );
+            let error = functions.scalar("error").ok_or(Unsupported)?;
+            let message = BoundExpr::constant(Value::varchar(crate::execution::expression_executor::MULTIPLE_ROWS));
+            let mut error = crate::function::binder::bind_scalar_function(error, vec![message], false, &|_| None)
+                .map_err(|_| Unsupported)?;
+            error.return_type = ty.clone();
+            let case = BoundExpr::new(
+                BoundExprKind::Case {
+                    checks: vec![(count_check, error)],
+                    else_expr: Box::new(first_ref),
+                },
+                ty.clone(),
+            );
+            let projection_index = take_index(next_table_index);
+            right = LogicalOperator::new(
+                K::Projection {
+                    table_index: projection_index,
+                    expressions: vec![case],
+                },
+                vec![aggregate],
+            );
+            output = BoundExpr::column_ref(ColumnBinding::new(projection_index, 0), ty, "");
+        }
+    }
+    let outer = std::mem::replace(left, LogicalOperator::new(K::CrossProduct, Vec::new()));
+    *left = LogicalOperator::new(K::CrossProduct, vec![outer, right]);
+    Ok(output.with_alias(expr.alias.clone()))
+}
+
+/// `PlanUncorrelatedSubquery` for EXISTS: a cross product with `count_star() = 1` of its first row
+/// (`LIMIT 1`), which is one row of either TRUE or FALSE.
+fn flatten_exists(
+    expr: &BoundExpr,
+    raw: &LogicalOperator,
+    left: &mut LogicalOperator,
+    next_table_index: &mut usize,
+) -> Flat<BoundExpr> {
+    let left_bindings = left.column_bindings();
+    if raw.column_bindings().iter().any(|b| left_bindings.contains(b)) {
+        return Err(Unsupported);
+    }
+    let limit = LogicalOperator::new(
+        K::Limit {
+            limit: Some(1),
+            offset: 0,
+            failure: None,
+        },
+        vec![raw.clone()],
+    );
+    let count_star = BuiltinFunctions::get().aggregate("count_star").ok_or(Unsupported)?;
+    let count_star = bind_aggregate_function(count_star, Vec::new(), None, false).map_err(|_| Unsupported)?;
+    let count_type = count_star.return_type.clone();
+    let aggregate_index = take_index(next_table_index);
+    let aggregate = LogicalOperator::new(
+        K::Aggregate {
+            group_index: take_index(next_table_index),
+            aggregate_index,
+            groupings_index: take_index(next_table_index),
+            groups: Vec::new(),
+            aggregates: vec![count_star],
+            grouping_sets: Vec::new(),
+            grouping_functions: Vec::new(),
+            perfect_hash: false,
+            domain_cap: None,
+        },
+        vec![limit],
+    );
+    let comparison = BoundExpr::new(
+        BoundExprKind::Comparison {
+            op: ComparisonOp::Equal,
+            left: Box::new(BoundExpr::column_ref(ColumnBinding::new(aggregate_index, 0), count_type, "")),
+            right: Box::new(BoundExpr::constant(Value::bigint(1))),
+        },
+        LogicalType::BOOLEAN,
+    );
+    let projection_index = take_index(next_table_index);
+    let right = LogicalOperator::new(
+        K::Projection {
+            table_index: projection_index,
+            expressions: vec![comparison],
+        },
+        vec![aggregate],
+    );
+    let outer = std::mem::replace(left, LogicalOperator::new(K::CrossProduct, Vec::new()));
+    *left = LogicalOperator::new(K::CrossProduct, vec![outer, right]);
+    let output = BoundExpr::column_ref(ColumnBinding::new(projection_index, 0), LogicalType::BOOLEAN, "");
+    Ok(output.with_alias(expr.alias.clone()))
+}
+
+/// `PlanUncorrelatedSubquery` for `x IN (...)`, the case that gains from a join; the other ANY
+/// comparisons run once as they are. A MARK join puts whether a right row equals `x` next to each left row.
 fn flatten_in(expr: &BoundExpr, left: &mut LogicalOperator, next_table_index: &mut usize) -> Flat<BoundExpr> {
     let BoundExprKind::Subquery {
         subquery,
@@ -161,10 +325,10 @@ fn flatten_in(expr: &BoundExpr, left: &mut LogicalOperator, next_table_index: &m
     else {
         return Err(Unsupported);
     };
+    // uncorrelated, it runs once, volatile or not
     let BoundSubquery {
         kind: SubqueryKind::Any(ComparisonOp::Equal),
         raw: Some(raw),
-        volatile: false,
         row,
         ..
     } = subquery.as_ref()
@@ -188,7 +352,7 @@ fn flatten_in(expr: &BoundExpr, left: &mut LogicalOperator, next_table_index: &m
             vec![JoinCondition {
                 left: (**child).clone(),
                 right,
-                null_safe: false,
+                comparison: ComparisonOp::Equal,
                 filter: None,
             }],
             None,
@@ -273,6 +437,29 @@ fn flatten_subquery(expr: &BoundExpr, left: &mut LogicalOperator, next_table_ind
     else {
         return Err(Unsupported);
     };
+    // an uncorrelated scalar subquery runs once, volatile or not
+    if let BoundSubquery {
+        kind: SubqueryKind::Scalar,
+        raw: Some(raw),
+        error_on_multiple_rows,
+        ..
+    } = subquery.as_ref()
+        && correlated.is_empty()
+    {
+        return flatten_scalar(expr, raw, *error_on_multiple_rows, left, next_table_index);
+    }
+    if let BoundSubquery {
+        kind: SubqueryKind::Exists,
+        raw: Some(raw),
+        ..
+    } = subquery.as_ref()
+        && correlated.is_empty()
+    {
+        return flatten_exists(expr, raw, left, next_table_index);
+    }
+    if correlated.is_empty() {
+        return flatten_in(expr, left, next_table_index);
+    }
     let BoundSubquery {
         kind,
         raw: Some(raw),
@@ -302,8 +489,10 @@ fn flatten_subquery(expr: &BoundExpr, left: &mut LogicalOperator, next_table_ind
         .collect();
     let types = domain.iter().map(|(_, ty)| ty.clone()).collect::<Vec<_>>();
     let delim = Arc::new(Mutex::new(ColumnDataCollection::new(types)));
+    let names = correlated.iter().map(|value| value.alias.clone()).collect();
     let mut flatten = Flatten {
         domain,
+        names,
         delim: delim.clone(),
         next_table_index,
         empty_values: Vec::new(),
@@ -325,8 +514,8 @@ fn flatten_subquery(expr: &BoundExpr, left: &mut LogicalOperator, next_table_ind
         .zip(&state)
         .map(|(value, binding)| JoinCondition {
             left: value.clone(),
-            right: BoundExpr::column_ref(*binding, value.return_type.clone(), ""),
-            null_safe: true,
+            right: BoundExpr::column_ref(*binding, value.return_type.clone(), value.alias.clone()),
+            comparison: ComparisonOp::NotDistinctFrom,
             filter: None,
         })
         .collect();
@@ -382,6 +571,8 @@ struct EmptyValue {
 /// `FlattenDependentJoins`.
 struct Flatten<'a> {
     domain: Vec<(ColumnBinding, LogicalType)>,
+    /// The names of the correlated columns, which the columns standing in for them take.
+    names: Vec<String>,
     delim: Arc<Mutex<ColumnDataCollection>>,
     next_table_index: &'a mut usize,
     empty_values: Vec<EmptyValue>,
@@ -435,8 +626,8 @@ impl Flatten<'_> {
     fn state_refs(&self, state: &[ColumnBinding]) -> Vec<BoundExpr> {
         state
             .iter()
-            .zip(&self.domain)
-            .map(|(binding, (_, ty))| BoundExpr::column_ref(*binding, ty.clone(), ""))
+            .zip(self.domain.iter().zip(&self.names))
+            .map(|(binding, ((_, ty), name))| BoundExpr::column_ref(*binding, ty.clone(), name.clone()))
             .collect()
     }
 
@@ -521,7 +712,7 @@ impl Flatten<'_> {
             K::Distinct { .. } => {
                 let state = self.push_through(plan)?;
                 let refs = self.state_refs(&state);
-                let K::Distinct { targets } = &mut plan.kind else {
+                let K::Distinct { targets, .. } = &mut plan.kind else {
                     unreachable!()
                 };
                 targets.extend(refs);
@@ -628,6 +819,7 @@ impl Flatten<'_> {
                 },
                 conditions,
                 predicate: None,
+                algorithm: Default::default(),
             },
             vec![get, aggregate],
         );
@@ -651,6 +843,8 @@ impl Flatten<'_> {
                 aggregates: aggregates.to_vec(),
                 grouping_sets: Vec::new(),
                 grouping_functions: Vec::new(),
+                perfect_hash: false,
+                domain_cap: None,
             },
             vec![input],
         );
@@ -765,7 +959,7 @@ impl Flatten<'_> {
             .map(|(left, right)| JoinCondition {
                 left,
                 right,
-                null_safe: true,
+                comparison: ComparisonOp::NotDistinctFrom,
                 filter: None,
             })
             .collect()
@@ -787,6 +981,7 @@ impl Flatten<'_> {
             join_type: JoinType::Inner,
             conditions: self.state_conditions(&left_state, &right_state),
             predicate: None,
+            algorithm: Default::default(),
         };
         Ok(left_state)
     }
@@ -798,6 +993,7 @@ impl Flatten<'_> {
             join_type,
             conditions,
             predicate,
+            ..
         } = &mut plan.kind
         else {
             unreachable!()
@@ -810,7 +1006,7 @@ impl Flatten<'_> {
         if !moved.is_empty() {
             let mut conjuncts: Vec<BoundExpr> = predicate.take().into_iter().collect();
             conjuncts.extend(moved.into_iter().map(|condition| {
-                let op = if condition.null_safe {
+                let op = if condition.null_safe() {
                     ComparisonOp::NotDistinctFrom
                 } else {
                     ComparisonOp::Equal

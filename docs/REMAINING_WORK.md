@@ -3,7 +3,7 @@
 What is still missing from the roadmap in [`RUST_PORT_PLAN.md`](../../RUST_PORT_PLAN.md) §6.
 The test numbers come from [`STATUS.md`](STATUS.md) at baseline `d4eea3f208d`.
 
-- Overall: 4399 of 6367 test files pass (**72.7%** of the 6047 that run). The v1 target is ≥ 90%.
+- Overall: 4832 of 6367 test files pass (**79.9%** of the 6044 that run). The v1 target is ≥ 90%.
 - Phases 0–11 have code but are below their pass targets.
 - Phase 12 is partly done. Phases 13 and 14 have not started.
 - In git, the branches named "Phase 13"–"Phase 21" are rounds of fixes against the test suite.
@@ -155,7 +155,22 @@ Each item gives the number of failing files in `test/` that it should fix, where
     `Leaf` of 4 row ids, 15-byte prefixes, 6 allocators); the `storage_version` option is the file's
   - [ ] dense row id rewriting of files before v2.0.0 (`rowid_gaps/old_storage_*`): row groups stay as they are
   - [x] unshredded VARIANT columns, in the file and the WAL
-  - [ ] shredded VARIANT columns (~20 files), shredded GEOMETRY columns, Patas and Chimp segments (8), `read_duckdb` (8)
+  - [x] shredded VARIANT columns: read from files C++ writes, and written at a checkpoint by
+    `variant_minimum_shredding_size` and `force_variant_shredding`, with the type inferred as C++ does (object fields
+    in name order where C++ has its hash order) and the statistics of the typed part
+  - [x] `stats()` of a VARIANT: its shredding state and the statistics of the typed part, from files, through
+    casts to and from VARIANT and `variant_extract`; row groups merge their typed parts (`MergeShredding`), and
+    one a checkpoint leaves as it is keeps how it was shredded
+  - [x] pushdown extract into table and parquet scans: fields of STRUCT and VARIANT columns read only through
+    extracts (and casts of them) are columns of the scan (`s.y.z` in EXPLAIN), also in SQL export
+  - [x] reading a pushed field of a VARIANT by keys from the typed part of the row groups that have it there,
+    in parallel, serial and filtered scans of a file (7-10x faster over 1M rows)
+  - [x] the statistics of the pushed fields, those of their extracts, for compressed materialization
+  - [x] `SHREDDED_VECTOR`: what a scan reads of a shredded VARIANT row group or Parquet column
+  - [x] the statistics of the unshredded part, a row group the checkpoint does not shred as `UNINITIALIZED`
+    (which merges into what the others are), and the row groups a delete emptied dropped in files before
+    v2.0.0, the rows after them taking new ids where no index keeps them
+  - [ ] shredded GEOMETRY columns, Patas and Chimp segments (8), `read_duckdb` (8)
   - [ ] string and list-length statistics for `stats()` (~10 files), per-column `USING COMPRESSION`
   - [x] `read_duckdb` and the replacement scan of `.db` files; `enable_view_dependencies` (DROP ... CASCADE,
     refused DROP and ALTER, CREATE OR REPLACE of a view that reads itself)
@@ -178,8 +193,17 @@ Each item gives the number of failing files in `test/` that it should fix, where
 
 ## Phase 7: Optimizer
 
-- [ ] 14. Filter pushdown and pullup (`optimizer/pushdown`: 29 failing, 32.6%)
-- [ ] 15. Statistics propagation (`optimizer/statistics`: 32 failing, 37.3%)
+- [ ] 14. Filter pushdown and pullup (`optimizer/pushdown`: 19 failing, 55.8% pass)
+  - [x] OR range merge, monotone preimage, filter reordering (`ExpressionHeuristics`), BETWEEN of a column as two comparisons
+  - [x] a filter that can throw stays above the projection of an inlined CTE: `position`/`instr`/`strpos` and a
+    string `a[i]` with a constant index cannot throw, as in C++ (`test_no_pushdown_cast_into_cte`)
+  - [ ] scalar functions pushed into Parquet scans, a filter on the right of a SEMI join through a subquery's
+    projection
+  - [x] `can_throw` as C++ has it: only the functions C++ marks `SetFallible` can fail, by overload where C++ decides
+    it at bind time (extracts, substring, unary `+`/`-`, `list_value`, ICU date parts of TIMESTAMPTZ)
+  - [x] `CanThrow` of aggregates and window functions: `sum`/`avg` of HUGEINT and wide DECIMAL, `string_agg`, the
+    `n` variants of min/max/arg_min/arg_max, `ntile`, ... (common subplans, window pushdown)
+- [ ] 15. Statistics propagation (`optimizer/statistics`: 4 failing, 91.8% pass)
   - [x] row groups of the database's `ROW_GROUP_SIZE`; zone maps through CASE, COALESCE, greatest/least,
     arithmetic with constants, month/quarter, prefix, left, sign, two-column comparisons
   - [x] statistics of least/greatest, of sum (rows times the bounds), min and max; `constant_or_null` keeps both
@@ -201,16 +225,75 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [ ] string comparisons that C++'s prefixes can't decide but exact bounds do (`a = b` prunes more here), an
     OR of columns proven false is an empty result here where C++ scans no row groups, INTERVAL and TIMESTAMPTZ_NS
     bounds, week, division by a column
-  - [ ] secure views (7 files), the scalar aggregate merger (`scalar_aggregate_merge_threshold`, 3),
-    `json_serialize_plan`, gamma's errors without IEEE
+  - [x] the scalar aggregate merger (`scalar_aggregate_merge_threshold`), over tables, `read_parquet`, `read_csv`
+    and `read_json`; predicate factoring of ORs in filters
+  - [ ] secure views (7 files), `json_serialize_plan`, gamma's errors without IEEE
   - [x] string statistics in `stats()`: bounds, unicode, lengths and totals of tables and constants; `approx_unique`
   - [ ] string statistics through functions (contains, suffix, upper/lower, length), struct/list/map extracts,
     EXPLAIN ANALYZE metrics of other operators (~190 EXPLAIN-shape files under `test/optimizer`, `sql/optimizer`)
-- [ ] 16. Join order and cardinality estimation (`optimizer/joins`: 14 failing)
+- [ ] 16. Join order and cardinality estimation (`optimizer/joins`: 1 failing)
+  - [x] LEFT join equality groups, `debug_force_no_cross_product`, `approximate_join_order_threshold`
+  - [ ] LEFT joins reordered inside the join graph (C++'s CD-C conflict detector, `left_join_cardinality_estimation`)
 - [ ] 17. Column lifetime, unused columns, TopN, expression rewriter (small dirs under `test/optimizer`)
-- [ ] 18. Optimizer-dependent SQL tests (`sql/optimizer`: 114 failing, 32.7%)
-- [ ] 19. TPC-H 22/22 and TPC-DS 99/99 correct. Today the tests are skipped and the generators in `tools/tpch` and `tools/tpcds` are stubs.
-- [ ] 20. Verification mode: run each query with the optimizer on and off and compare the results
+  - [x] `CastCanThrow` of nested, DECIMAL and timestamp casts; `x * 0` and `x // 0` (`ArithmeticSimplificationRule`);
+    `prefix` decided by statistics only in a one-column filter on a scan; empty statistics fold no `constant_or_null`
+  - [x] count/min/max from row group statistics (`TryExecuteAggregates`), of tables and single Parquet files, with
+    the row groups a scan filter is never or always true for; counts not exact with uncommitted changes or deletes
+    the file had at open, bounds not with any delete (partial precomputation is off at the baseline too)
+  - [x] windows and aggregates whose outputs nothing reads are removed, volatile projections too
+    (`ClearUnusedExpressions`); a LIMIT above fewer rows than it lets through (`PropagateStatistics(LogicalLimit)`,
+    with the row bounds of `range` and Parquet row groups); `ArrayGenericFoldStats`; large INs of an inner
+    join's predicate become MARK joins; `EXPLAIN (FORMAT yaml)`; scan filters of a column as one conjunction
+  - [ ] struct fields pushed into a scan through a view's projection (`unused_columns/deliver_child_columns`)
+  - [ ] the ORDER BY of DISTINCT ON inside the DISTINCT, so its keys can be dropped (`remove_redundant_order_keys`)
+  - [ ] an OR whose NULL check statistics remove is a table filter in full, as C++ pushes it before statistics
+    (`date_trunc_simplification` IS DISTINCT FROM)
+  - [x] the values aggregates keep for their rows count toward `memory_limit` with the bytes of their strings,
+    BLOBs and BITs (`bitagg_memory_limit`)
+  - [ ] EXPLAIN shapes: join-dependent filters, projection placement, filter pullup join order, recursive CTE join
+    order, zone maps of ORs over joins, grouping sets of the common aggregate
+  - [ ] `duckdb_extensions()`, named table function arguments (`materialized_cte_column_count`)
+- [ ] 18. Optimizer-dependent SQL tests (`sql/optimizer`: 62 failing, 63.7% pass)
+  - [x] uncorrelated scalar subqueries planned as cross products (`PlanUncorrelatedSubquery`), with first() and
+    the multiple-rows check where they may not return one row
+  - [x] window self-join, window join pushdown (with `GetUniqueColumnCombinations`), filter pushdown through
+    windows on their partitions; `EMPTY_RESULT_PULLUP` runs where C++ runs it
+  - [x] late materialization of Top-N, LIMIT and SAMPLE over tables (a SEMI join on the rowid; the second
+    scan's filters are `optional:`)
+  - [x] late materialization over `read_parquet`, on `file_index` and `file_row_number`
+  - [ ] the second parquet scan's filters as filters that only skip row groups (they are applied again)
+  - [x] TopN window elimination: `row_number() <= k` per partition as a grouped `arg_min`/`arg_max` of `k`,
+    unnested back into rows
+  - [x] its late-materialization variant: a payload of several columns of one table fetched by rowid, through
+    projections, filters and joins on equal columns
+  - [ ] projections between the filter and the window that compute something
+  - [x] self-join aggregate (TPC-DS q95's `ws_wh` as `GROUP BY keys HAVING min(x) <> max(x)`); volatile
+    uncorrelated IN subqueries are MARK joins too
+  - [ ] `duckdb_types()` and the other system functions as `LogicalGet`s in EXPLAIN (`self_join_aggregate`)
+  - [x] compressed materialization, stages 1-3: integral and VARCHAR columns of ORDER BY, DISTINCT, aggregate
+    groups and the build side and single key pair of comparison joins (casts, `__internal_compress_integral_*`,
+    `__internal_compress_string_*`); calling them is the binder error C++ gives
+  - [x] compressed materialization of POINT-XY GEOMETRY columns (`__internal_compress_geometry_point`)
+  - [x] compressed materialization of VARIANT columns fully shredded on a primitive type: cast to it and
+    compressed further, also as grouped by (`variant_comparator`); joins of them compare the integers
+  - [ ] `stats()` of a VARCHAR read from several parquet files with `union_by_name` (NULL here)
+  - [x] partitioned execution: a large aggregate, ORDER BY or window over a table as a UNION ALL of parts by
+    ranges of a column, cut where the row groups' zones overlap little
+  - [x] list comprehension rewrite: a list comprehension whose result reads no field of the filter's struct
+    becomes `list_transform(list_filter(l, f), r)`
+  - [x] enum IN simplification (`InEnumSimplificationRule`, `EnumCompareSimplificationRule`), of the IN lists
+    the binder spells out as comparisons too; `constant_or_null` is not folded by statistics in a statement with
+    side effects, side-effecting CTEs included
+  - [x] IN lists kept as IN through filter pushdown (dense ranges, optional IN and OR filters on scans, index
+    scans and zone maps of them); the auxiliary `e(b) op e(c)` filters of window pushdown
+  - [x] uncorrelated EXISTS as a cross product with `count_star() = 1` of its `LIMIT 1`
+- [ ] 19. TPC-H 22/22 and TPC-DS 99/99 correct
+  - [x] with `tools/tpch` and `tools/tpcds` building dbgen and dsdgen from the C++ checkout, the examples get
+    TPC-H 22/22 at SF 0.01 and 0.1, TPC-DS 99/99 at SF 0.01
+  - [ ] `dbgen` / `dsdgen` as table functions in duckrs, so the corpus's tpch and tpcds tests run
+- [x] 20. Verification mode: run each query with the optimizer on and off and compare the results
+  (`sqllogictest --diff-against unoptimized --diff-out <file>`); over `optimizer`, `join`, `subquery` and
+  `aggregate` it found `complex_top_n` (105 rows against 102) and `test_no_pushdown_cast_into_cte`, both fixed
 
 ## Phase 6: SQL surface
 
@@ -234,25 +317,107 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [ ] the EXPLAIN shapes of materialized CTEs, and their runtime filters
 - [ ] 24. Subquery flattening edge cases (`sql/subquery`: 25 failing, 3 erroring)
 - [ ] 25. Joins: ASOF, positional, lateral (`sql/join`: 46 failing)
-- [ ] 26. Set operations, `SAMPLE`, `RETURNING`, `WITH ORDINALITY`, `UNNEST` (`setops` 8, `sample` 7, `returning` 2, `ordinality` 2, `unnest` 2)
+- [ ] 26. Set operations, `SAMPLE`, `RETURNING`, `WITH ORDINALITY`, `UNNEST` (`setops` 8, `sample` 7, `returning` 2, `ordinality` 0, `unnest` 2)
 - [ ] 27. SQL variables: `SET VARIABLE`, `getvariable` (`sql/variables`: 3 failing)
 - [ ] 28. `EXPLAIN` / `EXPLAIN ANALYZE` and profiling (`explain` 7, `profiling` 3, `detailed_profiler` 1)
 - [ ] 29. Query progress bar (`sql/progress`: 1 failing)
+- [ ] 29a. The parser and errors (`sql/parser`: 23 failing, 66.7%; `sql/error`: 12 failing, 47.8%)
+  - [x] `has_error` as the HAS_ERROR operator (a macro of its name shadows it, exported as `system.main.has_error`);
+    TRY and HAS_ERROR refuse volatile arguments, aggregates and windows; ORDER BY `*` and `COLUMNS(..)`, of a set
+    operation too; one `_` between digits in DOUBLE and FLOAT casts (not when sniffing a CSV), and in the test
+    runner's typed comparison; `invoke`'s errors and `alias()` of its parameters; `cast_to_type` keeping the target
+    collation; a call folded to NULL keeping its arguments' collation
+  - [ ] error locations (carets), `errors_as_json`, AT clauses, `preserve_identifier_case`
 
 ## Phase 5: Functions
 
-- [ ] 30. Scalar and table functions (`sql/function`: 127 failing, 69.6%; `sql/table_function`: 42 failing)
+- [ ] 30. Scalar and table functions (`sql/function`: 51 failing, 87.7%; `sql/table_function`: 31 failing)
   - [x] `remap_struct`, `struct_values`, `parse_formatted_bytes`, `equi_width_bins`, `is_histogram_other_bin`;
     `date_part` of a list of parts, the time zone parts of TIMESTAMP and TIME, `date_trunc` of an INTERVAL by
     ISO year, week and day parts; `list_where` past the end of the list; `map_concat`'s type from its non-empty
     maps; the distance functions' overloads, messages, `<->` and `<=>`, and the rescaled cosine
   - [x] `get_type` and `make_type`, whose TYPE values keep the type serialized
-  - [ ] TYPE columns and casts, `create_sort_key`, `index_key`, `variant_normalize`,
-    `strptime` edge cases, `list_contains` and the other templated list functions' type deduction,
-    the external-resource and profiling table functions
-- [ ] 31. Aggregates (`sql/aggregate`: 57 failing, 73.7%; target ≥ 90%)
+  - [x] `variant_exists`, `variant_extract_string`, `variant_array_length` at a path; `binom`, `replace_type`,
+    `invoke`; `timezone(INTERVAL, TIMETZ)`; fmod floored and refusing a zero divisor as C++ does; the decade
+    truncated; `last_day` of the last month; a `date_part` of an infinity is NULL whatever the part
+  - [x] window functions in `duckdb_functions()`; GROUP BY ALL refuses a window; a string slice with a step is
+    refused when bound, and slice bounds are cast to BIGINT
+  - [x] `duckdb_keywords()` from the grammar's keyword lists, `duckdb_dialects()` (none) and `current_dialect`'s
+    check, `pragma_version()`, `pragma_platform()`; `standard_vector_size` in `duckdb_settings()`; every catalog's
+    `main` schema internal; `pragma_table_info` names parsed as `QualifiedName::TryParse` does
+  - [x] the Postgres setof aliasing of `range`, `generate_series` and `unnest` (the one column takes the table
+    alias, the original name stays bindable and joins USING); `WITH ORDINALITY`, numbered per input row when
+    lateral; a NULL bound of a timestamp range; infinite bounds refused
+  - [x] C++'s errors for: struct_insert/struct_update (no arguments, not a STRUCT, nothing to add, duplicate
+    named arguments), struct_concat (positions, duplicates, named and unnamed mixed; unnamed ones make a
+    TUPLE), MAP and struct_extract of the wrong types (no overload matches), cot of zero, url_decode, `__between`,
+    a SET value with a column or a subquery, a DEFAULT in WHERE/GROUP BY, DISTINCT ON a literal, ORDER BY an UNNEST
+    of a struct, QUALIFY of an unknown column, DROP of a built-in type or system view, make_type's name parsed
+    as a qualified name; INTERVAL / 0; a timestamp out of range after adding an interval; acosh below 1 is NaN;
+    struct functions with prepared parameters bind when executed
+  - [x] `regexp_extract`'s group as C++ binds it (a constant 0–9, its options in its place, a NULL or missing
+    group is no match) and `regexp_extract_all`'s (negative is nothing, an unmatched group is NULL);
+    `parse_dirname`/`parse_dirpath` as `TrimPathFunction` and `ParseDirpathFunction`, unknown and NULL separators
+    as both slashes, `parse_filename`'s trim argument of any type; `reservoir_quantile` with its sample size and
+    default quantile; `struct_extract_at` of named structs; gamma and lgamma of zero, and their IEEE variants;
+    the difference of timestamps across the whole range; GEOMETRY in VARIANTs; extra column aliases of a table
+    function are ignored
+  - [x] VARIANTs nested tens of thousands deep: decoded, encoded and dropped without recursion, a child moved
+    out rather than cloned, and a deep JSON document cast on a thread with the stack it needs; `overlay`,
+    `md5_number`, `make_timestamp_ms`, `char_length` and `character_length`, `unlist`; `to_timestamp`'s range as
+    `EpochSecOperator` checks it; the time parts of TIME_NS (`nanosecond` exactly); `SELECT * AS x` names every
+    column x; `struct_keys(NULL)`
+  - [x] `strptime` and `try_strptime` as `StrpTimeFormat` parses (`function/strptime.rs`): week numbers (`%U`, `%W`),
+    ISO years, weeks and weekdays (`%G`, `%V`, `%u`), `infinity`/`epoch` specials, TIMESTAMP_NS and TIMESTAMPTZ
+    results for `%n` and `%z`, C++'s error text; `strftime` of TIMESTAMP_NS; TIMESTAMP_NS ± INTERVAL keeping its
+    nanoseconds, and TIMESTAMP_S/MS ± INTERVAL as TIMESTAMP; `time_bucket` as the `TimeBucket` operators (month
+    offsets, overflow checks); `epoch_ms` rounding and the epoch functions' range errors; `round` of every integer
+    type; `create_sort_key` (BIGINT or BLOB, intervals as stored); `variant_type`, `variant_contains`,
+    `variant_normalize`, `variant_keys` as a path function; `normalized_interval` as `interval_t::Normalize`;
+    `ilike_escape`'s escape lowercased; `map_concat` of NULLs; `list_resize` to a NULL size; a NULL `string_agg`
+    separator in `list_aggr`; `atan(inf)`
+  - [x] `decimal_division` and `decimal_average`; `variant_group_object` and `variant_comparator`; a macro used as
+    a window function (`variant_group_array() OVER`, any scalar macro of one aggregate); UNION comparisons as
+    `UnionComparator` (a NULL member is NULL; join conditions still match whole values), UNION to UNION TRY_CAST
+    losing the row when a member fails, STRUCT to UNION by case-insensitive names, a prepared `union_extract` key;
+    `arg_min_nulls_last` / `arg_max_nulls_last` with n; `avg` of TIMESTAMP_NS and of TIMESTAMP_S/MS/DATE as
+    TIMESTAMP; the list `range` with a step of 0; EXPORT DATABASE of UNION columns past the tag
+  - [x] map subscripts and `list_has_any`/`list_has_all` deducing their template types (and failing as C++ does);
+    `map_keys`/`map_values`/`map_entries`/`map_extract` of an untyped NULL typed as C++ folds them; BLOB
+    `array_slice`; `array_to_string` of NULL, with a NULL separator, refusing a column separator; `bit_length` of a
+    string; `make_date` of a STRUCT; `make_time` taking a leap second; `make_timestamp` and `make_timestamp_ns`
+    refusing an infinity; `date_trunc` before the first timestamp; `epoch_ms/us/ns` of TIME_NS and TIMETZ; the date
+    parts of a date taking no TIME, and `date_part`'s unit checked against its type when bound; `list_resize` past
+    the largest vector; `list_reduce` typed as `ListReduceBind` (the accumulator from the initial value, widened to
+    the lambda's type); the lambda functions' arity and NULL-argument errors, UNNEST refused in a lambda;
+    `enum_code` and friends of a prepared parameter; `variant_extract` of a folded key and its overloads' types;
+    `regexp_extract`'s ambiguous string group; RE2 octal escapes; OR filters short-circuiting as `SelectOr`
+  - [x] `switch` as `SwitchBindExpression` (a constant MAP of cases made a CASE, its key template deduced);
+    comparison operators called as functions (`"="(a, b)`); `struct_extract` refusing a VARIANT while `.key`
+    of one is its variant_extract; `list_sort`/`list_grade_up` refusing a VARIANT; `list_concat` of NULLs;
+    a folded tuple index; UNNEST of an empty struct refused; `fill` of HUGEINT as `InterpolateOperator`
+  - [ ] `stats()` of nested types and VARIANT, Parquet UNION columns, state export of `variant_group_object`;
+    `list_max`/`list_min` under a collation, regex `\C`, lambdas in a subquery that see a column of their
+    parameter's name
+  - [ ] TYPE columns and casts, `index_key`, JSON date-format detection, `list_contains` and the other templated list functions' type deduction,
+    the external-resource and profiling table functions; `duckdb_constraints()` lists a primary key's implied
+    NOT NULL after the declared constraints (the catalog keeps NOT NULL per column, not in order); a view's
+    columns as bound when it was created
+- [ ] 31. Aggregates (`sql/aggregate`: 34 failing, 84.3%; target ≥ 90%)
   - [x] `histogram(x, bins)` and `histogram_exact`, with the "other values" bucket; stddev and variance are
-    infinite rather than out of range
+    infinite rather than out of range; the moments, covariances, regressions and Kahan sums computed with C++'s
+    update and finalize, so their results are C++'s to the bit
+  - [x] `approx_count_distinct` with C++'s HyperLogLog (`HyperLogLogP<10>` and Ertl's estimator), its exported
+    sketch and the checks on importing one
+  - [x] `approx_quantile` with C++'s t-digest (compression 100, `function/tdigest.rs`): the overloads' types, the
+    values encoded as doubles and decoded with clamping as `ApproxQuantileCoding` does, FLOAT fractions, its exported
+    state of centroids and the checks on importing one; `string_agg` casts its input to VARCHAR
+  - [x] `count(t.*)` as `TryRewriteQualifiedCountStar` in every clause and in windows and macros, with the
+    relations outer and positional joins NULL-extend tracked, `AnyColumnNotNull` where there is no row id;
+    `median` of non-interpolatable types discrete; quantile interpolation of HUGEINTs and of DECIMALs stored as
+    integers as C++ does it; `quantile_cont`'s overloads (no INTERVAL or VARCHAR, no single argument);
+    list_aggr's "No matching aggregate function"; `list_contains` deducing its template type
+  - [ ] the memory limits of quantiles and of window builds (7 files)
   - [x] `EXPORT_STATE` in C++'s layouts for the aggregates duckrs computes from their rows
     (`function/holistic_states.rs`): bool_and/or, product, string_agg, the stddev/variance family, covar, corr,
     skewness, kurtosis, fsum/favg, the regr_* family, arg_min/arg_max, the TIMESTAMP/TIME/TIMETZ/INTERVAL averages
@@ -264,9 +429,15 @@ Each item gives the number of failing files in `test/` that it should fix, where
     COMBINE; `to_aggregate_state` with an ORDER BY spec and its checks
   - [ ] the sketches of approx_count_distinct, approx_quantile and approx_top_k, `lttb`, the states of files before
     v1.5 (`LEGACY_AGGREGATE_STATE`)
-- [ ] 32. Window functions (`sql/window`: 19 failing, 79.1%; target ≥ 85%)
-- [ ] 33. `pragma_*` functions and PRAGMA statements (`sql/pragma`: 29 failing, 50.0%)
+- [ ] 32. Window functions (`sql/window`: 14 failing, 84.6%; target ≥ 85%)
+  - [x] `fill` as `WindowFillExecutor`: only finite values count and the search stops at an order value that
+    does not, interpolated integers clamped to their endpoints, values a type cannot hold (past a DECIMAL's
+    width, an integer's range, a coarse timestamp's) NULL; FILTER refused on window functions
+- [ ] 33. `pragma_*` functions and PRAGMA statements (`sql/pragma`: 20 failing, 65.5%)
   - [x] SHOW TABLES over the search path, SHOW TABLES FROM a database, a schema or both
+  - [x] PRAGMA version, platform, functions, database_size, storage_info and metadata_info as the queries C++
+    rewrites them to; a pragma no function has is a Catalog Error, and one called with the wrong arguments a
+    Binder Error
 
 ## Phase 4: Types and casts
 
@@ -279,9 +450,15 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [ ] shredded GEOMETRY columns, and the spatial extension's format of files before v1.5.0
   - [x] `GeometryStats`: in `stats()`, in database files (extent, types, flags), and `vertex_extract`'s bounds
   - [ ] `ST_GeomFromWKB`'s types from BLOB min/max (duckrs keeps no string statistics), GeoParquet, the spatial extension's blob format
-- [ ] 34. Remaining type and cast failures (`sql/types`: 82 failing, 84.1%; `sql/cast`: 5 failing)
+- [ ] 34. Remaining type and cast failures (`sql/types`: 39 failing, 92.6%; `sql/cast`: 2 failing)
   - [x] UNNEST with `recursive`, `max_depth` and `keep_parent_names`, of structs at the root of a select list,
     refused nested; a cast to NULL of anything that is NULL
+  - [x] DOUBLE to VARCHAR of powers of two from 2^53 (fmt's fallback shifts its denominator by the boundary bits);
+    VARCHAR to MAP with NULL keys; VARIANT casts as `CastVariant` (UNION targets refused, a nested value of
+    another shape cast from the value it holds, NULL map entries, JSON leaves parsed, the depth limit, FLOAT and
+    DECIMAL leaves in JSON); `FLOAT(precision)`; type parameters described as C++ does (DECIMAL and BOOLEAN
+    literals, NULL refused by name, VARCHAR with two, a user type with any); built-in types qualified by `main`, a
+    missing schema of a type as a missing type
 - [ ] 35. The VARIANT type (`sql/variant`: 2 failing)
 
 ## Phase 12: Catalog, settings, APIs and shell

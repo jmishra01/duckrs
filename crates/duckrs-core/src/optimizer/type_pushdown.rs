@@ -69,7 +69,7 @@ pub fn push_down_types(plan: &mut LogicalOperator) {
 }
 
 /// A copy of the scan's data, to change its types in.
-fn clone_scan(scan: &CsvScanData) -> CsvScanData {
+pub(super) fn clone_scan(scan: &CsvScanData) -> CsvScanData {
     CsvScanData {
         files: scan.files.clone(),
         options: scan.options.clone(),
@@ -86,6 +86,10 @@ fn clone_scan(scan: &CsvScanData) -> CsvScanData {
         virtual_columns: scan.virtual_columns.clone(),
         rejects: scan.rejects.clone(),
         first_data: std::sync::Mutex::new(scan.first_data.lock().map(|data| data.clone()).unwrap_or(None)),
+        projection: scan.projection.clone(),
+        column_order: scan.column_order.clone(),
+        file_filters: scan.file_filters.clone(),
+        total_files: scan.total_files,
     }
 }
 

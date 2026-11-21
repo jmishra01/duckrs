@@ -249,6 +249,15 @@ pub struct CsvScanData {
     /// the bytes of the first file that sniffing read, for the first scan (the CSV reader keeps
     /// the handle it sniffed with)
     pub first_data: std::sync::Mutex<Option<Vec<u8>>>,
+    /// the columns of `output_types` the scan outputs, in order (`column_ids`); `None` for all.
+    /// The others are not converted, so their values cannot fail.
+    pub projection: Option<Vec<usize>>,
+    /// the order the binder read the columns in, which projection pushdown keeps
+    pub column_order: crate::execution::multi_file::ColumnOrder,
+    /// `ExtraOperatorInfo::file_filters`: the filters that left files out, as text
+    pub file_filters: String,
+    /// how many files there were before filters left some out
+    pub total_files: Option<usize>,
 }
 
 /// The tables that `store_rejects` fills (`CSVRejectsTable`).
@@ -294,6 +303,23 @@ impl CsvScanData {
         types.extend(self.hive.iter().map(|(_, ty)| ty.clone()));
         types.extend(crate::execution::multi_file::virtual_types(&self.virtual_columns));
         types
+    }
+
+    /// The types of the columns the scan outputs.
+    pub fn projected_types(&self) -> Vec<LogicalType> {
+        let types = self.output_types();
+        match &self.projection {
+            Some(columns) => columns.iter().map(|&c| types[c].clone()).collect(),
+            None => types,
+        }
+    }
+
+    /// The output columns the scan outputs, by their position among all of them.
+    pub fn projected_columns(&self) -> Vec<usize> {
+        match &self.projection {
+            Some(columns) => columns.clone(),
+            None => (0..self.output_types().len()).collect(),
+        }
     }
 }
 
@@ -448,14 +474,20 @@ pub fn scan_chunk(scan: &CsvScanData, state: &mut CsvScanState) -> Result<Option
         return Ok(None);
     };
     let path = &scan.files[state.file].path;
-    crate::execution::multi_file::append_virtual_columns(
+    let chunk = crate::execution::multi_file::append_virtual_columns(
         chunk,
         &scan.virtual_columns,
         path,
         state.file,
         &mut state.virtual_rows,
-    )
-    .map(Some)
+    )?;
+    Ok(Some(match &scan.projection {
+        Some(columns) => {
+            let count = chunk.len();
+            DataChunk::from_columns(columns.iter().map(|&c| chunk.column(c).clone()).collect(), count)
+        }
+        None => chunk,
+    }))
 }
 
 fn scan_file_chunk(scan: &CsvScanData, state: &mut CsvScanState) -> Result<Option<DataChunk>> {
@@ -990,6 +1022,11 @@ fn typed_chunk(
     let mut result = Vec::with_capacity(scan.types.len() + 1);
     let mut bad: std::collections::BTreeSet<usize> = (0..count).filter(|&row| doomed[row]).collect();
     for (index, (ty, column)) in scan.types.iter().zip(&file.mapping).enumerate() {
+        // a column nothing reads is not converted (`column_ids` of the scan)
+        if scan.projection.as_ref().is_some_and(|columns| !columns.contains(&index)) {
+            result.push(Vector::constant_null(ty.clone()));
+            continue;
+        }
         let fields: Vec<_> = rows.iter().map(|row| column.and_then(|c| row.get(c))).collect();
         let mut strings = varchar_vector(&fields, &scan.options, &file.dialect)?;
         if scan.force_not_null.get(index).copied().unwrap_or(false) {
@@ -1223,7 +1260,7 @@ fn flush_rejects(scan: &CsvScanData, state: &mut CsvScanState) -> Result<()> {
             .names
             .iter()
             .zip(&scan.types)
-            .map(|(name, ty)| format!("'{}': '{ty}'", name.replace('\'', "''")))
+            .map(|(name, ty)| format!("'{}': '{}'", name.replace('\'', "''"), ty.to_string().replace('\'', "''")))
             .collect();
         let new_line = new_line_identifier(&file.dialect);
         scans.push(vec![

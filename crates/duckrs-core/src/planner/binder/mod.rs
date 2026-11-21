@@ -4,19 +4,23 @@
 //! expressions and plans it as a tree of logical operators.
 
 mod alter;
+mod alter_fields;
 mod copy;
 mod create_index;
 mod expression;
 mod generated;
+mod index_key;
 mod join;
 mod json;
 mod lambda;
+pub(crate) use lambda::is_lambda_function;
 mod macros;
 mod match_recognize;
 mod merge;
 mod on_conflict;
 mod parquet;
 mod pivot;
+pub(crate) use pivot::has_subquery;
 pub mod read_duckdb;
 mod show;
 mod star;
@@ -70,6 +74,19 @@ pub struct BoundStatement {
     pub return_type: StatementReturnType,
 }
 
+/// A CTE that runs once (`CTE_MATERIALIZE_ALWAYS`), whose references are `CteRef`s
+/// (`CTEBindState`).
+#[derive(Debug)]
+pub(super) struct MaterializedCteState {
+    pub cte_index: usize,
+    pub data: Arc<Mutex<ColumnDataCollection>>,
+    /// what the first reference bound: the plan, its names, types and column aliases
+    pub bound: Option<(LogicalOperator, Vec<String>, Vec<LogicalType>, Vec<(String, usize)>, StatementReturnType)>,
+    /// the CTE reads the queries around it: each reference binds it on its own
+    pub inline: bool,    /// `CTE_MATERIALIZE_ALWAYS`
+    pub always: bool,
+}
+
 /// The columns a FROM clause entry makes visible (`TableBinding`).
 #[derive(Debug, Clone)]
 pub struct Binding {
@@ -93,6 +110,20 @@ impl Binding {
             return position.parse().ok();
         }
         self.names.iter().position(|n| n.eq_ignore_ascii_case(name))
+    }
+
+    /// `Binding::HasMatchingBinding`: a column, or a column alias such as the original name of a
+    /// set-returning function's column.
+    fn matches_column(&self, name: &str) -> bool {
+        self.column_index(name).is_some() || self.column_alias(name).is_some()
+    }
+
+    /// `Binding::AddColumnAlias`: another name of one of the columns (kept as a hidden column at the
+    /// column's own position, which a scan's virtual columns are never at).
+    fn column_alias(&self, name: &str) -> Option<usize> {
+        self.virtual_column(name)
+            .map(|(index, _, _)| index)
+            .filter(|index| *index < self.names.len())
     }
 
     /// `rowid`, for a table that has no column of that name (`TableBinding::Bind`).
@@ -202,7 +233,7 @@ impl BindContext {
     fn matching_bindings(&self, column: &str) -> Vec<&Binding> {
         self.bindings
             .iter()
-            .filter(|b| b.column_index(column).is_some())
+            .filter(|b| b.matches_column(column))
             .collect()
     }
 
@@ -369,7 +400,7 @@ impl BindContext {
                 .map(|b| (b.alias.clone(), similarity_rating(&b.alias, table)))
                 .collect();
             let name = match schema {
-                Some(schema) => format!("{schema}.{table}"),
+                Some(schema) => format!("{}.{table}", schema.replace(crate::catalog::SCHEMA_PATH_SEPARATOR, ".")),
                 None => table.to_string(),
             };
             return Err(binder_error(format!(
@@ -382,7 +413,7 @@ impl BindContext {
 
     /// `BindingAlias::Matches`: whether a qualification names the schema a binding is of. It is the
     /// end of its path: the innermost schema, the path, or the catalog and the path.
-    fn schema_matches(binding: &str, qualification: &str) -> bool {
+    pub(super) fn schema_matches(binding: &str, qualification: &str) -> bool {
         let sep = crate::catalog::SCHEMA_PATH_SEPARATOR;
         let mut full = vec![crate::catalog::DEFAULT_CATALOG];
         full.extend(binding.split(sep));
@@ -400,13 +431,13 @@ impl BindContext {
         let has_table_column = |table: &str, column: &str| {
             self.bindings
                 .iter()
-                .any(|b| b.alias.eq_ignore_ascii_case(table) && b.column_index(column).is_some())
+                .any(|b| b.alias.eq_ignore_ascii_case(table) && b.matches_column(column))
         };
         let schema_table_column = |schema: &str, table: &str, column: &str| {
             self.bindings.iter().any(|b| {
                 b.alias.eq_ignore_ascii_case(table)
                     && b.schema.as_ref().is_some_and(|s| Self::schema_matches(s, schema))
-                    && b.column_index(column).is_some()
+                    && b.matches_column(column)
             })
         };
         let has_column = |column: &str| self.bindings.iter().any(|b| b.column_index(column).is_some());
@@ -427,12 +458,48 @@ impl BindContext {
         (column_parts < names.len()).then_some(column_parts)
     }
 
-    /// `AmbiguityException`, for bindings with one alias.
-    fn ambiguous_table(table: &str) -> Error {
-        binder_error(format!(
-            "Ambiguous reference to table \"{table}\" (duplicate alias \"{table}\", explicitly alias one of the \
-             tables using \"AS my_alias\")"
-        ))
+    /// `AmbiguityException`: the bindings `table` names, each by the least that tells it apart
+    /// (`MinimumUniqueAlias`), or a duplicate alias if two can't be.
+    fn ambiguous_table(table: &str, bindings: &[&Binding]) -> Error {
+        let same_schema = |a: &Binding, b: &Binding| match (&a.schema, &b.schema) {
+            (Some(x), Some(y)) => x.eq_ignore_ascii_case(y),
+            (None, None) => true,
+            _ => false,
+        };
+        let mut result = "(use: ".to_string();
+        for (i, binding) in bindings.iter().enumerate() {
+            if i > 0 {
+                result += if i + 1 == bindings.len() { " or " } else { ", " };
+            }
+            let mut duplicate = false;
+            let mut minimum = String::new();
+            for (k, other) in bindings.iter().enumerate() {
+                if k == i {
+                    continue;
+                }
+                let same_alias = binding.alias.eq_ignore_ascii_case(&other.alias);
+                if same_alias && same_schema(binding, other) {
+                    duplicate = true;
+                }
+                let alias = ast::sql_identifier(&binding.alias);
+                let candidate = match &binding.schema {
+                    Some(schema) if same_alias => format!("{}.{alias}", ast::sql_identifier(schema)),
+                    _ => alias,
+                };
+                if candidate.len() > minimum.len() {
+                    minimum = candidate;
+                }
+            }
+            if duplicate {
+                result = format!(
+                    "(duplicate alias \"{table}\", explicitly alias one of the tables using \"AS my_alias\""
+                );
+            } else {
+                result += &minimum;
+            }
+        }
+        result += ")";
+        binder_error(format!("Ambiguous reference to table \"{table}\" {result}"))
     }
 
     /// Binds `[schema.]table.column` (`BindContext::GetBinding(alias, column)`): of the bindings
@@ -446,14 +513,17 @@ impl BindContext {
         let matching = self.bindings_of(schema, table)?;
         let mut with_column = matching.iter().filter(|b| b.column(name).is_some());
         let Some(binding) = with_column.next() else {
+            // `TableBinding::ColumnNotFoundError`
+            let names: Vec<String> = matching.iter().flat_map(|b| b.names.iter().cloned()).collect();
             return Err(binder_error(format!(
-                "Table {} does not have a column named {}",
+                "Table {} does not have a column named {}\n{}",
                 ast::sql_quoted_identifier(&matching[0].alias),
-                ast::sql_quoted_identifier(name)
+                ast::sql_quoted_identifier(name),
+                duckrs_common::string_util::candidates_error_message(&names, name, "Candidate bindings: ")
             )));
         };
         if with_column.next().is_some() {
-            return Err(Self::ambiguous_table(table));
+            return Err(Self::ambiguous_table(table, &matching));
         }
         let (index, ty, name) = binding.column(name).expect("filtered above");
         Ok((ColumnBinding::new(binding.table_index, index), ty, name))
@@ -562,7 +632,12 @@ pub struct SessionValues {
     pub replacement_scans: Vec<ReplacementScan>,
     /// `DatabaseManager::IsAttachedDatabaseFile`: the files of the attached databases
     pub database_files: Box<dyn Fn() -> Vec<std::path::PathBuf> + Send + Sync>,
+    /// the catalog of an attached database by name (`Catalog::GetCatalogEntry`), committed state
+    pub attached_catalog: AttachedCatalogLookup,
 }
+
+/// [`SessionValues::attached_catalog`].
+pub type AttachedCatalogLookup = Box<dyn Fn(&str) -> Option<Arc<crate::catalog::Catalog>> + Send + Sync>;
 
 /// The rows of an `Appender`, for `__internal_appender_chunks`.
 pub type AppendedRows = (
@@ -605,6 +680,10 @@ impl std::fmt::Debug for SessionValues {
 /// The settings that change how statements bind.
 #[derive(Debug, Clone)]
 pub struct BindOptions {
+    /// `disabled_filesystems` has `LocalFileSystem`
+    pub local_file_system_disabled: bool,
+    /// how SQL that binding parses (`query()`) is parsed
+    pub parser: duckrs_parser::ParserOptions,
     /// `txid_current`
     pub transaction_id: u64,
     /// `default_order`
@@ -627,6 +706,8 @@ pub struct BindOptions {
     pub error_on_division_by_zero: bool,
     /// `ieee_floating_point_ops`
     pub ieee_floating_point_ops: bool,
+    /// `order_by_non_integer_literal`
+    pub order_by_non_integer_literal: bool,
 }
 
 /// What `SHOW name` looks for (`ShowBehaviorType`).
@@ -640,6 +721,8 @@ pub enum ShowBehavior {
 impl Default for BindOptions {
     fn default() -> Self {
         Self {
+            local_file_system_disabled: false,
+            parser: duckrs_parser::ParserOptions::default(),
             transaction_id: 0,
             default_order: OrderType::Ascending,
             default_null_order: DefaultNullOrder::NullsLast,
@@ -651,6 +734,7 @@ impl Default for BindOptions {
             file_access: None,
             error_on_division_by_zero: true,
             ieee_floating_point_ops: true,
+            order_by_non_integer_literal: false,
         }
     }
 }
@@ -739,6 +823,8 @@ pub struct Binder<'a> {
     pub options: BindOptions,
     bind_context: BindContext,
     next_table_index: usize,
+    /// The order the columns of the scans with projection pushdown are read in, by table index.
+    column_orders: std::collections::HashMap<usize, crate::execution::multi_file::ColumnOrder>,
     /// The COPY being bound is about JSON.
     copy_json: bool,
     /// Binding what a table function was given: `TableFunctionBinder` reads a name as its text.
@@ -751,6 +837,8 @@ pub struct Binder<'a> {
     aggregate_error: &'static str,
     pub session: Option<Arc<SessionValues>>,
     lambda_scopes: Vec<lambda::LambdaScope>,
+    /// the lambda scopes an aggregate being bound cannot read (`inaccessible_lambda_binding_count`)
+    inaccessible_lambdas: usize,
     /// The windows of the SELECT clause being bound, when it may have any here.
     windows: Option<window::WindowBindState>,
     window_error: &'static str,
@@ -767,6 +855,14 @@ pub struct Binder<'a> {
     /// The left sides of the joins whose right side is being bound. Their columns are out of
     /// reach until LATERAL exists, which is a missing feature and not a bad column.
     left_of_join: Vec<BindContext>,
+    /// the table indexes of the relations an outer join NULL-extends (`Binding::IsNullExtended`)
+    pub(super) null_extended: std::collections::HashSet<usize>,
+    /// binding the argument of a TRY or HAS_ERROR, where aggregates and windows are refused
+    pub(super) inside_try: bool,
+    /// binding the correlated columns of a subquery (`depth > 0` in C++'s binders)
+    pub(super) binding_correlated: bool,
+    /// rebinding a subquery whose expressions of this query's groups stand for the groups
+    pub(super) subquery_group_expressions: bool,
     /// The views being bound, innermost last (`bound_views`).
     bound_views: Vec<Arc<ViewCatalogEntry>>,
     /// The schema unqualified tables are looked up in before the default one: the schema of the
@@ -788,8 +884,9 @@ pub struct Binder<'a> {
     unnest_level: usize,
     /// The parameters of the prepared statement being bound, if it is one.
     pub parameters: Option<Arc<ParameterValues>>,
-    /// The CTEs in scope, innermost last, with how many outer contexts they can see.
-    ctes: Vec<(String, Arc<ast::CteInfo>, usize)>,
+    /// The CTEs in scope, innermost last, with how many outer contexts they can see, and for one
+    /// that is materialized, what its references read.
+    ctes: Vec<(String, Arc<ast::CteInfo>, usize, Option<Arc<Mutex<MaterializedCteState>>>)>,
     /// The CTEs whose definition is being bound, which cannot refer to themselves.
     ctes_being_bound: Vec<String>,
     /// What the queries around a subquery can see, innermost last.
@@ -801,6 +898,8 @@ pub struct Binder<'a> {
     working_tables: Vec<WorkingTable>,
     /// RETURNING of a MERGE can read `merge_action`
     merge_action_column: bool,
+    /// DELETE ... RETURNING: the statement gives the `rowid` of each row after its columns
+    returning_row_id: bool,
     /// the aggregate of an outer query's columns that stopped this binder
     pending_outer_aggregate: Option<ast::FunctionExpr>,
 }
@@ -832,6 +931,13 @@ impl<'a> Binder<'a> {
     /// `OpenerFileSystem::VerifyCanAccessFile`: with `enable_external_access` off, only the
     /// allowed paths and directories can be read or written.
     pub(crate) fn check_file_access(&self, path: &str) -> Result<()> {
+        // `VirtualFileSystem::FindFileSystem`: a local path needs the LocalFileSystem
+        if self.options.local_file_system_disabled && !path.contains("://") {
+            return Err(Error::new(
+                ErrorKind::Permission,
+                "File system LocalFileSystem has been disabled by configuration",
+            ));
+        }
         match &self.options.file_access {
             Some(access) => access.check(path, false),
             None => Ok(()),
@@ -848,6 +954,7 @@ impl<'a> Binder<'a> {
             options,
             bind_context: BindContext::default(),
             next_table_index: 0,
+            column_orders: std::collections::HashMap::new(),
             copy_json: false,
             table_function_argument: false,
             unnamed_subquery_index: 1,
@@ -855,6 +962,7 @@ impl<'a> Binder<'a> {
             aggregate_error: "Aggregate functions are not supported here",
             session: None,
             lambda_scopes: Vec::new(),
+            inaccessible_lambdas: 0,
             windows: None,
             window_error: "Window functions are not supported here",
             inside_window: false,
@@ -862,6 +970,10 @@ impl<'a> Binder<'a> {
             later_select_aliases: None,
             outer_aliases: Vec::new(),
             left_of_join: Vec::new(),
+            null_extended: std::collections::HashSet::new(),
+            inside_try: false,
+            binding_correlated: false,
+            subquery_group_expressions: false,
             bound_views: Vec::new(),
             search_schema: None,
             foreign_databases: Vec::new(),
@@ -878,6 +990,7 @@ impl<'a> Binder<'a> {
             correlated: Arc::default(),
             working_tables: Vec::new(),
             merge_action_column: false,
+            returning_row_id: false,
             pending_outer_aggregate: None,
         };
         // the transition tables of the trigger whose body this binds
@@ -980,6 +1093,11 @@ impl<'a> Binder<'a> {
     }
 
     /// `Binder::GenerateTableIndex`.
+    /// The order of the columns of the scan at `table_index`, kept as the binder reads them.
+    fn column_order(&mut self, table_index: usize) -> crate::execution::multi_file::ColumnOrder {
+        self.column_orders.entry(table_index).or_default().clone()
+    }
+
     fn generate_table_index(&mut self) -> usize {
         let index = self.next_table_index;
         self.next_table_index += 1;

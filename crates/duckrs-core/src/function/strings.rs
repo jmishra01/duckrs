@@ -207,10 +207,23 @@ fn right_grapheme(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
+/// `AssertInSupportedRange` of `left`'s substring: a count beyond what a string can hold is refused.
+/// A negative count, like any count of `right`, is bounded by the string's length first.
+fn substring_length_in_range(length: i64) -> Result<()> {
+    if length > SUBSTRING_UPPER_BOUND {
+        return Err(duckrs_common::Error::new(
+            duckrs_common::ErrorKind::OutOfRange,
+            "Substring length outside of supported range",
+        ));
+    }
+    Ok(())
+}
+
 fn left(args: &DataChunk, result: &mut Vector) -> Result<()> {
     strict_rows(args, result, |row| {
         let chars: Vec<char> = text(&row[0]).chars().collect();
         let count = integer(&row[1]);
+        substring_length_in_range(count)?;
         let size = chars.len() as i64;
         let take = if count >= 0 {
             count.min(size)
@@ -597,8 +610,27 @@ fn ilike_escape(args: &DataChunk, result: &mut Vector) -> Result<()> {
     strict_rows(args, result, |row| {
         let input: Vec<char> = text(&row[0]).to_lowercase().chars().collect();
         let pattern: Vec<char> = text(&row[1]).to_lowercase().chars().collect();
-        let escape = escape_of(&row[2])?;
+        // the pattern is lowercased, so the escape character is as well
+        let escape = escape_of(&row[2])?.map(|c| c.to_ascii_lowercase());
         Ok(Value::boolean(like_match(&input, &pattern, escape)?))
+    })
+}
+
+fn not_like_escape(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    strict_rows(args, result, |row| {
+        let input: Vec<char> = text(&row[0]).chars().collect();
+        let pattern: Vec<char> = text(&row[1]).chars().collect();
+        let escape = escape_of(&row[2])?;
+        Ok(Value::boolean(!like_match(&input, &pattern, escape)?))
+    })
+}
+
+fn not_ilike_escape(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    strict_rows(args, result, |row| {
+        let input: Vec<char> = text(&row[0]).to_lowercase().chars().collect();
+        let pattern: Vec<char> = text(&row[1]).to_lowercase().chars().collect();
+        let escape = escape_of(&row[2])?.map(|c| c.to_ascii_lowercase());
+        Ok(Value::boolean(!like_match(&input, &pattern, escape)?))
     })
 }
 
@@ -716,6 +748,45 @@ fn md5_digest(input: &[u8]) -> [u8; 16] {
         digest[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
     }
     digest
+}
+
+/// `MD5Number128Operator`: the digest's bytes as a little-endian UHUGEINT.
+fn md5_number(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    strict_rows(args, result, |row| {
+        Ok(Value::uhugeint(u128::from_le_bytes(md5_digest(bytes_of(&row[0])))))
+    })
+}
+
+/// `OverlayFunction`: `replacement` in place of `count` characters (by default as many as it has) from
+/// character `start`.
+fn overlay(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    row_wise(args, result, |row| {
+        if row.iter().any(Value::is_null) {
+            return Ok(Value::null(LogicalType::VARCHAR));
+        }
+        let input = row[0].try_to_string()?;
+        let replacement = row[1].try_to_string()?;
+        let start = row[2].as_i128().unwrap_or(0) as i64;
+        let mut count = replacement.chars().count() as i64;
+        if let Some(given) = row.get(3).and_then(Value::as_i128)
+            && given >= 0
+        {
+            count = given as i64;
+        }
+        // `CharPosToByte`: the byte where the 1-based character starts, clamped to the string
+        let byte_of = |position: i64| -> usize {
+            if position <= 1 {
+                return 0;
+            }
+            input
+                .char_indices()
+                .nth((position - 1) as usize)
+                .map_or(input.len(), |(at, _)| at)
+        };
+        let end = if count > 0 && start > i64::MAX - count { i64::MAX } else { start + count };
+        let (from, to) = (byte_of(start), byte_of(end));
+        Ok(Value::varchar(format!("{}{replacement}{}", &input[..from], &input[to..])))
+    })
 }
 
 fn md5(args: &DataChunk, result: &mut Vector) -> Result<()> {
@@ -928,8 +999,29 @@ pub fn string_functions() -> Vec<ScalarFunctionSet> {
             b.clone(),
             ilike_escape,
         ),
+        (
+            "not_like_escape",
+            vec![v.clone(), v.clone(), v.clone()],
+            b.clone(),
+            not_like_escape,
+        ),
+        (
+            "not_ilike_escape",
+            vec![v.clone(), v.clone(), v.clone()],
+            b.clone(),
+            not_ilike_escape,
+        ),
         ("md5", vec![v.clone()], v.clone(), md5),
         ("md5", vec![blob.clone()], v.clone(), md5),
+        ("md5_number", vec![v.clone()], LogicalType::UHUGEINT, md5_number),
+        ("md5_number", vec![blob.clone()], LogicalType::UHUGEINT, md5_number),
+        ("overlay", vec![v.clone(), v.clone(), LogicalType::BIGINT], v.clone(), overlay),
+        (
+            "overlay",
+            vec![v.clone(), v.clone(), LogicalType::BIGINT, LogicalType::BIGINT],
+            v.clone(),
+            overlay,
+        ),
         ("~~~", vec![v.clone(), v.clone()], b.clone(), glob),
         ("encode", vec![v.clone()], blob.clone(), encode),
         ("to_base64", vec![blob.clone()], v.clone(), to_base64),

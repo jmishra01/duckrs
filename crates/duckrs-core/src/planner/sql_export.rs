@@ -772,8 +772,9 @@ impl Exporter<'_> {
                 filters,
                 projection,
                 table_index,
+                extracts,
                 ..
-            } => self.get(table, *table_index, column_ids, filters, projection.as_deref())?,
+            } => self.get(table, *table_index, column_ids, filters, projection.as_deref(), extracts)?,
             Op::Range {
                 start,
                 increment,
@@ -936,6 +937,8 @@ impl Exporter<'_> {
                 select.limit = Some((Some(limit), offset, true));
                 Body::Select(select)
             }
+            // `LogicalSecureView::ToSQL` names the view, which needs the mapping of its outputs
+            Op::SecureView { .. } => return Err("secure view boundaries are not exported yet".into()),
             Op::Sample { options } => {
                 let child = self.export_child(op, 0)?;
                 let child_fields = child.fields.clone();
@@ -949,7 +952,7 @@ impl Exporter<'_> {
                 select.sample = Some(options.clone());
                 Body::Select(select)
             }
-            Op::Distinct { targets } => {
+            Op::Distinct { targets, .. } => {
                 let child = self.export_child(op, 0)?;
                 let child_fields = child.fields.clone();
                 let all_columns = targets.len() == child_fields.len()
@@ -1161,6 +1164,7 @@ impl Exporter<'_> {
                 join_type,
                 conditions,
                 predicate,
+                ..
             } => {
                 let left = self.export_child(op, 0)?;
                 let right = self.export_child(op, 1)?;
@@ -1261,6 +1265,42 @@ impl Exporter<'_> {
             Op::CsvScan { .. } | Op::JsonScan { .. } => {
                 return Err("The file scan has no SQL export".into());
             }
+            // `ExportMaterializedCTE`: the definition is a WITH entry that runs once
+            Op::MaterializedCte { data, .. } => {
+                let name = self.alias();
+                let types = op.children[0].types();
+                let producer = self.export_child(op, 0)?;
+                let query = self.set_child(producer, &types)?;
+                let aliases: Vec<String> = (0..types.len()).map(field_name).collect();
+                let at = self.ctes.len();
+                self.ctes.push((
+                    name.clone(),
+                    CteInfo {
+                        aliases,
+                        query: Box::new(query),
+                        key_targets: Vec::new(),
+                        materialized: CteMaterialize::Always,
+                    },
+                ));
+                self.working.push((std::sync::Arc::as_ptr(data) as usize, name, 0));
+                let consumer = self.export_child(op, 1);
+                let (.., reads) = self.working.pop().expect("pushed above");
+                let consumer = consumer?;
+                if reads == 0 {
+                    self.ctes.remove(at);
+                    return Err("SQL would discard the unreferenced CTE producer".into());
+                }
+                consumer.body
+            }
+            Op::CteRef { data, types, .. } => {
+                let key = std::sync::Arc::as_ptr(data) as usize;
+                let Some(entry) = self.working.iter_mut().find(|(k, ..)| *k == key) else {
+                    return Err("A materialized CTE has no SQL export".into());
+                };
+                entry.2 += 1;
+                let name = entry.1.clone();
+                Body::Select(self.named_source(&name, types.len()))
+            }
             Op::Insert { .. }
             | Op::Delete { .. }
             | Op::Update { .. }
@@ -1336,6 +1376,7 @@ impl Exporter<'_> {
         column_ids: &[usize],
         filters: &[BoundExpr],
         projection: Option<&[usize]>,
+        extracts: &[Option<std::sync::Arc<super::logical::PushedExtract>>],
     ) -> Res<Body> {
         let alias = self.alias();
         let mut qualification = Vec::new();
@@ -1353,6 +1394,24 @@ impl Exporter<'_> {
         .into();
         from.alias = alias.clone();
         let column_of = |id: usize| {
+            // `TableFunctionColumn`: the `row_number` column is the window it stands for
+            if id == super::logical::COLUMN_IDENTIFIER_ROW_NUMBER {
+                let window = WindowExpr {
+                    name: QualifiedName {
+                        qualification: vec!["system".into(), "main".into()],
+                        name: "row_number".into(),
+                    },
+                    start: ast::WindowBoundary::UnboundedPreceding,
+                    end: ast::WindowBoundary::CurrentRowRange,
+                    ..Default::default()
+                };
+                // a window: a WHERE on the scan goes in a SELECT around it
+                return Column {
+                    expr: ExprKind::Window(Box::new(window)).into(),
+                    kind: Kind::Window,
+                    volatile: false,
+                };
+            }
             let name = if id == COLUMN_IDENTIFIER_ROW_ID {
                 "rowid".to_string()
             } else {
@@ -1361,7 +1420,7 @@ impl Exporter<'_> {
             Column::plain(Expr::column(vec![alias.clone(), name]))
         };
         let type_of = |id: usize| {
-            if id == COLUMN_IDENTIFIER_ROW_ID {
+            if id == COLUMN_IDENTIFIER_ROW_ID || id == super::logical::COLUMN_IDENTIFIER_ROW_NUMBER {
                 LogicalType::BIGINT
             } else {
                 table.columns[id].ty.clone()
@@ -1373,11 +1432,33 @@ impl Exporter<'_> {
                 .columns
                 .insert(ColumnBinding::new(table_index, position), (column_of(id), type_of(id)));
         }
+        // a pushed field is the extract of its column
+        for (position, extract) in extracts.iter().enumerate() {
+            let Some(extract) = extract else { continue };
+            let base = ColumnBinding::new(table_index, usize::MAX - position);
+            let id = column_ids[position];
+            scope.columns.insert(base, (column_of(id), type_of(id)));
+            let mut expression = extract.expression.clone();
+            expression.walk_mut(&mut |e| {
+                if matches!(e.kind, BoundExprKind::Reference(0)) {
+                    e.kind = BoundExprKind::ColumnRef { binding: base, depth: 0 };
+                }
+            });
+            let ty = expression.return_type.clone();
+            let column = Column::plain(self.expr(&scope, &expression)?);
+            scope.columns.insert(ColumnBinding::new(table_index, position), (column, ty));
+        }
         let positions: Vec<usize> = match projection {
             Some(p) => p.to_vec(),
             None => (0..column_ids.len()).collect(),
         };
-        let columns = positions.iter().map(|&p| column_of(column_ids[p])).collect();
+        let mut columns = Vec::with_capacity(positions.len());
+        for &p in &positions {
+            columns.push(match extracts.get(p) {
+                Some(Some(_)) => scope.columns[&ColumnBinding::new(table_index, p)].0.clone(),
+                _ => column_of(column_ids[p]),
+            });
+        }
         let mut select = Select::new(from, columns);
         for filter in filters {
             select.filters.push(self.expr(&scope, filter)?);
@@ -1435,6 +1516,22 @@ impl Exporter<'_> {
             scope
                 .columns
                 .insert(ColumnBinding::new(table_index, position), (column.clone(), ty));
+        }
+        // a pushed field is the extract of its column
+        for (base, extract) in &scan.extracts {
+            let binding = ColumnBinding::new(table_index, *base);
+            let mut expression = extract.expression.clone();
+            expression.walk_mut(&mut |e| {
+                if matches!(e.kind, BoundExprKind::Reference(0)) {
+                    e.kind = BoundExprKind::ColumnRef { binding, depth: 0 };
+                }
+            });
+            let ty = expression.return_type.clone();
+            let column = Column::plain(self.expr(&scope, &expression)?);
+            scope
+                .columns
+                .insert(ColumnBinding::new(table_index, columns.len()), (column.clone(), ty));
+            columns.push(column);
         }
         let mut select = Select::new(from, columns);
         for filter in &scan.filters {
@@ -1892,11 +1989,7 @@ impl Exporter<'_> {
         scope.add(&right_select, &right_fields);
         let mut on = Vec::new();
         for c in conditions {
-            let op = if c.null_safe {
-                ComparisonOp::NotDistinctFrom
-            } else {
-                ComparisonOp::Equal
-            };
+            let op = c.comparison;
             on.push(Expr::comparison(
                 op,
                 self.expr(&scope, &c.left)?,
@@ -1990,11 +2083,7 @@ impl Exporter<'_> {
         scope.add(&Select::new(TableRef::empty(), right_columns), &right_fields);
         let mut on = Vec::new();
         for c in conditions {
-            let op = if c.null_safe {
-                ComparisonOp::NotDistinctFrom
-            } else {
-                ComparisonOp::Equal
-            };
+            let op = c.comparison;
             on.push(Expr::comparison(
                 op,
                 self.expr(&scope, &c.left)?,
@@ -2073,7 +2162,7 @@ impl Exporter<'_> {
         predicate: Option<&BoundExpr>,
     ) -> Res<Expr> {
         if let ([condition], None) = (conditions, predicate)
-            && !condition.null_safe
+            && condition.comparison == ComparisonOp::Equal
         {
             // IN is exactly that
             let key = self.expr(scope, &condition.right)?;
@@ -2095,15 +2184,11 @@ impl Exporter<'_> {
         for c in conditions {
             let l = self.expr(scope, &c.left)?;
             let r = self.expr(scope, &c.right)?;
-            if !c.null_safe {
+            if !c.null_safe() {
                 left_nulls.push(Expr::operator(OperatorType::IsNull, vec![l.clone()]));
                 right_nulls.push(Expr::operator(OperatorType::IsNull, vec![r.clone()]));
             }
-            let op = if c.null_safe {
-                ComparisonOp::NotDistinctFrom
-            } else {
-                ComparisonOp::Equal
-            };
+            let op = c.comparison;
             keys.push(Expr::comparison(op, l, r));
         }
         let predicate = predicate.map(|p| self.expr(scope, p)).transpose()?;
@@ -2181,11 +2266,7 @@ impl Exporter<'_> {
             JoinType::Single => {
                 let mut keys = Vec::new();
                 for c in conditions {
-                    let op = if c.null_safe {
-                        ComparisonOp::NotDistinctFrom
-                    } else {
-                        ComparisonOp::Equal
-                    };
+                    let op = c.comparison;
                     keys.push(Expr::comparison(
                         op,
                         self.expr(&scope, &c.left)?,
@@ -2349,12 +2430,21 @@ impl Exporter<'_> {
             }
             BoundExprKind::Operator { op, children } => {
                 let children = children.iter().map(|c| self.expr(scope, c)).collect::<Res<Vec<_>>>()?;
+                if *op == BoundOperator::HasError {
+                    // spelled out, so that a macro of the same name cannot capture the replay
+                    let mut call = FunctionExpr::new("has_error", children);
+                    call.name.qualification = vec!["system".to_string(), "main".to_string()];
+                    return Ok(Expr::from(ExprKind::Function(call)));
+                }
                 let op = match op {
                     BoundOperator::Not => OperatorType::Not,
                     BoundOperator::IsNull => OperatorType::IsNull,
                     BoundOperator::IsNotNull => OperatorType::IsNotNull,
                     BoundOperator::Coalesce => OperatorType::Coalesce,
                     BoundOperator::Try => OperatorType::Try,
+                    BoundOperator::HasError => unreachable!("exported as a function"),
+                    BoundOperator::In => OperatorType::In,
+                    BoundOperator::NotIn => OperatorType::NotIn,
                 };
                 Expr::operator(op, children)
             }
@@ -2396,6 +2486,14 @@ impl Exporter<'_> {
                 children,
                 is_operator,
             } => {
+                // `TryExportCompressedMaterialization`: SQL has the values as they were, without the
+                // optimizer's compression, so a compress or decompress function is its input
+                if (function.name.starts_with("__internal_compress_")
+                    || function.name.starts_with("__internal_decompress_"))
+                    && let Some(input) = children.first()
+                {
+                    return self.expr(scope, input);
+                }
                 if let Some(expr) = self.extract_call(scope, &function.name, children)? {
                     return Ok(expr);
                 }

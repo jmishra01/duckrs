@@ -12,6 +12,7 @@ pub mod geometry_crs;
 pub mod hash;
 pub mod json;
 pub mod path;
+pub mod render_width;
 pub mod row;
 pub mod serializer;
 pub mod sort_key;
@@ -21,6 +22,7 @@ pub mod string_util;
 pub mod types;
 pub mod value;
 pub mod variant;
+pub mod variant_shredding;
 pub mod vector;
 
 pub use error::{Error, ErrorKind, Result};

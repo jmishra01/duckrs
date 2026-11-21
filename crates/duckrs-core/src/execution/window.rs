@@ -43,6 +43,132 @@ impl PhysicalWindow {
     }
 }
 
+thread_local! {
+    /// `enable_optimizer`: without it, no window streams
+    static STREAMING: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Whether windows can stream, from `enable_optimizer`.
+pub fn set_streaming(enabled: bool) {
+    STREAMING.with(|s| s.set(enabled));
+}
+
+/// `GetSources`: how many sources feed the pipeline of `op`.
+fn sources(op: &dyn PhysicalOperator) -> usize {
+    if op.name() == "UNION" {
+        return op.children().iter().map(|child| sources(child.as_ref())).sum();
+    }
+    if op.is_source() || op.children().is_empty() {
+        return 1;
+    }
+    sources(op.children()[0].as_ref())
+}
+
+/// `PhysicalPlanGenerator::CreatePlan(LogicalWindow &)`: the windows that share their partitions
+/// and whose orders are prefixes of one another are computed together; each such group is a
+/// window operator on top of the one before, and a projection puts the results back in place.
+/// Streaming windows go in one operator below the others. The rows leave in the order of the last group, ties in the order the group below left them.
+pub fn plan(
+    types: Vec<LogicalType>,
+    windows: Vec<BoundWindow>,
+    mut children: Vec<Box<dyn PhysicalOperator>>,
+) -> Box<dyn PhysicalOperator> {
+    let input_width = types.len() - windows.len();
+    // the streaming windows come first, in one operator, and the others go on top of them
+    let can_stream = STREAMING.with(std::cell::Cell::get) && children.len() == 1 && sources(children[0].as_ref()) == 1;
+    let streaming: Vec<usize> = if can_stream {
+        (0..windows.len())
+            .filter(|&at| super::streaming_window::is_streaming(&windows[at]))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let text = |expr: &BoundExpr| format!("{expr:?}");
+    let partitions_equivalent = |a: &BoundWindow, b: &BoundWindow| {
+        a.partitions.len() == b.partitions.len() && {
+            let others: Vec<String> = b.partitions.iter().map(text).collect();
+            a.partitions.iter().all(|p| others.contains(&text(p)))
+        }
+    };
+    let shared_orders = |a: &BoundWindow, b: &BoundWindow| {
+        a.orders
+            .iter()
+            .zip(&b.orders)
+            .take_while(|((x, xm), (y, ym))| xm == ym && text(x) == text(y))
+            .count()
+    };
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut remaining: Vec<usize> = (0..windows.len()).filter(|at| !streaming.contains(at)).collect();
+    while !remaining.is_empty() {
+        let mut over = remaining[0];
+        let mut matching = Vec::new();
+        let mut unprocessed = Vec::new();
+        for &at in &remaining {
+            if at == over && matching.is_empty() {
+                matching.push(at);
+                continue;
+            }
+            let (over_window, window) = (&windows[over], &windows[at]);
+            if !partitions_equivalent(over_window, window) {
+                unprocessed.push(at);
+                continue;
+            }
+            let prefix = shared_orders(over_window, window);
+            if prefix != over_window.orders.len().min(window.orders.len()) {
+                unprocessed.push(at);
+                continue;
+            }
+            matching.push(at);
+            if prefix < window.orders.len() {
+                over = at;
+            }
+        }
+        remaining = unprocessed;
+        groups.push(matching);
+    }
+    let mut slots: Vec<Option<BoundWindow>> = windows.into_iter().map(Some).collect();
+    let mut layer_types = types[..input_width].to_vec();
+    let mut position = vec![0; slots.len()];
+    let mut plan: Option<Box<dyn PhysicalOperator>> = None;
+    if !streaming.is_empty() {
+        let mut group_windows = Vec::with_capacity(streaming.len());
+        for &at in &streaming {
+            position[at] = layer_types.len();
+            layer_types.push(types[input_width + at].clone());
+            group_windows.push(slots[at].take().expect("each window is in one group"));
+        }
+        plan = Some(Box::new(super::streaming_window::PhysicalStreamingWindow::new(
+            layer_types.clone(),
+            group_windows,
+            std::mem::take(&mut children),
+        )));
+    }
+    for group in groups {
+        let mut group_windows = Vec::with_capacity(group.len());
+        for at in group {
+            position[at] = layer_types.len();
+            layer_types.push(types[input_width + at].clone());
+            group_windows.push(slots[at].take().expect("each window is in one group"));
+        }
+        let below = match plan.take() {
+            Some(op) => vec![op],
+            None => std::mem::take(&mut children),
+        };
+        plan = Some(Box::new(PhysicalWindow::new(layer_types.clone(), group_windows, below)));
+    }
+    let expressions = (0..types.len())
+        .map(|column| {
+            let source = if column < input_width { column } else { position[column - input_width] };
+            BoundExpr::new(crate::planner::expression::BoundExprKind::Reference(source), types[column].clone())
+        })
+        .collect();
+    Box::new(super::physical::PhysicalProjection {
+        types,
+        expressions,
+        children: vec![plan.expect("at least one group")],
+    })
+}
+
 impl PhysicalOperator for PhysicalWindow {
     fn name(&self) -> &'static str {
         "WINDOW"
@@ -70,8 +196,15 @@ impl PhysicalOperator for PhysicalWindow {
         // windows over the same partitions and orders share their sort
         let mut sorts: HashMap<String, Arc<Sorted>> = HashMap::new();
         let mut results = Vec::with_capacity(self.windows.len());
+        // `PhysicalWindow::order_idx`: the rows leave in the order of the window with the most orders
+        let mut most_orders = 0;
+        for (at, window) in self.windows.iter().enumerate() {
+            if window.orders.len() > self.windows[most_orders].orders.len() {
+                most_orders = at;
+            }
+        }
         let mut first_order = None;
-        for window in &self.windows {
+        for (at, window) in self.windows.iter().enumerate() {
             let key = format!("{:?}{:?}", window.partitions, window.orders);
             let sorted = match sorts.get(&key) {
                 Some(sorted) => sorted.clone(),
@@ -87,9 +220,10 @@ impl PhysicalOperator for PhysicalWindow {
                 by_row[sorted.rows[position]] = value;
             }
             results.push(by_row);
-            first_order.get_or_insert_with(|| sorted.clone());
+            if at == most_orders {
+                first_order = Some(sorted.clone());
+            }
         }
-        // the rows leave in the order of the first window, as they do in C++
         let first_order = first_order.expect("a window operator has windows");
         let mut output = self.output.lock();
         for rows in first_order.rows.chunks(STANDARD_VECTOR_SIZE) {
@@ -726,19 +860,35 @@ impl<'a> Evaluation<'a> {
         if let Some(keys) = &self.arg_keys {
             rows.sort_by(|a, b| keys[*a].cmp(&keys[*b]).then(a.cmp(b)));
         }
-        let point = |p: usize| Some((number(&along[p])?, number(&values[p])?));
-        let points: Vec<(usize, Option<(f64, f64)>)> = rows.iter().map(|p| (*p, point(*p))).collect();
+        // `FillValueFunction`: a value counts if it is there and finite
+        let finite = |v: &Value| number(v).filter(|n| n.is_finite());
+        let points: Vec<(usize, Option<f64>, Option<f64>)> =
+            rows.iter().map(|p| (*p, finite(&along[*p]), finite(&values[*p]))).collect();
         let start = result.len();
         result.extend(values[begin..end].iter().cloned());
-        for (at, (position, _)) in points.iter().enumerate() {
+        // the neighbours with values, up to an order value that does not count
+        let neighbours = |side: &mut dyn Iterator<Item = &(usize, Option<f64>, Option<f64>)>| {
+            let mut found = Vec::new();
+            for (p, x, y) in side {
+                let Some(x) = x else { break };
+                if let Some(y) = y {
+                    found.push(((*x, *y), *p));
+                    if found.len() == 2 {
+                        break;
+                    }
+                }
+            }
+            found
+        };
+        for (at, (position, x, _)) in points.iter().enumerate() {
             if !values[*position].is_null() {
                 continue;
             }
-            let Some(x) = number(&along[*position]) else {
+            let Some(x) = *x else {
                 continue;
             };
-            let before: Vec<(f64, f64)> = points[..at].iter().rev().filter_map(|(_, p)| *p).take(2).collect();
-            let after: Vec<(f64, f64)> = points[at + 1..].iter().filter_map(|(_, p)| *p).take(2).collect();
+            let before = neighbours(&mut points[..at].iter().rev());
+            let after = neighbours(&mut points[at + 1..].iter());
             let line = match (before.as_slice(), after.as_slice()) {
                 ([low, ..], [high, ..]) => Some((*low, *high)),
                 ([last, previous], []) => Some((*previous, *last)),
@@ -746,14 +896,51 @@ impl<'a> Evaluation<'a> {
                 ([only], []) | ([], [only]) => Some((*only, *only)),
                 _ => None,
             };
-            let Some(((x0, y0), (x1, y1))) = line else {
+            let Some((((x0, y0), p0), ((x1, y1), p1))) = line else {
                 continue;
             };
             // halved, for orders whose span doesn't fit in a double
             let span = x1 / 2.0 - x0 / 2.0;
             let along_line = if span == 0.0 { 0.0 } else { (x / 2.0 - x0 / 2.0) / span };
             let filled = y0 + (y1 - y0) * along_line;
-            result[start + (*position - begin)] = like(&window.return_type, filled)?;
+            // `FillInterpolateFunc`: an interpolated integer lies between the two values, which the
+            // double can round past
+            let integral = !matches!(
+                window.return_type.physical_type(),
+                duckrs_common::types::PhysicalType::Float | duckrs_common::types::PhysicalType::Double
+            );
+            let hugeint = window.return_type.physical_type() == duckrs_common::types::PhysicalType::Int128;
+            let value = if hugeint && (0.0..=1.0).contains(&along_line) {
+                // `InterpolateOperator::Operation(hugeint_t)`: from the exact difference, which can overflow
+                let (Some(lo), Some(hi)) = (values[p0].as_i128(), values[p1].as_i128()) else {
+                    continue;
+                };
+                let interpolated = match hi.checked_sub(lo) {
+                    Some(delta) => {
+                        let offset = (delta as f64 * along_line) as i128;
+                        lo.checked_add(offset).ok_or_else(|| {
+                            Error::new(
+                                ErrorKind::OutOfRange,
+                                format!("Overflow in HUGEINT addition: {lo} + {offset}"),
+                            )
+                        })?
+                    }
+                    None => (lo as f64 + (hi as f64 - lo as f64) * along_line) as i128,
+                };
+                Value::new(window.return_type.clone(), ValueData::Int128(interpolated))?
+            } else if integral && (0.0..=1.0).contains(&along_line) {
+                let ((low, low_at), (high, high_at)) = if y0 <= y1 { ((y0, p0), (y1, p1)) } else { ((y1, p1), (y0, p0)) };
+                if filled <= low {
+                    values[low_at].clone()
+                } else if filled >= high {
+                    values[high_at].clone()
+                } else {
+                    like(&window.return_type, filled)?
+                }
+            } else {
+                like(&window.return_type, filled)?
+            };
+            result[start + (*position - begin)] = value;
         }
         Ok(())
     }
@@ -772,6 +959,38 @@ fn number(value: &Value) -> Option<f64> {
 fn like(ty: &LogicalType, number: f64) -> Result<Value> {
     use duckrs_common::types::PhysicalType as P;
     let rounded = number.round();
+    // a value the type cannot hold is NULL: past an integer's range, or a DECIMAL's width
+    let range = match ty.physical_type() {
+        P::Int8 => Some((f64::from(i8::MIN), f64::from(i8::MAX))),
+        P::Int16 => Some((f64::from(i16::MIN), f64::from(i16::MAX))),
+        P::Int32 => Some((f64::from(i32::MIN), f64::from(i32::MAX))),
+        P::Int64 => Some((i64::MIN as f64, i64::MAX as f64)),
+        P::Int128 => Some((i128::MIN as f64, i128::MAX as f64)),
+        P::UInt8 => Some((0.0, f64::from(u8::MAX))),
+        P::UInt16 => Some((0.0, f64::from(u16::MAX))),
+        P::UInt32 => Some((0.0, f64::from(u32::MAX))),
+        P::UInt64 => Some((0.0, u64::MAX as f64)),
+        P::UInt128 => Some((0.0, u128::MAX as f64)),
+        _ => None,
+    };
+    // (exclusive bounds) a DECIMAL holds fewer digits than its integer, and coarse timestamps have to
+    // be timestamps in microseconds, short of the infinities
+    let micros = i64::MAX as f64;
+    let range = match (ty.decimal_properties(), ty.id()) {
+        (Some((width, _)), _) => {
+            let limit = 10f64.powi(i32::from(width));
+            Some((-limit, limit))
+        }
+        (None, LogicalTypeId::TimestampSec) => Some((-micros / 1e6, micros / 1e6)),
+        (None, LogicalTypeId::TimestampMs) => Some((-micros / 1e3, micros / 1e3)),
+        // an integer's minimum is a double, its maximum plus one is the double past it
+        (None, _) => range.map(|(low, high)| (low.next_down(), high + 1.0)),
+    };
+    if let Some((low, high)) = range
+        && (!rounded.is_finite() || rounded <= low || rounded >= high)
+    {
+        return Ok(Value::null(ty.clone()));
+    }
     let data = match ty.physical_type() {
         P::Float => ValueData::Float(number as f32),
         P::Double => ValueData::Double(number),

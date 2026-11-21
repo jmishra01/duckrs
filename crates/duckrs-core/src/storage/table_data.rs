@@ -19,6 +19,7 @@ use duckrs_common::vector::{DataChunk, SelectionVector, Vector};
 use duckrs_common::{Error, Result};
 use duckrs_parser::ast::ComparisonOp;
 use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 const STANDARD_VECTOR_SIZE: usize = 2048;
@@ -74,8 +75,11 @@ fn read_data_pointer(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalType>) -
 pub(super) struct PersistentColumn {
     pointers: Vec<DataPointer>,
     validity: Option<Box<PersistentColumn>>,
-    /// Of a LIST or ARRAY, one; of a STRUCT, its fields.
+    /// Of a LIST or ARRAY, one; of a STRUCT, its fields; of a VARIANT, its unshredded values and, if it is
+    /// shredded, their typed part.
     children: Vec<PersistentColumn>,
+    /// Of a shredded VARIANT, the type of its typed part (`VariantPersistentColumnData`).
+    shredded: Option<LogicalType>,
 }
 
 fn not_ported_column(ty: &LogicalType) -> Error {
@@ -90,7 +94,11 @@ fn read_persistent_column(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalTyp
     d.read_object_value(|d| {
         // `GeometryPersistentColumnData`: a GEOMETRY stored as WKB reads as the strings it is
         if ty.map(LogicalType::id) == Some(LogicalTypeId::Geometry) && d.has_property(99)? {
+            // a `unique_ptr`: whether there is one, then it
             let storage_type = d.read_object_field(99, "extra_data", |d| {
+                if !bool::read_value(d)? {
+                    return Ok(None);
+                }
                 d.read_object_value(|d| {
                     d.read_optional_property::<u8>(100, "type")?;
                     d.read_optional_property::<u8>(101, "storage_type")
@@ -107,13 +115,25 @@ fn read_persistent_column(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalTyp
                 "reading a GEOMETRY column of the spatial extension from a database file is not yet ported to duckrs",
             ));
         }
-        if d.has_property(99)? {
-            return Err(Error::not_implemented(match ty.map(LogicalType::id) {
-                Some(LogicalTypeId::Variant) => {
-                    "reading a shredded VARIANT column from a database file is not yet ported to duckrs"
+        // `VariantPersistentColumnData`: the type the typed part of a shredded VARIANT is stored as
+        let mut shredded = None;
+        if ty.map(LogicalType::id) == Some(LogicalTypeId::Variant) && d.has_property(99)? {
+            shredded = d.read_object_field(99, "extra_data", |d| {
+                if !bool::read_value(d)? {
+                    return Ok(None);
                 }
-                _ => "reading extra column data from a database file is not yet ported to duckrs",
-            }));
+                d.read_object_value(|d| {
+                    const VARIANT: u8 = 1;
+                    if d.read_optional_property::<u8>(100, "type")? != Some(VARIANT) {
+                        return Err(corrupt("VARIANT column data has extra data of another type"));
+                    }
+                    d.read_optional_property::<LogicalType>(101, "storage_type")
+                })
+            })?;
+        } else if d.has_property(99)? {
+            return Err(Error::not_implemented(
+                "reading extra column data from a database file is not yet ported to duckrs",
+            ));
         }
         let pointers = if d.has_property(100)? {
             d.read_list(100, "data_pointers", |d| read_data_pointer(d, ty))?
@@ -125,16 +145,22 @@ fn read_persistent_column(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalTyp
                 pointers,
                 validity: None,
                 children: Vec::new(),
+                shredded: None,
             });
         };
         let validity = d.read_object_field(101, "validity", |d| read_persistent_column(d, None))?;
         if ty.id() == LogicalTypeId::Variant {
             let unshredded = duckrs_common::variant::unshredded_type();
-            let child = d.read_object_field(102, "unshredded", |d| read_persistent_column(d, Some(&unshredded)))?;
+            let mut children =
+                vec![d.read_object_field(102, "unshredded", |d| read_persistent_column(d, Some(&unshredded)))?];
+            if let Some(shredded) = &shredded {
+                children.push(d.read_object_field(103, "shredded", |d| read_persistent_column(d, Some(shredded)))?);
+            }
             return Ok(PersistentColumn {
                 pointers,
                 validity: Some(Box::new(validity)),
-                children: vec![child],
+                children,
+                shredded,
             });
         }
         let children = match ty.physical_type() {
@@ -155,6 +181,7 @@ fn read_persistent_column(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalTyp
             pointers,
             validity: Some(Box::new(validity)),
             children,
+            shredded: None,
         })
     })
 }
@@ -494,13 +521,30 @@ fn scan_column_as(
             .first()
             .ok_or_else(|| corrupt("a VARIANT column has no data"))?;
         let stored = scan_column(buffer, child, &unshredded, rows)?;
+        // `UnshredVariantData`: the typed part of the values, with what is left of them
+        let typed = match (&column.shredded, column.children.get(1)) {
+            (Some(shredded), Some(typed)) => Some((shredded, scan_column(buffer, typed, shredded, rows)?)),
+            _ => None,
+        };
         let mut vector = Vector::new(ty.clone(), rows);
         for (row, &valid) in valid.iter().enumerate() {
             if !valid {
                 vector.set_null(row, true);
                 continue;
             }
-            let node = duckrs_common::variant::VariantNode::from_unshredded(&stored.get_value(row))?;
+            let node = match &typed {
+                Some((shredded, typed)) => {
+                    let unshredded = stored.get_value(row);
+                    match duckrs_common::variant_shredding::unshred_row(&unshredded, &typed.get_value(row), shredded)? {
+                        Some(node) => node,
+                        None => {
+                            vector.set_null(row, true);
+                            continue;
+                        }
+                    }
+                }
+                None => duckrs_common::variant::VariantNode::from_unshredded(&stored.get_value(row))?,
+            };
             vector.set_value(row, &Value::new(ty.clone(), ValueData::Bytes(node.encode()))?)?;
         }
         return Ok(vector);
@@ -714,6 +758,74 @@ impl DiskTable {
     }
 }
 
+/// The bound of a value of `ty` in its little-endian bytes.
+fn bound_of(ty: &LogicalType, bytes: Option<&[u8; 16]>) -> Result<Option<Value>> {
+    let width = fixed_width(ty.physical_type());
+    let (Some(bytes), Some(width)) = (bytes, width.filter(|_| has_ordered_statistics(ty))) else {
+        return Ok(None);
+    };
+    let mut vector = Vector::new(ty.clone(), 1);
+    fill_vector(&mut vector, &bytes[..width])?;
+    Ok(Some(vector.get_value(0)))
+}
+
+/// What the statistics of a file say about a column of `ty`, with those of what is in it. Bounds with the
+/// minimum above the maximum, as those of no values, are none (`NumericStats::HasMinMax`).
+fn column_statistics_of(stored: &BaseStatistics, ty: &LogicalType) -> Option<ColumnStatistics> {
+    let mut min = bound_of(ty, stored.min.as_ref()).ok()?;
+    let mut max = bound_of(ty, stored.max.as_ref()).ok()?;
+    if let (Some(a), Some(b)) = (&min, &max)
+        && compare_values(ComparisonOp::GreaterThan, a, b) == Some(true)
+    {
+        (min, max) = (None, None);
+    }
+    let child_types: Vec<&LogicalType> = match ty.physical_type() {
+        PhysicalType::Struct if ty.id() != LogicalTypeId::Variant => {
+            ty.struct_children().iter().map(|(_, ty)| ty).collect()
+        }
+        PhysicalType::List | PhysicalType::Array => ty.child_type().into_iter().collect(),
+        _ => Vec::new(),
+    };
+    let children = if child_types.len() == stored.children.len() {
+        child_types
+            .iter()
+            .zip(&stored.children)
+            .map(|(ty, stored)| column_statistics_of(stored, ty))
+            .collect::<Option<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
+    let variant = match &stored.variant {
+        _ if ty.id() != LogicalTypeId::Variant => None,
+        Some(variant) => Some(Box::new(match (variant.state, &variant.shredded) {
+            (2, Some((shredded, stats))) => {
+                crate::catalog::VariantStatistics::Shredded(shredded.clone(), column_statistics_of(stats, shredded)?)
+            }
+            (0, _) => crate::catalog::VariantStatistics::Uninitialized,
+            (1, _) => crate::catalog::VariantStatistics::NotShredded,
+            _ => crate::catalog::VariantStatistics::Inconsistent,
+        })),
+        None => None,
+    };
+    Some(ColumnStatistics {
+        variant,
+        min,
+        max,
+        can_be_null: stored.has_null,
+        can_be_valid: stored.has_no_null,
+        geometry: stored.geometry,
+        strings: stored.strings.as_ref().map(|strings| crate::catalog::StringStatistics {
+            bounds: strings.bounds_known.then(|| (strings.min.clone(), strings.max.clone())),
+            has_unicode: strings.has_unicode,
+            min_length: strings.min_length,
+            max_length: strings.max_length,
+            total_length: strings.total_length,
+        }),
+        distinct: None,
+        children,
+    })
+}
+
 impl DiskTable {
     /// [`TableSource::fetch_rows`] of a fixed-width column of a group without deletes: the rows read
     /// from their segments, those that can be read on their own (constant, uncompressed, bit-packed)
@@ -836,6 +948,95 @@ impl TableSource for DiskTable {
         }
     }
 
+    fn variant_field(&self, group: usize, column: usize, keys: &[String]) -> Result<Option<Vector>> {
+        use duckrs_common::variant::VariantNode;
+        let ty = &self.table.columns[column].ty;
+        if ty.id() != LogicalTypeId::Variant || keys.is_empty() {
+            return Ok(None);
+        }
+        let rows = self.table.row_groups[group].tuple_count as usize;
+        let stored = self.persistent_column(group, column)?;
+        let (Some(mut level_type), Some(mut level)) = (stored.shredded.clone(), stored.children.get(1)) else {
+            return Ok(None);
+        };
+        let validity = |column: &PersistentColumn| -> Result<Vec<bool>> {
+            match &column.validity {
+                Some(validity) => scan_validity_column(&self.buffer, validity, rows),
+                None => Ok(vec![true; rows]),
+            }
+        };
+        // a row is NULL where the VARIANT is, or the root of its typed part
+        let mut present = validity(&stored)?;
+        for (row, valid) in validity(level)?.into_iter().enumerate() {
+            present[row] &= valid;
+        }
+        // each key: of an object, which its typed part holds as a STRUCT; a value that is no object has no field
+        for key in keys {
+            let fields = level_type.struct_children();
+            let (typed_type, typed) = match (fields.first(), level.children.first()) {
+                (Some((_, typed_type)), Some(typed)) if typed_type.id() == LogicalTypeId::Struct => (typed_type, typed),
+                _ => return Ok(None),
+            };
+            let Some(at) = typed_type.struct_children().iter().position(|(name, _)| name == key) else {
+                return Ok(None);
+            };
+            for (row, valid) in validity(typed)?.into_iter().enumerate() {
+                present[row] &= valid;
+            }
+            let Some(field) = typed.children.get(at) else {
+                return Ok(None);
+            };
+            level_type = typed_type.struct_children()[at].1.clone();
+            level = field;
+        }
+        // the field: a primitive, or one that is NULL (a VARIANT NULL) or missing where it has no typed value
+        let (leaf_type, leaf, untyped) = if level_type.id() == LogicalTypeId::Struct {
+            let fields = level_type.struct_children();
+            let (Some((_, typed_type)), Some(typed)) = (fields.first(), level.children.first()) else {
+                return Ok(None);
+            };
+            let untyped = match (fields.get(1), level.children.get(1)) {
+                (Some(_), Some(untyped)) => Some(scan_column(&self.buffer, untyped, &LogicalType::UINTEGER, rows)?),
+                _ => None,
+            };
+            (typed_type.clone(), typed, untyped)
+        } else {
+            (level_type.clone(), level, None)
+        };
+        if leaf_type.is_nested() {
+            return Ok(None);
+        }
+        let values = scan_column(&self.buffer, leaf, &leaf_type, rows)?;
+        let variant = LogicalType::new(LogicalTypeId::Variant);
+        let mut result = Vector::new(variant.clone(), rows.max(1));
+        for row in 0..rows {
+            if !present[row] {
+                result.set_null(row, true);
+                continue;
+            }
+            let value = values.get_value(row);
+            if value.is_null() {
+                // a VARIANT NULL, or missing from its object: either is NULL, as `variant_extract` gives it
+                match untyped.as_ref().map(|u| u.get_value(row)) {
+                    Some(index) if !index.is_null() && index.as_i128() != Some(0) => {
+                        // what is left of the value, which only the unshredded part has
+                        return Ok(None);
+                    }
+                    _ => {
+                        result.set_null(row, true);
+                        continue;
+                    }
+                }
+            }
+            let node = VariantNode::Scalar(value);
+            result.set_value(row, &Value::new(variant.clone(), ValueData::Bytes(node.encode()))?)?;
+        }
+        if let Some(alive) = &self.alive[group] {
+            result.slice(&SelectionVector::from_vec(alive.clone()), alive.len());
+        }
+        Ok(Some(result))
+    }
+
     fn read_group(&self, group: usize, columns: &[usize]) -> Result<DataChunk> {
         let rows = self.table.row_groups[group].tuple_count as usize;
         let mut vectors = Vec::with_capacity(columns.len());
@@ -869,35 +1070,49 @@ impl TableSource for DiskTable {
         let statistics = self.table.column_statistics.iter().enumerate();
         statistics
             .map(|(column, stored)| {
-                let unknown = ColumnStatistics {
-                    min: None,
-                    max: None,
-                    can_be_null: true,
-                    can_be_valid: true,
-                    geometry: None,
-                    strings: None,
-                    distinct: None,
-                };
-                let Some(stored) = stored else {
-                    return Some(unknown);
-                };
-                Some(ColumnStatistics {
-                    min: self.bound(column, stored.min.as_ref()).ok()?,
-                    max: self.bound(column, stored.max.as_ref()).ok()?,
-                    can_be_null: stored.has_null,
-                    can_be_valid: stored.has_no_null,
-                    geometry: stored.geometry,
-                    strings: stored.strings.as_ref().map(|strings| crate::catalog::StringStatistics {
-                        bounds: Some((strings.min.clone(), strings.max.clone())),
-                        has_unicode: strings.has_unicode,
-                        min_length: strings.min_length,
-                        max_length: strings.max_length,
-                        total_length: strings.total_length,
+                let ty = &self.table.columns[column].ty;
+                match stored {
+                    Some(stored) => column_statistics_of(stored, ty),
+                    None => Some(ColumnStatistics {
+                        variant: None,
+                        min: None,
+                        max: None,
+                        can_be_null: true,
+                        can_be_valid: true,
+                        geometry: None,
+                        strings: None,
+                        distinct: None,
+                        children: Vec::new(),
                     }),
-                    distinct: None,
-                })
+                }
             })
             .collect()
+    }
+
+    fn variant_group_shredded(&self, group: usize, column: usize) -> bool {
+        self.table.columns[column].ty.id() == LogicalTypeId::Variant
+            && self.persistent_column(group, column).is_ok_and(|stored| stored.shredded.is_some())
+    }
+
+    fn all_variant_shredding(&self, columns: &[usize]) -> HashMap<(u64, usize, usize), Option<LogicalType>> {
+        let mut result = HashMap::new();
+        for (index, group) in self.table.row_groups.iter().enumerate() {
+            for &column in columns {
+                if let Ok(stored) = self.persistent_column(index, column) {
+                    result.insert((group.row_start, group.tuple_count as usize, column), stored.shredded);
+                }
+            }
+        }
+        result
+    }
+
+    fn variant_shredding(&self, row_start: u64, rows: usize, column: usize) -> Option<Option<LogicalType>> {
+        let group = self
+            .table
+            .row_groups
+            .iter()
+            .position(|group| group.row_start == row_start && group.tuple_count as usize == rows)?;
+        Some(self.persistent_column(group, column).ok()?.shredded)
     }
 
     fn segments(&self, include_info: bool) -> Result<Vec<SegmentInfo>> {
@@ -947,8 +1162,13 @@ impl TableSource for DiskTable {
             for (index, inner) in stored.children.iter().enumerate() {
                 let mut child = path.to_vec();
                 child.push(index + 1);
-                let name = match ty.map(LogicalType::physical_type) {
-                    Some(PhysicalType::Struct) => ty.map(|ty| &ty.struct_children()[index].1),
+                let unshredded = duckrs_common::variant::unshredded_type();
+                let name = match ty.map(LogicalType::id) {
+                    Some(LogicalTypeId::Variant) if index == 0 => Some(&unshredded),
+                    Some(LogicalTypeId::Variant) => stored.shredded.as_ref(),
+                    _ if ty.map(LogicalType::physical_type) == Some(PhysicalType::Struct) => {
+                        ty.map(|ty| &ty.struct_children()[index].1)
+                    }
                     _ => ty.and_then(LogicalType::child_type),
                 };
                 add(buffer, result, inner, group, column, &child, name)?;
@@ -989,7 +1209,20 @@ impl TableSource for DiskTable {
                 continue;
             }
             let varchar = self.table.columns[column].ty.id() == LogicalTypeId::Varchar;
+            let mut lengths_known = varchar;
             for pointer in &stored.pointers {
+                // the lengths of the strings, while every segment has them
+                match pointer.statistics.strings.as_ref().and_then(|s| Some((s.min_length.unwrap_or(0), s.max_length?, s.has_unicode))) {
+                    Some((low, high, unicode)) if lengths_known => {
+                        let (old_low, old_high) = zone.lengths.unwrap_or((low, high));
+                        zone.lengths = Some((old_low.min(low), old_high.max(high)));
+                        zone.has_unicode |= unicode;
+                    }
+                    _ => {
+                        lengths_known = false;
+                        zone.lengths = None;
+                    }
+                }
                 let (min, max) = if varchar {
                     string_bounds(pointer.statistics.strings.as_ref())
                 } else {
@@ -1028,7 +1261,7 @@ impl TableSource for DiskTable {
 /// all of them, and a truncated maximum is raised to above all strings it is a prefix of (`StringStats::CheckZonemap`
 /// compares the prefixes instead).
 fn string_bounds(bounds: Option<&super::statistics::StringBounds>) -> (Option<Value>, Option<Value>) {
-    let Some(bounds) = bounds else {
+    let Some(bounds) = bounds.filter(|bounds| bounds.bounds_known) else {
         return (None, None);
     };
     // what of a truncated bound is UTF-8, cut where a character was split

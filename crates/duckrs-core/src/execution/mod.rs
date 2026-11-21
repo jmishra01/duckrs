@@ -41,9 +41,12 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 pub mod alter;
 pub mod constraints;
 mod merge;
+pub mod random_engine;
 mod special_joins;
 mod upsert;
+mod streaming_window;
 mod window;
+pub use window::set_streaming as set_streaming_windows;
 
 /// A projection does not compute what is dropped right after it.
 fn create_column_select(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
@@ -147,12 +150,97 @@ pub fn create_plan(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
     create_physical(op)
 }
 
+/// Points the scans of the CTE whose table was `old` at `fresh`, in the plans of subqueries and
+/// recursive CTEs too.
+fn renew_cte_scans(
+    op: &mut LogicalOperator,
+    old: *const Mutex<ColumnDataCollection>,
+    fresh: &Arc<Mutex<ColumnDataCollection>>,
+) {
+    match &mut op.kind {
+        LogicalOperatorKind::CteRef { data, .. } if Arc::as_ptr(data) == old => *data = fresh.clone(),
+        LogicalOperatorKind::RecursiveCte {
+            recursive, unresolved, ..
+        } => {
+            renew_cte_scans(recursive, old, fresh);
+            renew_cte_scans(unresolved, old, fresh);
+        }
+        LogicalOperatorKind::LateralJoin { right, .. } => renew_cte_scans(right, old, fresh),
+        _ => {}
+    }
+    for expr in op.expressions_mut() {
+        expr.walk_mut(&mut |e| {
+            if let BoundExprKind::Subquery { subquery, .. } = &mut e.kind {
+                // the subquery runs again for this table: it has no results yet
+                let mut plan = subquery.plan.clone();
+                renew_cte_scans(&mut plan, old, fresh);
+                let raw = subquery.raw.clone().map(|mut raw| {
+                    renew_cte_scans(&mut raw, old, fresh);
+                    raw
+                });
+                *subquery = Arc::new(crate::planner::expression::BoundSubquery {
+                    kind: subquery.kind,
+                    plan,
+                    raw,
+                    correlated: subquery.correlated.clone(),
+                    volatile: subquery.volatile,
+                    error_on_multiple_rows: subquery.error_on_multiple_rows,
+                    row: subquery.row,
+                    results: Mutex::default(),
+                });
+            }
+        });
+    }
+    for child in &mut op.children {
+        renew_cte_scans(child, old, fresh);
+    }
+}
+
+/// `LogicalOperator::EstimateCardinality`: the rows of the tables below, as the operators above
+/// them do not reduce them.
+fn base_cardinality(op: &LogicalOperator) -> u64 {
+    match &op.kind {
+        LogicalOperatorKind::Get { table, .. } => table.row_count() as u64,
+        LogicalOperatorKind::ExpressionGet { expressions, .. } => expressions.len() as u64,
+        LogicalOperatorKind::DummyScan { .. } => 1,
+        LogicalOperatorKind::EmptyResult { .. } => 0,
+        LogicalOperatorKind::Range { count, .. } => (*count).max(0) as u64,
+        LogicalOperatorKind::TopN { limit, .. } => (*limit).min(op.children.first().map_or(0, base_cardinality)),
+        LogicalOperatorKind::Limit { limit: Some(limit), .. } => {
+            (*limit).min(op.children.first().map_or(0, base_cardinality))
+        }
+        LogicalOperatorKind::Sample { options } => {
+            let child = op.children.first().map_or(0, base_cardinality);
+            let size = options.sample_size.parse::<f64>().unwrap_or(0.0);
+            if options.is_percentage {
+                ((child as f64) * size / 100.0).min(child as f64) as u64
+            } else {
+                (size as u64).min(child)
+            }
+        }
+        _ => op.children.iter().map(base_cardinality).max().unwrap_or(1),
+    }
+}
+
 /// [`create_plan`] once the join filters are in place.
-fn create_physical(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
+fn create_physical(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
     if matches!(op.kind, LogicalOperatorKind::ColumnSelect { .. }) {
         return create_column_select(op);
     }
+    if let LogicalOperatorKind::MaterializedCte { data, .. } = &mut op.kind {
+        // each run of a plan has a table of its own, as copies of a plan can run at once
+        let old = Arc::as_ptr(data);
+        let fresh = Arc::new(Mutex::new(ColumnDataCollection::new(data.lock().types().to_vec())));
+        *data = fresh.clone();
+        renew_cte_scans(&mut op.children[1], old, &fresh);
+    }
     let types = op.types();
+    // `CreatePlan(LogicalSample)`: a SYSTEM sample of rows keeps them at the rate of their number
+    // to the child's estimated rows
+    let child_cardinality = match &op.kind {
+        LogicalOperatorKind::Sample { .. } => op.children.first().map_or(0, base_cardinality),
+        _ => 0,
+    };
     let mut children: Vec<Box<dyn PhysicalOperator>> = op.children.into_iter().map(create_physical).collect();
     match op.kind {
         LogicalOperatorKind::Get {
@@ -160,11 +248,19 @@ fn create_physical(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             column_ids,
             filters,
             zone_filters,
+            optional_filters,
             projection,
             index_rows,
+            sample,
+            extracts,
             ..
         } => {
-            let all: Vec<_> = filters.iter().chain(&zone_filters).cloned().collect();
+            let all: Vec<_> = filters
+                .iter()
+                .chain(&zone_filters)
+                .chain(&optional_filters)
+                .cloned()
+                .collect();
             Box::new(PhysicalTableScan {
                 table,
                 column_ids,
@@ -173,6 +269,8 @@ fn create_physical(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
                 filter: (!filters.is_empty()).then(|| crate::optimizer::conjunction_of(filters)),
                 prune: (!all.is_empty()).then(|| crate::optimizer::conjunction_of(all)),
                 index_rows,
+                sample,
+                extracts,
             })
         }
         LogicalOperatorKind::CsvScan { scan, .. } => Box::new(PhysicalCsvScan { types, scan }),
@@ -255,6 +353,7 @@ fn create_physical(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             aggregates,
             grouping_sets,
             grouping_functions,
+            perfect_hash,
             ..
         } => match distinct_in_two_steps(&groups, &aggregates, &grouping_sets, &grouping_functions) {
             Some(argument) => {
@@ -292,16 +391,14 @@ fn create_physical(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
                     vec![Box::new(inner)],
                 ))
             }
-            None => Box::new(PhysicalAggregate::new(
-                types,
-                groups,
-                aggregates,
-                &grouping_sets,
-                &grouping_functions,
-                children,
-            )),
+            None => {
+                let mut aggregate =
+                    PhysicalAggregate::new(types, groups, aggregates, &grouping_sets, &grouping_functions, children);
+                aggregate.perfect_hash = perfect_hash;
+                Box::new(aggregate)
+            }
         },
-        LogicalOperatorKind::Window { windows, .. } => Box::new(window::PhysicalWindow::new(types, windows, children)),
+        LogicalOperatorKind::Window { windows, .. } => window::plan(types, windows, children),
         LogicalOperatorKind::MatchRecognize { data, .. } => {
             Box::new(match_recognize::PhysicalMatchRecognize::new(types, data, children))
         }
@@ -325,8 +422,26 @@ fn create_physical(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
                 data,
             })
         }
-        LogicalOperatorKind::Sample { options } => Box::new(PhysicalSample::new(options, children.remove(0))),
-        LogicalOperatorKind::Distinct { targets } => {
+        LogicalOperatorKind::Sample { options } => {
+            let rows = (options.method == duckrs_parser::ast::SampleMethod::System && !options.is_percentage)
+                .then(|| options.sample_size.parse::<f64>().unwrap_or(0.0) as u64);
+            let mut sample = PhysicalSample::new(options, children.remove(0));
+            if let Some(rows) = rows {
+                sample.rate = if child_cardinality > 0 { rows as f64 / child_cardinality as f64 } else { 1.0 };
+                // the sample can keep more rows than asked for: a LIMIT stops at them
+                let types = sample.types.clone();
+                return Box::new(PhysicalLimit {
+                    types,
+                    children: vec![Box::new(sample)],
+                    remaining: Mutex::new((0, Some(rows))),
+                    failure: None,
+                });
+            }
+            Box::new(sample)
+        }
+        // only the optimizer sees the boundary
+        LogicalOperatorKind::SecureView { .. } => children.remove(0),
+        LogicalOperatorKind::Distinct { targets, .. } => {
             let (child, keys, columns) = computed_targets(children.remove(0), targets);
             drop_computed(Box::new(PhysicalDistinct::new(&keys, child)), columns)
         }
@@ -373,6 +488,19 @@ fn create_physical(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             types, children, union_all, working, recurring, key, *recursive,
         )),
         LogicalOperatorKind::WorkingTable { working, .. } => Box::new(PhysicalWorkingTable { types, working }),
+        LogicalOperatorKind::CteRef { data, .. } => Box::new(PhysicalWorkingTable { types, working: data }),
+        LogicalOperatorKind::MaterializedCte {
+            name,
+            table_index,
+            data,
+            ..
+        } => Box::new(physical::PhysicalMaterializedCte::new(
+            types,
+            children,
+            name,
+            table_index,
+            data,
+        )),
         LogicalOperatorKind::DelimGet { delim, .. } => Box::new(PhysicalWorkingTable { types, working: delim }),
         LogicalOperatorKind::DelimJoin {
             join_type,
@@ -415,6 +543,17 @@ fn create_physical(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             children,
         }),
         LogicalOperatorKind::ColumnSelect { .. } => unreachable!("create_column_select"),
+        // `CreatePlan(LogicalProjection)`: a projection of the child's columns in their order is omitted
+        LogicalOperatorKind::Projection { expressions, .. }
+            if children[0].types().len() == expressions.len()
+                && expressions.iter().enumerate().all(|(at, e)| {
+                    matches!(e.kind, BoundExprKind::Reference(index) if index == at)
+                        && e.return_type == children[0].types()[at]
+                        && e.return_type.collation() == children[0].types()[at].collation()
+                }) =>
+        {
+            children.remove(0)
+        }
         LogicalOperatorKind::Projection { expressions, .. } => Box::new(PhysicalProjection {
             types,
             expressions,
@@ -425,8 +564,9 @@ fn create_physical(op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             join_type,
             conditions,
             predicate,
-        } => Box::new(join::PhysicalJoin::new(
-            types, join_type, conditions, predicate, children,
+            algorithm,
+        } => Box::new(join::PhysicalJoin::for_algorithm(
+            types, join_type, conditions, predicate, algorithm, children,
         )),
         LogicalOperatorKind::AsOfJoin {
             join_type,
@@ -644,6 +784,14 @@ impl Pipeline<'_> {
                     break;
                 }
             }
+            // `PipelineExecutor::FinishProcessing`: what the operators hold back goes on up
+            for index in 0..self.operators.len() {
+                while !self.is_finished()
+                    && let Some(chunk) = self.operators[index].final_execute(&mut operator_states[index])?
+                {
+                    self.push(chunk, index + 1, &mut operator_states)?;
+                }
+            }
         }
         if self.finish_input {
             self.sink.finish_input(self.input)?;
@@ -707,7 +855,7 @@ fn build_pipelines<'a>(sink: &'a dyn PhysicalOperator, pipelines: &mut Vec<Pipel
 /// The argument of aggregates that are all DISTINCT on the same one, with nothing else that keeps
 /// rows apart, which can then run as a grouping by the groups and the argument and then the
 /// aggregates without DISTINCT over that: what DISTINCT keeps apart keeps no thread from the work.
-fn distinct_in_two_steps(
+pub(crate) fn distinct_in_two_steps(
     groups: &[BoundExpr],
     aggregates: &[BoundAggregate],
     grouping_sets: &[BTreeSet<usize>],
@@ -723,6 +871,7 @@ fn distinct_in_two_steps(
             && a.filter.is_none()
             && a.order_by.is_empty()
             && a.distinct_key.is_none()
+            && a.distinct_order.is_empty()
             && a.children.len() == 1
             && format!("{:?}", a.children[0]) == format!("{argument:?}")
     };

@@ -173,6 +173,9 @@ fn compare_nested(left: &Vector, right: &Vector, result: &mut Vector, count: usi
         order: OrderType::Ascending,
         nulls: NullOrder::NullsLast,
     };
+    if !null_aware && left.logical_type().id() == LogicalTypeId::Union && !JOIN_CONDITION.with(|c| c.get()) {
+        return compare_unions(left, right, result, count, op);
+    }
     let left_keys = create_sort_keys(&[(left, modifiers)], count)?;
     let right_keys = create_sort_keys(&[(right, modifiers)], count)?;
     let (lu, ru) = (left.to_unified(count), right.to_unified(count));
@@ -187,6 +190,66 @@ fn compare_nested(left: &Vector, right: &Vector, result: &mut Vector, count: usi
             continue;
         }
         result.data_mut::<bool>()[i] = op.evaluate(lnull, rnull, || left_keys[i].cmp(&right_keys[i]));
+    }
+    Ok(())
+}
+
+thread_local! {
+    /// Whether a join's condition is being evaluated: joins match UNIONs as the row matcher does,
+    /// by the whole value, not with `UnionComparator`'s NULL members.
+    static JOIN_CONDITION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` as the evaluation of a join condition.
+pub fn as_join_condition<T>(f: impl FnOnce() -> T) -> T {
+    let before = JOIN_CONDITION.with(|c| c.replace(true));
+    let result = f();
+    JOIN_CONDITION.with(|c| c.set(before));
+    result
+}
+
+/// `UnionComparator` of an SQL comparison: different tags compare as the tags, and the same tag
+/// as that member, which is NULL when the member is.
+fn compare_unions(left: &Vector, right: &Vector, result: &mut Vector, count: usize, op: ComparisonType) -> Result<()> {
+    let modifiers = OrderModifiers {
+        order: OrderType::Ascending,
+        nulls: NullOrder::NullsLast,
+    };
+    let (mut left, mut right) = (left.clone(), right.clone());
+    left.flatten(count);
+    right.flatten(count);
+    let (lu, ru) = (left.to_unified(count), right.to_unified(count));
+    let (lchildren, rchildren) = (left.struct_children(), right.struct_children());
+    let (ltags, rtags) = (lchildren[0].to_unified(count), rchildren[0].to_unified(count));
+    // the sort keys of each member on either side, made when a row first needs them
+    type MemberKeys = Option<(Vec<Vec<u8>>, Vec<Vec<u8>>)>;
+    let mut member_keys: Vec<MemberKeys> = vec![None; lchildren.len()];
+    result.prepare_flat(count.max(1));
+    for i in 0..count {
+        if !lu.validity.is_valid(lu.sel.get(i)) || !ru.validity.is_valid(ru.sel.get(i)) {
+            result.set_null(i, true);
+            continue;
+        }
+        let ltag = ltags.data::<u8>()[ltags.sel.get(i)];
+        let rtag = rtags.data::<u8>()[rtags.sel.get(i)];
+        if ltag != rtag {
+            result.data_mut::<bool>()[i] = op.evaluate(false, false, || ltag.cmp(&rtag));
+            continue;
+        }
+        let member = usize::from(ltag) + 1;
+        let (lm, rm) = (lchildren[member].to_unified(count), rchildren[member].to_unified(count));
+        if !lm.validity.is_valid(lm.sel.get(i)) || !rm.validity.is_valid(rm.sel.get(i)) {
+            result.set_null(i, true);
+            continue;
+        }
+        if member_keys[member].is_none() {
+            member_keys[member] = Some((
+                create_sort_keys(&[(&lchildren[member], modifiers)], count)?,
+                create_sort_keys(&[(&rchildren[member], modifiers)], count)?,
+            ));
+        }
+        let (lk, rk) = member_keys[member].as_ref().expect("computed");
+        result.data_mut::<bool>()[i] = op.evaluate(false, false, || lk[i].cmp(&rk[i]));
     }
     Ok(())
 }
@@ -575,7 +638,7 @@ fn any_matches(result: &SubqueryResult, op: ComparisonOp, key: &[u8]) -> Option<
     }
 }
 
-pub(super) const MULTIPLE_ROWS: &str = "More than one row returned by a subquery used as an expression - scalar subqueries can \
+pub(crate) const MULTIPLE_ROWS: &str = "More than one row returned by a subquery used as an expression - scalar subqueries can \
                              only return a single row.\n\nUse \"SET scalar_subquery_error_on_multiple_rows=false\" to \
                              revert to previous behavior of returning a random row.";
 
@@ -683,6 +746,34 @@ fn execute_try(child: &BoundExpr, return_type: &LogicalType, input: &DataChunk) 
     }
 }
 
+/// `OPERATOR_HAS_ERROR`: whether each row's evaluation fails, as TRY finds it.
+fn execute_has_error(child: &BoundExpr, input: &DataChunk) -> Result<Vector> {
+    let count = input.len();
+    let mut result = Vector::new(LogicalType::BOOLEAN, count.max(1));
+    match execute(child, input) {
+        Ok(_) => {
+            for row in 0..count {
+                result.set_value(row, &Value::boolean(false))?;
+            }
+        }
+        Err(error) if error.kind == ErrorKind::Internal => return Err(error),
+        Err(_) => {
+            for row in 0..count {
+                let failed = match execute(child, &slice_rows(input, &[row as u32])) {
+                    Ok(_) => false,
+                    Err(error) if error.kind == ErrorKind::Internal => return Err(error),
+                    Err(_) => true,
+                };
+                result.set_value(row, &Value::boolean(failed))?;
+            }
+        }
+    }
+    if count == 0 {
+        result.set_value(0, &Value::boolean(false))?;
+    }
+    Ok(result)
+}
+
 /// `OPERATOR_COALESCE`: each argument only sees the rows that are still NULL.
 fn execute_coalesce(children: &[BoundExpr], return_type: &LogicalType, input: &DataChunk) -> Result<Vector> {
     let mut result = Vector::new(return_type.clone(), input.len().max(1));
@@ -765,8 +856,10 @@ fn execute_lambda(
                 let mut rest = items.iter().enumerate();
                 let mut accumulator = match start {
                     Some(start) => start,
+                    // the first element is the accumulator, of the accumulator's type
                     None => match rest.next() {
-                        Some((_, first)) => first.clone(),
+                        Some((_, first)) if first.logical_type() == return_type => first.clone(),
+                        Some((_, first)) => super::parquet::cast_value(first, return_type)?,
                         None => {
                             return Err(Error::new(
                                 ErrorKind::ParameterNotAllowed,
@@ -810,9 +903,13 @@ pub fn execute(expr: &BoundExpr, input: &DataChunk) -> Result<Vector> {
     let count = input.len();
     match &expr.kind {
         BoundExprKind::Constant(value) => Ok(Vector::constant(value)),
-        BoundExprKind::JoinFilter { child, filter } => {
+        BoundExprKind::JoinFilter {
+            child,
+            filter,
+            keep_null,
+        } => {
             let values = execute(child, input)?;
-            let Some(kept) = filter.select(&values, count) else {
+            let Some(kept) = filter.select(&values, count, *keep_null) else {
                 return Ok(Vector::constant(&Value::boolean(true)));
             };
             let mut result = Vector::new(LogicalType::BOOLEAN, count);
@@ -907,6 +1004,33 @@ pub fn execute(expr: &BoundExpr, input: &DataChunk) -> Result<Vector> {
             op: BoundOperator::Try,
             children,
         } => execute_try(&children[0], &expr.return_type, input),
+        BoundExprKind::Operator {
+            op: BoundOperator::HasError,
+            children,
+        } => execute_has_error(&children[0], input),
+        // a volatile input is evaluated once, and compared from a column of its own
+        BoundExprKind::Operator {
+            op: op @ (BoundOperator::In | BoundOperator::NotIn),
+            children,
+        } if children[0].is_volatile() => {
+            let probe = execute(&children[0], input)?;
+            let mut columns = input.columns().to_vec();
+            columns.push(probe);
+            let extended = DataChunk::from_columns(columns, input.len());
+            let mut lowered = children.clone();
+            lowered[0] = BoundExpr::new(BoundExprKind::Reference(input.column_count()), children[0].return_type.clone());
+            execute(
+                &crate::planner::expression::in_as_comparisons(*op == BoundOperator::NotIn, &lowered),
+                &extended,
+            )
+        }
+        BoundExprKind::Operator {
+            op: op @ (BoundOperator::In | BoundOperator::NotIn),
+            children,
+        } => execute(
+            &crate::planner::expression::in_as_comparisons(*op == BoundOperator::NotIn, children),
+            input,
+        ),
         BoundExprKind::Operator { op, children } => {
             let child = execute(&children[0], input)?;
             Ok(match op {
@@ -917,7 +1041,13 @@ pub fn execute(expr: &BoundExpr, input: &DataChunk) -> Result<Vector> {
                 }
                 BoundOperator::IsNull => null_check(&child, count, true),
                 BoundOperator::IsNotNull => null_check(&child, count, false),
-                BoundOperator::Coalesce | BoundOperator::Try => unreachable!("handled above"),
+                BoundOperator::Coalesce
+                | BoundOperator::Try
+                | BoundOperator::HasError
+                | BoundOperator::In
+                | BoundOperator::NotIn => {
+                    unreachable!("handled above")
+                }
             })
         }
         BoundExprKind::Function { function, children, .. } => {
@@ -957,6 +1087,19 @@ pub fn execute(expr: &BoundExpr, input: &DataChunk) -> Result<Vector> {
             }
             let arguments = DataChunk::from_columns(arguments, count);
             let mut result = Vector::new(expr.return_type.clone(), count.max(1));
+            // `RandomFunction`: the engine of this call, seeded from the client's when first run
+            if let Some(state) = &function.random {
+                let mut state = state.lock();
+                let engine = state.get_or_insert_with(|| {
+                    let mut engine = super::random_engine::RandomEngine::new(0);
+                    engine.set_seed(super::random_engine::client_next_seed());
+                    engine
+                });
+                for row in 0..count {
+                    result.set_value(row, &Value::double(engine.next_random()))?;
+                }
+                return Ok(result);
+            }
             (function.function)(&arguments, &mut result).map_err(|error| {
                 if error.message == DIVISION_BY_ZERO {
                     let message = format!(
@@ -1032,9 +1175,55 @@ pub fn select(expr: &BoundExpr, input: &DataChunk) -> Result<(SelectionVector, u
         let count = remaining.len();
         return Ok((SelectionVector::from_vec(remaining), count));
     }
-    if let BoundExprKind::JoinFilter { child, filter } = &expr.kind {
+    // `SelectOr`: each disjunct sees only the rows the ones before it did not select, so that a
+    // guard (`g LIKE 'ke%' OR CAST(s AS ..) = ..`) keeps the others from failing on its rows
+    if let BoundExprKind::Conjunction { and: false, children } = &expr.kind
+        && children.len() > 1
+        && !children.iter().all(|c| {
+            matches!(&c.kind, BoundExprKind::Comparison { op: duckrs_parser::ast::ComparisonOp::Equal, right, .. }
+                if matches!(right.kind, BoundExprKind::Constant(_)))
+        })
+    {
+        let mut remaining: Vec<u32> = (0..input.len() as u32).collect();
+        let mut chosen = Vec::new();
+        for child in children {
+            if remaining.is_empty() {
+                break;
+            }
+            let (selected, count) = if remaining.len() == input.len() {
+                select(child, input)?
+            } else {
+                select(child, &slice_rows(input, &remaining))?
+            };
+            if count == 0 {
+                continue;
+            }
+            let mut picked = vec![false; remaining.len()];
+            for i in 0..count {
+                picked[selected.get(i)] = true;
+            }
+            let mut rest = Vec::with_capacity(remaining.len() - count);
+            for (row, picked) in remaining.into_iter().zip(picked) {
+                if picked {
+                    chosen.push(row);
+                } else {
+                    rest.push(row);
+                }
+            }
+            remaining = rest;
+        }
+        chosen.sort_unstable();
+        let count = chosen.len();
+        return Ok((SelectionVector::from_vec(chosen), count));
+    }
+    if let BoundExprKind::JoinFilter {
+        child,
+        filter,
+        keep_null,
+    } = &expr.kind
+    {
         let values = execute(child, input)?;
-        return Ok(match filter.select(&values, input.len()) {
+        return Ok(match filter.select(&values, input.len(), *keep_null) {
             Some(kept) => {
                 let count = kept.len();
                 (SelectionVector::from_vec(kept), count)

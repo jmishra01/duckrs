@@ -39,6 +39,8 @@ pub struct QueryMemory {
     next_file: AtomicUsize,
     /// how many threads the query may run a pipeline on, for what it runs on the side (a subquery)
     threads: AtomicUsize,
+    /// `MetaTransaction::start_timestamp` of the query's transaction, `i64::MIN` until it is known
+    transaction_start: std::sync::atomic::AtomicI64,
 }
 
 impl QueryMemory {
@@ -52,7 +54,20 @@ impl QueryMemory {
             temp_size: AtomicU64::new(0),
             next_file: AtomicUsize::new(0),
             threads: AtomicUsize::new(1),
+            transaction_start: std::sync::atomic::AtomicI64::new(i64::MIN),
         })
+    }
+
+    pub fn set_transaction_start(&self, micros: i64) {
+        self.transaction_start.store(micros, Ordering::Relaxed);
+    }
+
+    /// The start of the transaction, in microseconds since the epoch: now if nobody said.
+    pub fn transaction_start(&self) -> i64 {
+        match self.transaction_start.load(Ordering::Relaxed) {
+            i64::MIN => now_micros(),
+            micros => micros,
+        }
     }
 
     pub fn set_threads(&self, threads: usize) {
@@ -152,6 +167,14 @@ impl Drop for QueryMemory {
             let _ = std::fs::remove_dir(&self.directory);
         }
     }
+}
+
+/// Microseconds since the epoch.
+pub fn now_micros() -> i64 {
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    elapsed.as_micros() as i64
 }
 
 thread_local! {

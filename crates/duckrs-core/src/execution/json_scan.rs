@@ -26,7 +26,7 @@ pub enum JsonFormat {
 }
 
 /// `JSONScanData`
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct JsonScanData {
     pub files: Vec<String>,
     pub format: JsonFormat,
@@ -47,6 +47,82 @@ pub struct JsonScanData {
     pub hive: Vec<(String, LogicalType)>,
     /// the virtual columns, after the rest
     pub virtual_columns: Vec<crate::execution::multi_file::VirtualColumn>,
+    /// the name of the table function, for EXPLAIN
+    pub function_name: String,
+    /// the columns of `output_types` the scan outputs, in order (`column_ids`); `None` for all.
+    /// The others are not converted, so their values cannot fail.
+    pub projection: Option<Vec<usize>>,
+    /// the order the binder read the columns in, which projection pushdown keeps
+    pub column_order: crate::execution::multi_file::ColumnOrder,
+    /// `ExtraOperatorInfo::file_filters`: the filters that left files out, as text
+    pub file_filters: String,
+    /// how many files there were before filters left some out
+    pub total_files: Option<usize>,
+    /// `estimated_cardinality_per_file`, from the records sampled at bind
+    pub cardinality_per_file: Option<u64>,
+}
+
+impl JsonScanData {
+    /// The types of the columns the scan outputs.
+    pub fn projected_types(&self) -> Vec<LogicalType> {
+        let types = self.output_types();
+        match &self.projection {
+            Some(columns) => columns.iter().map(|&c| types[c].clone()).collect(),
+            None => types,
+        }
+    }
+
+    /// The output columns the scan outputs, by their position among all of them.
+    pub fn projected_columns(&self) -> Vec<usize> {
+        match &self.projection {
+            Some(columns) => columns.clone(),
+            None => (0..self.output_types().len()).collect(),
+        }
+    }
+
+    /// The names of all output columns, by position.
+    pub fn output_names(&self) -> Vec<String> {
+        let mut names = self.names.clone();
+        if self.filename {
+            names.push("filename".to_string());
+        }
+        names.extend(self.hive.iter().map(|(name, _)| name.clone()));
+        names.extend(self.virtual_columns.iter().map(|c| c.name().to_string()));
+        names
+    }
+
+    /// The value of the output column at `at` in the file at `path`, if it has one for the whole
+    /// file (the file name and the hive partitions).
+    pub fn known_value(&self, at: usize, path: &str) -> Option<Value> {
+        known_value(&self.names, self.filename, &self.hive, &self.virtual_columns, at, path)
+    }
+}
+
+/// The value of output column `at` of a multi-file scan for the file at `path`, when it is the same
+/// for all its rows: its file name or a hive partition.
+pub fn known_value(
+    names: &[String],
+    filename: bool,
+    hive: &[(String, LogicalType)],
+    virtual_columns: &[crate::execution::multi_file::VirtualColumn],
+    at: usize,
+    path: &str,
+) -> Option<Value> {
+    let mut next = names.len();
+    if filename {
+        if at == next {
+            return Some(Value::varchar(path));
+        }
+        next += 1;
+    }
+    if let Some((key, ty)) = at.checked_sub(next).and_then(|i| hive.get(i)) {
+        return super::csv::hive_value(path, key, ty).ok();
+    }
+    next += hive.len();
+    match at.checked_sub(next).and_then(|i| virtual_columns.get(i)) {
+        Some(crate::execution::multi_file::VirtualColumn::Filename) => Some(Value::varchar(path)),
+        _ => None,
+    }
 }
 
 impl JsonScanData {
@@ -428,7 +504,11 @@ pub fn formatted_value(text: &str, ty: &LogicalType, formats: &Formats) -> Optio
     match ty.id() {
         Id::Date => {
             let micros = strptime_micros(text, formats.date.as_deref()?).ok()?;
-            Some(Value::date(Timestamp(micros).date()))
+            Some(Value::date(match micros {
+                i64::MAX => duckrs_common::types::Date::INFINITY,
+                m if m == -i64::MAX => duckrs_common::types::Date::NINFINITY,
+                m => Timestamp(m).date(),
+            }))
         }
         Id::Timestamp => {
             let micros = strptime_micros(text, formats.timestamp.as_deref()?).ok()?;
@@ -496,6 +576,7 @@ fn record_row(
     text: &[u8],
     formats: &Formats,
     strict: bool,
+    wanted: &[bool],
 ) -> Result<Option<Vec<Value>>> {
     // `ReadJSONObjectsFunction`: the bytes of the record as they are
     if scan.objects {
@@ -504,6 +585,9 @@ fn record_row(
             .map(|v| Some(vec![v]));
     }
     if !scan.records {
+        if !wanted[0] {
+            return Ok(Some(vec![Value::null(scan.types[0].clone())]));
+        }
         let value = transform_with(record, &scan.types[0], strict, formats)?;
         return Ok(Some(vec![value]));
     }
@@ -521,7 +605,12 @@ fn record_row(
         ));
     };
     let mut row = Vec::with_capacity(scan.names.len());
-    for (name, ty) in scan.names.iter().zip(&scan.types) {
+    for ((name, ty), &wanted) in scan.names.iter().zip(&scan.types).zip(wanted) {
+        // projection pushdown: a column the scan does not output is not converted
+        if !wanted {
+            row.push(Value::null(ty.clone()));
+            continue;
+        }
         let found = crate::function::json::object_member(record, items, name, formats)?;
         let value = match found {
             Some(item) => match transform_with(item, ty, strict, formats) {
@@ -588,6 +677,9 @@ impl PhysicalOperator for PhysicalJsonScan {
             map_threshold: None,
         };
         let strict = !scan.ignore_errors;
+        let wanted: Vec<bool> = (0..scan.types.len())
+            .map(|column| scan.projection.as_ref().is_none_or(|p| p.contains(&column)))
+            .collect();
         loop {
             let Some(path) = scan.files.get(state.file) else {
                 return Ok(None);
@@ -609,7 +701,7 @@ impl PhysicalOperator for PhysicalJsonScan {
                     Some(Ok((record, span))) => {
                         state.record += 1;
                         let text = &state.data[span];
-                        let row = record_row(scan, &record, text, &formats, strict)
+                        let row = record_row(scan, &record, text, &formats, strict, &wanted)
                             .map_err(|error| transform_error(scan, path, state.format, state.record, error))?;
                         if let Some(row) = row {
                             rows.push(row);
@@ -646,7 +738,46 @@ impl PhysicalOperator for PhysicalJsonScan {
                 state.file,
                 &mut state.virtual_rows,
             )
-            .map(Some);
+            .map(|chunk| {
+                Some(match &scan.projection {
+                    Some(columns) => {
+                        let count = chunk.len();
+                        DataChunk::from_columns(columns.iter().map(|&c| chunk.column(c).clone()).collect(), count)
+                    }
+                    None => chunk,
+                })
+            });
         }
     }
+}
+
+/// `estimated_cardinality_per_file` of `ReadJSONBind`: the size of a file over the average size of
+/// the records sampled from it (`JSONSchemaTask`). C++ samples whole vectors of records until it has
+/// `sample_size`, and counts the bytes its buffer moved on by; for a file of lines whose last line
+/// has no newline, that last line is read into a buffer of its own, and the count wraps around to
+/// the size of that line alone.
+pub fn estimate_per_file(
+    data: &[u8],
+    records: &[Record],
+    format: JsonFormat,
+    file_size: u64,
+    sample_size: usize,
+) -> Option<u64> {
+    let count = records.len();
+    let tuples = count.min(sample_size.div_ceil(STANDARD_VECTOR_SIZE).saturating_mul(STANDARD_VECTOR_SIZE));
+    if tuples == 0 {
+        return None;
+    }
+    let bytes = if tuples < count {
+        match &records[tuples - 1] {
+            Ok((_, span)) => (span.end + 1).min(data.len()),
+            Err(error) => error.position.min(data.len()),
+        }
+    } else if format == JsonFormat::NewlineDelimited && data.last() != Some(&b'\n') {
+        data.len() - data.iter().rposition(|&c| c == b'\n').map_or(0, |at| at + 1)
+    } else {
+        data.len()
+    };
+    let average = (bytes / tuples).max(1) as u64;
+    Some(file_size / average)
 }

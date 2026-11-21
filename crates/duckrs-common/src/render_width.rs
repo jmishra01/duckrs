@@ -1,6 +1,6 @@
 // Ported from duckdb/third_party/utf8proc/utf8proc_wrapper.cpp @ rust-port-baseline
 //
-//! The render widths and grapheme clusters the box renderer needs (`Utf8Proc::RenderWidth`,
+//! The render widths and grapheme clusters the box renderers need (`Utf8Proc::RenderWidth`,
 //! `Utf8Proc::NextGraphemeCluster`).
 //!
 //! C++ reads both from utf8proc's Unicode tables. The crate has no Unicode-table dependency, so these
@@ -100,7 +100,7 @@ fn is_regional_indicator(cp: u32) -> bool {
 }
 
 /// `utf8proc_charwidth`.
-pub(crate) fn char_width(cp: u32) -> usize {
+pub fn char_width(cp: u32) -> usize {
     if cp < 0x20 || (0x7F..0xA0).contains(&cp) {
         return 0;
     }
@@ -203,7 +203,7 @@ pub(crate) fn char_width(cp: u32) -> usize {
 }
 
 /// `Utf8Proc::NextGraphemeCluster`: the byte position after the cluster that starts at `pos`.
-pub(crate) fn next_grapheme_cluster(s: &str, pos: usize) -> usize {
+pub fn next_grapheme_cluster(s: &str, pos: usize) -> usize {
     let mut chars = s[pos..].char_indices();
     let Some((_, first)) = chars.next() else {
         return s.len();
@@ -237,12 +237,12 @@ pub(crate) fn next_grapheme_cluster(s: &str, pos: usize) -> usize {
 }
 
 /// `Utf8Proc::RenderWidth(s, len, pos)`: the width of the character at `pos`.
-pub(crate) fn render_width_at(s: &str, pos: usize) -> usize {
+pub fn render_width_at(s: &str, pos: usize) -> usize {
     s[pos..].chars().next().map_or(0, |c| char_width(c as u32))
 }
 
 /// `Utf8Proc::RenderWidth(str)`: the width of each cluster's first character, summed.
-pub(crate) fn render_width(s: &str) -> usize {
+pub fn render_width(s: &str) -> usize {
     let mut width = 0;
     let mut pos = 0;
     while pos < s.len() {

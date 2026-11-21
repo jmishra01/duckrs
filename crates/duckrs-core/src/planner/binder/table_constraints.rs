@@ -72,7 +72,7 @@ pub(super) fn check_key_types(columns: &[ColumnDefinition], key: &[usize]) -> Re
 fn find_referenced_key(
     table: &str,
     columns: &[ColumnDefinition],
-    uniques: &[(Vec<usize>, bool)],
+    uniques: &[(Vec<usize>, bool, bool)],
     foreign: &[String],
     referenced: &[String],
 ) -> Result<Vec<usize>> {
@@ -85,7 +85,12 @@ fn find_referenced_key(
         )));
     }
     let mut found_constraint = false;
-    for (key, primary_key) in uniques {
+    let mut found_deferred = false;
+    // `ThrowDeferredReferencedKey`
+    let deferred_key = || {
+        binder_error("Failed to create foreign key: the referenced PRIMARY KEY or UNIQUE constraint cannot be DEFERRED")
+    };
+    for (key, primary_key, deferred) in uniques {
         if find_primary_key && !primary_key {
             continue;
         }
@@ -99,12 +104,23 @@ fn find_referenced_key(
                     names.join(",")
                 )));
             }
+            if *deferred {
+                return Err(deferred_key());
+            }
             return Ok(key.clone());
         }
         let wanted: Vec<Option<usize>> = referenced.iter().map(|name| column_index(columns, name)).collect();
         if key.len() == wanted.len() && key.iter().all(|c| wanted.contains(&Some(*c))) {
+            if *deferred {
+                // keep looking for one that is not deferred
+                found_deferred = true;
+                continue;
+            }
             return Ok(wanted.into_iter().flatten().collect());
         }
+    }
+    if found_deferred {
+        return Err(deferred_key());
     }
     if !found_constraint {
         let term = if find_primary_key {
@@ -134,11 +150,35 @@ fn find_referenced_key(
 impl Binder<'_> {
     /// `BindCheckConstraint`: the expression reads the columns of the new table by position.
     fn bind_check(&self, table: &str, columns: &[ColumnDefinition], check: &Expr) -> Result<BoundExpr> {
+        // `CheckBinder::BindCheckColumn`: a column inside a lambda is not supported yet
+        // (a lambda that reads only its parameters binds)
+        let mut lambda = false;
+        visit_expr_mut(&mut check.clone(), &mut |expr: &mut Expr| {
+            if let ExprKind::Lambda { expr: body, .. } = &mut expr.kind {
+                visit_expr_mut(body, &mut |inner: &mut Expr| {
+                    if let ExprKind::ColumnRef(names) = &inner.kind {
+                        lambda |= names.iter().take(2).any(|name| column_index(columns, name).is_some());
+                    }
+                });
+            }
+        });
+        if lambda {
+            return Err(Error::new(
+                ErrorKind::NotImplemented,
+                "Lambda functions are currently not supported in CHECK constraints.",
+            ));
+        }
         let mut error = None;
         let mut parsed = check.clone();
         visit_expr_mut(&mut parsed, &mut |expr: &mut Expr| match &expr.kind {
+            // a lambda here reads only its parameters
+            ExprKind::Lambda { .. } => expr.kind = ExprKind::Default,
             ExprKind::Subquery { .. } => {
                 error.get_or_insert_with(|| "cannot use subquery in check constraint".to_string());
+            }
+            // `CheckBinder::BindExpression`
+            ExprKind::Window(_) => {
+                error.get_or_insert_with(|| "window functions are not allowed in check constraints".to_string());
             }
             ExprKind::ColumnRef(names) if names.len() == 1 && column_index(columns, &names[0]).is_none() => {
                 error.get_or_insert_with(|| {
@@ -185,49 +225,80 @@ impl Binder<'_> {
         schema: &Arc<SchemaCatalogEntry>,
     ) -> Result<Vec<TableConstraint>> {
         let table = &info.name.name;
-        let mut bound = Vec::new();
-        // the keys go first, for the foreign keys of a table that references itself
+        // each at the place it was written; the keys are bound first, for the foreign keys of a
+        // table that references itself
+        let mut slots: Vec<Option<TableConstraint>> = vec![None; info.constraints.len()];
+        let mut primary_columns: Vec<usize> = Vec::new();
         let mut has_primary_key = false;
-        for constraint in &info.constraints {
+        for (slot, constraint) in info.constraints.iter().enumerate() {
             match constraint {
-                Constraint::NotNull(index) => columns[*index].not_null = true,
+                Constraint::NotNull(index) => {
+                    columns[*index].not_null = true;
+                    slots[slot] = Some(TableConstraint::NotNull(*index));
+                }
                 Constraint::Unique {
                     index,
                     columns: names,
                     primary_key,
                     check_mode,
                 } => {
-                    if *check_mode == ConstraintCheckMode::Deferred {
-                        return Err(crate::unported("DEFERRED constraints"));
-                    }
                     if *primary_key && std::mem::replace(&mut has_primary_key, true) {
                         return Err(Error::new(
                             ErrorKind::Parser,
                             format!("table {} has more than one primary key", sql_quoted_identifier(table)),
                         ));
                     }
+                    if !info.temporary && !schema.name.eq_ignore_ascii_case(crate::catalog::TEMP_SCHEMA) {
+                        self.catalog.check_constraint_check_mode(*check_mode)?;
+                    }
                     let key = bind_unique(table, columns, *index, names)?;
                     check_key_types(columns, &key)?;
                     if *primary_key {
-                        for column in &key {
-                            columns[*column].not_null = true;
-                        }
+                        primary_columns.clone_from(&key);
                     }
-                    bound.push(TableConstraint::Unique {
+                    slots[slot] = Some(TableConstraint::Unique {
                         columns: key,
                         primary_key: *primary_key,
+                        column_level: index.is_some(),
+                        check_mode: *check_mode,
                     });
                 }
-                Constraint::Check(_) | Constraint::ForeignKey { .. } => {}
+                // `BindForeignKey`, in the order of the constraints: a key named twice
+                Constraint::ForeignKey {
+                    fk_columns, pk_columns, ..
+                } => {
+                    let twice = |names: &[String]| {
+                        names
+                            .iter()
+                            .enumerate()
+                            .any(|(at, name)| names[..at].iter().any(|n| n.eq_ignore_ascii_case(name)))
+                    };
+                    if twice(pk_columns) {
+                        return Err(Error::new(
+                            ErrorKind::Parser,
+                            "duplicate primary key referenced in FOREIGN KEY constraint",
+                        ));
+                    }
+                    if twice(fk_columns) {
+                        return Err(Error::new(
+                            ErrorKind::Parser,
+                            "duplicate key specified in FOREIGN KEY constraint",
+                        ));
+                    }
+                }
+                Constraint::Check(_) => {}
             }
         }
-        for constraint in &info.constraints {
+        let keys: Vec<TableConstraint> = slots.iter().flatten().cloned().collect();
+        for (slot, constraint) in info.constraints.iter().enumerate() {
             match constraint {
-                Constraint::Check(check) => bound.push(TableConstraint::Check {
-                    expression: self.bind_check(table, columns, check)?,
-                    parsed: (**check).clone(),
-                    text: constraint.to_string(),
-                }),
+                Constraint::Check(check) => {
+                    slots[slot] = Some(TableConstraint::Check {
+                        expression: self.bind_check(table, columns, check)?,
+                        parsed: (**check).clone(),
+                        text: constraint.to_string(),
+                    });
+                }
                 Constraint::ForeignKey {
                     fk_columns,
                     pk_columns,
@@ -237,17 +308,25 @@ impl Binder<'_> {
                     let foreign_key = self.bind_foreign_key(
                         info,
                         columns,
-                        &bound,
+                        &keys,
                         schema,
                         fk_columns,
                         pk_columns,
                         referenced_schema,
                         referenced_table,
                     )?;
-                    bound.push(TableConstraint::ForeignKey(foreign_key));
+                    slots[slot] = Some(TableConstraint::ForeignKey(foreign_key));
                 }
                 Constraint::NotNull(_) | Constraint::Unique { .. } => {}
             }
+        }
+        let mut bound: Vec<TableConstraint> = slots.into_iter().flatten().collect();
+        // `BindNewConstraints`: a NOT NULL for each column of the primary key without one, last
+        for column in primary_columns {
+            if !columns[column].not_null {
+                bound.push(TableConstraint::NotNull(column));
+            }
+            columns[column].not_null = true;
         }
         Ok(bound)
     }
@@ -277,11 +356,20 @@ impl Binder<'_> {
             }
             foreign.push(index);
         }
-        let uniques_of = |constraints: &[TableConstraint]| -> Vec<(Vec<usize>, bool)> {
+        let uniques_of = |constraints: &[TableConstraint]| -> Vec<(Vec<usize>, bool, bool)> {
             constraints
                 .iter()
                 .filter_map(|c| match c {
-                    TableConstraint::Unique { columns, primary_key } => Some((columns.clone(), *primary_key)),
+                    TableConstraint::Unique {
+                        columns,
+                        primary_key,
+                        check_mode,
+                        ..
+                    } => Some((
+                        columns.clone(),
+                        *primary_key,
+                        *check_mode == ConstraintCheckMode::Deferred,
+                    )),
                     _ => None,
                 })
                 .collect()
@@ -332,7 +420,8 @@ impl Binder<'_> {
         // keys compare in the order of the UNIQUE that they use
         let key = uniques
             .iter()
-            .map(|(key, _)| key)
+            .filter(|(_, _, deferred)| !deferred)
+            .map(|(key, ..)| key)
             .find(|key| key.len() == wanted.len() && key.iter().all(|c| wanted.contains(c)))
             .expect("find_referenced_key found it");
         let columns = key

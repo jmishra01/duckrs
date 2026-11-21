@@ -260,11 +260,18 @@ fn list_resize(args: &DataChunk, result: &mut Vector) -> Result<()> {
         if row[0].is_null() {
             return Ok(Value::null(ty.clone()));
         }
-        let Some(size) = row[1].as_i128() else {
-            return Value::new(ty.clone(), ValueData::List(items(&row[0]).to_vec()));
-        };
+        // `ListResizeFunction`: a NULL size is 0
+        let size = row[1].as_i128().unwrap_or(0);
         if size < 0 {
             return Err(Error::new(ErrorKind::OutOfRange, "Cannot resize list to negative size"));
+        }
+        // `VectorBuffer::GetReserveSize`: a vector holds at most 128GB
+        const MAX_VECTOR_SIZE: i128 = 1 << 37;
+        if size > MAX_VECTOR_SIZE {
+            return Err(Error::new(
+                ErrorKind::OutOfRange,
+                format!("Cannot resize vector to {size} rows: maximum allowed vector size is 128.0 GiB"),
+            ));
         }
         let fill = row.get(2).cloned().unwrap_or_else(|| Value::null(element.clone()));
         let mut values = items(&row[0]).to_vec();
@@ -372,6 +379,13 @@ fn list_grade_up(args: &DataChunk, result: &mut Vector) -> Result<()> {
 /// `ListAggregatesFunction`: the aggregate over the items of each list.
 fn list_aggr(args: &DataChunk, result: &mut Vector) -> Result<()> {
     let ty = result.logical_type().clone();
+    // `default_collation` comes with the aggregate's name, an explicit one with the items
+    let declared = args.column(0).logical_type().child_type().map(|element| {
+        match args.columns().get(1).and_then(|which| which.logical_type().collation()) {
+            Some(collation) if element.collation().is_none() => element.with_collation(Some(collation)),
+            _ => element.clone(),
+        }
+    });
     row_wise(args, result, |row| {
         if row[0].is_null() {
             return Ok(Value::null(ty.clone()));
@@ -379,16 +393,35 @@ fn list_aggr(args: &DataChunk, result: &mut Vector) -> Result<()> {
         let name = row[1].try_to_string()?;
         let set = BuiltinFunctions::get().aggregate(&name).expect("checked when binding");
         let element = row[0].logical_type().child_type().expect("a list").clone();
-        let mut children: Vec<BoundExpr> = vec![BoundExpr::constant(Value::null(element))];
+        let mut children: Vec<BoundExpr> = vec![BoundExpr::constant(Value::null(element.clone()))];
         children.extend(row[2..].iter().map(|extra| BoundExpr::constant(extra.clone())));
         let bound = bind_aggregate_function(set, children, None, false)?;
         let values = items(&row[0]);
+        // `BindMinMax`: a collated string compares by its collated key (`arg_min`/`arg_max`)
+        if matches!(set.name.as_str(), "min" | "max")
+            && row.len() == 2
+            && let Some(declared) = declared.as_ref().filter(|d| {
+                d.id() == LogicalTypeId::Varchar && d.collation().is_some()
+            })
+        {
+            return collated_extreme(values, declared, set.name == "max", &ty);
+        }
         let input_type = bound.children[0].return_type.clone();
+        // the parameters the aggregate was bound with (its own defaults too), packed with each item
+        let packed = match &bound.children[0].kind {
+            crate::planner::expression::BoundExprKind::Function { function, .. } if function.name == "struct_pack" => {
+                Some(evaluate_scalar(&bound.children[0])?)
+            }
+            _ => None,
+        };
         let mut vector = Vector::new(input_type.clone(), values.len().max(1));
         for (at, value) in values.iter().enumerate() {
-            let value = if row.len() > 2 {
+            let value = if let Some(packed) = &packed {
+                let ValueData::Struct(parameters) = packed.data() else {
+                    unreachable!("a struct_pack of constants");
+                };
                 let mut fields = vec![cast_value(value, &input_type.struct_children()[0].1)?];
-                fields.extend(row[2..].iter().cloned());
+                fields.extend(parameters[1..].iter().cloned());
                 Value::new(input_type.clone(), ValueData::Struct(fields))?
             } else {
                 cast_value(value, &input_type)?
@@ -405,6 +438,34 @@ fn list_aggr(args: &DataChunk, result: &mut Vector) -> Result<()> {
         let input = Some(&input_type);
         bound.function.finalize(&states[0], &bound.return_type, input)
     })
+}
+
+/// The smallest or largest of `values` by the collation of `element`, the first of equals.
+fn collated_extreme(values: &[Value], element: &LogicalType, largest: bool, ty: &LogicalType) -> Result<Value> {
+    let mut best: Option<(Value, &Value)> = None;
+    for value in values.iter().filter(|v| !v.is_null()) {
+        let (key, _) = crate::planner::collation::push_collation(
+            BoundExpr::constant(value.clone()),
+            element,
+            "",
+            crate::planner::collation::CollationType::AllCollations,
+        )?;
+        let key = evaluate_scalar(&key)?;
+        let better = best.as_ref().is_none_or(|(current, _)| {
+            let order = match (key.data(), current.data()) {
+                (ValueData::Bytes(a), ValueData::Bytes(b)) => a.cmp(b),
+                _ => std::cmp::Ordering::Equal,
+            };
+            if largest { order.is_gt() } else { order.is_lt() }
+        });
+        if better {
+            best = Some((key, value));
+        }
+    }
+    match best {
+        Some((_, value)) => cast_value(value, ty),
+        None => Ok(Value::null(ty.clone())),
+    }
 }
 
 fn cast_value(value: &Value, ty: &LogicalType) -> Result<Value> {
@@ -447,6 +508,10 @@ fn bind_list_aggr(name: &str, aggregate: Option<&str>, children: Vec<BoundExpr>)
         ));
     };
     if children.iter().any(|child| !child.is_foldable()) {
+        // `BindListAggregate` binds the aggregate first, whose bind may refuse the argument itself
+        let mut arguments = vec![BoundExpr::constant(Value::null(element.clone()))];
+        arguments.extend(children.iter().cloned());
+        bind_aggregate_function(set, arguments, None, false)?;
         return Err(Error::new(
             ErrorKind::InvalidInput,
             format!("Aggregate function {function} is not supported for list_aggr: extra arguments must be constant"),
@@ -454,7 +519,17 @@ fn bind_list_aggr(name: &str, aggregate: Option<&str>, children: Vec<BoundExpr>)
     }
     let mut probe = vec![BoundExpr::constant(Value::null(element))];
     probe.extend(children.iter().cloned());
-    let return_type = bind_aggregate_function(set, probe, None, false)?.return_type;
+    // `BindListAggregate`: an aggregate without the overload is "No matching aggregate function"
+    let return_type = bind_aggregate_function(set, probe, None, false)
+        .map_err(|error| {
+            if error.message.starts_with("No function matches") {
+                Error::new(ErrorKind::Binder, format!("No matching aggregate function
+{}", error.message))
+            } else {
+                error
+            }
+        })?
+        .return_type;
     let mut arguments = vec![list, which];
     arguments.extend(children);
     Ok(bound_function(name, arguments, return_type, list_aggr))
@@ -484,6 +559,21 @@ fn bind_search(
         }
         _ => needle.return_type.clone(),
     };
+    // a VARCHAR next to a type that is not a string deduces no `T`
+    let varchar = |t: &LogicalType| t.id() == LogicalTypeId::Varchar;
+    if (varchar(&element) || varchar(&needle_type))
+        && super::nested::deduce_template(&element, &needle_type).is_none()
+    {
+        let error = no_match(name, &[list.clone(), needle.clone()]);
+        return Err(Error::new(
+            ErrorKind::Binder,
+            format!(
+                "{}\n\tCannot deduce template type 'T', it was inferred to be:\n  - '{element}', from first \
+                 occurrence\n  - '{needle_type}', which is incompatible with the previously inferred type",
+                error.message
+            ),
+        ));
+    }
     let common = match force_max_logical_type(&element, &needle_type) {
         common if common.id() == LogicalTypeId::SqlNull => LogicalType::INTEGER,
         common => common,
@@ -576,6 +666,20 @@ pub fn bind_list_function(name: &str, children: Vec<BoundExpr>) -> Result<BoundE
             let (Some(a), Some(b)) = (element_of(&left), element_of(&right)) else {
                 return Err(no_match(&lower, &children));
             };
+            // `T` of `(LIST(T), LIST(T))`: nested elements with nothing in common deduce no type
+            let nested = |t: &LogicalType| t.is_nested();
+            let deduced = super::nested::deduce_template(&a, &b);
+            if deduced.is_none() && (nested(&a) || nested(&b)) {
+                let error = no_match(&lower, &children);
+                return Err(Error::new(
+                    ErrorKind::Binder,
+                    format!(
+                        "{}\n\tCannot deduce template type 'T', it was inferred to be:\n  - '{a}', from first \
+                         occurrence\n  - '{b}', which is incompatible with the previously inferred type",
+                        error.message
+                    ),
+                ));
+            }
             let common = LogicalType::list(force_max_logical_type(&a, &b));
             let args = vec![left.cast_to(&common, false), right.cast_to(&common, false)];
             if lower.ends_with("any") || lower == "&&" {
@@ -674,6 +778,13 @@ pub fn bind_list_function(name: &str, children: Vec<BoundExpr>) -> Result<BoundE
             Ok(bound_function("list_where", vec![list, mask], ty, list_where))
         }
         "list_grade_up" | "array_grade_up" | "grade_up" => {
+            // `ListGradeUpBind`: what is not a list (a VARIANT matches `LIST(ANY)` uncast) is refused
+            if children
+                .first()
+                .is_some_and(|c| c.return_type.id() == LogicalTypeId::Variant)
+            {
+                return Err(Error::new(ErrorKind::Binder, "list_grade_up can only operate on LISTs"));
+            }
             let (list, _) = list_arg(&children)?;
             let mut args = vec![list];
             args.extend(

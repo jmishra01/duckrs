@@ -22,16 +22,17 @@ use crate::function::{BuiltinFunctions, constant_or_null};
 use crate::planner::column_binding_resolver::resolve_column_bindings;
 use crate::planner::expression::{BoundAggregate, BoundExpr, BoundExprKind, BoundOperator, ColumnBinding};
 use crate::planner::logical::{COLUMN_IDENTIFIER_ROW_ID, LogicalOperator, LogicalOperatorKind as K};
-use duckrs_common::types::{LogicalType, LogicalTypeId};
-use duckrs_common::value::Value;
+use duckrs_common::types::{LogicalType, LogicalTypeId, PhysicalType};
+use duckrs_common::value::{Value, ValueData};
 use duckrs_parser::ast::{ComparisonOp, JoinType};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 type Stats = ColumnStatistics;
 
-fn unknown() -> Stats {
+pub(super) fn unknown() -> Stats {
     Stats {
+        variant: None,
         min: None,
         max: None,
         can_be_null: true,
@@ -39,6 +40,7 @@ fn unknown() -> Stats {
         geometry: None,
         strings: None,
         distinct: None,
+        children: Vec::new(),
     }
 }
 
@@ -59,11 +61,67 @@ fn compute_statistics(table: &Arc<TableCatalogEntry>, positions: Option<Vec<usiz
         && let Some(mut statistics) = table.source().and_then(|source| source.column_statistics())
     {
         add_geometry_statistics(table, None, &mut statistics)?;
+        mark_variants(table, &mut statistics);
         return Some(statistics);
     }
     let mut statistics = compute_ordered_statistics(table, positions.clone())?;
-    add_geometry_statistics(table, positions, &mut statistics)?;
+    add_geometry_statistics(table, positions.clone(), &mut statistics)?;
+    add_nested_statistics(table, positions, &mut statistics)?;
+    mark_variants(table, &mut statistics);
     Some(statistics)
+}
+
+/// `VariantStats::MarkAsNotShredded`: the VARIANT columns that no checkpoint shredded.
+fn mark_variants(table: &Arc<TableCatalogEntry>, statistics: &mut [Stats]) {
+    for (column, stats) in table.columns.iter().zip(statistics.iter_mut()) {
+        if column.ty.id() == LogicalTypeId::Variant && stats.variant.is_none() {
+            stats.variant = Some(Box::new(crate::catalog::VariantStatistics::NotShredded));
+        }
+    }
+}
+
+/// The statistics of the LIST, ARRAY and STRUCT columns, with their children's, from their values.
+fn add_nested_statistics(
+    table: &Arc<TableCatalogEntry>,
+    positions: Option<Vec<usize>>,
+    statistics: &mut [Stats],
+) -> Option<()> {
+    let nested = |ty: &LogicalType| matches!(ty.id(), LogicalTypeId::List | LogicalTypeId::Array | LogicalTypeId::Struct);
+    let columns: Vec<usize> = (0..table.columns.len())
+        .filter(|&c| nested(&table.columns[c].ty) && statistics[c].children.is_empty())
+        .collect();
+    if columns.is_empty() {
+        return Some(());
+    }
+    let scan = LogicalOperator::new(
+        K::Get {
+            table: table.clone(),
+            table_index: 0,
+            column_ids: columns.clone(),
+            filters: Vec::new(),
+            zone_filters: Vec::new(),
+            optional_filters: Vec::new(),
+            projection: None,
+            index_rows: positions.map(Arc::new),
+            sample: None,
+            extracts: Vec::new(),
+        },
+        Vec::new(),
+    );
+    let mut plan = scan;
+    resolve_column_bindings(&mut plan).ok()?;
+    let result = run_plan(plan).ok()?;
+    for (index, &column) in columns.iter().enumerate() {
+        let ty = &table.columns[column].ty;
+        let merged = (0..result.len())
+            .map(|row| value_stats(&result.get_value(index, row), ty))
+            .reduce(union);
+        if let Some(merged) = merged {
+            let distinct = statistics[column].distinct;
+            statistics[column] = Stats { distinct, ..merged };
+        }
+    }
+    Some(())
 }
 
 /// `VertexExtractStats`: the bounds of a coordinate of the points, and whether it is always NULL.
@@ -166,8 +224,11 @@ fn add_geometry_statistics(
             column_ids: columns.clone(),
             filters: Vec::new(),
             zone_filters: Vec::new(),
+            optional_filters: Vec::new(),
             projection: None,
             index_rows: positions.map(Arc::new),
+            sample: None,
+            extracts: Vec::new(),
         },
         Vec::new(),
     );
@@ -230,8 +291,11 @@ fn compute_ordered_statistics(table: &Arc<TableCatalogEntry>, positions: Option<
             column_ids: (0..table.columns.len()).collect(),
             filters: Vec::new(),
             zone_filters: Vec::new(),
+            optional_filters: Vec::new(),
             projection: None,
             index_rows: positions.map(Arc::new),
+            sample: None,
+            extracts: Vec::new(),
         },
         Vec::new(),
     );
@@ -245,6 +309,8 @@ fn compute_ordered_statistics(table: &Arc<TableCatalogEntry>, positions: Option<
             aggregates,
             grouping_sets: Vec::new(),
             grouping_functions: Vec::new(),
+            perfect_hash: false,
+            domain_cap: None,
         },
         vec![scan],
     );
@@ -277,6 +343,7 @@ fn compute_ordered_statistics(table: &Arc<TableCatalogEntry>, positions: Option<
             usable.then_some(value)
         };
         statistics.push(Stats {
+            variant: None,
             min: count_at.checked_sub(2).and_then(bound),
             max: count_at.checked_sub(1).and_then(bound),
             can_be_null: valid < total,
@@ -284,9 +351,16 @@ fn compute_ordered_statistics(table: &Arc<TableCatalogEntry>, positions: Option<
             geometry: None,
             strings,
             distinct: None,
+            children: Vec::new(),
         });
     }
     Some(statistics)
+}
+
+/// Makes sure what is known of the columns of `table` is there, for rows written from here on to
+/// add to.
+pub fn warm_statistics(table: &Arc<TableCatalogEntry>) {
+    let _ = table_statistics(table);
 }
 
 /// What is known of the columns of `table`. Reading all rows takes long, and a table that is written
@@ -360,154 +434,15 @@ pub(super) fn table_statistics(table: &Arc<TableCatalogEntry>) -> Option<Arc<Vec
     Some(columns)
 }
 
-/// How many rows `compute_distinct_counts` reads, which a statement can pay for after every write.
-const DISTINCT_SAMPLE_ROWS: u64 = 100_000;
-
-/// A HyperLogLog sketch of 2^14 registers, for about 1.6% of error.
-struct DistinctSketch {
-    registers: Vec<u8>,
-}
-
-impl DistinctSketch {
-    const BITS: u32 = 14;
-
-    fn new() -> Self {
-        Self {
-            registers: vec![0; 1 << Self::BITS],
-        }
-    }
-
-    fn add(&mut self, value: u64) {
-        // the finalizer of MurmurHash3: nearby keys have to end up far apart
-        let mut hash = value;
-        hash ^= hash >> 33;
-        hash = hash.wrapping_mul(0xff51_afd7_ed55_8ccd);
-        hash ^= hash >> 33;
-        hash = hash.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
-        hash ^= hash >> 33;
-        let register = (hash >> (64 - Self::BITS)) as usize;
-        let rest = hash << Self::BITS | 1 << (Self::BITS - 1);
-        let slot = &mut self.registers[register];
-        *slot = (*slot).max(rest.leading_zeros() as u8 + 1);
-    }
-
-    fn estimate(&self) -> u64 {
-        let m = self.registers.len() as f64;
-        let harmonic: f64 = self.registers.iter().map(|&r| 2f64.powi(-i32::from(r))).sum();
-        let raw = 0.7213 / (1.0 + 1.079 / m) * m * m / harmonic;
-        let empty = self.registers.iter().filter(|&&r| r == 0).count();
-        // few values leave registers empty, and counting those is more exact
-        let estimate = if raw <= 2.5 * m && empty > 0 {
-            m * (m / empty as f64).ln()
-        } else {
-            raw
-        };
-        estimate.round() as u64
-    }
-}
-
-/// The distinct values in all rows of an integer or date column, which is what keys are. Those are
-/// cheap to read, and of keys a sample says little: the first rows of a sorted key have a part of
-/// its values, and those of a random one miss some.
-fn key_column_distinct(table: &TableCatalogEntry, column: usize) -> Option<u64> {
-    let mut sketch = DistinctSketch::new();
-    let id = table.columns[column].ty.id();
-    if !matches!(id, LogicalTypeId::BigInt | LogicalTypeId::Integer | LogicalTypeId::Date) {
-        return None;
-    }
-    table
-        .for_each_chunk(column, |_, vector, count| {
-            let unified = vector.to_unified(count);
-            if id == LogicalTypeId::BigInt {
-                let data = unified.data::<i64>();
-                for row in (0..count).filter(|&row| unified.is_valid(row)) {
-                    sketch.add(data[unified.sel.get(row)] as u64);
-                }
-            } else {
-                let data = unified.data::<i32>();
-                for row in (0..count).filter(|&row| unified.is_valid(row)) {
-                    sketch.add(data[unified.sel.get(row)] as u64);
-                }
-            }
-        })
-        .ok()?;
-    Some(sketch.estimate())
-}
-
-/// A scan that counts the distinct values of the columns of `table`, in its first rows. Nearly
-/// all distinct there is taken to go on in the same way, and otherwise for the values to be all
-/// there are. Key columns are counted in all rows, with [`key_column_distinct`].
+/// The distinct values of each column of `table`, as C++'s statistics count them
+/// ([`super::distinct_statistics`]).
 fn compute_distinct_counts(table: &Arc<TableCatalogEntry>) -> Option<TableDistinctCounts> {
-    let functions = BuiltinFunctions::get();
-    let mut aggregates = Vec::new();
-    let mut columns = Vec::with_capacity(table.columns.len());
-    for (index, column) in table.columns.iter().enumerate() {
-        if !has_ordered_statistics(&column.ty) {
-            columns.push(None);
-            continue;
-        }
-        let reference = BoundExpr::column_ref(ColumnBinding::new(0, index), column.ty.clone(), "");
-        let distinct = functions.aggregate("approx_count_distinct")?;
-        aggregates.push(bind_aggregate_function(distinct, vec![reference], None, false).ok()?);
-        columns.push(Some(aggregates.len() - 1));
-    }
-    let count_star = functions.aggregate("count_star")?;
-    aggregates.push(bind_aggregate_function(count_star, Vec::new(), None, false).ok()?);
-    let rows_at = aggregates.len() - 1;
-    let scan = LogicalOperator::new(
-        K::Get {
-            table: table.clone(),
-            table_index: 0,
-            column_ids: (0..table.columns.len()).collect(),
-            filters: Vec::new(),
-            projection: None,
-            zone_filters: Vec::new(),
-            index_rows: None,
-        },
-        Vec::new(),
-    );
-    let rows = table.row_count() as u64;
-    let scan = if rows > DISTINCT_SAMPLE_ROWS {
-        let limit = K::Limit {
-            limit: Some(DISTINCT_SAMPLE_ROWS),
-            offset: 0,
-            failure: None,
-        };
-        LogicalOperator::new(limit, vec![scan])
-    } else {
-        scan
-    };
-    let mut plan = LogicalOperator::new(
-        K::Aggregate {
-            group_index: 1,
-            aggregate_index: 2,
-            groupings_index: 3,
-            groups: Vec::new(),
-            aggregates,
-            grouping_sets: Vec::new(),
-            grouping_functions: Vec::new(),
-        },
-        vec![scan],
-    );
-    resolve_column_bindings(&mut plan).ok()?;
-    let result = run_plan(plan).ok()?;
-    let as_count = |at: usize| result.get_value(at, 0).try_to_string().ok()?.parse::<u64>().ok();
-    let sampled = as_count(rows_at)?;
-    let rows = rows.max(sampled);
-    let scale = |distinct: u64| {
-        if sampled > 0 && distinct as f64 >= 0.9 * sampled as f64 {
-            (distinct as f64 * rows as f64 / sampled as f64) as u64
-        } else {
-            distinct
-        }
-    };
-    let columns = columns.into_iter().enumerate().map(|(column, at)| {
-        let exact = (rows > sampled).then(|| key_column_distinct(table, column)).flatten();
-        exact.or_else(|| at.and_then(as_count).map(scale))
-    });
+    let columns = (0..table.columns.len())
+        .map(|column| super::distinct_statistics::table_column_distinct(table, column))
+        .collect();
     Some(TableDistinctCounts {
-        rows,
-        columns: columns.collect(),
+        rows: table.row_count() as u64,
+        columns,
     })
 }
 
@@ -597,6 +532,12 @@ fn decide(op: ComparisonOp, left: &Stats, right: &Stats) -> Option<bool> {
     }
 }
 
+/// Whether `column op constant` holds for all the values of a column with `column` statistics that are
+/// not NULL (`Some(true)`), for none (`Some(false)`), or is not known.
+pub(super) fn decide_with_constant(op: ComparisonOp, column: &Stats, constant: &Value, ty: &LogicalType) -> Option<bool> {
+    decide(op, column, &value_stats(constant, ty))
+}
+
 fn smaller(a: Option<Value>, b: Option<Value>) -> Option<Value> {
     let (a, b) = (a?, b?);
     compare_values(ComparisonOp::LessThan, &b, &a).map(|less| if less { b } else { a })
@@ -616,6 +557,7 @@ fn union(a: Stats, b: Stats) -> Stats {
         _ => (smaller(a.min, b.min), larger(a.max, b.max)),
     };
     Stats {
+        variant: None,
         min,
         max,
         can_be_null: a.can_be_null || b.can_be_null,
@@ -633,6 +575,91 @@ fn union(a: Stats, b: Stats) -> Stats {
             _ => None,
         },
         distinct: None,
+        children: if a.children.len() == b.children.len() {
+            a.children.into_iter().zip(b.children).map(|(a, b)| union(a, b)).collect()
+        } else {
+            Vec::new()
+        },
+    }
+}
+
+/// `BaseStatistics::FromConstant`: the statistics of one value, its children's too.
+fn value_stats(value: &Value, ty: &LogicalType) -> Stats {
+    use duckrs_common::value::ValueData;
+    // no value at all: what is merged into nothing changes nothing
+    let empty = |ty: &LogicalType| Stats {
+        can_be_null: false,
+        can_be_valid: false,
+        children: empty_children(ty),
+        ..unknown()
+    };
+    fn empty_children(ty: &LogicalType) -> Vec<Stats> {
+        let none = |child: &LogicalType| Stats {
+            can_be_null: false,
+            can_be_valid: false,
+            children: empty_children(child),
+            ..unknown()
+        };
+        match ty.id() {
+            LogicalTypeId::List | LogicalTypeId::Array => ty.child_type().map(none).into_iter().collect(),
+            LogicalTypeId::Struct => ty.struct_children().iter().map(|(_, child)| none(child)).collect(),
+            _ => Vec::new(),
+        }
+    }
+    if value.is_null() {
+        return Stats {
+            can_be_null: true,
+            can_be_valid: false,
+            children: empty_children(ty),
+            ..unknown()
+        };
+    }
+    match (ty.id(), value.data()) {
+        (LogicalTypeId::List | LogicalTypeId::Array, ValueData::List(items)) => {
+            let child = ty.child_type().cloned().unwrap_or(LogicalType::SQLNULL);
+            let merged = items
+                .iter()
+                .map(|item| value_stats(item, &child))
+                .reduce(union)
+                .unwrap_or_else(|| empty(&child));
+            Stats {
+                can_be_null: false,
+                can_be_valid: true,
+                children: vec![merged],
+                ..unknown()
+            }
+        }
+        (LogicalTypeId::Struct, ValueData::Struct(fields)) => Stats {
+            can_be_null: false,
+            can_be_valid: true,
+            children: ty
+                .struct_children()
+                .iter()
+                .zip(fields)
+                .map(|((_, child), field)| value_stats(field, child))
+                .collect(),
+            ..unknown()
+        },
+        _ => {
+            let strings = match (ty.id(), value.data()) {
+                (id @ (LogicalTypeId::Varchar | LogicalTypeId::Blob), ValueData::Bytes(bytes)) => Some(
+                    crate::catalog::StringStatistics::of_constant(bytes, id == LogicalTypeId::Varchar),
+                ),
+                _ => None,
+            };
+            let bound = has_ordered_statistics(ty).then(|| value.clone());
+            Stats {
+                variant: None,
+                min: bound.clone(),
+                max: bound,
+                can_be_null: false,
+                can_be_valid: true,
+                geometry: geometry_stats_of(value),
+                strings,
+                distinct: None,
+                children: Vec::new(),
+            }
+        }
     }
 }
 
@@ -708,15 +735,72 @@ fn has_unique_tables(op: &LogicalOperator, seen: &mut HashSet<usize>) -> bool {
     own && op.children.iter().all(|child| has_unique_tables(child, seen))
 }
 
-/// Runs the pass over a plan.
-pub fn propagate_statistics(plan: &mut LogicalOperator) {
-    if has_unique_tables(plan, &mut HashSet::new()) {
-        StatisticsPropagator::default().visit(plan);
+/// Runs the pass over a plan, and gives what it found out of the columns of the plan
+/// (`GetStatisticsMap`), if it ran.
+/// `side_effects`: the statement writes elsewhere, as its side-effecting CTEs, which the plan does not show.
+pub fn propagate_statistics(
+    plan: &mut LogicalOperator,
+    perfect_ht_threshold: u64,
+    side_effects: bool,
+) -> Option<StatisticsMap> {
+    if !has_unique_tables(plan, &mut HashSet::new()) {
+        return None;
+    }
+    let mut propagator = StatisticsPropagator {
+        perfect_ht_threshold,
+        side_effects: side_effects || super::cte_inlining::has_side_effects(plan),
+        ..Default::default()
+    };
+    propagator.visit(plan);
+    Some(StatisticsMap(propagator))
+}
+
+/// `StatisticsPropagator` with `StatisticsPropagationMode::FILTER_SIMPLIFICATION`, before the joins
+/// are ordered: it also takes the branches out of filters that statistics tell cannot be true, and
+/// leaves the joins' range filters and the choice of aggregates for the full pass. Gives whether a
+/// filter now reads other tables than before (`FilterBindingsChanged`).
+pub fn simplify_filters(plan: &mut LogicalOperator, side_effects: bool) -> bool {
+    if !has_unique_tables(plan, &mut HashSet::new()) {
+        return false;
+    }
+    let mut propagator = StatisticsPropagator {
+        filter_simplification: true,
+        side_effects: side_effects || super::cte_inlining::has_side_effects(plan),
+        ..Default::default()
+    };
+    propagator.visit(plan);
+    propagator.filter_bindings_changed
+}
+
+/// The statistics of the columns of a plan after `propagate_statistics` (`statistics_map`).
+pub struct StatisticsMap(StatisticsPropagator);
+
+impl StatisticsMap {
+    /// What is known of the values of `binding`.
+    pub fn get(&mut self, binding: ColumnBinding) -> ColumnStatistics {
+        self.0.lookup(binding)
+    }
+
+    /// `target` has the values of `expr`, of bindings this knows the statistics of.
+    pub fn set_expression(&mut self, target: ColumnBinding, expr: &BoundExpr) {
+        let stats = self.0.expression(&mut expr.clone(), false);
+        self.0.aliases.remove(&target);
+        self.0.stats.insert(target, stats);
+    }
+
+    /// `CopyStatistics`: `target` has the values of `source`.
+    pub fn copy(&mut self, source: ColumnBinding, target: ColumnBinding) {
+        if source != target {
+            self.0.stats.remove(&target);
+            self.0.aliases.insert(target, source);
+        }
     }
 }
 
 #[derive(Default)]
 struct StatisticsPropagator {
+    /// `perfect_ht_threshold`: the most bits the groups of a perfect hash aggregate take
+    perfect_ht_threshold: u64,
     /// what is known by now
     stats: HashMap<ColumnBinding, Stats>,
     /// the table columns a binding reads, whose statistics nobody asked for yet
@@ -725,6 +809,21 @@ struct StatisticsPropagator {
     aliases: HashMap<ColumnBinding, ColumnBinding>,
     /// bindings an outer join puts NULLs in
     nullable: HashSet<ColumnBinding>,
+    /// `StatisticsPropagationMode::FILTER_SIMPLIFICATION`
+    filter_simplification: bool,
+    /// `filter_bindings_changed`
+    filter_bindings_changed: bool,
+    /// the plan writes (`HasSideEffects`): its statistics may not see the rows it adds, NULLs among them
+    side_effects: bool,
+    /// the filter being propagated is on a scan, where it becomes a table filter
+    filter_on_scan: bool,
+    /// the expression being propagated is a conjunct of a filter on a scan that reads one column,
+    /// which C++ makes a table filter that the column's statistics decide (`ExpressionFilter::CheckStatistics`)
+    scan_prefix: bool,
+    /// `cte_stats_map`: the statistics of the columns of each materialized CTE's definition
+    ctes: HashMap<usize, Vec<Stats>>,
+    /// the most rows each materialized CTE's definition has
+    cte_rows: HashMap<usize, Option<u64>>,
 }
 
 impl StatisticsPropagator {
@@ -782,6 +881,7 @@ impl StatisticsPropagator {
     fn expression(&mut self, expr: &mut BoundExpr, in_filter: bool) -> Stats {
         match &mut expr.kind {
             BoundExprKind::Constant(value) if value.is_null() => Stats {
+                variant: None,
                 min: None,
                 max: None,
                 can_be_null: true,
@@ -790,7 +890,16 @@ impl StatisticsPropagator {
                     .filter(|_| expr.return_type.id() == LogicalTypeId::Geometry),
                 strings: None,
                 distinct: None,
+                children: Vec::new(),
             },
+            BoundExprKind::Constant(value)
+                if matches!(
+                    expr.return_type.id(),
+                    LogicalTypeId::List | LogicalTypeId::Array | LogicalTypeId::Struct
+                ) =>
+            {
+                value_stats(value, &expr.return_type)
+            }
             BoundExprKind::Constant(value) => {
                 let geometry = geometry_stats_of(value);
                 let strings = match (expr.return_type.id(), value.data()) {
@@ -805,6 +914,7 @@ impl StatisticsPropagator {
                 };
                 let value = has_ordered_statistics(&expr.return_type).then(|| value.clone());
                 Stats {
+                    variant: None,
                     min: value.clone(),
                     max: value,
                     can_be_null: false,
@@ -812,6 +922,7 @@ impl StatisticsPropagator {
                     geometry,
                     strings,
                     distinct: None,
+                    children: Vec::new(),
                 }
             }
             BoundExprKind::ColumnRef { binding, depth: 0 } => {
@@ -820,9 +931,16 @@ impl StatisticsPropagator {
             }
             BoundExprKind::Comparison { .. } => self.comparison(expr, in_filter),
             BoundExprKind::Between { .. } => self.between(expr, in_filter),
-            BoundExprKind::Conjunction { children, .. } => {
-                for child in children {
+            BoundExprKind::Conjunction { children, and } => {
+                for child in children.iter_mut() {
                     self.expression(child, in_filter);
+                }
+                if *and {
+                    simplify_constant_or_null(children);
+                    if children.len() == 1 {
+                        let only = children.remove(0);
+                        *expr = only;
+                    }
                 }
                 unknown()
             }
@@ -836,7 +954,8 @@ impl StatisticsPropagator {
             } => self.coalesce(expr),
             // TRY has its own idea of errors, a subquery and a lambda their own columns
             BoundExprKind::Operator {
-                op: BoundOperator::Try, ..
+                op: BoundOperator::Try | BoundOperator::HasError,
+                ..
             }
             | BoundExprKind::Subquery { .. }
             | BoundExprKind::ListLambda { .. } => unknown(),
@@ -893,9 +1012,25 @@ impl StatisticsPropagator {
             return unknown();
         }
         let can_be_null = left_stats.can_be_null || right_stats.can_be_null;
-        if !left_stats.can_be_valid || !right_stats.can_be_valid {
+        // a side that is only NULL makes NULL; one without any value (a column of an empty table)
+        // prunes a filter (`FILTER_ALWAYS_FALSE`), but a projection keeps the comparison
+        let only_null = |stats: &Stats| stats.can_be_null && !stats.can_be_valid;
+        let empty = |stats: &Stats| !stats.can_be_null && !stats.can_be_valid;
+        if only_null(&left_stats) || only_null(&right_stats) {
             let alias = expr.alias.clone();
             *expr = BoundExpr::constant(Value::null(LogicalType::BOOLEAN)).with_alias(alias);
+            return unknown();
+        }
+        // `ExpressionFilter::CheckStatistics` of a table filter on the column; elsewhere there is no
+        // minimum and maximum to decide by
+        let bare_empty = |stats: &Stats, side: &BoundExpr| {
+            empty(stats) && matches!(side.kind, BoundExprKind::ColumnRef { depth: 0, .. })
+        };
+        if bare_empty(&left_stats, left) || bare_empty(&right_stats, right) {
+            if in_filter && self.filter_on_scan {
+                let alias = expr.alias.clone();
+                *expr = BoundExpr::constant(Value::boolean(false)).with_alias(alias);
+            }
             return unknown();
         }
         if let Some(answer) = decide(op, &left_stats, &right_stats) {
@@ -1033,12 +1168,63 @@ impl StatisticsPropagator {
         let BoundExprKind::Cast { child, try_cast } = &mut expr.kind else {
             unreachable!()
         };
+        // `FunctionNullHandling::SPECIAL_HANDLING`: a TRY_CAST gives NULL of what doesn't convert
         let try_cast = *try_cast;
-        let stats = self.expression(child, false);
-        // a value that does not fit fails, or is NULL with TRY_CAST
-        if try_cast || !child.return_type.is_integral() || !target.is_integral() {
+        let mut stats = self.expression(child, false);
+        // `StatisticsPropagateToVariant`: what is shredded are the values, a TRY_CAST makes the VARIANT NULL
+        if target.id() == LogicalTypeId::Variant {
+            let mut result =
+                super::variant_statistics::cast_to_variant(&child.return_type, &stats).unwrap_or_else(unknown);
+            result.can_be_null |= try_cast;
+            return result;
+        }
+        if try_cast {
+            stats.can_be_null = true;
+        }
+        // `StatisticsPropagateVariant`
+        if child.return_type.id() == LogicalTypeId::Variant {
+            return super::variant_statistics::cast_from_variant(&stats, &target).unwrap_or_else(unknown);
+        }
+        // `CastStatistics::CanPropagate`: of numbers to numbers, by their physical types, DECIMAL
+        // too; a DATE or a TIMESTAMP, whose -infinity sorts above its smallest values, is left out
+        let numeric = |ty: &LogicalType| {
+            ty.id() != LogicalTypeId::Enum
+                && matches!(
+                    ty.physical_type(),
+                    PhysicalType::Int8
+                        | PhysicalType::Int16
+                        | PhysicalType::Int32
+                        | PhysicalType::Int64
+                        | PhysicalType::Int128
+                        | PhysicalType::UInt8
+                        | PhysicalType::UInt16
+                        | PhysicalType::UInt32
+                        | PhysicalType::UInt64
+                        | PhysicalType::UInt128
+                        | PhysicalType::Float
+                        | PhysicalType::Double
+                )
+        };
+        let temporal = |ty: &LogicalType| {
+            matches!(
+                ty.id(),
+                LogicalTypeId::Date
+                    | LogicalTypeId::Time
+                    | LogicalTypeId::TimeTz
+                    | LogicalTypeId::Timestamp
+                    | LogicalTypeId::TimestampTz
+                    | LogicalTypeId::TimestampSec
+                    | LogicalTypeId::TimestampMs
+                    | LogicalTypeId::TimestampNs
+                    | LogicalTypeId::TimestampTzNs
+                    | LogicalTypeId::Interval
+            )
+        };
+        let source = &child.return_type;
+        if !numeric(source) || !numeric(&target) || temporal(source) || temporal(&target) {
             return unknown();
         }
+        // a value that does not fit fails, or is NULL with TRY_CAST: with both bounds fitting, all do
         let convert = |value: Option<Value>| {
             let cast = BoundExpr::constant(value?).cast_to(&target, false);
             let converted = crate::execution::expression_executor::try_evaluate_scalar(&cast)?;
@@ -1066,7 +1252,174 @@ impl StatisticsPropagator {
         else {
             unreachable!()
         };
+        let scan_prefix = self.scan_prefix;
         let mut stats: Vec<Stats> = children.iter_mut().map(|c| self.expression(c, false)).collect();
+        // `prefix` of strings that all start with it, or that all sort outside of the strings that do,
+        // as the range C++ puts in the scan for it
+        if scan_prefix
+            && matches!(function.name.as_str(), "prefix" | "starts_with" | "^@")
+            && let [child, needle] = stats.as_slice()
+            && let BoundExprKind::Constant(needle_value) = &children[1].kind
+            && !needle_value.is_null()
+            && needle.can_be_valid
+            && let (Some(min), Some(max)) = (&child.min, &child.max)
+            && let (Ok(min), Ok(max), Ok(prefix)) = (min.try_to_string(), max.try_to_string(), needle_value.try_to_string())
+            && !children[0].is_volatile()
+        {
+            // C++'s string statistics keep 12 bytes of the bounds
+            let provable = prefix.len() <= crate::execution::zone_map::STRING_STATISTICS_BYTES;
+            let answer = if !provable {
+                None
+            } else if min.starts_with(&prefix) && max.starts_with(&prefix) {
+                Some(true)
+            } else if max.as_str() < prefix.as_str() || (min.as_str() > prefix.as_str() && !min.starts_with(&prefix)) {
+                Some(false)
+            } else {
+                None
+            };
+            if let Some(answer) = answer {
+                let alias = expr.alias.clone();
+                let can_be_null = child.can_be_null;
+                let constant = BoundExpr::constant(Value::boolean(answer));
+                // NULL where the string is
+                *expr = if can_be_null {
+                    crate::function::constant_or_null(vec![constant, children[0].clone()])
+                } else {
+                    constant
+                }
+                .with_alias(alias);
+                return Stats {
+                    min: Some(Value::boolean(answer)),
+                    max: Some(Value::boolean(answer)),
+                    can_be_null,
+                    ..unknown()
+                };
+            }
+        }
+        // `ArrayGenericFoldStats`: NULL where an array is, and no error where no element is NULL
+        if matches!(
+            function.name.as_str(),
+            "array_distance"
+                | "array_inner_product"
+                | "array_dot_product"
+                | "array_negative_inner_product"
+                | "array_negative_dot_product"
+                | "array_cosine_similarity"
+                | "array_cosine_distance"
+        ) && let [left, right] = stats.as_slice()
+            && children.iter().all(|c| c.return_type.id() == LogicalTypeId::Array)
+        {
+            let elements_valid = [left, right]
+                .iter()
+                .all(|s| s.children.first().is_some_and(|element| !element.can_be_null));
+            if elements_valid {
+                *function = Arc::new(function.infallible());
+            }
+            return Stats {
+                can_be_null: left.can_be_null || right.can_be_null,
+                can_be_valid: left.can_be_valid && right.can_be_valid,
+                ..unknown()
+            };
+        }
+        // a function that gives NULL for NULL, of an argument that is only NULL, is only NULL
+        if matches!(
+            function.name.as_str(),
+            "array_extract" | "list_extract" | "list_element" | "map_extract_value" | "split_part" | "lower" | "upper"
+                | "length" | "substring" | "substr" | "replace" | "trim" | "ltrim" | "rtrim" | "left" | "right"
+        ) && !expr_is_volatile_function(&function.name)
+            && stats.iter().any(|s| s.can_be_null && !s.can_be_valid)
+        {
+            return Stats {
+                can_be_null: true,
+                can_be_valid: false,
+                ..unknown()
+            };
+        }
+        // `SubstringPropagateStats`, `SubstringGraphemePropagateStats` and `RepeatStringStats`: the longest
+        // string of the result
+        if let Some(max_length) = string_function_max_length(&function.name, children, &stats) {
+            let child = &stats[0];
+            // `PropagateStrictFunctionValidity`
+            let mut result = Stats {
+                can_be_null: stats.iter().any(|s| s.can_be_null),
+                can_be_valid: stats.iter().all(|s| s.can_be_valid),
+                strings: Some(crate::catalog::StringStatistics {
+                    bounds: None,
+                    has_unicode: child.strings.as_ref().is_none_or(|s| s.has_unicode),
+                    min_length: None,
+                    max_length: Some(max_length),
+                    total_length: None,
+                }),
+                ..unknown()
+            };
+            if function.name == "repeat" {
+                // the result is known to fit in a string
+                *function = Arc::new(function.infallible());
+                result.can_be_valid = child.can_be_valid && stats[1].can_be_valid;
+            }
+            return result;
+        }
+        // `left(s, 0)` is the empty string
+        if function.name == "left"
+            && let [child, _] = stats.as_slice()
+            && matches!(&children[1].kind, BoundExprKind::Constant(v) if v.as_i128() == Some(0))
+        {
+            return Stats {
+                min: Some(Value::varchar("")),
+                max: Some(Value::varchar("")),
+                can_be_null: child.can_be_null,
+                can_be_valid: child.can_be_valid,
+                ..unknown()
+            };
+        }
+        // `CaseConvertPropagateStats`: `lower` and `upper` are NULL only for a NULL, and say nothing of the
+        // lengths of their strings
+        if matches!(function.name.as_str(), "lower" | "upper" | "lcase" | "ucase")
+            && let [child] = stats.as_slice()
+        {
+            return Stats {
+                can_be_null: child.can_be_null,
+                can_be_valid: child.can_be_valid,
+                ..unknown()
+            };
+        }
+        // `StringStats` of `length`: the longest string bounds it, and so does the shortest without unicode
+        if matches!(function.name.as_str(), "length" | "len" | "char_length" | "character_length" | "strlen" | "octet_length")
+            && let [child] = stats.as_slice()
+            && let Some(strings) = &child.strings
+            && let Some(max) = strings.max_length
+        {
+            let bytes = matches!(function.name.as_str(), "strlen" | "octet_length");
+            let shortest = strings.min_length.unwrap_or(0);
+            // a character takes at most 4 bytes
+            let min = if bytes || !strings.has_unicode { shortest } else { shortest.div_ceil(4) };
+            return Stats {
+                min: Some(Value::bigint(min as i64)),
+                max: Some(Value::bigint(max as i64)),
+                can_be_null: child.can_be_null,
+                ..unknown()
+            };
+        }
+        // `isnan` of a float whose largest value is a number: NaN sorts above every number
+        if function.name == "isnan"
+            && let [child] = stats.as_slice()
+            && !child.can_be_null
+            && child.max.as_ref().is_some_and(|max| match max.data() {
+                duckrs_common::value::ValueData::Float(f) => !f.is_nan(),
+                duckrs_common::value::ValueData::Double(d) => !d.is_nan(),
+                _ => false,
+            })
+            && !children[0].is_volatile()
+        {
+            let alias = expr.alias.clone();
+            *expr = BoundExpr::constant(Value::boolean(false)).with_alias(alias);
+            return Stats {
+                min: Some(Value::boolean(false)),
+                max: Some(Value::boolean(false)),
+                can_be_null: false,
+                ..unknown()
+            };
+        }
         // `PropagateLeastGreatestStats`: one of the inputs; only those that are never NULL anchor the far side
         if matches!(function.name.as_str(), "least" | "greatest")
             && !children.is_empty()
@@ -1110,6 +1463,7 @@ impl StatisticsPropagator {
             }
             let (min, max) = if least { (loose, anchored) } else { (anchored, loose) };
             return Stats {
+                variant: None,
                 min,
                 max,
                 can_be_null: !has_nonnull,
@@ -1117,14 +1471,92 @@ impl StatisticsPropagator {
                 geometry: None,
                 strings: None,
                 distinct: None,
+                children: Vec::new(),
             };
+        }
+        // `StructPackStats`, `ListValueStats`, `StructExtractStats`, `ListExtractStats`
+        match function.name.as_str() {
+            "struct_pack" | "row" if return_type.id() == LogicalTypeId::Struct => {
+                return Stats {
+                    can_be_null: false,
+                    can_be_valid: true,
+                    children: stats,
+                    ..unknown()
+                };
+            }
+            // `StructConcatStats`, `StructInsertStats`, `StructUpdateStats`: a struct, also of NULL inputs
+            "struct_concat" | "struct_insert" | "struct_update" if return_type.id() == LogicalTypeId::Struct => {
+                return Stats {
+                    can_be_null: false,
+                    can_be_valid: true,
+                    ..unknown()
+                };
+            }
+            "list_value" | "list_pack" if matches!(return_type.id(), LogicalTypeId::List) => {
+                let child = stats.into_iter().reduce(union).unwrap_or_else(|| Stats {
+                    can_be_null: false,
+                    can_be_valid: false,
+                    ..unknown()
+                });
+                return Stats {
+                    can_be_null: false,
+                    can_be_valid: true,
+                    children: vec![child],
+                    ..unknown()
+                };
+            }
+            "variant_extract" if children.len() == 2 && children[0].return_type.id() == LogicalTypeId::Variant => {
+                if let BoundExprKind::Constant(key) = &children[1].kind
+                    && let Some(result) = super::variant_statistics::extract(&stats[0], key)
+                {
+                    return result;
+                }
+                return unknown();
+            }
+            "struct_extract" if children.len() == 2 && children[0].return_type.id() == LogicalTypeId::Struct => {
+                let position = match &children[1].kind {
+                    BoundExprKind::Constant(key) => match key.data() {
+                        duckrs_common::value::ValueData::Bytes(name) => {
+                            let name = String::from_utf8_lossy(name);
+                            children[0]
+                                .return_type
+                                .struct_children()
+                                .iter()
+                                .position(|(field, _)| field.eq_ignore_ascii_case(&name))
+                        }
+                        _ => key.as_i128().and_then(|i| usize::try_from(i).ok()),
+                    },
+                    _ => None,
+                };
+                if let Some(child) = position.and_then(|at| stats[0].children.get(at)) {
+                    let mut child = child.clone();
+                    child.can_be_null |= stats[0].can_be_null;
+                    return child;
+                }
+                return unknown();
+            }
+            "array_extract" | "list_extract" | "list_element"
+                if children.len() == 2
+                    && matches!(children[0].return_type.id(), LogicalTypeId::List | LogicalTypeId::Array) =>
+            {
+                // an index past the end is NULL
+                if let Some(child) = stats[0].children.first() {
+                    let mut child = child.clone();
+                    child.can_be_null = true;
+                    return child;
+                }
+                return unknown();
+            }
+            _ => {}
         }
         // `StatsPropagateStats`: `stats()` gets the statistics of its argument as a constant
         if function.name == "stats" && children.len() == 1 {
             let argument = children[0].return_type.clone();
             // `DistinctStatistics` of a table's column: only what a column of it is has them
             let mut argument_stats = stats[0].clone();
+            // a VARIANT column has no `DistinctStatistics`
             if let BoundExprKind::ColumnRef { binding, depth: 0 } = &children[0].kind
+                && argument.id() != LogicalTypeId::Variant
                 && let Some((table, column)) = self.sources.get(&self.base_of(*binding)).cloned()
             {
                 argument_stats.distinct = table_distinct_counts(&table)
@@ -1138,6 +1570,89 @@ impl StatisticsPropagator {
                 children.push(BoundExpr::constant(value));
             }
             return unknown();
+        }
+        // `DateTruncStatistics`: with a constant part, the bounds are those of the truncated bounds
+        if matches!(function.name.as_str(), "date_trunc" | "datetrunc")
+            && children.len() == 2
+            && return_type.id() == LogicalTypeId::Timestamp
+            && matches!(
+                children[1].return_type.id(),
+                LogicalTypeId::Date | LogicalTypeId::Timestamp
+            )
+        {
+            let part = match &children[0].kind {
+                BoundExprKind::Constant(value) if !value.is_null() => value.try_to_string().ok(),
+                _ => None,
+            };
+            let supported = part.is_some_and(|part| {
+                matches!(
+                    part.to_lowercase().as_str(),
+                    "millennium" | "millennia" | "mil" | "mils" | "millenia"
+                        | "century" | "centuries" | "cent" | "c"
+                        | "decade" | "decades" | "dec" | "decs"
+                        | "year" | "years" | "y" | "yr" | "yrs"
+                        | "quarter" | "quarters"
+                        | "month" | "months" | "mon" | "mons"
+                        | "week" | "weeks" | "w" | "weekofyear" | "yearweek"
+                        | "isoyear"
+                        | "day" | "days" | "d" | "dayofmonth"
+                        | "dow" | "dayofweek" | "weekday" | "isodow" | "doy" | "dayofyear" | "julian" | "jd"
+                        | "hour" | "hours" | "h" | "hr" | "hrs"
+                        | "minute" | "minutes" | "min" | "mins" | "m"
+                        | "second" | "seconds" | "sec" | "secs" | "s" | "epoch"
+                        | "millisecond" | "milliseconds" | "ms" | "msec" | "msecs" | "msecond" | "mseconds"
+                        | "microsecond" | "microseconds" | "us" | "usec" | "usecs" | "usecond" | "useconds"
+                )
+            });
+            let (Some(min), Some(max)) = (stats[1].min.clone(), stats[1].max.clone()) else {
+                return unknown();
+            };
+            if !supported || compare_values(ComparisonOp::GreaterThan, &min, &max) != Some(false) {
+                return unknown();
+            }
+            let truncate = |bound: Value| {
+                let call = BoundExpr {
+                    kind: BoundExprKind::Function {
+                        function: function.clone(),
+                        children: vec![children[0].clone(), BoundExpr::constant(bound)],
+                        is_operator: *is_operator,
+                    },
+                    ..BoundExpr::new(BoundExprKind::Reference(0), return_type.clone())
+                };
+                crate::execution::expression_executor::try_evaluate_scalar(&call)
+                    .filter(|value| value.logical_type().id() == LogicalTypeId::Timestamp)
+            };
+            let (Some(min), Some(max)) = (truncate(min), truncate(max)) else {
+                return unknown();
+            };
+            return Stats {
+                variant: None,
+                min: Some(min),
+                max: Some(max),
+                can_be_null: stats[0].can_be_null || stats[1].can_be_null,
+                can_be_valid: stats[0].can_be_valid && stats[1].can_be_valid,
+                geometry: None,
+                strings: None,
+                distinct: None,
+                children: Vec::new(),
+            };
+        }
+        let part = match (function.name.as_str(), children.len()) {
+            ("date_part" | "datepart", 2) => match &children[0].kind {
+                BoundExprKind::Constant(value) if !value.is_null() => value
+                    .try_to_string()
+                    .ok()
+                    .map(|part| format!("date_part:{}", part.to_lowercase())),
+                _ => None,
+            },
+            (name, 1) => Some(name.to_string()),
+            _ => None,
+        };
+        if let Some(part) = part {
+            let at = children.len() - 1;
+            if let Some(result) = date_part_stats(&part, &stats[at], &children[at].return_type, &return_type) {
+                return result;
+            }
         }
         if function.name == "vertex_extract" && children.len() == 2 {
             let coordinate = match &children[1].kind {
@@ -1154,7 +1669,12 @@ impl StatisticsPropagator {
             }
             return result;
         }
-        if function.name == "constant_or_null" && stats[1..].iter().all(|s| !s.can_be_null) {
+        // `ConstantOrNullSimplification`: folding drops the NULL check, which a plan that adds rows can't;
+        // empty statistics (of no rows) describe no value (`TryInferConstantBounds`)
+        if function.name == "constant_or_null"
+            && !self.side_effects
+            && stats[1..].iter().all(|s| !s.can_be_null && s.can_be_valid)
+        {
             let alias = expr.alias.clone();
             let value = children.swap_remove(0);
             *expr = value.with_alias(alias);
@@ -1198,6 +1718,7 @@ impl StatisticsPropagator {
                 (0, negated_low.max(high))
             };
             return Stats {
+                variant: None,
                 min: int_value(min),
                 max: int_value(max),
                 can_be_null: child.can_be_null,
@@ -1205,6 +1726,7 @@ impl StatisticsPropagator {
                 geometry: None,
                 strings: None,
                 distinct: None,
+                children: Vec::new(),
             };
         }
         if children.len() == 2 && return_type.is_integral() && matches!(function.name.as_str(), "%" | "//") {
@@ -1257,6 +1779,7 @@ impl StatisticsPropagator {
                 return unknown();
             };
             return Stats {
+                variant: None,
                 min: int_value(min),
                 max: int_value(max),
                 can_be_null,
@@ -1264,10 +1787,17 @@ impl StatisticsPropagator {
                 geometry: None,
                 strings: None,
                 distinct: None,
+                children: Vec::new(),
             };
         }
-        if !*is_operator || children.len() != 2 || !return_type.is_integral() {
-            return unknown();
+        let floating = matches!(return_type.id(), LogicalTypeId::Float | LogicalTypeId::Double);
+        let decimal = return_type.id() == LogicalTypeId::Decimal;
+        let arithmetic = *is_operator
+            && children.len() == 2
+            && (return_type.is_integral() || floating || decimal)
+            && matches!(function.name.as_str(), "+" | "-" | "*");
+        if !arithmetic {
+            return monotone_bounds(function, *is_operator, children, &stats, &return_type).unwrap_or_else(unknown);
         }
         let right = stats.pop().expect("two children");
         let left = stats.pop().expect("two children");
@@ -1282,7 +1812,12 @@ impl StatisticsPropagator {
         let apply = |x: &Value, y: &Value| {
             let call = expr_with_constants(function, x, y, &return_type);
             let value = crate::execution::expression_executor::try_evaluate_scalar(&call)?;
-            (value.logical_type() == &return_type).then_some(value)
+            if value.logical_type() == &return_type {
+                return Some(value);
+            }
+            // a DECIMAL of another width, as the bound function gives it
+            let cast = BoundExpr::constant(value).cast_to(&return_type, true);
+            crate::execution::expression_executor::try_evaluate_scalar(&cast).filter(|v| v.logical_type() == &return_type)
         };
         let corners: Option<Vec<Value>> = match function.name.as_str() {
             "+" => [apply(&a, &c), apply(&b, &d)].into_iter().collect(),
@@ -1426,9 +1961,42 @@ impl StatisticsPropagator {
             unreachable!()
         };
         let mut kept = Vec::with_capacity(expressions.len());
+        let on_scan = matches!(op.children[0].kind, K::Get { .. });
         for mut expr in std::mem::take(expressions) {
-            self.expression(&mut expr, true);
-            rewrite_expression(&mut expr, true);
+            let outer = std::mem::replace(&mut self.filter_on_scan, on_scan);
+            self.handle_filter(&mut expr);
+            self.filter_on_scan = outer;
+            // `constant_or_null(false, x)` is false or NULL, which a filter does not let through
+            let never = matches!(&expr.kind, BoundExprKind::Function { function, children, .. }
+                if function.name == "constant_or_null"
+                    && matches!(&children[0].kind, BoundExprKind::Constant(v) if v.data() == &ValueData::Bool(false)));
+            if never {
+                *op = empty_result(op);
+                return;
+            }
+            // `ExpressionFilter::CheckStatistics` of the IN lists `PushdownGet` put into the scan
+            if matches!(op.children[0].kind, K::Get { .. }) {
+                match self.check_in_list(&expr) {
+                    Some(InListResult::Never) => {
+                        *op = empty_result(op);
+                        return;
+                    }
+                    Some(InListResult::Always) => continue,
+                    Some(InListResult::TrueOrNull(column)) => {
+                        let not_null = BoundExpr::new(
+                            BoundExprKind::Operator {
+                                op: BoundOperator::IsNotNull,
+                                children: vec![column],
+                            },
+                            LogicalType::BOOLEAN,
+                        );
+                        self.update_from_filter(&not_null);
+                        kept.push(not_null);
+                        continue;
+                    }
+                    None => {}
+                }
+            }
             match fold_boolean(&expr) {
                 Some(Some(true)) => {}
                 Some(_) => {
@@ -1441,6 +2009,48 @@ impl StatisticsPropagator {
                 }
             }
         }
+        simplify_constant_or_null(&mut kept);
+        // as a table filter (which a filter that can fail keeps it from becoming), where the statistics then
+        // tell it is always true: not in a plan that adds rows, which they don't see
+        if !self.side_effects && !kept.iter().any(crate::optimizer::rewriter::can_throw) {
+            kept = kept.into_iter().map(|expr| true_or_null_as_not_null(expr, &op.children[0])).collect();
+        }
+        // `x != a AND x != b ...` that leaves no value of an integer column's range (a NOT IN list
+        // covering it) is never true
+        let mut excluded: HashMap<ColumnBinding, HashSet<i128>> = HashMap::new();
+        for expr in &kept {
+            if let BoundExprKind::Comparison {
+                op: ComparisonOp::NotEqual,
+                left,
+                right,
+            } = &expr.kind
+            {
+                let (column, constant) = match (&left.kind, &right.kind) {
+                    (BoundExprKind::ColumnRef { binding, depth: 0 }, BoundExprKind::Constant(c))
+                    | (BoundExprKind::Constant(c), BoundExprKind::ColumnRef { binding, depth: 0 }) => (*binding, c),
+                    _ => continue,
+                };
+                if let Some(value) = constant.as_i128() {
+                    excluded.entry(column).or_default().insert(value);
+                }
+            }
+        }
+        for (column, values) in excluded {
+            let stats = self.lookup(column);
+            let (Some(min), Some(max)) = (
+                stats.min.as_ref().and_then(Value::as_i128),
+                stats.max.as_ref().and_then(Value::as_i128),
+            ) else {
+                continue;
+            };
+            if stats.min.as_ref().is_some_and(|v| !v.logical_type().is_integral()) {
+                continue;
+            }
+            if max >= min && max - min < values.len() as i128 + 1 && (min..=max).all(|v| values.contains(&v)) {
+                *op = empty_result(op);
+                return;
+            }
+        }
         if kept.is_empty() {
             *op = op.children.remove(0);
         } else {
@@ -1448,25 +2058,124 @@ impl StatisticsPropagator {
         }
     }
 
+    /// `CheckInOperatorStatistics` and `CheckNotOperatorStatistics`, for `col IN (...)` and
+    /// `NOT (col IN (...))` of constants.
+    fn check_in_list(&mut self, expr: &BoundExpr) -> Option<InListResult> {
+        let (list, negated) = match &expr.kind {
+            BoundExprKind::Operator {
+                op: BoundOperator::Not,
+                children,
+            } if children.len() == 1 => (&children[0], true),
+            _ => (expr, false),
+        };
+        let BoundExprKind::Operator {
+            op: BoundOperator::In,
+            children,
+        } = &list.kind
+        else {
+            return None;
+        };
+        if children.len() < 2 {
+            return None;
+        }
+        // `NOT (x IN (NULL))` is never true
+        if negated && children.len() == 2 && matches!(&children[1].kind, BoundExprKind::Constant(v) if v.is_null()) {
+            return Some(InListResult::Never);
+        }
+        let BoundExprKind::ColumnRef { binding, depth: 0 } = &children[0].kind else {
+            return None;
+        };
+        let mut values = Vec::with_capacity(children.len() - 1);
+        for child in &children[1..] {
+            let BoundExprKind::Constant(value) = &child.kind else {
+                return None;
+            };
+            if !value.is_null() {
+                values.push(value.clone());
+            }
+        }
+        let stats = self.lookup(*binding);
+        let result = if values.is_empty() || !stats.can_be_valid {
+            InListResult::Never
+        } else {
+            match in_zonemap(&stats, &values) {
+                Some(true) if stats.can_be_null => InListResult::TrueOrNull(children[0].clone()),
+                Some(true) => InListResult::Always,
+                Some(false) => InListResult::Never,
+                None => return None,
+            }
+        };
+        if !negated {
+            return Some(result);
+        }
+        // a list matching every row makes NOT match none; one matching none may be NULL, which NOT keeps
+        match result {
+            InListResult::Always | InListResult::TrueOrNull(_) => Some(InListResult::Never),
+            InListResult::Never => None,
+        }
+    }
+
+    /// `HandleFilter`, up to classifying the result.
+    fn handle_filter(&mut self, expr: &mut BoundExpr) {
+        let before = self.filter_simplification.then(|| filter_bindings(expr));
+        self.scan_prefix = self.filter_on_scan && {
+            let mut columns = HashSet::new();
+            expr.walk_mut(&mut |e| {
+                if let BoundExprKind::ColumnRef { binding, .. } = e.kind {
+                    columns.insert(binding);
+                }
+            });
+            columns.len() == 1
+        };
+        self.expression(expr, true);
+        self.scan_prefix = false;
+        super::rewriter::rewrite_pushed_filter(expr);
+        if let Some(before) = before {
+            simplify_filter(expr);
+            self.filter_bindings_changed |= before != filter_bindings(expr);
+        }
+    }
+
     /// `PropagateStatistics(LogicalJoin)`.
     fn join(&mut self, op: &mut LogicalOperator) {
         let K::Join {
-            join_type,
-            conditions,
-            predicate,
+            join_type, conditions, ..
         } = &mut op.kind
         else {
             unreachable!()
         };
         let join_type = *join_type;
-        let matches_only = matches!(join_type, JoinType::Inner | JoinType::Semi);
+        let matches_only = matches!(join_type, JoinType::Inner | JoinType::Semi | JoinType::RightSemi);
         let mut no_rows = false;
         let mut right_is_empty = false;
-        for condition in conditions.iter_mut().filter(|c| !c.null_safe) {
+        // the filters the ranges of the keys after the join make for each side (`CreateFilterFromJoinStats`)
+        let mut range_filters: [Vec<BoundExpr>; 2] = [Vec::new(), Vec::new()];
+        // `SimplifyDistinctComparison` with `ComparisonContext::JOIN`: a join rejects the NULL pairs too,
+        // so with one side without NULLs `IS NOT DISTINCT FROM` is `=`
+        for condition in conditions.iter_mut() {
+            if !matches!(condition.comparison, ComparisonOp::NotDistinctFrom | ComparisonOp::DistinctFrom) {
+                continue;
+            }
+            let nested = |e: &BoundExpr| {
+                matches!(e.return_type.id(), LogicalTypeId::Union | LogicalTypeId::Tuple)
+            };
+            if nested(&condition.left) || nested(&condition.right) {
+                continue;
+            }
+            let left_not_null = !self.expression(&mut condition.left.clone(), false).can_be_null;
+            let right_not_null = !self.expression(&mut condition.right.clone(), false).can_be_null;
+            condition.comparison = match condition.comparison {
+                ComparisonOp::NotDistinctFrom if left_not_null || right_not_null => ComparisonOp::Equal,
+                ComparisonOp::DistinctFrom if left_not_null && right_not_null => ComparisonOp::NotEqual,
+                other => other,
+            };
+        }
+        for condition in conditions.iter_mut().filter(|c| !c.null_safe()) {
             let left = self.expression(&mut condition.left, false);
             let right = self.expression(&mut condition.right, false);
-            let never =
-                decide(ComparisonOp::Equal, &left, &right) == Some(false) || !left.can_be_valid || !right.can_be_valid;
+            // `PropagateComparison`: without minimum and maximum nothing is decided, not even for a
+            // side without values
+            let never = decide(ComparisonOp::Equal, &left, &right) == Some(false);
             no_rows |= matches_only && never;
             right_is_empty |= join_type == JoinType::Left && never;
             if let (
@@ -1475,12 +2184,45 @@ impl StatisticsPropagator {
                 BoundExprKind::ColumnRef { binding: b, depth: 0 },
             ) = (matches_only, &condition.left.kind, &condition.right.kind)
             {
-                self.update_columns(ComparisonOp::Equal, *a, *b);
+                let (a, b) = (*a, *b);
+                self.update_columns(ComparisonOp::Equal, a, b);
+                for (side, (expr, before)) in [(&condition.left, &left), (&condition.right, &right)].into_iter().enumerate() {
+                    let binding = if side == 0 { a } else { b };
+                    let after = self.lookup(binding);
+                    range_filters[side].extend(join_range_filters(expr, before, &after));
+                }
             }
         }
+        for (side, filters) in range_filters.into_iter().enumerate() {
+            // C++ evaluates the filters already on a scan before those it adds: one that can fail fails
+            // on the rows the range would have left out, as here it would not
+            // `CreateFilterFromJoinStats` waits for the joins to be ordered
+            if filters.is_empty() || no_rows || self.filter_simplification || has_failing_filter(&op.children[side]) {
+                continue;
+            }
+            let child = std::mem::replace(&mut op.children[side], LogicalOperator::new(K::CrossProduct, Vec::new()));
+            let filtered = LogicalOperator::new(K::Filter { expressions: filters }, vec![child]);
+            op.children[side] = super::filter_pushdown::push_down(filtered);
+        }
+        let K::Join {
+            conditions,
+            predicate,
+            ..
+        } = &mut op.kind
+        else {
+            unreachable!()
+        };
+        // `PropagateStatistics(LogicalAnyJoin)`: the condition of an outer join is an expression, not a
+        // filter: an OR keeps a branch that is false or NULL. What duckrs keeps as the condition of an
+        // inner join, C++ has as a filter above it
+        let in_filter = join_type == JoinType::Inner;
         if let Some(condition) = predicate {
-            self.expression(condition, true);
-            rewrite_expression(condition, true);
+            if in_filter {
+                self.handle_filter(condition);
+            } else {
+                self.expression(condition, in_filter);
+                rewrite_expression(condition, in_filter);
+            }
             match fold_boolean(condition) {
                 Some(Some(true)) => *predicate = None,
                 Some(_) => {
@@ -1566,8 +2308,39 @@ impl StatisticsPropagator {
     }
 
     fn visit(&mut self, op: &mut LogicalOperator) {
-        for child in &mut op.children {
+        for (at, child) in op.children.iter_mut().enumerate() {
             self.visit(child);
+            // `PropagateStatistics(LogicalMaterializedCTE)`: the definition runs once, so what holds
+            // for its columns holds for each scan of it
+            if at == 0
+                && let K::MaterializedCte { table_index, .. } = &op.kind
+            {
+                let columns = child.column_bindings().into_iter().map(|b| self.lookup(b)).collect();
+                self.ctes.insert(*table_index, columns);
+                let rows = self.max_rows(child);
+                self.cte_rows.insert(*table_index, rows);
+            }
+        }
+        // `PropagateStatistics(LogicalLimit)`: a limit above fewer rows than it lets through does nothing
+        if let K::Limit {
+            limit: Some(limit),
+            offset: 0,
+            failure: None,
+        } = &op.kind
+            && self.max_rows(&op.children[0]).is_some_and(|rows| rows < *limit)
+        {
+            *op = op.children.remove(0);
+            return;
+        }
+        // `PropagateStatistics(LogicalCTERef)`
+        if let K::CteRef {
+            table_index, cte_index, ..
+        } = &op.kind
+            && let Some(columns) = self.ctes.get(cte_index)
+        {
+            for (i, stats) in columns.clone().into_iter().enumerate() {
+                self.stats.insert(ColumnBinding::new(*table_index, i), stats);
+            }
         }
         self.count_valid_as_count_star(op);
         // `ParquetCopyToPropagateStatistics`: columns that can't be NULL are written REQUIRED
@@ -1630,24 +2403,74 @@ impl StatisticsPropagator {
                 groups,
                 grouping_sets,
                 aggregates,
+                grouping_functions,
+                perfect_hash,
+                domain_cap,
                 ..
             } if grouping_sets.len() <= 1 && grouping_sets.iter().all(|set| set.len() == groups.len()) => {
+                *perfect_hash = !self.filter_simplification
+                    && grouping_functions.is_empty()
+                    && !groups.is_empty()
+                    && !aggregates.iter().any(|a| a.distinct)
+                    && self.perfect_hash_bits(groups).is_some_and(|bits| bits <= self.perfect_ht_threshold);
+                // the result has no more rows than the input (its maximum, not its estimate)
+                *domain_cap = (!self.filter_simplification)
+                    .then(|| self.group_domain_bound(groups))
+                    .flatten()
+                    .map(|bound| self.max_rows(&op.children[0]).map_or(bound, |rows| bound.min(rows)));
                 for (index, group) in groups.iter().enumerate() {
                     if let BoundExprKind::ColumnRef { binding, depth: 0 } = &group.kind {
                         self.aliases.insert(ColumnBinding::new(*group_index, index), *binding);
                     }
                 }
                 let (aggregate_index, aggregates) = (*aggregate_index, aggregates.clone());
-                let rows = max_cardinality(&op.children[0]);
+                let rows = self.max_rows(&op.children[0]);
+                let mut no_overflow = Vec::new();
                 for (index, aggregate) in aggregates.iter().enumerate() {
                     if let Some(stats) = self.aggregate_stats(aggregate, rows) {
                         self.stats.insert(ColumnBinding::new(aggregate_index, index), stats);
+                    }
+                    if !self.filter_simplification && self.sum_fits_in_int64(aggregate, rows) {
+                        no_overflow.push(index);
+                    }
+                }
+                // `TryExecuteAggregates`: count_star, min and max from the statistics of the row groups
+                if !self.filter_simplification
+                    && let Some(result) = super::eager_aggregate::try_execute(op)
+                {
+                    *op = result;
+                    return;
+                }
+                // `SumPropagateStats`: a sum of INTEGER or BIGINT that fits in an int64 needs no wider state
+                if let K::Aggregate { aggregates, .. } = &mut op.kind {
+                    for index in no_overflow {
+                        let aggregate = &mut aggregates[index];
+                        if let Some(set) = BuiltinFunctions::get().aggregate("sum_no_overflow")
+                            && let Ok(bound) = bind_aggregate_function(
+                                set,
+                                aggregate.children.clone(),
+                                aggregate.filter.clone(),
+                                false,
+                            )
+                            && bound.return_type == aggregate.return_type
+                        {
+                            aggregate.function = bound.function;
+                        }
                     }
                 }
             }
             K::Union { table_index, types } => {
                 let (table_index, columns) = (*table_index, types.len());
                 self.union_of_children(op, table_index, columns);
+            }
+            // `PropagateStatistics(LogicalSetOperation)`: EXCEPT and INTERSECT have values of the left side
+            K::ExceptIntersect { table_index, types, .. } => {
+                let (table_index, columns) = (*table_index, types.len());
+                let left = op.children[0].column_bindings();
+                for (column, binding) in left.into_iter().enumerate().take(columns) {
+                    let stats = self.lookup(binding);
+                    self.stats.insert(ColumnBinding::new(table_index, column), stats);
+                }
             }
             K::DelimJoin {
                 join_type: JoinType::Single,
@@ -1664,6 +2487,430 @@ impl StatisticsPropagator {
             _ => {}
         }
     }
+}
+
+impl StatisticsPropagator {
+    /// `CapGroupedAggregateCardinalityByKeyDomain`: the product of what `TryGetGroupKeyDistinctUpperBound`
+    /// says of each group, a range of values from the statistics of an integer, else the values of a
+    /// narrow type, and one more for NULL. The caller clamps it with the rows of the input. Not for
+    /// groups that are all columns of tables: C++'s expectations (`current_domain_cardinality.test`)
+    /// keep the join order estimate for those, which its comment says already uses their range.
+    fn group_domain_bound(&mut self, groups: &[BoundExpr]) -> Option<u64> {
+        use duckrs_common::types::PhysicalType::*;
+        if groups.is_empty() {
+            return None;
+        }
+        let base_column = |group: &BoundExpr, this: &Self| match &group.kind {
+            BoundExprKind::ColumnRef { binding, depth: 0 } => this.sources.contains_key(&this.base_of(*binding)),
+            _ => false,
+        };
+        if groups.iter().all(|g| base_column(g, self)) {
+            return None;
+        }
+        let mut bound: u128 = 1;
+        for group in groups {
+            let ty = &group.return_type;
+            let stats = self.expression(&mut group.clone(), false);
+            let ranged = matches!(ty.physical_type(), Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64)
+                && (ty.is_integral()
+                    || matches!(
+                        ty.id(),
+                        LogicalTypeId::Date
+                            | LogicalTypeId::Time
+                            | LogicalTypeId::Timestamp
+                            | LogicalTypeId::TimestampSec
+                            | LogicalTypeId::TimestampMs
+                            | LogicalTypeId::TimestampNs
+                            | LogicalTypeId::TimestampTz
+                    ));
+            let known = stats.min.as_ref().and_then(Value::as_i128).zip(stats.max.as_ref().and_then(Value::as_i128));
+            let key = match known.filter(|_| ranged) {
+                Some((min, max)) => {
+                    let range = u128::try_from(max - min).ok()?;
+                    range + 1 + u128::from(stats.can_be_null)
+                }
+                None => match ty.id() {
+                    LogicalTypeId::Boolean => 3,
+                    LogicalTypeId::TinyInt | LogicalTypeId::UTinyInt => 257,
+                    LogicalTypeId::SmallInt | LogicalTypeId::USmallInt => 65537,
+                    LogicalTypeId::Enum => ty.enum_values().len() as u128 + 1,
+                    _ => return None,
+                },
+            };
+            bound = bound.saturating_mul(key).min(u64::MAX as u128);
+        }
+        Some(bound as u64)
+    }
+
+    /// The bits the groups take in a perfect hash table (`CanUsePerfectHashAggregate`): each needs
+    /// its range of values, plus one for NULL and one to count from one. Groups must be integers,
+    /// with statistics unless their type is small enough to take its whole range.
+    fn perfect_hash_bits(&mut self, groups: &[BoundExpr]) -> Option<u64> {
+        use duckrs_common::types::PhysicalType::*;
+        let mut total = 0;
+        for group in groups {
+            let ty = &group.return_type;
+            let physical = ty.physical_type();
+            if !matches!(physical, Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64) {
+                return None;
+            }
+            let stats = self.expression(&mut group.clone(), false);
+            let known = stats.min.as_ref().and_then(Value::as_i128).zip(stats.max.as_ref().and_then(Value::as_i128));
+            let (min, max) = match known {
+                Some(range) => range,
+                None if matches!(physical, Int8 | Int16 | UInt8 | UInt16) => integer_range(ty)?,
+                None => return None,
+            };
+            if max < min {
+                return None;
+            }
+            let range = u64::try_from(max - min).ok()?;
+            if range >= i32::MAX as u64 {
+                return None;
+            }
+            // `RequiredBitsForValue`
+            total += u64::from(64 - (range + 2).leading_zeros());
+        }
+        Some(total)
+    }
+}
+
+/// Whether calls of the function `name` give something else each time.
+/// The longest string `substring`, `substring_grapheme` or `repeat` gives for arguments with `stats`
+/// (`StringStats::SetMaxStringLength` of their statistics functions).
+fn string_function_max_length(name: &str, children: &[BoundExpr], stats: &[Stats]) -> Option<u64> {
+    let constant = |expr: &BoundExpr| match &expr.kind {
+        BoundExprKind::Constant(value) if !value.is_null() => value.try_to_string().ok()?.parse::<i128>().ok(),
+        _ => None,
+    };
+    let input_max = stats.first()?.strings.as_ref().and_then(|s| s.max_length);
+    match name {
+        "substring" | "substr" if (2..=3).contains(&children.len()) => {
+            // `TryGetSubstringStatsParameters`: a constant offset from 1 on, and a constant positive length
+            let mut parameters = None;
+            if let Some(mut offset) = constant(&children[1]) {
+                let count = match children.get(2) {
+                    None => Some(None),
+                    Some(length) => constant(length).filter(|&l| l > 0 && l <= i128::from(u32::MAX)).map(Some),
+                };
+                if let Some(mut count) = count {
+                    let mut valid = true;
+                    if offset == 0 {
+                        match count {
+                            Some(n) if n > 1 => {
+                                count = Some(n - 1);
+                                offset = 1;
+                            }
+                            _ => valid = false,
+                        }
+                    }
+                    if valid && offset >= 1 {
+                        parameters = Some(count);
+                    }
+                }
+            }
+            let unicode = stats[0].strings.as_ref().is_none_or(|s| s.has_unicode);
+            let mut max = parameters.flatten().and_then(|count| {
+                let per_character = if unicode { 4 } else { 1 };
+                (count <= i128::from(u32::MAX) / per_character).then(|| (count * per_character) as u64)
+            });
+            if let Some(input_max) = input_max {
+                max = Some(max.map_or(input_max, |m| m.min(input_max)));
+            }
+            max
+        }
+        "substring_grapheme" if (2..=3).contains(&children.len()) => input_max,
+        "repeat" if children.len() == 2 => {
+            let count = constant(&children[1])?;
+            let input_max = input_max?;
+            let size = if count > 0 { input_max.checked_mul(u64::try_from(count).ok()?)? } else { 0 };
+            (size <= u64::from(u32::MAX)).then_some(size)
+        }
+        _ => None,
+    }
+}
+
+/// Whether the filters down from `op` to its scan include one that can fail.
+/// `GetFilterBindings`: the tables a filter reads.
+fn filter_bindings(expr: &BoundExpr) -> HashSet<usize> {
+    let mut tables = HashSet::new();
+    let mut expr = expr.clone();
+    expr.walk_mut(&mut |e| {
+        if let BoundExprKind::ColumnRef { binding, depth: 0 } = &e.kind {
+            tables.insert(binding.table_index);
+        }
+    });
+    tables
+}
+
+/// `ExpressionIsConstantOrNull(expr, false)` and `ExpressionIsConstant(expr, value)`.
+fn constant_answer(expr: &BoundExpr) -> Option<(bool, bool)> {
+    match &expr.kind {
+        BoundExprKind::Constant(value) => match value.data() {
+            ValueData::Bool(b) => Some((*b, false)),
+            _ => None,
+        },
+        BoundExprKind::Function { function, children, .. } if function.name == "constant_or_null" => {
+            match &children.first()?.kind {
+                BoundExprKind::Constant(value) => match value.data() {
+                    ValueData::Bool(b) => Some((*b, true)),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// `StatisticsPropagator::SimplifyFilter`: in a filter, a branch that is false or NULL decides an
+/// AND and drops out of an OR.
+fn simplify_filter(condition: &mut BoundExpr) -> bool {
+    let BoundExprKind::Conjunction { and, children } = &mut condition.kind else {
+        return false;
+    };
+    let is_and = *and;
+    let mut changed = false;
+    let mut index = 0;
+    while index < children.len() {
+        changed |= simplify_filter(&mut children[index]);
+        let answer = constant_answer(&children[index]);
+        let is_true = answer == Some((true, false));
+        let false_or_null = matches!(answer, Some((false, _)));
+        if (is_and && false_or_null) || (!is_and && is_true) {
+            *condition = BoundExpr::constant(Value::boolean(!is_and));
+            return true;
+        }
+        if (is_and && is_true) || (!is_and && false_or_null) {
+            children.remove(index);
+            changed = true;
+            continue;
+        }
+        index += 1;
+    }
+    if children.is_empty() {
+        *condition = BoundExpr::constant(Value::boolean(is_and));
+        return true;
+    }
+    if children.len() == 1 {
+        let only = children.remove(0);
+        *condition = only;
+        return true;
+    }
+    changed
+}
+
+fn has_failing_filter(op: &LogicalOperator) -> bool {
+    match &op.kind {
+        K::Filter { expressions } => {
+            expressions.iter().any(crate::optimizer::rewriter::can_throw) || op.children.iter().any(has_failing_filter)
+        }
+        K::Get { filters, .. } => filters.iter().any(crate::optimizer::rewriter::can_throw),
+        K::Projection { .. } | K::ColumnSelect { .. } => op.children.iter().any(has_failing_filter),
+        _ => false,
+    }
+}
+
+/// The name of a filter `CreateFilterFromJoinStats` makes. C++ makes them once the joins are
+/// ordered, and the estimates of the operators they go into are taken by then: the cardinality
+/// estimates leave them out.
+pub(crate) const JOIN_STATS_FILTER: &str = "\u{0}join_stats_filter";
+
+/// `CreateFilterFromJoinStats`: the bounds a join left of an integer key column, as filters for its side.
+fn join_range_filters(expr: &BoundExpr, before: &Stats, after: &Stats) -> Vec<BoundExpr> {
+    if !matches!(expr.kind, BoundExprKind::ColumnRef { depth: 0, .. }) || !expr.return_type.is_integral() {
+        return Vec::new();
+    }
+    let (Some(min_before), Some(max_before), Some(min_after), Some(max_after)) =
+        (&before.min, &before.max, &after.min, &after.max)
+    else {
+        return Vec::new();
+    };
+    let compare = |op, value: &Value| {
+        BoundExpr::new(
+            BoundExprKind::Comparison {
+                op,
+                left: Box::new(expr.clone()),
+                right: Box::new(BoundExpr::constant(value.clone()).cast_to(&expr.return_type, false)),
+            },
+            LogicalType::BOOLEAN,
+        )
+        .with_alias(JOIN_STATS_FILTER)
+    };
+    let mut filters = Vec::new();
+    if compare_values(ComparisonOp::GreaterThan, min_after, min_before) == Some(true) {
+        filters.push(compare(ComparisonOp::GreaterThanOrEqual, min_after));
+    }
+    if compare_values(ComparisonOp::LessThan, max_after, max_before) == Some(true) {
+        filters.push(compare(ComparisonOp::LessThanOrEqual, max_after));
+    }
+    filters
+}
+
+/// `FilterRejectsNull`: whether `filter` is never true where `expr` is NULL.
+fn filter_rejects_null(filter: &BoundExpr, expr: &BoundExpr) -> bool {
+    let same = |e: &BoundExpr| format!("{:?}", e.kind) == format!("{:?}", expr.kind);
+    match &filter.kind {
+        BoundExprKind::Conjunction { and: true, children } => children.iter().any(|c| filter_rejects_null(c, expr)),
+        BoundExprKind::Conjunction { and: false, children } => {
+            !children.is_empty() && children.iter().all(|c| filter_rejects_null(c, expr))
+        }
+        BoundExprKind::Operator {
+            op: BoundOperator::IsNotNull,
+            children,
+        } => children.first().is_some_and(same),
+        BoundExprKind::Comparison { op, left, right }
+            if !matches!(op, ComparisonOp::DistinctFrom | ComparisonOp::NotDistinctFrom) =>
+        {
+            same(left) || same(right)
+        }
+        _ => false,
+    }
+}
+
+/// `SimplifyConstantOrNull`: `constant_or_null(true, x, ...)` among conjuncts that are each NULL where one of
+/// `x, ...` is adds nothing, as long as removing it lets no conjunct see more rows that can fail.
+fn simplify_constant_or_null(expressions: &mut Vec<BoundExpr>) {
+    let is_candidate = |e: &BoundExpr| {
+        matches!(&e.kind, BoundExprKind::Function { function, children, .. }
+            if function.name == "constant_or_null"
+                && children.len() >= 2
+                && matches!(&children[0].kind, BoundExprKind::Constant(v) if v.data() == &ValueData::Bool(true)))
+    };
+    if expressions.len() < 2 || !expressions.iter().any(is_candidate) {
+        return;
+    }
+    if expressions
+        .iter()
+        .any(|e| crate::optimizer::rewriter::can_throw(e) || e.is_volatile() || crate::optimizer::rewriter::contains_barrier(e))
+    {
+        return;
+    }
+    let mut at = 0;
+    while at < expressions.len() {
+        let redundant = is_candidate(&expressions[at]) && {
+            let BoundExprKind::Function { children, .. } = &expressions[at].kind else {
+                unreachable!("a candidate")
+            };
+            children[1..].iter().all(|child| match &child.kind {
+                BoundExprKind::Constant(value) => !value.is_null(),
+                _ => expressions
+                    .iter()
+                    .enumerate()
+                    .any(|(other, filter)| other != at && filter_rejects_null(filter, child)),
+            })
+        };
+        if redundant {
+            expressions.remove(at);
+        } else {
+            at += 1;
+        }
+    }
+}
+
+/// `PropagateStatistics(LogicalGet)` of a `FILTER_TRUE_OR_NULL` table filter: `constant_or_null(true, ...)`
+/// of one column of a scan, and constants that are not NULL, is NULL just when the column is, and
+/// filters as `column IS NOT NULL` (`IsNullOnlyForNullColumn`).
+/// `FilterPropagateResult` of an IN list.
+enum InListResult {
+    Always,
+    /// true for the values, NULL for NULL: `col IS NOT NULL`
+    TrueOrNull(BoundExpr),
+    Never,
+}
+
+/// `CheckZonemapAgainstConstants` with `=` and `NumericStats::ConstantsCoverRange`: whether a value of the
+/// range is always (`Some(true)`) or never (`Some(false)`) among the constants.
+fn in_zonemap(stats: &Stats, values: &[Value]) -> Option<bool> {
+    let (Some(min), Some(max)) = (stats.min.as_ref(), stats.max.as_ref()) else {
+        return None;
+    };
+    let ty = min.logical_type();
+    let numeric = ty.is_numeric() || ty.id() == LogicalTypeId::Boolean || ty.id() == LogicalTypeId::Interval;
+    if !numeric && stats.strings.is_none() {
+        return None;
+    }
+    if !numeric && ty.id() != LogicalTypeId::Varchar {
+        return None;
+    }
+    let outside = |v: &Value| {
+        compare_values(ComparisonOp::LessThan, v, min) == Some(true)
+            || compare_values(ComparisonOp::GreaterThan, v, max) == Some(true)
+    };
+    if values.iter().all(outside) {
+        return Some(false);
+    }
+    if compare_values(ComparisonOp::Equal, min, max) == Some(true)
+        && values.iter().any(|v| compare_values(ComparisonOp::Equal, v, min) == Some(true))
+    {
+        return Some(true);
+    }
+    // an integral column whose whole [min, max] range is listed
+    if ty.is_integral() && ty != &LogicalType::UHUGEINT {
+        let (low, high) = (min.as_i128()?, max.as_i128()?);
+        let range = high.checked_sub(low)?;
+        if range >= values.len() as i128 {
+            return None;
+        }
+        let mut inside = Vec::new();
+        for value in values {
+            if value.logical_type() != ty {
+                return None;
+            }
+            let v = value.as_i128()?;
+            if (low..=high).contains(&v) {
+                inside.push(v);
+            }
+        }
+        inside.sort_unstable();
+        inside.dedup();
+        if inside.first() == Some(&low) && inside.last() == Some(&high) && inside.len() as i128 == range + 1 {
+            return Some(true);
+        }
+    }
+    None
+}
+
+fn true_or_null_as_not_null(expr: BoundExpr, child: &LogicalOperator) -> BoundExpr {
+    let BoundExprKind::Function { function, children, .. } = &expr.kind else {
+        return expr;
+    };
+    if function.name != "constant_or_null"
+        || children.len() < 2
+        || !matches!(&children[0].kind, BoundExprKind::Constant(v) if v.data() == &ValueData::Bool(true))
+        || !matches!(child.kind, K::Get { .. })
+    {
+        return expr;
+    }
+    let scan = child.column_bindings();
+    let mut column: Option<&BoundExpr> = None;
+    for argument in &children[1..] {
+        match &argument.kind {
+            BoundExprKind::ColumnRef { binding, depth: 0 } if scan.contains(binding) => {
+                let same = |c: &BoundExpr| matches!(&c.kind, BoundExprKind::ColumnRef { binding: b, .. } if b == binding);
+                if column.is_some_and(|c| !same(c)) {
+                    return expr;
+                }
+                column = Some(argument);
+            }
+            BoundExprKind::Constant(value) if !value.is_null() => {}
+            _ => return expr,
+        }
+    }
+    let Some(column) = column else {
+        return expr;
+    };
+    BoundExpr::new(
+        BoundExprKind::Operator {
+            op: BoundOperator::IsNotNull,
+            children: vec![column.clone()],
+        },
+        LogicalType::BOOLEAN,
+    )
+}
+
+fn expr_is_volatile_function(name: &str) -> bool {
+    crate::planner::expression::VOLATILE_FUNCTIONS.contains(&name)
 }
 
 /// The smallest and largest value of an integer type that fits in an `i128`.
@@ -1686,13 +2933,51 @@ fn integer_range(ty: &LogicalType) -> Option<(i128, i128)> {
 fn max_cardinality(op: &LogicalOperator) -> Option<u64> {
     match &op.kind {
         K::Get { table, .. } => Some(table.row_count() as u64),
+        // `RangeCardinality`
+        K::Range { count, .. } => Some(*count),
+        K::ParquetScan { scan, .. } => crate::execution::parquet::scan_max_cardinality(scan),
         K::Filter { .. } | K::Projection { .. } => op.children.first().and_then(max_cardinality),
         _ => None,
     }
 }
 
 impl StatisticsPropagator {
+    /// `NodeStatistics::max_cardinality`, which a scan of a CTE has from its definition.
+    fn max_rows(&self, op: &LogicalOperator) -> Option<u64> {
+        match &op.kind {
+            K::CteRef { cte_index, .. } => self.cte_rows.get(cte_index).copied().flatten(),
+            K::Filter { .. } | K::Projection { .. } => op.children.first().and_then(|c| self.max_rows(c)),
+            _ => max_cardinality(op),
+        }
+    }
+
     /// `SumPropagateStats`: a sum of integers lies between the smallest and largest value times the rows.
+    /// `SumPropagateStats`: whether a sum of INTEGER or BIGINT values provably fits in an int64.
+    fn sum_fits_in_int64(&mut self, aggregate: &BoundAggregate, rows: Option<u64>) -> bool {
+        let [child] = aggregate.children.as_slice() else {
+            return false;
+        };
+        if aggregate.function.name != "sum"
+            || aggregate.distinct
+            || !matches!(child.return_type.id(), LogicalTypeId::Integer | LogicalTypeId::BigInt)
+        {
+            return false;
+        }
+        let Some(rows) = rows else {
+            return false;
+        };
+        let stats = self.expression(&mut child.clone(), false);
+        let as_int = |value: &Option<Value>| value.as_ref()?.try_to_string().ok()?.parse::<i128>().ok();
+        let (Some(low), Some(high)) = (as_int(&stats.min), as_int(&stats.max)) else {
+            return false;
+        };
+        let rows = i128::from(rows);
+        match (low.checked_mul(rows), high.checked_mul(rows)) {
+            (Some(low), Some(high)) => low > i128::from(i64::MIN) && high < i128::from(i64::MAX),
+            _ => false,
+        }
+    }
+
     fn aggregate_stats(&mut self, aggregate: &BoundAggregate, rows: Option<u64>) -> Option<Stats> {
         if aggregate.children.len() != 1 {
             return None;
@@ -1726,6 +3011,7 @@ impl StatisticsPropagator {
             crate::execution::expression_executor::try_evaluate_scalar(&value)
         };
         Some(Stats {
+            variant: None,
             min: cast(min),
             max: cast(max),
             can_be_null: true,
@@ -1733,6 +3019,7 @@ impl StatisticsPropagator {
             geometry: None,
             strings: None,
             distinct: None,
+            children: Vec::new(),
         })
     }
 }
@@ -1741,7 +3028,39 @@ impl StatisticsPropagator {
 /// `BaseStatistics::ToStruct` of numeric statistics (`NumericStats::ToStruct`), as a VARIANT
 /// (`StatsPropagateStats`). duckrs keeps no distinct counts, so there is no `approx_unique`.
 fn stats_struct(stats: &Stats, ty: &LogicalType) -> Option<Value> {
+    let fields = stats_fields(stats, ty)?;
+    let variant = LogicalType::new(LogicalTypeId::Variant);
+    let source = duckrs_common::vector::Vector::constant(&fields);
+    let mut result = duckrs_common::vector::Vector::new(variant, 1);
+    crate::function::cast::cast_vector(&source, &mut result, 1, crate::function::cast::CastMode::Strict).ok()?;
+    Some(result.get_value(0))
+}
+
+/// `BaseStatistics::ToStruct`, as a STRUCT value.
+pub(super) fn stats_fields(stats: &Stats, ty: &LogicalType) -> Option<Value> {
     let mut fields = Vec::new();
+    // `VariantStats::ToStruct`
+    if ty.id() == LogicalTypeId::Variant {
+        fields.extend(super::variant_statistics::variant_fields(stats));
+    }
+    // `ListStats::ToStruct` / `ArrayStats::ToStruct` / `StructStats::ToStruct`: the children's
+    let child = |at: usize, child_type: &LogicalType| -> Option<Value> {
+        let unknown_child = unknown();
+        stats_fields(stats.children.get(at).unwrap_or(&unknown_child), child_type)
+    };
+    match ty.id() {
+        LogicalTypeId::List | LogicalTypeId::Array => {
+            fields.push(("child_stats".to_string(), child(0, ty.child_type()?)?));
+        }
+        LogicalTypeId::Struct => {
+            let mut children = Vec::new();
+            for (at, (name, child_type)) in ty.struct_children().iter().enumerate() {
+                children.push((name.clone(), child(at, child_type)?));
+            }
+            fields.push(("child_stats".to_string(), Value::struct_value(children)));
+        }
+        _ => {}
+    }
     // `StringStats::ToStruct`
     if matches!(ty.id(), LogicalTypeId::Varchar | LogicalTypeId::Blob) {
         let strings = stats.strings.as_ref()?;
@@ -1803,11 +3122,156 @@ fn stats_struct(stats: &Stats, ty: &LogicalType) -> Option<Value> {
     if let Some(distinct) = stats.distinct {
         fields.push(("approx_unique".to_string(), Value::ubigint(distinct)));
     }
-    let variant = LogicalType::new(LogicalTypeId::Variant);
-    let source = duckrs_common::vector::Vector::constant(&Value::struct_value(fields));
-    let mut result = duckrs_common::vector::Vector::new(variant, 1);
-    crate::function::cast::cast_vector(&source, &mut result, 1, crate::function::cast::CastMode::Strict).ok()?;
-    Some(result.get_value(0))
+    Some(Value::struct_value(fields))
+}
+
+/// The `ArgProperties` monotonicity of argument `at` of a call of `name` with arguments of
+/// `types`: 1 when the result does not decrease with it, -1 when it does not increase.
+fn arg_monotonicity(name: &str, at: usize, types: &[LogicalType]) -> Option<i8> {
+    use LogicalTypeId as T;
+    let numeric = |t: &LogicalType| t.is_numeric();
+    let id = |i: usize| types.get(i).map(LogicalType::id);
+    match (name, types.len()) {
+        ("+", 1) => Some(1),
+        ("-", 1) => Some(-1),
+        ("+", 2) => match (id(0)?, id(1)?) {
+            _ if numeric(&types[0]) && numeric(&types[1]) => Some(1),
+            (T::Date, T::Integer) | (T::Integer, T::Date) | (T::Interval, T::Interval) => Some(1),
+            // calendar months make it monotone in the DATE only
+            (T::Date, T::Interval) => (at == 0).then_some(1),
+            (T::Interval, T::Date) => (at == 1).then_some(1),
+            _ => None,
+        },
+        ("-", 2) => match (id(0)?, id(1)?) {
+            _ if numeric(&types[0]) && numeric(&types[1]) => Some(if at == 0 { 1 } else { -1 }),
+            (T::Date, T::Date) | (T::Date, T::Integer) | (T::Timestamp, T::Timestamp) => {
+                Some(if at == 0 { 1 } else { -1 })
+            }
+            (T::Date, T::Interval) => (at == 0).then_some(1),
+            _ => None,
+        },
+        // the base of a two-argument log can be below 1
+        ("log", 2) => None,
+        (
+            "ceil" | "ceiling" | "floor" | "trunc" | "round" | "round_even" | "roundbankers" | "sqrt" | "cbrt" | "ln"
+            | "log10" | "log" | "log2" | "degrees" | "radians" | "atan" | "sinh" | "asinh" | "tanh" | "isoyear"
+            | "era" | "last_day" | "to_timestamp" | "normalized_interval" | "epoch_ms" | "epoch_us" | "epoch_ns",
+            _,
+        ) => (at == 0).then_some(1),
+        // `SetNonDecreasingExceptInterval`
+        ("year" | "decade" | "century" | "millennium" | "epoch", _) => {
+            (at == 0 && id(0)? != T::Interval).then_some(1)
+        }
+        ("make_date" | "make_timestamp" | "make_timestamp_ns" | "make_timestamp_ms", 1) => (at == 0).then_some(1),
+        ("date_diff" | "datediff" | "date_sub" | "datesub", 3) => match at {
+            1 => Some(-1),
+            2 => Some(1),
+            _ => None,
+        },
+        ("date_trunc" | "datetrunc" | "time_bucket", _) => (at == 1).then_some(1),
+        _ => None,
+    }
+}
+
+/// `PropagateMonotoneBounds`: the function at the smallest and the largest values of its
+/// arguments that it is monotone in, and at the constants it is called with.
+fn monotone_bounds(
+    function: &Arc<crate::function::ScalarFunction>,
+    is_operator: bool,
+    children: &[BoundExpr],
+    stats: &[Stats],
+    return_type: &LogicalType,
+) -> Option<Stats> {
+    if children.is_empty() || function.random.is_some() || expr_is_volatile_function(&function.name) {
+        return None;
+    }
+    let numeric_stats = return_type.is_numeric()
+        || matches!(
+            return_type.id(),
+            LogicalTypeId::Date
+                | LogicalTypeId::Time
+                | LogicalTypeId::Timestamp
+                | LogicalTypeId::TimestampTz
+                | LogicalTypeId::TimestampSec
+                | LogicalTypeId::TimestampMs
+                | LogicalTypeId::TimestampNs
+        );
+    if !numeric_stats {
+        return None;
+    }
+    let types: Vec<LogicalType> = children.iter().map(|c| c.return_type.clone()).collect();
+    let mut low = Vec::with_capacity(children.len());
+    let mut high = Vec::with_capacity(children.len());
+    let mut can_be_null = false;
+    for (at, (child, stats)) in children.iter().zip(stats).enumerate() {
+        if child.is_foldable() {
+            let value = crate::execution::expression_executor::try_evaluate_scalar(child)?;
+            if value.is_null() {
+                return None;
+            }
+            low.push(value.clone());
+            high.push(value);
+            continue;
+        }
+        can_be_null |= stats.can_be_null;
+        let (Some(min), Some(max)) = (stats.min.clone(), stats.max.clone()) else {
+            return None;
+        };
+        match arg_monotonicity(&function.name, at, &types)? {
+            1 => {
+                low.push(min);
+                high.push(max);
+            }
+            _ => {
+                low.push(max);
+                high.push(min);
+            }
+        }
+    }
+    let at = |values: Vec<Value>| {
+        let call = BoundExpr::new(
+            BoundExprKind::Function {
+                function: function.clone(),
+                children: values.into_iter().map(BoundExpr::constant).collect(),
+                is_operator,
+            },
+            return_type.clone(),
+        );
+        let value = crate::execution::expression_executor::try_evaluate_scalar(&call)?;
+        if value.logical_type() == return_type {
+            return Some(value);
+        }
+        // a DECIMAL of another width, as the bound function gives it
+        let cast = BoundExpr::constant(value).cast_to(return_type, true);
+        crate::execution::expression_executor::try_evaluate_scalar(&cast).filter(|v| v.logical_type() == return_type)
+    };
+    let (out_low, out_high) = (at(low)?, at(high)?);
+    // NaN or NULL at a corner: the input was NaN, or e.g. year(infinity)
+    let unusable = |v: &Value| {
+        v.is_null()
+            || match v.data() {
+                duckrs_common::value::ValueData::Double(d) => d.is_nan(),
+                duckrs_common::value::ValueData::Float(f) => f.is_nan(),
+                _ => false,
+            }
+    };
+    if unusable(&out_low) || unusable(&out_high) {
+        return None;
+    }
+    if compare_values(ComparisonOp::GreaterThan, &out_low, &out_high) != Some(false) {
+        return None;
+    }
+    Some(Stats {
+        variant: None,
+        min: Some(out_low),
+        max: Some(out_high),
+        can_be_null,
+        can_be_valid: true,
+        geometry: None,
+        strings: None,
+        distinct: None,
+        children: Vec::new(),
+    })
 }
 
 fn expr_with_constants(
@@ -1826,22 +3290,103 @@ fn expr_with_constants(
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::DistinctSketch;
-
-    #[test]
-    fn distinct_sketch_counts_within_its_error() {
-        for (values, repeats) in [(1u64, 100u64), (100, 5), (5_000, 3), (200_000, 30), (3_000_000, 1)] {
-            let mut sketch = DistinctSketch::new();
-            for _ in 0..repeats {
-                for value in 0..values {
-                    sketch.add(value);
-                }
-            }
-            let estimate = sketch.estimate() as f64;
-            let error = (estimate - values as f64).abs() / values as f64;
-            assert!(error < 0.05, "{values} values counted as {estimate}");
+/// A date part of a constant, `name` being a unary part function or `date_part:<part>`.
+fn evaluate_part(name: &str, value: &Value) -> Option<Value> {
+    use crate::execution::expression_executor::try_evaluate_scalar;
+    let call = match name.strip_prefix("date_part:") {
+        Some(part) => crate::function::dates::bind_date_function(
+            "date_part",
+            vec![BoundExpr::constant(Value::varchar(part)), BoundExpr::constant(value.clone())],
+        )
+        .ok()?,
+        None => {
+            let set = BuiltinFunctions::get().scalar(name)?;
+            let children = vec![BoundExpr::constant(value.clone())];
+            crate::function::binder::bind_scalar_function(set, children, false, &try_evaluate_scalar).ok()?
         }
+    };
+    try_evaluate_scalar(&call).filter(|value| !value.is_null())
+}
+
+/// `DatePart::*Operator::PropagateStatistics`: the bounds of a date part of a DATE, TIMESTAMP or
+/// TIME whose bounds are known and finite. `name` is the unary part function (or
+/// `date_part:<part>`).
+fn date_part_stats(name: &str, child: &Stats, child_type: &LogicalType, return_type: &LogicalType) -> Option<Stats> {
+    use LogicalTypeId as T;
+    let time = matches!(child_type.id(), T::Time | T::TimeNs);
+    if !time && !matches!(child_type.id(), T::Date | T::Timestamp | T::TimestampSec | T::TimestampMs | T::TimestampNs) {
+        return None;
     }
+    let (min, max) = (child.min.clone()?, child.max.clone()?);
+    if compare_values(ComparisonOp::GreaterThan, &min, &max) != Some(false) {
+        return None;
+    }
+    let finite = |value: &Value| !value.try_to_string().is_ok_and(|text| text.contains("infinity"));
+    if !finite(&min) || !finite(&max) {
+        return None;
+    }
+    let bigint = |low: i64, high: i64| (Some(Value::bigint(low)), Some(Value::bigint(high)));
+    // the parts of the parent period, which must agree for the endpoints to be exact bounds
+    let day: &[&str] = if time { &[] } else { &["year", "month", "day"] };
+    let within = |parents: &[&str], low: i64, high: i64| -> Option<(Option<Value>, Option<Value>)> {
+        let same = parents
+            .iter()
+            .map(|parent| Some(evaluate_part(parent, &min)? == evaluate_part(parent, &max)?))
+            .collect::<Option<Vec<bool>>>()?
+            .into_iter()
+            .all(|same| same);
+        Some(if same {
+            (Some(evaluate_part(name, &min)?), Some(evaluate_part(name, &max)?))
+        } else {
+            bigint(low, high)
+        })
+    };
+    let with = |extra: &[&'static str]| -> Vec<&str> { day.iter().copied().chain(extra.iter().copied()).collect() };
+    let (low, high) = match name {
+        // `EpochOperator::PropagateStatistics<dtime_t>`: any second of the day
+        "date_part:epoch" | "epoch" if child_type.id() == T::Time => {
+            (Some(Value::double(0.0)), Some(Value::double(86_400.0)))
+        }
+        // `YearWeekOperator::PropagateStatistics`: from ISO year 0 on down the week is subtracted,
+        // and the endpoints no longer bound the values between them
+        "yearweek" | "date_part:yearweek"
+            if evaluate_part("date_part:isoyear", &min)?.as_i128().is_none_or(|year| year < 1) =>
+        {
+            return None;
+        }
+        "year" | "decade" | "century" | "millennium" | "yearweek" | "date_part:yearweek" | "date_part:isoyear" | "isoyear" | "epoch_ms"
+        | "epoch_us" | "epoch_ns" | "date_part:epoch" | "epoch" | "date_part:julian" | "julian" => {
+            (Some(evaluate_part(name, &min)?), Some(evaluate_part(name, &max)?))
+        }
+        "month" if !time => within(&["year"], 1, 12)?,
+        "day" | "dayofmonth" if !time => within(&["year", "month"], 1, 31)?,
+        "quarter" if !time => within(&["year"], 1, 4)?,
+        "dayofyear" if !time => within(&["year"], 1, 366)?,
+        "week" | "weekofyear" if !time => within(&["date_part:isoyear"], 1, 53)?,
+        "dayofweek" | "weekday" if !time => bigint(0, 6),
+        "isodow" if !time => bigint(1, 7),
+        "date_part:era" | "era" if !time => bigint(0, 1),
+        "hour" => within(day, 0, 24)?,
+        "minute" => within(&with(&["hour"]), 0, 59)?,
+        "second" => within(&with(&["hour", "minute"]), 0, 59)?,
+        "millisecond" => within(&with(&["hour", "minute"]), 0, 59_999)?,
+        "microsecond" => within(&with(&["hour", "minute"]), 0, 59_999_999)?,
+        "nanosecond" => within(&with(&["hour", "minute"]), 0, 59_999_999_999)?,
+        _ => return None,
+    };
+    let (low, high) = (low?, high?);
+    if low.logical_type() != return_type || high.logical_type() != return_type {
+        return None;
+    }
+    Some(Stats {
+        variant: None,
+        min: Some(low),
+        max: Some(high),
+        can_be_null: child.can_be_null,
+        can_be_valid: child.can_be_valid,
+        geometry: None,
+        strings: None,
+        distinct: None,
+        children: Vec::new(),
+    })
 }
