@@ -94,7 +94,7 @@ pub(super) fn clone_scan(scan: &CsvScanData) -> CsvScanData {
 }
 
 /// The plans this plan runs as part of it, which hold operators the way children do.
-fn inner_plans(op: &mut LogicalOperator) -> Vec<&mut LogicalOperator> {
+pub(super) fn inner_plans(op: &mut LogicalOperator) -> Vec<&mut LogicalOperator> {
     let mut result: Vec<&mut LogicalOperator> = op.children.iter_mut().collect();
     match &mut op.kind {
         LogicalOperatorKind::RecursiveCte { recursive: inner, .. }
@@ -106,7 +106,7 @@ fn inner_plans(op: &mut LogicalOperator) -> Vec<&mut LogicalOperator> {
 
 /// Calls `f` on each expression of an operator (not of the operators below), with the conditions
 /// of its joins.
-fn for_each_expression(op: &mut LogicalOperator, f: &mut impl FnMut(&mut BoundExpr)) {
+pub(super) fn for_each_expression(op: &mut LogicalOperator, f: &mut impl FnMut(&mut BoundExpr)) {
     for expr in op.expressions_mut() {
         f(expr);
     }

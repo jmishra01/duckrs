@@ -222,6 +222,43 @@ fn base_cardinality(op: &LogicalOperator) -> u64 {
     }
 }
 
+/// `CreatePlan(LogicalProjection)` over a Parquet scan: the scan outputs only the columns read of it
+/// (`projection_ids`), so a projection that emits just those in their order, directly over the scan
+/// or through a LIMIT, is omitted. Gives the projection's child, the scan narrowed to those columns.
+fn omitted_projection(op: &mut LogicalOperator) -> Option<LogicalOperator> {
+    use crate::planner::expression::BoundExprKind;
+    let LogicalOperatorKind::Projection { expressions, .. } = &op.kind else {
+        return None;
+    };
+    if expressions.is_empty() || op.children.len() != 1 {
+        return None;
+    }
+    let mut scan = &mut op.children[0];
+    while matches!(scan.kind, LogicalOperatorKind::Limit { .. }) && scan.children.len() == 1 {
+        scan = &mut scan.children[0];
+    }
+    let LogicalOperatorKind::ParquetScan { scan: data, .. } = &mut scan.kind else {
+        return None;
+    };
+    let projected = data.projected.as_ref()?;
+    if data.output.is_some() {
+        return None;
+    }
+    let read: Vec<usize> = (0..projected.len()).filter(|&at| projected[at]).collect();
+    let types = data.output_types();
+    let forwards = read.len() == expressions.len()
+        && expressions.iter().zip(&read).all(|(e, &at)| {
+            matches!(e.kind, BoundExprKind::Reference(index) if index == at)
+                && e.return_type == types[at]
+                && e.return_type.collation() == types[at].collation()
+        });
+    if !forwards {
+        return None;
+    }
+    Arc::make_mut(data).output = Some(read);
+    Some(op.children.remove(0))
+}
+
 /// [`create_plan`] once the join filters are in place.
 fn create_physical(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
     if matches!(op.kind, LogicalOperatorKind::ColumnSelect { .. }) {
@@ -233,6 +270,9 @@ fn create_physical(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
         let fresh = Arc::new(Mutex::new(ColumnDataCollection::new(data.lock().types().to_vec())));
         *data = fresh.clone();
         renew_cte_scans(&mut op.children[1], old, &fresh);
+    }
+    if let Some(child) = omitted_projection(&mut op) {
+        return create_physical(child);
     }
     let types = op.types();
     // `CreatePlan(LogicalSample)`: a SYSTEM sample of rows keeps them at the rate of their number
