@@ -960,7 +960,7 @@ Projection __internal_decompress_string(l_shipmode), high_line_count, low_line_c
 
 ## TPC-H Q13, with the optimizer off and on
 
-Q13 counts how many customers have 0, 1, 2, … orders, leaving out orders whose comment mentions special requests. It is the only walkthrough with an outer join, and its filter sits in the `ON` clause, not in WHERE. It shows which filters may move below an outer join, and a gap in how duckrs picks the build side of one. The plans are from the same build as Q11 (`1ed6cc1`) and the same SF0.1 data.
+Q13 counts how many customers have 0, 1, 2, … orders, leaving out orders whose comment mentions special requests. It is the only walkthrough with an outer join, and its filter sits in the `ON` clause, not in WHERE. It shows which filters may move below an outer join, and how the build side of one is picked by turning it into a RIGHT join. The unoptimized plan is from the same build as Q11 (`1ed6cc1`). The optimized plan is from a release build of `phase-55-optimizer-rewriters` at `1ff6f10`, which merged the LEFT/RIGHT build side swap. Both use the same SF0.1 data.
 
 ```
 SELECT c_count, count(*) AS custdist
@@ -996,10 +996,10 @@ Order By custdist DESC, c_count DESC                        ~14,035
     └ Projection CAST(c_custkey AS BIGINT), count
       └ Hash Group By c_custkey, count(o_orderkey)          ~14,035
         └ Projection CAST(c_custkey AS SMALLINT), o_orderkey, o_custkey   ~32,062
-          └ Hash Join  LEFT  c_custkey = o_custkey           ~32,062
-            ├ Seq Scan customer  [c_custkey]              ~15,000
-            └ Seq Scan orders  [o_orderkey, o_custkey]    ← builds, ~30,000 estimated, 148,467 in fact
-                Filters: o_comment !~~ '%special%requests%'
+          └ Hash Join  RIGHT  o_custkey = c_custkey          ~32,062
+            ├ Seq Scan orders  [o_orderkey, o_custkey]    ~30,000 estimated, 148,467 in fact
+            │   Filters: o_comment !~~ '%special%requests%'
+            └ Seq Scan customer  [c_custkey]              ← builds, ~15,000
 ```
 
 > The first child of the hash join probes and the second child is the build side.
@@ -1010,16 +1010,19 @@ Order By custdist DESC, c_count DESC                        ~14,035
 2. **unused_columns** cut customer to 1 of its 8 columns and orders to 2 of 9 (plus `o_comment`, read inside the scan for its filter). The outer GROUP BY doesn't read `c_custkey` after the inner one, so the plan passes a constant `NULL` in its place.
 3. **compressed_materialization** narrows `c_custkey` to a SMALLINT for the inner GROUP BY, as DuckDB does (it uses a 2-byte unsigned integer with an offset).
 4. **join_order** has nothing to reorder: an outer join can't be moved, and there are only two tables.
+5. **build_side_probe_side** turned the LEFT join into a RIGHT join with the sides swapped, so the 15,000 customers build the hash table and the filtered orders probe it. A RIGHT join keeps the rows of its right side that find no match, which are still the customers, so the result doesn't change. The pass compares rows times row width for the two sides (`BuildProbeSideOptimizer::GetBuildSize`): two columns of ~30,000 estimated orders cost more than one column of 15,000 customers. Join order doesn't move outer joins, so for LEFT and RIGHT joins that comparison decides alone, as in C++ (`optimizer/build_side.rs`, `flip_by_width`).
+
+`SET disabled_optimizers = 'build_side_probe_side'` keeps the LEFT join, which then builds on all 148,467 orders that pass the filter. That hash table is about ten times larger.
 
 ### Where duckrs differs from DuckDB 1.5.6
 
-1. **duckrs builds the hash table on orders, DuckDB on customer.** DuckDB turns the LEFT join into a RIGHT join with the sides swapped, so the 15,000 customers build and the filtered orders probe. duckrs's `build_side` pass only swaps SEMI and ANTI joins (`optimizer/build_side.rs`, `choose`), so a LEFT join always builds its right side, here all 148,467 orders that pass the filter. That is a hash table about ten times larger than DuckDB's. C++ `BuildProbeSideOptimizer` swaps every join type that has an inverse (`HasInverseJoinType`), LEFT and RIGHT among them.
-2. **Writing the join as a RIGHT join doesn't help.** With `orders RIGHT OUTER JOIN customer`, duckrs does build on customer, but then the comment condition stays in the join instead of moving into the orders scan.
-3. **The estimates are rough in both.** The comment filter is estimated at 20% of orders (~30,000) where 99% pass (148,467). duckrs estimates ~14,035 customer groups and DuckDB ~11,711; there are 15,000, one per customer.
+1. **Writing the join as a RIGHT join keeps the filter in the join.** With `orders RIGHT OUTER JOIN customer`, both duckrs and DuckDB build on customer. DuckDB also moves the comment condition into the orders scan, since it reads only the side of the RIGHT join that may lose rows. duckrs leaves it in the join condition, so the scan reads `o_comment` for all 150,000 orders and the join evaluates the `LIKE`.
+2. **The estimates are rough in both.** The comment filter is estimated at 20% of orders (~30,000) where 99% pass (148,467). duckrs estimates ~14,035 customer groups and DuckDB ~11,711; there are 15,000, one per customer.
 
 - **5,000**: Customers with no qualifying orders: the largest group of the result, c_count 0. The next ones are 9 orders (659 customers), 10 (658) and 11 (643).
-- **148,467**: Orders out of 150,000 that pass the comment filter. Since nearly all pass, the side to build on should have been decided by the 15,000 customers.
-- **Not measured**: The machine's load average was above 55 during these runs, and Q13's times ranged from 0.021 s to 0.159 s, too noisy to compare the build sides or the passes.
+- **148,467**: Orders out of 150,000 that pass the comment filter. Since nearly all pass, the side to build on is decided by the 15,000 customers.
+- **0.031 s**: Q13 with the RIGHT join, against 0.029 s with the LEFT join that builds on orders. These are medians of 100 warm runs each, with the two builds interleaved at a load average of 39–46. The swap is slower here, although it builds a table ten times smaller. At SF1 it is also slower (0.230 s against 0.215 s, with half again as much CPU time).
+- **2× faster join**: At SF1, the join alone, without the comment filter, takes 0.037 s with the swap and 0.076 s without. The loss in Q13 comes from execution: the filtered orders scan runs in the probe pipeline, and the runtime join filters help the LEFT plan more. With `join_filter_pushdown` also off, the swap wins (0.101 s against 0.134 s with the filter). DuckDB 1.5.6 runs Q13 at SF1 in about 0.052 s.
 
 ## TPC-H Q14, with the optimizer off and on
 
