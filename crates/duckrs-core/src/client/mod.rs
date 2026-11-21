@@ -920,6 +920,9 @@ pub struct ClientContext {
     trigger_tables: Vec<String>,
     /// what the plan of the statement being profiled did: its phases and its operators
     pending_profile: Option<PendingProfile>,
+    /// EXPLAIN ANALYZE asks the statement it runs to keep the tree of its plan, with what each operator did
+    capture_analyzed: bool,
+    analyzed: Option<explain::ExplainNode>,
 }
 
 /// The phases (with their times) and the operator tree of a profiled statement.
@@ -1052,6 +1055,8 @@ impl ClientContext {
             profiling: false,
             pending_profile: None,
             trigger_tables: Vec::new(),
+            capture_analyzed: false,
+            analyzed: None,
         };
         context.sync_logging_settings();
         context
@@ -2916,10 +2921,14 @@ impl ClientContext {
         let physical = if explain_type == ExplainType::Analyze {
             // what the joins gave the scans is known once the statement ran
             crate::execution::join_filter::start_recording();
+            self.capture_analyzed = true;
+            self.analyzed = None;
             let ran = self.execute_statement(statement);
+            self.capture_analyzed = false;
             let recorded = crate::execution::join_filter::take_recorded();
             ran?;
-            let mut physical = physical;
+            // the plan that ran, where the statement planned one; else the one planned to show
+            let mut physical = self.analyzed.take().unwrap_or(physical);
             explain::add_dynamic_filters(&mut physical, &mut recorded.into_iter());
             explain::render(&physical, format, upper)
         } else {
@@ -3596,13 +3605,22 @@ impl ClientContext {
         let mut plan = crate::optimizer::optimize_timed(bound.plan, self.optimizer_options(), &mut optimizers);
         crate::optimizer::join_order::take_error()?;
         let optimized = profiling.map(|_| std::time::Instant::now());
+        // EXPLAIN ANALYZE renders this plan once it ran: the optimized plan, its estimates, and what the
+        // profiler saw of each operator
+        let analyzed = std::mem::take(&mut self.capture_analyzed).then(|| {
+            let estimate = estimate_plan(&plan);
+            (plan.clone(), estimate)
+        });
         crate::execution::join_filter::note_probe_estimates(&plan);
         resolve_column_bindings(&mut plan)?;
         let plan = create_plan(plan);
         let physical = profiling.map(|_| std::time::Instant::now());
         let collector = PhysicalResultCollector::new(plan);
         let threads = self.thread_count();
-        let operator_profiler = profiling.and_then(|_| crate::execution::profiler::current());
+        let mut operator_profiler = profiling.and_then(|_| crate::execution::profiler::current());
+        if analyzed.is_some() && operator_profiler.is_none() {
+            operator_profiler = Some(Arc::new(crate::execution::profiler::OperatorProfiler::default()));
+        }
         if let Some(profiler) = &operator_profiler {
             profiler.clear_operators();
         }
@@ -3618,6 +3636,14 @@ impl ClientContext {
             crate::execution::temporary::with_memory(memory, || execute_plan_with(&collector, threads))
         })?;
         crate::execution::join_filter::record(&collector);
+        if let (Some((logical, estimate)), Some(profiler)) = (&analyzed, &operator_profiler) {
+            self.analyzed = Some(explain::analyzed_tree(
+                collector.children[0].as_ref(),
+                Some(logical),
+                Some(estimate),
+                profiler.clone(),
+            ));
+        }
         if let (Some(start), Some(planned), Some(optimized), Some(physical), Some(operators)) =
             (profiling, planned, optimized, physical, &operator_profiler)
         {

@@ -117,9 +117,14 @@ pub(super) fn try_execute(op: &LogicalOperator) -> Option<LogicalOperator> {
             table_partitions(table, column_ids)?
         }
         K::ParquetScan { table_index, scan } => {
-            if !scan.extracts.is_empty() || scan.files.len() != 1 || scan.union_by_name {
+            if !scan.extracts.is_empty()
+                || scan.files.len() != 1
+                || scan.union_by_name
+                || !scan.optional_filters.is_empty()
+            {
                 return None;
             }
+            filters.extend(&scan.filters);
             for want in &wanted {
                 if let Wanted::Min(column) | Wanted::Max(column) = want
                     && (column.binding.table_index != *table_index || column.binding.column_index >= scan.names.len())

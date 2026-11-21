@@ -343,22 +343,23 @@ pub fn push_into_scans(op: &mut LogicalOperator) {
     push_into(op, false);
 }
 
-/// [`push_into_scans`] of the filters on scans of tables only, whose table filters statistics then check.
+/// [`push_into_scans`] of the filters on scans of tables and Parquet files only, whose table filters statistics
+/// then check (`PushdownGet` runs before statistics for any `LogicalGet` with `filter_pushdown`).
 pub fn push_into_table_scans(op: &mut LogicalOperator) {
     push_into(op, true);
 }
 
-fn push_into(op: &mut LogicalOperator, tables_only: bool) {
+fn push_into(op: &mut LogicalOperator, before_statistics: bool) {
     for child in &mut op.children {
-        push_into(child, tables_only);
+        push_into(child, before_statistics);
     }
     if let K::LateralJoin { right, .. } = &mut op.kind {
-        push_into(right, tables_only);
+        push_into(right, before_statistics);
     }
     let K::Filter { expressions } = &mut op.kind else {
         return;
     };
-    if tables_only && !matches!(op.children[0].kind, K::Get { .. }) {
+    if before_statistics && !matches!(op.children[0].kind, K::Get { .. } | K::ParquetScan { .. }) {
         return;
     }
     // `MultiFileFunction` has no `filter_pushdown` for CSV and JSON, only `pushdown_complex_filter`, which
