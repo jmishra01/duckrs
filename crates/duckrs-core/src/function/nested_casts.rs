@@ -22,7 +22,7 @@ fn is_unnamed(ty: &LogicalType) -> bool {
 }
 
 /// `StructBoundCastData::GetFieldMapping`: for each target field, the source field it takes.
-fn field_mapping(source: &LogicalType, target: &LogicalType) -> Result<Vec<Option<usize>>> {
+pub(crate) fn field_mapping(source: &LogicalType, target: &LogicalType) -> Result<Vec<Option<usize>>> {
     let (from, to) = (source.struct_children(), target.struct_children());
     if is_unnamed(source) || is_unnamed(target) {
         if from.len() != to.len() {

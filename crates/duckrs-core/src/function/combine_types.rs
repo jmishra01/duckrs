@@ -322,6 +322,11 @@ fn combine_equal_union(force: bool, left: &LogicalType, right: &LogicalType) -> 
 /// `UnionType::MAX_UNION_MEMBERS`.
 const MAX_UNION_MEMBERS: usize = 255;
 
+/// `LogicalType::DefaultTryGetMaxLogicalTypeUnchecked`: without `old_implicit_casting`.
+pub fn try_max_logical_type_unchecked(left: &LogicalType, right: &LogicalType) -> Option<LogicalType> {
+    try_max_internal(false, left, right)
+}
+
 pub fn try_max_logical_type(left: &LogicalType, right: &LogicalType) -> Option<LogicalType> {
     // `LogicalType::TryGetMaxLogicalType`: with `old_implicit_casting` any two types combine
     if super::cast_rules::old_implicit_casting() {

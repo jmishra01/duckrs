@@ -235,6 +235,18 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] LEFT join equality groups, `debug_force_no_cross_product`, `approximate_join_order_threshold`
   - [ ] LEFT joins reordered inside the join graph (C++'s CD-C conflict detector, `left_join_cardinality_estimation`)
 - [ ] 17. Column lifetime, unused columns, TopN, expression rewriter (small dirs under `test/optimizer`)
+  - [x] `CastCanThrow` of nested, DECIMAL and timestamp casts; `x * 0` and `x // 0` (`ArithmeticSimplificationRule`);
+    `prefix` decided by statistics only in a one-column filter on a scan; empty statistics fold no `constant_or_null`
+  - [ ] count/min/max from row group statistics (`TryExecuteAggregates`: `eager_aggregate_execution`, its parquet
+    variant, `partial_aggregate_precomputation`, `partition_stats_exactness`)
+  - [ ] a window none of whose outputs are read is removed (`unused_window_columns`); child columns through views
+    (`unused_columns/deliver_child_columns`)
+  - [ ] EXPLAIN shapes: ANY joins folded to cross products, IN rewrites under ORs into MARK joins, date_trunc
+    filters as ranges, join-dependent filters, LIMIT above exact bounds, projection placement, filter pullup
+    join order, recursive CTE join order, redundant ORDER BY keys with COLLATE, zone maps of ORs over joins,
+    grouping sets of the common aggregate
+  - [ ] `duckdb_extensions()`, named table function arguments (`materialized_cte_column_count`), an unnest rewrite
+    of a LIST constant (`unnest_rewriter_issue_14542`)
 - [ ] 18. Optimizer-dependent SQL tests (`sql/optimizer`: 62 failing, 63.7% pass)
   - [x] uncorrelated scalar subqueries planned as cross products (`PlanUncorrelatedSubquery`), with first() and
     the multiple-rows check where they may not return one row

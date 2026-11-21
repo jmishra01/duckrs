@@ -817,6 +817,9 @@ struct StatisticsPropagator {
     side_effects: bool,
     /// the filter being propagated is on a scan, where it becomes a table filter
     filter_on_scan: bool,
+    /// the expression being propagated is a conjunct of a filter on a scan that reads one column,
+    /// which C++ makes a table filter that the column's statistics decide (`ExpressionFilter::CheckStatistics`)
+    scan_prefix: bool,
     /// `cte_stats_map`: the statistics of the columns of each materialized CTE's definition
     ctes: HashMap<usize, Vec<Stats>>,
     /// the most rows each materialized CTE's definition has
@@ -1249,9 +1252,12 @@ impl StatisticsPropagator {
         else {
             unreachable!()
         };
+        let scan_prefix = self.scan_prefix;
         let mut stats: Vec<Stats> = children.iter_mut().map(|c| self.expression(c, false)).collect();
-        // `prefix` of strings that all start with it, or that all sort outside of the strings that do
-        if matches!(function.name.as_str(), "prefix" | "starts_with" | "^@")
+        // `prefix` of strings that all start with it, or that all sort outside of the strings that do,
+        // as the range C++ puts in the scan for it
+        if scan_prefix
+            && matches!(function.name.as_str(), "prefix" | "starts_with" | "^@")
             && let [child, needle] = stats.as_slice()
             && let BoundExprKind::Constant(needle_value) = &children[1].kind
             && !needle_value.is_null()
@@ -1638,8 +1644,12 @@ impl StatisticsPropagator {
             }
             return result;
         }
-        // `ConstantOrNullSimplification`: folding drops the NULL check, which a plan that adds rows can't
-        if function.name == "constant_or_null" && !self.side_effects && stats[1..].iter().all(|s| !s.can_be_null) {
+        // `ConstantOrNullSimplification`: folding drops the NULL check, which a plan that adds rows can't;
+        // empty statistics (of no rows) describe no value (`TryInferConstantBounds`)
+        if function.name == "constant_or_null"
+            && !self.side_effects
+            && stats[1..].iter().all(|s| !s.can_be_null && s.can_be_valid)
+        {
             let alias = expr.alias.clone();
             let value = children.swap_remove(0);
             *expr = value.with_alias(alias);
@@ -2083,7 +2093,17 @@ impl StatisticsPropagator {
     /// `HandleFilter`, up to classifying the result.
     fn handle_filter(&mut self, expr: &mut BoundExpr) {
         let before = self.filter_simplification.then(|| filter_bindings(expr));
+        self.scan_prefix = self.filter_on_scan && {
+            let mut columns = HashSet::new();
+            expr.walk_mut(&mut |e| {
+                if let BoundExprKind::ColumnRef { binding, .. } = e.kind {
+                    columns.insert(binding);
+                }
+            });
+            columns.len() == 1
+        };
         self.expression(expr, true);
+        self.scan_prefix = false;
         super::rewriter::rewrite_pushed_filter(expr);
         if let Some(before) = before {
             simplify_filter(expr);

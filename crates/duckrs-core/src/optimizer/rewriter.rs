@@ -1167,6 +1167,22 @@ fn arithmetic_simplification(expr: &mut BoundExpr) -> bool {
     let is = |n: i128| number == Some(n);
     let name = function.name.as_str();
     let other = 1 - constant_child;
+    if is_integral(&expr.return_type) {
+        // multiply by zero: zero, or NULL where the other side is
+        if name == "*" && is(0) {
+            let return_type = expr.return_type.clone();
+            let zero = BoundExpr::constant(Value::bigint(0)).cast_to(&return_type, false);
+            let zero = try_evaluate_scalar(&zero).map_or(zero, BoundExpr::constant);
+            let alias = expr.alias.clone();
+            *expr = crate::function::constant_or_null(vec![zero, take(&mut children[other])]).with_alias(alias);
+            return true;
+        }
+        // divide by zero where that gives NULL (`error_on_division_by_zero = false`)
+        if name == "//" && constant_child == 1 && is(0) && function.null_on_zero {
+            expr.kind = BoundExprKind::Constant(Value::null(expr.return_type.clone()));
+            return true;
+        }
+    }
     let keep_other = if name == "/" {
         let float = matches!(
             children[0].return_type.id(),
@@ -1756,7 +1772,7 @@ pub(crate) fn contains_barrier(expr: &BoundExpr) -> bool {
 pub(crate) fn can_throw(expr: &BoundExpr) -> bool {
     let own = match &expr.kind {
         BoundExprKind::Subquery { .. } | BoundExprKind::ListLambda { .. } | BoundExprKind::Sequence { .. } => true,
-        BoundExprKind::Cast { child, try_cast } => !try_cast && cast_can_throw(&child.return_type, &expr.return_type),
+        BoundExprKind::Cast { child, try_cast } => cast_can_throw_of(&child.return_type, &expr.return_type, *try_cast),
         BoundExprKind::Function { function, children, .. } => function_can_throw(function, children, &expr.return_type),
         _ => false,
     };
@@ -1795,24 +1811,124 @@ fn offset_in_range(offset: &BoundExpr, length: Option<&BoundExpr>) -> bool {
     matches!((offset, length), (Some(o), Some(l)) if (LOWER..=UPPER).contains(&o) && (LOWER..=UPPER).contains(&l))
 }
 
-fn cast_can_throw(source: &LogicalType, target: &LogicalType) -> bool {
+/// `BoundCastExpression::CastCanThrow` of a cast that is not a TRY_CAST.
+pub(crate) fn cast_can_throw(source: &LogicalType, target: &LogicalType) -> bool {
+    cast_can_throw_of(source, target, false)
+}
+
+/// `BoundCastExpression::CastCanThrow`.
+pub(crate) fn cast_can_throw_of(source: &LogicalType, target: &LogicalType, try_cast: bool) -> bool {
     use LogicalTypeId::*;
-    if source == target || target.id() == Varchar {
+    if source == target {
         return false;
     }
-    let width = |id: LogicalTypeId| match id {
-        TinyInt => Some(1),
-        SmallInt => Some(2),
-        Integer => Some(4),
-        BigInt => Some(8),
-        HugeInt => Some(16),
-        _ => None,
-    };
-    match (width(source.id()), target.id()) {
-        (Some(_), Float | Double) => false,
-        (Some(from), id) => width(id).is_none_or(|to| from > to),
-        (None, _) => true,
+    // converting VARIANT can hit its traversal depth limit, and extensions implement the casts of
+    // custom types, which can throw even as TRY_CAST
+    if source.id() == Variant || source.alias().is_some() || target.alias().is_some() {
+        return true;
     }
+    if try_cast || target.id() == Varchar || (source.id() == Geometry && target.id() == Geometry) {
+        return false;
+    }
+    // parsing a string, or an ENUM's, throws for what is not the target type
+    if matches!(source.id(), Varchar | Enum | Bignum) {
+        return true;
+    }
+    if target.id() == Bignum && matches!(source.id(), Float | Double) {
+        return true;
+    }
+    if source.is_nested() || target.is_nested() {
+        return nested_cast_can_throw(source, target);
+    }
+    if target.id() == Decimal {
+        return !decimal_holds_every_value(source, target);
+    }
+    // a DATE far in the future does not fit in a TIMESTAMP
+    if matches!(target.id(), Timestamp | TimestampMs | TimestampNs | TimestampSec | TimestampTz | TimestampTzNs) {
+        return true;
+    }
+    // the target must hold every value of the source: be the larger of the two types
+    crate::function::combine_types::try_max_logical_type_unchecked(source, target).is_none_or(|max| &max != target)
+}
+
+/// `NestedCastCanThrow`: a nested cast runs the casts of its children, and throws where the shapes
+/// do not fit.
+fn nested_cast_can_throw(source: &LogicalType, target: &LogicalType) -> bool {
+    use LogicalTypeId::*;
+    if source.id() == Union || target.id() == Union {
+        return true;
+    }
+    match source.id() {
+        List | Array => {
+            if target.id() == Array {
+                // a fixed-size ARRAY throws for other lengths
+                let any = |t: &LogicalType| t.array_size().is_none_or(|n| n == 0);
+                if source.id() != Array || any(source) || any(target) || source.array_size() != target.array_size() {
+                    return true;
+                }
+            } else if target.id() != List {
+                return true;
+            }
+            match (source.child_type(), target.child_type()) {
+                (Some(from), Some(to)) => cast_can_throw(from, to),
+                _ => true,
+            }
+        }
+        Struct | Tuple => {
+            if !matches!(target.id(), Struct | Tuple) {
+                return true;
+            }
+            // the fields pair by name, or by position for unnamed structs; a field without a pair is
+            // dropped or NULL, which does not throw
+            let Ok(mapping) = crate::function::struct_field_mapping(source, target) else {
+                return true;
+            };
+            let (from, to) = (source.struct_children(), target.struct_children());
+            mapping
+                .iter()
+                .enumerate()
+                .any(|(t, s)| s.is_some_and(|s| cast_can_throw(&from[s].1, &to[t].1)))
+        }
+        Map => {
+            if target.id() != Map {
+                return true;
+            }
+            let entry = |t: &LogicalType| t.child_type().map(|c| c.struct_children().to_vec());
+            let (Some(from), Some(to)) = (entry(source), entry(target)) else {
+                return true;
+            };
+            if from.len() != 2 || to.len() != 2 {
+                return true;
+            }
+            // keys must stay unique, and cannot be NULL
+            (from[0].1 != to[0].1 && !cast_is_invertible(&from[0].1, &to[0].1))
+                || cast_can_throw(&from[0].1, &to[0].1)
+                || cast_can_throw(&from[1].1, &to[1].1)
+        }
+        _ => true,
+    }
+}
+
+/// `DecimalHoldsEveryValue`: the DECIMAL keeps every digit of the source on both sides of the point.
+fn decimal_holds_every_value(source: &LogicalType, target: &LogicalType) -> bool {
+    use LogicalTypeId::*;
+    let Some((width, scale)) = target.decimal_properties() else {
+        return false;
+    };
+    let integral = i32::from(width) - i32::from(scale);
+    if let Some((source_width, source_scale)) = source.decimal_properties() {
+        return scale >= source_scale && integral >= i32::from(source_width) - i32::from(source_scale);
+    }
+    // `IntegerTypeDecimalDigits`
+    let digits = match source.id() {
+        TinyInt | UTinyInt => 3,
+        SmallInt | USmallInt => 5,
+        Integer | UInteger => 10,
+        BigInt => 19,
+        UBigInt => 20,
+        _ => 0,
+    };
+    digits > 0 && integral >= digits
 }
 
 fn integer_of(value: &Value) -> Option<i128> {

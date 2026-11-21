@@ -485,6 +485,7 @@ test/issues/rigger/timestamp_overflow.test
 test/issues/rigger/zonemap_column_out_of_range.test
 test/ldbc/ldbc-empty.test
 test/optimizer/aggregate_reuse.test
+test/optimizer/arithmetic_simplification.test
 test/optimizer/avg_rewrite_profitability.test
 test/optimizer/case_simplification.test
 test/optimizer/case_simplification_errors.test
@@ -506,6 +507,7 @@ test/optimizer/constant_argument_errors.test
 test/optimizer/constant_argument_errors_case.test
 test/optimizer/constant_argument_errors_like_regex.test
 test/optimizer/constant_folding.test
+test/optimizer/constant_or_null_value_arg.test
 test/optimizer/constant_order_normalization.test
 test/optimizer/contains_to_in_clause.test
 test/optimizer/csv_pushdown.test
@@ -605,6 +607,7 @@ test/optimizer/pushdown/filters_on_limit_optimizer.test
 test/optimizer/pushdown/issue_16104.test
 test/optimizer/pushdown/issue_16863.test
 test/optimizer/pushdown/issue_18202.test
+test/optimizer/pushdown/issue_18603.test
 test/optimizer/pushdown/join_filter_pushdown.test
 test/optimizer/pushdown/join_filter_pushdown_bloom_cast.test
 test/optimizer/pushdown/join_filter_pushdown_cast.test
@@ -687,6 +690,7 @@ test/optimizer/statistics/union_group_cardinality.test
 test/optimizer/statistics/union_selected_cardinality.test
 test/optimizer/stats_non_numeric_cast.test
 test/optimizer/string_prefix.test
+test/optimizer/struct_cast_can_throw_reordering.test
 test/optimizer/table_in_out_unique_keys.test
 test/optimizer/temporal_cardinality_bounds.test
 test/optimizer/test_aggregate_function_rewrite.test

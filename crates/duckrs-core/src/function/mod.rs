@@ -26,6 +26,7 @@ mod lists;
 pub(crate) mod math;
 pub mod nested;
 mod nested_casts;
+pub(crate) use nested_casts::field_mapping as struct_field_mapping;
 pub(crate) mod operators;
 mod printf;
 pub(crate) mod regexp;
