@@ -261,10 +261,11 @@ fn try_late_materialization(op: &mut LogicalOperator, next: &mut usize, root: bo
             // all its columns, of which the removal of unused columns keeps what is read
             *projection = None;
         }
-        // its filters stay: the scan has no filters that only skip row groups
         K::ParquetScan { table_index, scan } => {
             *table_index = lhs_index;
             let scan = std::sync::Arc::make_mut(scan);
+            let filters = std::mem::take(&mut scan.filters);
+            scan.optional_filters.extend(filters);
             scan.projected = None;
             scan.read = None;
         }

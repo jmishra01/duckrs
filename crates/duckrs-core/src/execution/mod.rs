@@ -276,10 +276,16 @@ fn create_physical(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
         LogicalOperatorKind::CsvScan { scan, .. } => Box::new(PhysicalCsvScan { types, scan }),
         LogicalOperatorKind::JsonScan { scan, .. } => Box::new(json_scan::PhysicalJsonScan { types, scan }),
         LogicalOperatorKind::ParquetScan { scan, .. } => {
-            // an optional filter passes every row the filter above does, so it may filter here too
+            // an optional filter only skips row groups (`OptionalFilter`): the rows are filtered elsewhere
+            let filter = (!scan.filters.is_empty()).then(|| crate::optimizer::conjunction_of(scan.filters.clone()));
             let all: Vec<_> = scan.filters.iter().chain(&scan.optional_filters).cloned().collect();
-            let filter = (!all.is_empty()).then(|| crate::optimizer::conjunction_of(all));
-            Box::new(parquet::PhysicalParquetScan { types, scan, filter })
+            let prune = (!all.is_empty()).then(|| crate::optimizer::conjunction_of(all));
+            Box::new(parquet::PhysicalParquetScan {
+                types,
+                scan,
+                filter,
+                prune,
+            })
         }
         LogicalOperatorKind::CopyToParquet { path, names, options } => Box::new(parquet::PhysicalCopyToParquet::new(
             types, path, names, options, children,

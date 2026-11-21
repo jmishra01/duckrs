@@ -280,7 +280,8 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] late materialization of Top-N, LIMIT and SAMPLE over tables (a SEMI join on the rowid; the second
     scan's filters are `optional:`)
   - [x] late materialization over `read_parquet`, on `file_index` and `file_row_number`
-  - [ ] the second parquet scan's filters as filters that only skip row groups (they are applied again)
+  - [x] the second parquet scan's filters as filters that only skip row groups (`CreateLHSGet`); a Parquet
+    scan applies its optional filters only to skip row groups, as table scans do
   - [x] TopN window elimination: `row_number() <= k` per partition as a grouped `arg_min`/`arg_max` of `k`,
     unnested back into rows
   - [x] its late-materialization variant: a payload of several columns of one table fetched by rowid, through
