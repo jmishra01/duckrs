@@ -372,6 +372,8 @@ impl Binder<'_> {
             column_order: self.column_order(table_index),
             total_files: None,
             extracts: Vec::new(),
+            byte_lengths: Vec::new(),
+            output: None,
         };
         Ok(LogicalOperator::new(
             LogicalOperatorKind::ParquetScan {

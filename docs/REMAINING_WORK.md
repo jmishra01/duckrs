@@ -201,8 +201,10 @@ Each item gives the number of failing files in `test/` that it should fix, where
     in Parquet scans too; `now()` and its kin are `CONSISTENT_WITHIN_QUERY`, not volatile, so they move into scans;
     statistics compare strings by the 12-byte bounds C++ keeps; a comparison of both sides of a join is kept unless
     it is always true (`JoinCondition`); `nextval('s')` shown as C++ shows it
-  - [ ] `ScalarFnPushdown`: `strlen`/`octet_length` of a Parquet column read by the scan (`scalar_function_pushdown`,
-    its LIMIT variant)
+  - [x] `ScalarFnPushdown`: `strlen`/`octet_length` of a Parquet column, when it is the only use of the column, is
+    read by the scan as the byte lengths of the values (one file, no filter on the column, no
+    `DELTA_LENGTH_BYTE_ARRAY`); a projection that only forwards the columns a Parquet scan reads, directly or
+    through a LIMIT, is omitted, as the scan outputs just those (`projection_ids`)
   - [x] filters into table scans before statistics, as C++ does, so the scan keeps the filter as it was and
     statistics rewrite only the one above; statistics check the scan's table filters, optional ones too
     (`PropagateStatistics(LogicalGet)`); `constant_or_null` folds only of columns and constants

@@ -79,6 +79,12 @@ pub struct ParquetScanData {
     /// the fields of columns pushed into the scan (`IsPushdownExtract`): the output column they are of, and
     /// what gives them; they are output columns after all others
     pub extracts: Vec<(usize, Arc<crate::planner::logical::PushedExtract>)>,
+    /// `ParquetReaderProjectionExpressionType::BYTE_LENGTH`: the columns from the files read as the byte length of
+    /// their values (`strlen`, `octet_length` pushed into the scan), which are BIGINT in [`Self::types`]
+    pub byte_lengths: Vec<usize>,
+    /// `projection_ids`: once a projection of just these is omitted, the columns of
+    /// [`Self::output_types`] the scan emits, in order
+    pub output: Option<Vec<usize>>,
 }
 
 impl ParquetScanData {
@@ -130,6 +136,15 @@ impl ParquetScanData {
         types.extend(crate::execution::multi_file::virtual_types(&self.virtual_columns));
         types.extend(self.extracts.iter().map(|(_, e)| e.expression.return_type.clone()));
         types
+    }
+
+    /// The types of the columns the scan emits: [`Self::output_types`], or those of [`Self::output`].
+    pub fn emitted_types(&self) -> Vec<LogicalType> {
+        let types = self.output_types();
+        match &self.output {
+            Some(output) => output.iter().map(|&at| types[at].clone()).collect(),
+            None => types,
+        }
     }
 }
 
@@ -1374,6 +1389,18 @@ fn batch_chunk(
         for row in 0..count {
             vector.set_value(row, &array_value(array, row, file_type)?)?;
         }
+        if scan.byte_lengths.contains(&index) {
+            let mut lengths = Vector::new(LogicalType::BIGINT, count);
+            for row in 0..count {
+                let length = match vector.get_value(row).data() {
+                    ValueData::Bytes(bytes) => Value::bigint(bytes.len() as i64),
+                    _ => Value::null(LogicalType::BIGINT),
+                };
+                lengths.set_value(row, &length)?;
+            }
+            columns.push(lengths);
+            continue;
+        }
         // a VARIANT the file has shredded into a `typed_value` reads as a SHREDDED_VECTOR
         if file_type.id() == LogicalTypeId::Variant
             && array.as_struct_opt().is_some_and(|group| group.column_by_name("typed_value").is_some())
@@ -1545,6 +1572,10 @@ impl PhysicalOperator for PhysicalParquetScan {
                                 let input = DataChunk::from_columns(vec![chunk.column(*base).clone()], chunk.len());
                                 columns.push(crate::execution::expression_executor::execute(&extract.expression, &input)?);
                             }
+                            chunk = DataChunk::from_columns(columns, chunk.len());
+                        }
+                        if let Some(output) = &self.scan.output {
+                            let columns = output.iter().map(|&at| chunk.column(at).clone()).collect();
                             chunk = DataChunk::from_columns(columns, chunk.len());
                         }
                         return Ok(Some(chunk));
@@ -3772,4 +3803,36 @@ pub fn file_metadata_row(path: &str) -> Result<String> {
         metadata.num_row_groups(),
         file.version(),
     ))
+}
+
+/// The part of `ParquetScanFunction::ProjectionExpressionPushdown` that reads the file: whether the column of the
+/// scan's (only) file at `column` can be read as the byte lengths of its values. Its values are stored without
+/// `DELTA_LENGTH_BYTE_ARRAY` in every row group.
+pub fn reads_byte_length(scan: &ParquetScanData, column: usize) -> bool {
+    let (Some(path), Some(name)) = (scan.files.first(), scan.names.get(column)) else {
+        return false;
+    };
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    let Ok(metadata) = ParquetMetaDataReader::new().parse_and_finish(&file) else {
+        return false;
+    };
+    let schema = metadata.file_metadata().schema_descr();
+    let fields = schema.root_schema().get_fields();
+    let Some(root) = fields.iter().position(|field| field.name().eq_ignore_ascii_case(name)) else {
+        return false;
+    };
+    if !fields[root].is_primitive() {
+        return false;
+    }
+    let Some(leaf) = (0..schema.num_columns()).find(|leaf| schema.get_column_root_idx(*leaf) == root) else {
+        return false;
+    };
+    metadata.row_groups().iter().all(|group| {
+        group
+            .column(leaf)
+            .encodings()
+            .all(|encoding| encoding != parquet::basic::Encoding::DELTA_LENGTH_BYTE_ARRAY)
+    })
 }
