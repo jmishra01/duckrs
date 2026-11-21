@@ -861,7 +861,8 @@ impl LogicalOperator {
                 .chain(optional_filters.iter_mut())
                 .collect(),
             LogicalOperatorKind::ParquetScan { scan, .. } => {
-                std::sync::Arc::make_mut(scan).filters.iter_mut().collect()
+                let scan = std::sync::Arc::make_mut(scan);
+                scan.filters.iter_mut().chain(scan.optional_filters.iter_mut()).collect()
             }
             LogicalOperatorKind::MergeInto {
                 actions,

@@ -631,10 +631,12 @@ test/optimizer/pushdown/pushdown_window_decreasing_partition.test
 test/optimizer/pushdown/pushdown_window_partition_filter.test
 test/optimizer/pushdown/semi_anti_join_implied_filters.test
 test/optimizer/pushdown/starts_with_pushdown.test
+test/optimizer/pushdown/table_filter_pushdown.test
 test/optimizer/pushdown/test_pushdown_cte_group_by_all.test
 test/optimizer/pushdown/timestamp_to_date_infinity_pushdown.test
 test/optimizer/pushdown/type_pushdown_projection_index.test
 test/optimizer/pushdown/type_pushdown_virtual_column.test
+test/optimizer/pushdown/volatile_filter_aggregate_distinct.test
 test/optimizer/pushdown_semi_anti_join.test
 test/optimizer/pushdown_set_op.test
 test/optimizer/regex_optimizer.test

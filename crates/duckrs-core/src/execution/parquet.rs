@@ -66,6 +66,8 @@ pub struct ParquetScanData {
     pub arguments: String,
     /// `table_filters`: conditions on one column each, over the columns of [`Self::output_types`]
     pub filters: Vec<crate::planner::expression::BoundExpr>,
+    /// `OptionalFilter`s: implied by a filter above the scan, they only let it skip what none of their rows pass
+    pub optional_filters: Vec<crate::planner::expression::BoundExpr>,
     /// by output column, those the operators above read (`projection_ids`), once unused columns are known
     pub projected: Option<Vec<bool>>,
     /// `ExtraOperatorInfo::file_filters`: the filters that left files out, as text

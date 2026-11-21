@@ -14,7 +14,8 @@
 //! count as unknown.
 
 use super::filter_pushdown::empty_result;
-use super::rewriter::{fold_boolean, rewrite_expression};
+use super::rewriter::{fold_boolean, rewrite_expression, split_conjuncts};
+use super::conjunction_of;
 use crate::catalog::{ColumnStatistics, TableCatalogEntry, TableDistinctCounts};
 use crate::execution::run_plan;
 use crate::function::binder::bind_aggregate_function;
@@ -490,6 +491,63 @@ pub(super) fn flip(op: ComparisonOp) -> ComparisonOp {
 }
 
 /// `CheckZonemap`: what `left op right` is for all values within the statistics.
+/// `GetStringStatsMin` / `GetStringStatsMax`: the bounds of strings as C++'s statistics keep them, cut to
+/// `CURRENT_MAX_STRING_MINMAX_SIZE` bytes, with a cut maximum as the next prefix after it (`FindNextPrefix`).
+fn string_stats_bounds(stats: &Stats) -> Stats {
+    let (Some(strings), Some(min), Some(max)) = (&stats.strings, &stats.min, &stats.max) else {
+        return stats.clone();
+    };
+    let (Some((low, high)), ValueData::Bytes(exact_min), ValueData::Bytes(exact_max)) =
+        (&strings.bounds, min.data(), max.data())
+    else {
+        return stats.clone();
+    };
+    let size = crate::catalog::StringStatistics::PREFIX_SIZE;
+    let ty = min.logical_type().clone();
+    // a bound that is the value itself is exact (`EXACT_STATS`), as of a constant; any other was cut, which the
+    // value cut tells as merged bounds do not
+    let lower = if low == exact_min { exact_min.clone() } else { exact_min[..exact_min.len().min(size)].to_vec() };
+    let upper = if high == exact_max {
+        Some(exact_max.clone())
+    } else {
+        // `FindNextPrefix`: the last byte that can go up does, and what follows goes
+        let mut next = exact_max[..exact_max.len().min(size)].to_vec();
+        while next.last() == Some(&0xFF) {
+            next.pop();
+        }
+        next.last_mut().map(|last| *last += 1).map(|()| next)
+    };
+    Stats {
+        min: Value::new(ty.clone(), ValueData::Bytes(lower)).ok(),
+        max: upper.and_then(|upper| Value::new(ty, ValueData::Bytes(upper)).ok()),
+        ..stats.clone()
+    }
+}
+
+/// A comparison of an expression of each side of a join: a `JoinCondition` in C++.
+fn is_side_comparison(expr: &BoundExpr, sides: &[Vec<ColumnBinding>; 2]) -> bool {
+    let BoundExprKind::Comparison { left, right, .. } = &expr.kind else {
+        return false;
+    };
+    let side_of = |e: &BoundExpr| {
+        let mut found: Option<usize> = None;
+        let mut mixed = false;
+        e.clone().walk_mut(&mut |e| {
+            if let BoundExprKind::ColumnRef { binding, depth } = e.kind {
+                let side = (depth == 0).then(|| sides.iter().position(|s| s.contains(&binding))).flatten();
+                match (side, found) {
+                    (None, _) => mixed = true,
+                    (Some(side), None) => found = Some(side),
+                    (Some(side), Some(other)) if side != other => mixed = true,
+                    _ => {}
+                }
+            }
+        });
+        (!mixed).then_some(found).flatten()
+    };
+    matches!((side_of(left), side_of(right)), (Some(a), Some(b)) if a != b)
+}
+
 fn decide(op: ComparisonOp, left: &Stats, right: &Stats) -> Option<bool> {
     use ComparisonOp as C;
     let (left_min, left_max) = (left.min.as_ref()?, left.max.as_ref()?);
@@ -1033,7 +1091,7 @@ impl StatisticsPropagator {
             }
             return unknown();
         }
-        if let Some(answer) = decide(op, &left_stats, &right_stats) {
+        if let Some(answer) = decide(op, &string_stats_bounds(&left_stats), &string_stats_bounds(&right_stats)) {
             // `FILTER_TRUE_OR_NULL` / `FILTER_FALSE_OR_NULL`: NULL with either side, which both stay
             let sides = if left_stats.can_be_null || right_stats.can_be_null {
                 vec![(**left).clone(), (**right).clone()]
@@ -2204,6 +2262,7 @@ impl StatisticsPropagator {
             let filtered = LogicalOperator::new(K::Filter { expressions: filters }, vec![child]);
             op.children[side] = super::filter_pushdown::push_down(filtered);
         }
+        let sides = [op.children[0].column_bindings(), op.children[1].column_bindings()];
         let K::Join {
             conditions,
             predicate,
@@ -2218,7 +2277,34 @@ impl StatisticsPropagator {
         let in_filter = join_type == JoinType::Inner;
         if let Some(condition) = predicate {
             if in_filter {
-                self.handle_filter(condition);
+                // a comparison of a column of each side is a join condition in C++, which statistics only take
+                // out where it is always true (`FILTER_ALWAYS_TRUE`) and leave as it is otherwise
+                let mut conjuncts = Vec::new();
+                split_conjuncts(std::mem::replace(condition, BoundExpr::constant(Value::boolean(true))), &mut conjuncts);
+                let mut kept = Vec::new();
+                for mut conjunct in conjuncts {
+                    if is_side_comparison(&conjunct, &sides) {
+                        let BoundExprKind::Comparison { op: comparison, left, right } = &mut conjunct.kind else {
+                            unreachable!()
+                        };
+                        let (left, right) = (self.expression(left, false), self.expression(right, false));
+                        let distinct = matches!(comparison, ComparisonOp::DistinctFrom | ComparisonOp::NotDistinctFrom);
+                        match (!distinct).then(|| decide(*comparison, &string_stats_bounds(&left), &string_stats_bounds(&right))).flatten() {
+                            Some(true) if !left.can_be_null && !right.can_be_null => continue,
+                            Some(false) => no_rows |= matches_only,
+                            _ => {}
+                        }
+                        kept.push(conjunct);
+                    } else {
+                        self.handle_filter(&mut conjunct);
+                        kept.push(conjunct);
+                    }
+                }
+                *condition = match kept.len() {
+                    0 => BoundExpr::constant(Value::boolean(true)),
+                    1 => kept.pop().expect("one conjunct"),
+                    _ => conjunction_of(kept),
+                };
             } else {
                 self.expression(condition, in_filter);
                 rewrite_expression(condition, in_filter);

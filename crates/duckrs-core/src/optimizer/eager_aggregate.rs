@@ -332,7 +332,7 @@ fn table_filter(filter: &BoundExpr, scan_index: usize) -> bool {
     if other || columns.len() != 1 || filter.is_volatile() {
         return false;
     }
-    !matches!(table_pushdown(filter), TablePushdown::Optional(_))
+    !matches!(table_pushdown(filter), TablePushdown::Optional(_) | TablePushdown::Partially(_))
 }
 
 /// Whether C++'s statistics can tell a filter is always true (`NumericStats::CheckZonemap`): a comparison,

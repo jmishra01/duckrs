@@ -197,8 +197,21 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] OR range merge, monotone preimage, filter reordering (`ExpressionHeuristics`), BETWEEN of a column as two comparisons
   - [x] a filter that can throw stays above the projection of an inlined CTE: `position`/`instr`/`strpos` and a
     string `a[i]` with a constant index cannot throw, as in C++ (`test_no_pushdown_cast_into_cte`)
-  - [ ] scalar functions pushed into Parquet scans, a filter on the right of a SEMI join through a subquery's
-    projection
+  - [x] LIKE/ILIKE prefixes as ranges in the scan (`TryPushdownLikeFilter`), dense IN ranges and optional OR filters
+    in Parquet scans too; `now()` and its kin are `CONSISTENT_WITHIN_QUERY`, not volatile, so they move into scans;
+    statistics compare strings by the 12-byte bounds C++ keeps; a comparison of both sides of a join is kept unless
+    it is always true (`JoinCondition`); `nextval('s')` shown as C++ shows it
+  - [ ] `ScalarFnPushdown`: `strlen`/`octet_length` of a Parquet column read by the scan (`scalar_function_pushdown`,
+    its LIMIT variant)
+  - [ ] filters into scans before statistics, as C++ does, so the scan keeps the filter as it was and statistics
+    rewrite only the one above (`table_or_pushdown`, `test_constant_or_null_pushdown`, `date_trunc_simplification`)
+  - [ ] the order of a join's conditions where an inequality comes before IS DISTINCT FROM (`issue_17042`)
+  - [ ] filters through the row numbers of EXCEPT ALL / INTERSECT ALL on a collation key
+    (`pushdown_window_partition_expression`); dynamic filters of blockwise NL joins (`join_filter_pushdown_any_join`)
+  - [ ] the operator log and profiler output a few tests read (`join_filter_pushdown_integer_chain`,
+    `cte_domain_join_filter`); `read_csv`'s `schema`; `COLUMNS(json_keys(getvariable(...)))` (`issue_16671`);
+    EXPLAIN ANALYZE row counts of operators (`parquet_or_pushdown`); a filter on the right of a SEMI join through
+    a subquery's projection
   - [x] `can_throw` as C++ has it: only the functions C++ marks `SetFallible` can fail, by overload where C++ decides
     it at bind time (extracts, substring, unary `+`/`-`, `list_value`, ICU date parts of TIMESTAMPTZ)
   - [x] `CanThrow` of aggregates and window functions: `sum`/`avg` of HUGEINT and wide DECIMAL, `string_agg`, the

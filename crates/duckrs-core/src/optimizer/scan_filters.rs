@@ -106,6 +106,8 @@ fn prefix_bounds(expr: &BoundExpr) -> Option<[BoundExpr; 2]> {
 pub(super) enum TablePushdown {
     /// `PUSHED_DOWN_FULLY`: these filters in place of it
     Fully(Vec<BoundExpr>),
+    /// `PUSHED_DOWN_PARTIALLY` with filters of the scan: these go in, and the filter stays
+    Partially(Vec<BoundExpr>),
     /// `PUSHED_DOWN_PARTIALLY`: an optional filter for the zone maps, and the filter stays
     Optional(BoundExpr),
     None,
@@ -158,7 +160,84 @@ fn in_list(column: &BoundExpr, values: Vec<Value>) -> BoundExpr {
 }
 
 /// `TryPushdownInFilter` and `TryPushdownOrClause`.
+/// `Utf8Proc::FindNextLegalUTF8`: the next string of the same length, by its last character.
+fn next_legal_utf8(text: &str) -> Option<String> {
+    let mut chars: Vec<char> = text.chars().collect();
+    let last = chars.pop()?;
+    let next = (u32::from(last) + 1..=u32::from(char::MAX)).find_map(char::from_u32)?;
+    chars.push(next);
+    Some(chars.into_iter().collect())
+}
+
+/// `TryPushdownLikeFilter`: `col LIKE 'abc%...'` has `col >= 'abc' AND col < 'abd'`, and without a
+/// wildcard is `col = 'abc'`; `ILIKE` has the bounds of its prefix in any case (`GetCaseInsensitivePrefixBounds`).
+fn like_pushdown(expr: &BoundExpr) -> Option<TablePushdown> {
+    let BoundExprKind::Function { function, children, .. } = &expr.kind else {
+        return None;
+    };
+    let insensitive = function.name == "~~*";
+    if function.name != "~~" && !insensitive {
+        return None;
+    }
+    let [column, BoundExpr {
+        kind: BoundExprKind::Constant(value),
+        ..
+    }] = children.as_slice()
+    else {
+        return None;
+    };
+    if !matches!(column.kind, BoundExprKind::ColumnRef { .. }) || value.is_null() || column.return_type.collation().is_some() {
+        return None;
+    }
+    let pattern = value.try_to_string().ok()?;
+    if pattern.is_empty() || pattern.starts_with(['%', '_']) {
+        return None;
+    }
+    let end = pattern.find(['%', '_']);
+    let prefix = &pattern[..end.unwrap_or(pattern.len())];
+    let compare = |op, bound: String| {
+        BoundExpr::new(
+            BoundExprKind::Comparison {
+                op,
+                left: Box::new(column.clone()),
+                right: Box::new(BoundExpr::constant(Value::varchar(bound))),
+            },
+            LogicalType::BOOLEAN,
+        )
+    };
+    if end.is_none() && !insensitive {
+        return Some(TablePushdown::Fully(vec![compare(ComparisonOp::Equal, prefix.to_string())]));
+    }
+    if insensitive {
+        if !prefix.is_ascii() {
+            return None;
+        }
+        let min = prefix.to_ascii_uppercase();
+        let max: String = prefix
+            .chars()
+            .map(|c| match c.to_ascii_lowercase() {
+                'i' => "\u{130}".to_string(),
+                'k' => "\u{212A}".to_string(),
+                lower => lower.to_string(),
+            })
+            .collect();
+        let upper = next_legal_utf8(&max)?;
+        return Some(TablePushdown::Partially(vec![
+            compare(ComparisonOp::GreaterThanOrEqual, min),
+            compare(ComparisonOp::LessThan, upper),
+        ]));
+    }
+    let mut bounds = vec![compare(ComparisonOp::GreaterThanOrEqual, prefix.to_string())];
+    if let Some(upper) = next_legal_utf8(prefix) {
+        bounds.push(compare(ComparisonOp::LessThan, upper));
+    }
+    Some(TablePushdown::Partially(bounds))
+}
+
 pub(super) fn table_pushdown(expr: &BoundExpr) -> TablePushdown {
+    if let Some(pushdown) = like_pushdown(expr) {
+        return pushdown;
+    }
     match &expr.kind {
         BoundExprKind::Operator {
             op: BoundOperator::In,
@@ -314,7 +393,7 @@ pub fn push_into_scans(op: &mut LogicalOperator) {
         K::ParquetScan { scan: data, .. } => {
             let data = std::sync::Arc::make_mut(data);
             prune_files(data, &scan, &mut conjuncts);
-            (&mut data.filters, None)
+            (&mut data.filters, Some(&mut data.optional_filters))
         }
         _ => unreachable!("checked above"),
     };
@@ -323,19 +402,22 @@ pub fn push_into_scans(op: &mut LogicalOperator) {
     let mut partial = Vec::new();
     for conjunct in conjuncts {
         if can_move_into_scan(&conjunct, &scan) {
-            if let Some(optional) = optional.as_deref_mut() {
-                match table_pushdown(&conjunct) {
-                    TablePushdown::Fully(pushed) => {
-                        filters.extend(pushed);
-                        continue;
-                    }
-                    TablePushdown::Optional(pushed) => {
-                        optional.push(pushed);
-                        partial.push(conjunct);
-                        continue;
-                    }
-                    TablePushdown::None => {}
+            match (table_pushdown(&conjunct), optional.as_deref_mut()) {
+                (TablePushdown::Fully(pushed), _) => {
+                    filters.extend(pushed);
+                    continue;
                 }
+                (TablePushdown::Optional(pushed), Some(optional)) => {
+                    optional.push(pushed);
+                    partial.push(conjunct);
+                    continue;
+                }
+                (TablePushdown::Partially(pushed), _) => {
+                    filters.extend(pushed);
+                    partial.push(conjunct);
+                    continue;
+                }
+                _ => {}
             }
             if let Some(bounds) = prefix_bounds(&conjunct) {
                 filters.extend(bounds);

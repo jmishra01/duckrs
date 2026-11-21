@@ -366,6 +366,7 @@ impl Binder<'_> {
             function_name: call.name.name.to_lowercase(),
             arguments: format!("{:?}", call.args),
             filters: Vec::new(),
+            optional_filters: Vec::new(),
             projected: None,
             file_filters: String::new(),
             column_order: self.column_order(table_index),

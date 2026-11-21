@@ -145,6 +145,12 @@ fn aggregate_text(aggregate: &BoundAggregate) -> String {
 /// The filters of a scan as `GetFilterInfo` shows them: a BETWEEN of a column is its two
 /// comparisons (`FilterCombiner::GenerateTableScanFilters`), in one conjunction.
 fn scan_filter_lines(filters: &[BoundExpr]) -> String {
+    let marked: Vec<(BoundExpr, bool)> = filters.iter().map(|f| (f.clone(), false)).collect();
+    scan_filter_lines_marked(&marked)
+}
+
+/// [`scan_filter_lines`] of filters some of which are optional (`OptionalFilterScalarFun::ToString`).
+fn scan_filter_lines_marked(filters: &[(BoundExpr, bool)]) -> String {
     use crate::planner::expression::BoundExprKind as E;
     let text = |filter: &BoundExpr| match &filter.kind {
         E::Between { input, lower, upper } if matches!(input.kind, E::ColumnRef { .. }) => {
@@ -163,13 +169,21 @@ fn scan_filter_lines(filters: &[BoundExpr]) -> String {
         (columns.len() == 1).then(|| columns.into_iter().next()).flatten()
     };
     // an OR among them keeps its parentheses; the same filter twice is pushed once
-    let part = |filter: &BoundExpr| match &filter.kind {
-        E::Conjunction { and: false, .. } => format!("({})", text(filter)),
+    let whole = |(filter, optional): &(BoundExpr, bool)| {
+        if *optional {
+            format!("optional: {}", text(filter))
+        } else {
+            text(filter)
+        }
+    };
+    let part = |(filter, optional): &(BoundExpr, bool)| match (&filter.kind, optional) {
+        (_, true) => format!("optional: {}", text(filter)),
+        (E::Conjunction { and: false, .. }, false) => format!("({})", text(filter)),
         _ => text(filter),
     };
-    let mut groups: Vec<(Option<crate::planner::expression::ColumnBinding>, Vec<&BoundExpr>)> = Vec::new();
+    let mut groups: Vec<(Option<crate::planner::expression::ColumnBinding>, Vec<&(BoundExpr, bool)>)> = Vec::new();
     for filter in filters {
-        let key = column(filter);
+        let key = column(&filter.0);
         match groups.iter_mut().find(|(k, _)| key.is_some() && *k == key) {
             Some((_, members)) => {
                 if !members.iter().any(|m| part(m) == part(filter)) {
@@ -180,7 +194,7 @@ fn scan_filter_lines(filters: &[BoundExpr]) -> String {
         }
     }
     lines(groups.into_iter().map(|(_, members)| match members.as_slice() {
-        [only] => text(only),
+        [only] => whole(only),
         _ => members.iter().map(|m| part(m)).collect::<Vec<_>>().join(" AND "),
     }))
 }
@@ -466,16 +480,12 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
             let filters = &renamed;
             // `FormatOptionalFilterString`
             let filter_text = {
-                let mut text: Vec<String> = Vec::new();
-                if !filters.is_empty() {
-                    text.push(scan_filter_lines(filters));
-                }
-                text.extend(
-                    optional_filters
-                        .iter()
-                        .map(|f| format!("optional: {}", scan_filter_lines(&[rename(f)]))),
-                );
-                lines(text)
+                let marked: Vec<(BoundExpr, bool)> = filters
+                    .iter()
+                    .map(|f| (f.clone(), false))
+                    .chain(optional_filters.iter().map(|f| (rename(f), true)))
+                    .collect();
+                scan_filter_lines_marked(&marked)
             };
             // `LogicalGet::ParamsToString` has the filters, then what `TableScanToString` adds
             if !physical {
@@ -566,8 +576,14 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
             }
             let projected = order.into_iter().map(|at| names[at].clone());
             info.extend(entry("Projections", lines(projected)));
-            if !scan.filters.is_empty() {
-                info.extend(entry("Filters", lines(scan.filters.iter().map(filter_text))));
+            if !scan.filters.is_empty() || !scan.optional_filters.is_empty() {
+                let marked: Vec<(BoundExpr, bool)> = scan
+                    .filters
+                    .iter()
+                    .map(|f| (f.clone(), false))
+                    .chain(scan.optional_filters.iter().map(|f| (f.clone(), true)))
+                    .collect();
+                info.extend(entry("Filters", scan_filter_lines_marked(&marked)));
             }
             if !scan.file_filters.is_empty() {
                 info.extend(entry("File Filters", scan.file_filters.clone()));
