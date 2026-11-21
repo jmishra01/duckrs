@@ -175,7 +175,10 @@ Each item gives the number of failing files in `test/` that it should fix, where
     (which merges into what the others are), and the row groups a delete emptied dropped in files before
     v2.0.0, the rows after them taking new ids where no index keeps them
   - [ ] shredded GEOMETRY columns, Patas and Chimp segments (8), `read_duckdb` (8)
-  - [ ] string and list-length statistics for `stats()` (~10 files), per-column `USING COMPRESSION`
+  - [x] list-length statistics: the shortest, longest and total length of a table's lists, kept through appends,
+    checkpoints (v2.1.0, with the lists' `ListPersistentColumnData`) and WAL replay; checkpoints write v2.1.0 when
+    asked; a table's statistics keep those of what is in its nested columns
+  - [ ] string statistics for `stats()` from database files, per-column `USING COMPRESSION`
   - [x] `read_duckdb` and the replacement scan of `.db` files; `enable_view_dependencies` (DROP ... CASCADE,
     refused DROP and ALTER, CREATE OR REPLACE of a view that reads itself)
   - [ ] `vector_type` (~20 files) and `duckdb_memory` (~17) report engine internals duckrs does not model
@@ -256,8 +259,11 @@ Each item gives the number of failing files in `test/` that it should fix, where
     and `read_json`; predicate factoring of ORs in filters
   - [ ] secure views (7 files), `json_serialize_plan`, gamma's errors without IEEE
   - [x] string statistics in `stats()`: bounds, unicode, lengths and totals of tables and constants; `approx_unique`
-  - [ ] string statistics through functions (contains, suffix, upper/lower, length), struct/list/map extracts,
-    EXPLAIN ANALYZE metrics of other operators (~190 EXPLAIN-shape files under `test/optimizer`, `sql/optimizer`)
+  - [x] string statistics through functions (contains, suffix, upper/lower, length)
+  - [x] list lengths through `length` / `array_length` (a `constant_or_null` where all lists are as long),
+    `list_value`, `list_concat`, `flatten` and ARRAY to LIST casts
+  - [ ] struct/list/map extracts, EXPLAIN ANALYZE metrics of other operators (EXPLAIN-shape files under
+    `test/optimizer`, `sql/optimizer`)
 - [ ] 16. Join order and cardinality estimation (`optimizer/joins`: 1 failing)
   - [x] LEFT join equality groups, `debug_force_no_cross_product`, `approximate_join_order_threshold`
   - [ ] LEFT joins reordered inside the join graph (C++'s CD-C conflict detector, `left_join_cardinality_estimation`)

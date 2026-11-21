@@ -499,6 +499,62 @@ pub struct ColumnStatistics {
     pub children: Vec<ColumnStatistics>,
     /// of a VARIANT, how it is shredded (`VariantStats`); `None` when not known (`INCONSISTENT`)
     pub variant: Option<Box<VariantStatistics>>,
+    /// of a LIST (or MAP), the lengths of its lists (`ListStatsData`); `None` when none is known
+    pub lists: Option<ListLengths>,
+}
+
+/// `ListStatsData`: the shortest, longest and total length of the lists that are not NULL, each `None` when not
+/// known. Of no lists yet (`ResetLengthData`), the shortest is `u64::MAX`, which merges as none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListLengths {
+    pub min: Option<u64>,
+    pub max: Option<u64>,
+    pub total: Option<u64>,
+}
+
+impl ListLengths {
+    /// `ResetLengthData`: of no lists at all.
+    pub fn empty() -> Self {
+        Self {
+            min: Some(u64::MAX),
+            max: Some(0),
+            total: Some(0),
+        }
+    }
+
+    /// Of a list of `length` elements.
+    pub fn of_length(length: u64) -> Self {
+        Self {
+            min: Some(length),
+            max: Some(length),
+            total: Some(length),
+        }
+    }
+
+    /// `SetLengthBounds`: lists of `min` to `max` elements, with no total.
+    pub fn bounds(min: Option<u64>, max: Option<u64>) -> Self {
+        Self { min, max, total: None }
+    }
+
+    /// `ListStatsData::MinLength`: the shortest length, if known and there are lists.
+    pub fn known_min(&self) -> Option<u64> {
+        self.min.filter(|&min| min != u64::MAX)
+    }
+
+    /// `ListStats::Merge`, of two sets of lists; their totals add unless the sets may overlap
+    /// (`EXPAND_BOUNDS`).
+    pub fn merge(&self, other: &Self, add_totals: bool) -> Self {
+        let both = |a: Option<u64>, b: Option<u64>, f: fn(u64, u64) -> u64| a.zip(b).map(|(a, b)| f(a, b));
+        Self {
+            min: both(self.min, other.min, u64::min),
+            max: both(self.max, other.max, u64::max),
+            total: if add_totals {
+                self.total.zip(other.total).and_then(|(a, b)| a.checked_add(b))
+            } else {
+                None
+            },
+        }
+    }
 }
 
 /// `VariantStatsShreddingState`, with the type of the typed part of a shredded VARIANT and its statistics.

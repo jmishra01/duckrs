@@ -239,8 +239,8 @@ impl DatabaseInstance {
         let requested = options.storage_version.as_ref().map(|(_, version)| *version);
         if !storage::is_database_file(path) {
             let version = requested.unwrap_or_else(|| default_storage_version(options.settings.as_ref()));
-            // checkpoints write v2.0.0 at the newest
-            storage::create_database(path, options.block_size, version.min(StorageVersion::V2_0_0))?;
+            // checkpoints write v2.1.0 at the newest
+            storage::create_database(path, options.block_size, version.min(StorageVersion::V2_1_0))?;
         }
         let name = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
         let mut db = Self::with_file_access(None);
@@ -268,10 +268,10 @@ impl DatabaseInstance {
             Some(requested) => requested,
             None => file_version,
         };
-        // a file in a version newer than v2.0.0 is written as v2.0.0, the newest that checkpoints write
+        // a file in a version newer than v2.1.0 is written as v2.1.0, the newest that checkpoints write
         let storage_version = storage_version
-            .min(StorageVersion::V2_0_0)
-            .max(file_version.min(StorageVersion::V2_0_0));
+            .min(StorageVersion::V2_1_0)
+            .max(file_version.min(StorageVersion::V2_1_0));
         if let Some(size) = options.row_group_size
             && size > 122_880
             && storage_version < StorageVersion::V1_2_0

@@ -121,6 +121,8 @@ struct Stats {
     variant: Option<Box<VariantStatsOut>>,
     /// of a VARIANT column, the statistics of what is stored unshredded (`unshredded_stats`)
     unshredded: Option<Box<StatsTree>>,
+    /// of a LIST column, the lengths of its lists (`ListStatsData`); `None` when not known
+    lists: Option<crate::catalog::ListLengths>,
 }
 
 /// `VariantStatsData`: whether a VARIANT column is shredded, and if so the type of its typed part and the
@@ -316,6 +318,21 @@ fn write_stats_tree(s: &mut BinarySerializer, ty: &LogicalType, tree: &StatsTree
             });
         } else {
             s.write_object(200, "child_stats", |s| write_stats_tree(s, child_types[0], &tree.children[0]));
+            // `ListStats::Serialize`: the lengths that are known, from v2.1.0
+            if ty.physical_type() == PhysicalType::List
+                && s.should_serialize(StorageVersion::V2_1_0)
+                && let Some(lists) = &tree.stats.lists
+            {
+                for (field, name, value) in [
+                    (201, "min_list_length", lists.known_min()),
+                    (202, "max_list_length", lists.max),
+                    (203, "total_list_length", lists.total),
+                ] {
+                    if let Some(value) = value {
+                        s.write_property(field, name, &value);
+                    }
+                }
+            }
         }
     });
 }
@@ -383,6 +400,7 @@ impl Stats {
             strings: None,
             variant: None,
             unshredded: None,
+            lists: None,
         }
     }
 
@@ -395,12 +413,18 @@ impl Stats {
             strings: None,
             variant: None,
             unshredded: None,
+            lists: None,
         }
     }
 
     fn merge(&mut self, other: &Self, physical: PhysicalType) {
         self.has_null |= other.has_null;
         self.has_no_null |= other.has_no_null;
+        // the statistics of a segment have no lengths; those of a list column always do
+        self.lists = match (self.lists, other.lists) {
+            (Some(a), Some(b)) => Some(a.merge(&b, true)),
+            (a, b) => a.or(b),
+        };
         self.unshredded = match (self.unshredded.take(), &other.unshredded) {
             (Some(mut a), Some(b)) => {
                 a.merge(b, &duckrs_common::variant::unshredded_type());
@@ -833,6 +857,27 @@ fn write_column(s: &mut BinarySerializer, column: &ColumnOut, ty: Option<&Logica
         }
         _ => None,
     };
+    // `ListPersistentColumnData`: the lengths of the lists of the column, from v2.1.0
+    if ty.is_some_and(|ty| ty.physical_type() == PhysicalType::List)
+        && s.should_serialize(StorageVersion::V2_1_0)
+        && let Some(lists) = column.stats.lists
+    {
+        const LIST_EXTRA_DATA: u8 = 3;
+        s.write_field(99);
+        true.write_value(s);
+        s.write_object_value(|s| {
+            s.write_property(100, "type", &LIST_EXTRA_DATA);
+            for (field, name, value) in [
+                (101, "min_list_length", lists.known_min()),
+                (102, "max_list_length", lists.max),
+                (103, "total_list_length", lists.total),
+            ] {
+                if let Some(value) = value {
+                    s.write_property(field, name, &value);
+                }
+            }
+        });
+    }
     if let Some(shredded) = shredded {
         const VARIANT_EXTRA_DATA: u8 = 1;
         s.write_field(99);
@@ -2265,6 +2310,8 @@ impl<'a> Writer<'a> {
                 let mut offsets = Vec::with_capacity(rows * 8);
                 let mut child_parts = Vec::with_capacity(parts.len());
                 let mut total = 0u64;
+                // `ListColumnData`'s statistics: the lengths of the lists that are not NULL
+                let mut lengths = crate::catalog::ListLengths::empty();
                 for part in parts {
                     let entries = part.vector.data::<ListEntry>();
                     let mut selection = Vec::new();
@@ -2272,6 +2319,7 @@ impl<'a> Writer<'a> {
                         if part.vector.is_valid(row) {
                             selection.extend((entry.offset..entry.offset + entry.length).map(|i| i as u32));
                             total += entry.length;
+                            lengths = lengths.merge(&crate::catalog::ListLengths::of_length(entry.length), true);
                         }
                         offsets.extend_from_slice(&total.to_le_bytes());
                     }
@@ -2280,6 +2328,7 @@ impl<'a> Writer<'a> {
                     child.slice(&SelectionVector::from_vec(selection), count);
                     child_parts.push(Part::new(&child, count));
                 }
+                stats.lists = Some(lengths);
                 let child_type = ty.child_type().ok_or_else(|| internal("a list has no child type"))?;
                 let child = self.write_column_data(child_type, &child_parts)?;
                 let mut segments = Vec::new();
@@ -2451,7 +2500,7 @@ impl<'a> Writer<'a> {
         row_start: u64,
         rows: usize,
         deletes: Option<&[u8]>,
-        statistics: &mut [Option<Stats>],
+        statistics: &mut [Option<StatsTree>],
     ) -> Result<Vec<u8>> {
         let mut tables = std::mem::take(&mut self.tables);
         let mut pointers = Vec::with_capacity(parts.len());
@@ -2473,9 +2522,10 @@ impl<'a> Writer<'a> {
                 };
                 self.written_shredding.insert((row_start, rows, column), shredded);
             }
+            // the table's statistics of the column, with those of what is in it
             match &mut statistics[column] {
-                Some(stats) => stats.merge(&out.stats, ty.physical_type()),
-                empty => *empty = Some(out.stats.clone()),
+                Some(tree) => tree.merge(&StatsTree::of(&out), ty),
+                empty => *empty = Some(StatsTree::of(&out)),
             }
             let mut s = serializer(self.version);
             s.write_object_value(|s| write_column(s, &out, Some(ty), row_start));
@@ -2514,7 +2564,7 @@ impl<'a> Writer<'a> {
         ids: &RowIds,
         rows: &mut PositionedRows<'_>,
         indexes: &mut [TableIndex],
-        statistics: &mut [Option<Stats>],
+        statistics: &mut [Option<StatsTree>],
     ) -> Result<(Vec<u8>, usize)> {
         let types = table.types();
         let mut parts: Vec<Vec<Part>> = types.iter().map(|_| Vec::new()).collect();
@@ -2604,7 +2654,7 @@ impl<'a> Writer<'a> {
             memory,
             at: None,
         };
-        let mut statistics: Vec<Option<Stats>> = vec![None; types.len()];
+        let mut statistics: Vec<Option<StatsTree>> = vec![None; types.len()];
         let mut row_groups = Vec::new();
         let size = self.chunks_per_row_group * STANDARD_VECTOR_SIZE;
         let (mut stored_rows, mut next_row_id) = (0u64, 0u64);
@@ -2619,9 +2669,11 @@ impl<'a> Writer<'a> {
         s.write_object_value(|s| {
             s.write_list(100, "column_stats", types.len(), |s, column| {
                 true.write_value(s);
-                let stats = statistics[column].clone().unwrap_or_else(Stats::unknown);
                 s.write_object_value(|s| {
-                    s.write_object(100, "statistics", |s| write_stats(s, Some(&types[column]), &stats));
+                    s.write_object(100, "statistics", |s| match &statistics[column] {
+                        Some(tree) => write_stats_tree(s, &types[column], tree),
+                        None => write_stats(s, Some(&types[column]), &Stats::unknown()),
+                    });
                 });
             });
         });
