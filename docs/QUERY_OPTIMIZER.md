@@ -497,6 +497,74 @@ Top N 20 BY revenue DESC                                    ~20
 - **11,439 → 3,767**: Line items that are returned and in the quarter (out of 148,301 returned and 5,677 orders), and the customers they belong to. The estimates were ~20,085 and ~10,052.
 - **No clear gain**: Switching off partial_aggregate_pushdown, compressed_materialization or both gave medians of 0.037–0.042 s. The machine's load average was 24–30, and CPU time went the other way, so these differences are noise. At SF0.1 the customer join is too small for pushing the aggregate below it to show: it saves a join over about 7,700 rows and adds a second GROUP BY.
 
+## TPC-H Q12, with the optimizer off and on
+
+Q12 counts the late line items shipped by mail or ship in 1994, split by order priority. Its WHERE clause chains three dates (`l_shipdate < l_commitdate < l_receiptdate`) and has a short `IN` list, which shows two things the other walkthroughs don't: filters derived from other filters, and filters a scan can only use partly. The plans are from a release build of `phase-55-optimizer-rewriters` at `1ed6cc1`, on the same SF0.1 data.
+
+```
+SELECT l_shipmode,
+       sum(CASE WHEN o_orderpriority = '1-URGENT' OR o_orderpriority = '2-HIGH'
+                THEN 1 ELSE 0 END) AS high_line_count,
+       sum(CASE WHEN o_orderpriority <> '1-URGENT' AND o_orderpriority <> '2-HIGH'
+                THEN 1 ELSE 0 END) AS low_line_count
+FROM orders, lineitem
+WHERE o_orderkey = l_orderkey
+  AND l_shipmode IN ('MAIL', 'SHIP')
+  AND l_commitdate < l_receiptdate
+  AND l_shipdate < l_commitdate
+  AND l_receiptdate >= CAST('1994-01-01' AS date)
+  AND l_receiptdate <  CAST('1995-01-01' AS date)
+GROUP BY l_shipmode
+ORDER BY l_shipmode;
+```
+
+**Optimizer off: PRAGMA disable_optimizer**
+
+```
+Order By l_shipmode ASC                                     ~2
+└ Hash Group By l_shipmode, sum(CASE ...), sum(CASE ...)    ~2
+  └ Filter (6 conditions)                         ~18,017,160,000
+    └ Cross Product                             ~90,085,800,000
+      ├ Seq Scan orders    (all 9 columns)             ~150,000
+      └ Seq Scan lineitem  (all 16 columns)            ~600,572
+```
+
+**Optimizer on: default settings**
+
+```
+Projection __internal_decompress_string(l_shipmode), high_line_count, low_line_count   ~2
+└ Order By l_shipmode ASC                                   ~2
+  └ Projection __internal_compress_string_ubigint(l_shipmode), ...
+    └ Hash Group By l_shipmode, sum(CASE ...), sum(CASE ...)   ~2
+      └ Projection o_orderkey, o_orderpriority, l_orderkey, __internal_compress_string_ubigint(l_shipmode)
+        └ Hash Join  o_orderkey = l_orderkey               ~12,050
+          ├ Seq Scan orders  [o_orderkey, o_orderpriority]   ~150,000
+          └ Filter  l_commitdate < l_receiptdate,
+                    l_shipdate < l_commitdate,
+                    (l_shipmode = 'MAIL') OR (l_shipmode = 'SHIP')
+            └ Seq Scan lineitem  [l_orderkey, l_shipdate, l_commitdate, l_receiptdate, l_shipmode]   ~120,114
+                Filters: l_receiptdate >= '1994-01-01', l_receiptdate < '1995-01-01',
+                         l_commitdate < '1995-01-01', l_shipdate < '1995-01-01',
+                         optional: l_shipmode IN ('MAIL', 'SHIP')
+```
+
+> The first child of the hash join probes and the second child is the build side.
+
+### What each pass changed
+
+1. **filter_pushdown** turned the cross product into a hash join on the order key and moved the lineitem conditions below it. Its FilterCombiner also **derived two filters** the query doesn't state. From `l_commitdate < l_receiptdate` and `l_receiptdate < '1995-01-01'` it follows that `l_commitdate < '1995-01-01'`, and from that, with `l_shipdate < l_commitdate`, that `l_shipdate < '1995-01-01'`. A filter on one column against a constant can go into the scan, where zone maps can use it. The comparisons between two columns can't, so they stay in a Filter above the scan.
+2. **The IN list is used twice.** The scan gets `l_shipmode IN ('MAIL', 'SHIP')` as an optional filter: zone maps may use it to skip row groups, but it doesn't remove rows. The Filter above keeps the real check. The **in_clause** pass only turns long IN lists into joins, and it spells a short one out as ORs, as C++ does. With `SET disabled_optimizers = 'in_clause'` the Filter shows the IN instead.
+3. **join_order** builds the hash table on the filtered lineitem side (~12,050 rows estimated, 3,155 in fact) and probes it with all 150,000 orders, which have no filter of their own.
+4. **join_filter_pushdown** doesn't show in EXPLAIN. At run time the join gives the orders scan the range and a Bloom filter of the 3,155 order keys it built, so orders whose key isn't among them can be dropped in the scan before they reach the join.
+5. **compressed_materialization** packs `l_shipmode` (at most 7 characters) into an 8-byte integer (`ubigint`) for the GROUP BY and the ORDER BY, and unpacks it at the top.
+6. **unused_columns** cut orders to 2 of its 9 columns and lineitem to 5 of 16.
+
+- **0.007 s**: Q12 with the optimizer on, median of 11 warm runs, with a load average of about 3. It returns two rows: MAIL with 647 high-priority and 945 low-priority line items, SHIP with 620 and 943.
+- **0.011 s**: Q12 with `SET disabled_optimizers = 'join_filter_pushdown'`, slower in all 11 runs (0.010–0.011 s against 0.007–0.008 s). Here the runtime filter pays: it drops orders whose key isn't among the 3,155 the build side holds.
+- **0.006 s**: Q12 with `SET disabled_optimizers = 'filter_pushdown'`, slightly faster in all 11 runs. The join is still made (join_order finds the condition), but no filter goes into the scan and none is derived. The two derived filters remove only 2,453 of the 92,050 rows received in 1994, and the IN can't skip a row group, since every row group holds every ship mode. So checking them in the scan costs a little more than it saves.
+
+> DuckDB 1.5.6 makes the same plan: the same derived filters, the optional IN filter in the scan, and lineitem as the build side.
+
 ## TPC-H Q14, with the optimizer off and on
 
 Q14 works out what share of one month's revenue came from promotional parts. It is Q6 with one join added: lineitem filtered to September 1995, joined to part, and a `LIKE` inside the aggregate. The plans are from the same build as Q6 (`3bdaec9`) and the same SF0.1 data.
