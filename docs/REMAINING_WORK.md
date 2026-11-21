@@ -201,7 +201,8 @@ Each item gives the number of failing files in `test/` that it should fix, where
     projection
   - [x] `can_throw` as C++ has it: only the functions C++ marks `SetFallible` can fail, by overload where C++ decides
     it at bind time (extracts, substring, unary `+`/`-`, `list_value`, ICU date parts of TIMESTAMPTZ)
-  - [ ] `CanThrow` of aggregates and window functions (`sum`, `avg`, `ntile`, ... are fallible in C++)
+  - [x] `CanThrow` of aggregates and window functions: `sum`/`avg` of HUGEINT and wide DECIMAL, `string_agg`, the
+    `n` variants of min/max/arg_min/arg_max, `ntile`, ... (common subplans, window pushdown)
 - [ ] 15. Statistics propagation (`optimizer/statistics`: 4 failing, 91.8% pass)
   - [x] row groups of the database's `ROW_GROUP_SIZE`; zone maps through CASE, COALESCE, greatest/least,
     arithmetic with constants, month/quarter, prefix, left, sign, two-column comparisons

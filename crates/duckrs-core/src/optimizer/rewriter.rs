@@ -11,7 +11,8 @@
 use super::conjunction_of;
 use crate::execution::expression_executor::try_evaluate_scalar;
 use crate::function::{date_part_call_of, ScalarFunction};
-use crate::planner::expression::{BoundExpr, BoundExprKind, BoundOperator, ColumnBinding};
+use crate::function::aggregates::AggregateFunction;
+use crate::planner::expression::{BoundExpr, BoundExprKind, BoundOperator, BoundWindow, ColumnBinding, WindowFunction};
 use crate::planner::logical::{LogicalOperator, LogicalOperatorKind};
 use duckrs_common::types::{LogicalType, LogicalTypeId};
 use duckrs_common::value::{Value, ValueData};
@@ -1669,6 +1670,43 @@ const ICU_DATE_PARTS: &[&str] = &[
     "month", "monthname", "quarter", "second", "timezone", "timezone_hour", "timezone_minute", "week", "weekday",
     "weekofyear", "year", "yearweek",
 ];
+
+/// `BoundAggregateExpression::CanThrow` of the aggregate itself: the aggregates C++ declares
+/// fallible (`SetFallible`), by the overload where it decides by the input type.
+pub(crate) fn aggregate_can_throw(function: &AggregateFunction, children: &[BoundExpr]) -> bool {
+    use LogicalTypeId::*;
+    let first = children.first().map(|c| &c.return_type);
+    let id = first.map(LogicalType::id);
+    // the DECIMALs whose sum is a HUGEINT, which throws on overflow
+    let wide = first.is_some_and(|t| t.id() == Decimal && t.decimal_properties().is_some_and(|(w, _)| w > 18));
+    match function.name.as_str() {
+        "approx_top_k" | "lttb" | "mad" | "kurtosis" | "kurtosis_pop" | "skewness" | "string_agg" | "group_concat"
+        | "listagg" | "sum_no_overflow" | "variant_group_object" | "bitstring_agg" | "combine_aggr" => true,
+        "sum" => id == Some(HugeInt) || wide,
+        "avg" | "mean" => matches!(id, Some(HugeInt | Interval)) || wide,
+        "bit_and" | "bit_or" | "bit_xor" => id == Some(Bit),
+        // the `n` variants reject NULL and out-of-range `n` when they run
+        "min" | "max" => children.len() == 2,
+        "arg_min" | "argmin" | "min_by" | "arg_max" | "argmax" | "max_by" => children.len() == 3,
+        // interpolating temporal values throws for the infinities and out-of-range dates
+        "quantile_cont" | "median" => matches!(
+            id,
+            Some(Date | Timestamp | TimestampTz | TimestampTzNs | TimestampSec | TimestampMs | TimestampNs | Interval)
+        ),
+        // `HasExtremeDecimalQuantile`
+        "quantile_disc" | "quantile" => id == Some(Decimal),
+        _ => false,
+    }
+}
+
+/// `BoundWindowExpression::CanThrow` of the function itself: its aggregate's, or `ntile`'s, whose
+/// bucket count must be positive.
+pub(crate) fn window_can_throw(window: &BoundWindow) -> bool {
+    match &window.aggregate {
+        Some(aggregate) => aggregate_can_throw(aggregate, &window.children),
+        None => matches!(window.function, WindowFunction::Ntile),
+    }
+}
 
 /// `BoundFunctionExpression::CanThrow` of the function itself, by its overload where C++ decides
 /// it by the arguments.

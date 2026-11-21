@@ -11,7 +11,7 @@
 
 use super::conjunction_of;
 use super::rewriter::{
-    can_throw, contains_barrier, expressions_equal, fold_boolean, rewrite_expression, split_conjuncts,
+    can_throw, contains_barrier, expressions_equal, fold_boolean, rewrite_expression, split_conjuncts, window_can_throw,
 };
 use crate::planner::expression::{BoundExpr, BoundExprKind, BoundOperator, ColumnBinding, WindowFunction};
 use crate::planner::logical::{JoinCondition, LogicalOperator, LogicalOperatorKind};
@@ -454,7 +454,8 @@ impl FilterPushdown {
                     | WindowFunction::PercentRank
                     | WindowFunction::CumeDist
                     | WindowFunction::Ntile
-            ) && w.children.is_empty()
+            ) && !window_can_throw(w)
+                && w.children.is_empty()
                 && w.filter.is_none()
                 && w.start_expr.is_none()
                 && w.end_expr.is_none()

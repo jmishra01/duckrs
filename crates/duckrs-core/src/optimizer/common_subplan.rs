@@ -12,7 +12,7 @@
 //! identical subqueries are not shared.
 
 use super::join_order::{PlanEstimate, estimate_plan};
-use super::rewriter::{can_throw, contains_barrier};
+use super::rewriter::{aggregate_can_throw, can_throw, contains_barrier};
 use crate::planner::expression::{BoundAggregate, BoundExpr, BoundExprKind, ColumnBinding};
 use crate::planner::logical::{COLUMN_IDENTIFIER_ROW_ID, LogicalOperator, LogicalOperatorKind as K};
 use duckrs_common::column_data::ColumnDataCollection;
@@ -669,7 +669,9 @@ impl Finder {
         };
         let shareable = outputs.into_iter().all(|mut output| {
             let combinable = match &output {
-                Expandable::Aggregate(aggregate) => can_combine_aggregate(aggregate),
+                Expandable::Aggregate(aggregate) => {
+                    can_combine_aggregate(aggregate) && !aggregate_can_throw(&aggregate.function, &aggregate.children)
+                }
                 Expandable::Expression(_) => true,
             };
             combinable && output.expressions_mut().into_iter().all(|e| can_share_expression(e))
