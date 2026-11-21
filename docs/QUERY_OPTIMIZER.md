@@ -1617,6 +1617,78 @@ Top N 100 BY numwait DESC, s_name                           ~25
 - **0.051 s**: Q21 with the optimizer on, median of 11 warm runs, with a load average of about 13. With `deliminator` off it was 0.065 s, and with `join_filter_pushdown` off 0.061 s. The runs overlap (0.036–0.103 s in all), so these are rough.
 - **3 reads**: lineitem is scanned three times, once for the outer rows and once for each subquery. DuckDB scans it three times too.
 
+## TPC-H Q22, with the optimizer off and on
+
+Q22 counts the customers from seven country codes who have an above-average balance and have never ordered, by country code. The code is the first two characters of the phone number, so its filter is an `IN` list on an expression, not on a column. The query also has an uncorrelated average and a correlated `NOT EXISTS`. It shows a NOT EXISTS becoming an anti join, and the IN list gap from Q16 again. The plans are from the same build as Q21 (`0b13e01`) and the same SF0.1 data.
+
+```
+SELECT cntrycode, count(*) AS numcust, sum(c_acctbal) AS totacctbal
+FROM (SELECT substring(c_phone FROM 1 FOR 2) AS cntrycode, c_acctbal
+      FROM customer
+      WHERE substring(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17')
+        AND c_acctbal > (SELECT avg(c_acctbal) FROM customer
+                         WHERE c_acctbal > 0.00
+                           AND substring(c_phone FROM 1 FOR 2)
+                               IN ('13', '31', '23', '29', '30', '18', '17'))
+        AND NOT EXISTS (SELECT * FROM orders WHERE o_custkey = c_custkey)) AS custsale
+GROUP BY cntrycode
+ORDER BY cntrycode;
+```
+
+**Optimizer off: PRAGMA disable_optimizer**
+
+```
+Order By cntrycode                                          ~3,000
+└ Hash Group By cntrycode, count_star(), sum(c_acctbal)     ~3,000
+  └ Filter  code IN (7 values) AND c_acctbal > avg AND NOT #mark   ~3,000
+    └ Left Delim Join  MARK  c_custkey IS NOT DISTINCT FROM c_custkey   ~15,000
+      ├ Cross Product  customer (all columns) × (the average)   ~15,000
+      │ └ Ungrouped Aggregate avg(c_acctbal)
+      │   └ Filter  c_acctbal > 0.00 AND code IN (7 values)
+      │     └ Seq Scan customer  (all columns)
+      └ Filter  o_custkey = c_custkey                     ~421,050,000
+        └ Cross Product  orders (all columns) × outer c_custkey values   ~2,105,250,000
+```
+
+**Optimizer on: default settings**
+
+```
+Order By cntrycode                                          ~150
+└ Hash Group By substring(c_phone, 1, 2), count_star(), sum(c_acctbal)   ~150
+  └ Hash Join  RIGHT_ANTI  o_custkey = c_custkey         ~300
+    ├ Seq Scan orders  [o_custkey]                       ~150,000
+    └ Nested Loop Join  CAST(c_acctbal AS DOUBLE) > average   ~1,500
+      ├ Filter  IN (...)                                  ~3,000
+      │ └ Hash Join  MARK  substring(c_phone, 1, 2) = #code   ~15,000
+      │   ├ Seq Scan customer  (all 8 columns)          ~15,000
+      │   └ Column Data Scan  (the 7 codes)                ~7
+      └ Projection CAST(sum AS DOUBLE) / CAST(count AS DOUBLE)   ~1
+        └ Ungrouped Aggregate sum(c_acctbal), count_star()
+          └ Filter  IN (...), c_acctbal > 0.00              ~3,000
+            └ Hash Join  MARK  substring(c_phone, 1, 2) = #code
+              ├ Seq Scan customer  [c_phone, c_acctbal]    ~15,000
+              └ Column Data Scan  (the 7 codes)             ~7
+```
+
+> The first child of each hash join probes and the second child is the build side. The Filters above the IN joins and the customer scan with all 8 columns are the IN list gap described below.
+
+### What each pass changed
+
+1. **The NOT EXISTS became an anti join.** It is correlated only by `o_custkey = c_custkey`, an equality, so deliminator removed the Delim Join, as in Q4, and the MARK with a `NOT` filter became an ANTI join: keep the customers no order matches. build_side_probe_side then made it RIGHT_ANTI, so the qualifying customers (~1,500 estimated) build and all 150,000 orders probe, removing every customer they find.
+2. **The average became a one-row join.** The uncorrelated subquery returns one row, so its comparison became the condition of a Nested Loop Join, as in Q11. **aggregate_function_rewriter** turned `avg(c_acctbal)` into `sum / count`, as in Q1; `count(c_acctbal)` is a `count_star()`, since the column is NOT NULL.
+3. **in_clause** turned each `substring(c_phone, 1, 2) IN (7 codes)` into a MARK join with the 7 codes as a small table, as in Q16.
+4. **unused_columns** cut orders to 1 of its 9 columns and the subquery's customer scan to 2 of 8. The outer customer scan keeps all 8 (see below).
+
+### Where duckrs differs from DuckDB 1.5.6
+
+1. **The same IN list gap as in Q16.** DuckDB keeps `substring(c_phone, 1, 2) IN (…)` as a filter inside both customer scans, together with `c_acctbal > 0.00`, and the outer scan reads 3 columns. In duckrs the IN becomes a MARK join first, so the filters stay above it and the outer scan reads all 8 columns. With `SET disabled_optimizers = 'in_clause'` duckrs makes DuckDB's plan: both conditions in the scans and 3 columns.
+2. **duckrs removes the Delim Join that DuckDB keeps.** DuckDB 1.5.6 keeps a RIGHT Delim Join for the NOT EXISTS, which joins orders to the distinct customer keys first and groups them. duckrs has a single RIGHT_ANTI hash join.
+3. **DuckDB checks the scalar subquery's row count,** as in Q11 and Q15; duckrs doesn't.
+
+- **7 rows**: One per country code, the same as DuckDB: from 85 customers (code 29) to 99 (code 18), 641 in all.
+- **4,115 → 5,000**: Customers with one of the seven codes, and customers who have never ordered, out of 15,000. The average is taken over the 3,741 coded customers with a positive balance.
+- **0.009 s**: Q22 with the optimizer on, median of 11 warm runs, with a load average of about 7. With in_clause off it was also 0.009 s, and with deliminator off 0.008 s: at 15,000 customers neither the IN gap nor the anti join shows in the time.
+
 ## Every pass, what it does and why it's faster
 
 Each pass is marked **new** (added in Stage 3), **changed** (existed and was extended) or **existing** (existed already and was not changed). Its switch is the name to use in `disabled_optimizers`.
