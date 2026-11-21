@@ -334,17 +334,28 @@ fn unpack_narrow(
     macro_rules! write_all {
         ($ty:ty) => {{
             const SIZE: usize = std::mem::size_of::<$ty>();
-            let mut written = [0u8; ALGORITHM_GROUP_SIZE * SIZE];
             unpack_groups(packed, rows, packed_width, |values| {
-                for (slot, &value) in written.chunks_exact_mut(SIZE).zip(values) {
-                    let mut value = value.wrapping_add(frame);
-                    if delta {
-                        carry = value.wrapping_add(carry);
-                        value = carry;
+                let mut group = [0 as $ty; ALGORITHM_GROUP_SIZE];
+                let group = &mut group[..values.len()];
+                if delta {
+                    for (slot, &value) in group.iter_mut().zip(values) {
+                        carry = value.wrapping_add(frame).wrapping_add(carry);
+                        *slot = carry as $ty;
                     }
-                    slot.copy_from_slice(&(value as $ty).to_le_bytes());
+                } else {
+                    for (slot, &value) in group.iter_mut().zip(values) {
+                        *slot = value.wrapping_add(frame) as $ty;
+                    }
                 }
-                out.extend_from_slice(&written[..values.len() * SIZE]);
+                let spare = &mut out.spare_capacity_mut()[..group.len() * SIZE];
+                for (bytes, value) in spare.chunks_exact_mut(SIZE).zip(group.iter()) {
+                    for (byte, value) in bytes.iter_mut().zip(value.to_le_bytes()) {
+                        byte.write(value);
+                    }
+                }
+                let written = out.len() + group.len() * SIZE;
+                // SAFETY: the bytes up to `written` were reserved above and have just been written
+                unsafe { out.set_len(written) };
             });
         }};
     }

@@ -639,7 +639,7 @@ impl PhysicalTableScan {
                 column => source.fetch_rows(group, column, selection),
             }
         };
-        let mut selection: Vec<u32> = (0..group_rows as u32).collect();
+        let mut selection: Arc<Vec<u32>> = Arc::new((0..group_rows as u32).collect());
         let mut fetched: Vec<Option<Vector>> = vec![None; self.column_ids.len()];
         // what stands in a chunk for a column no filter has read yet
         let unread: Vec<Vector> = (0..self.column_ids.len())
@@ -661,11 +661,12 @@ impl PhysicalTableScan {
                 let vector = fetched[*position].as_ref().expect("fetched above");
                 if let Some(kept) = select_range(vector, selection.len(), range) {
                     if kept.len() < selection.len() {
-                        let keep = SelectionVector::from_vec(kept.clone());
+                        let kept = Arc::new(kept);
+                        let keep = SelectionVector::Explicit(Arc::clone(&kept));
                         for vector in fetched.iter_mut().flatten() {
                             vector.slice(&keep, kept.len());
                         }
-                        selection = kept.iter().map(|&k| selection[k as usize]).collect();
+                        selection = narrowed(selection, kept, group_rows);
                     }
                     if selection.is_empty() {
                         return Ok(());
@@ -688,11 +689,12 @@ impl PhysicalTableScan {
                 kept.extend((0..matched).map(|i| (start + sel.get(i)) as u32));
             }
             if kept.len() < selection.len() {
-                let keep = SelectionVector::from_vec(kept.clone());
+                let kept = Arc::new(kept);
+                let keep = SelectionVector::Explicit(Arc::clone(&kept));
                 for vector in fetched.iter_mut().flatten() {
                     vector.slice(&keep, kept.len());
                 }
-                selection = kept.iter().map(|&k| selection[k as usize]).collect();
+                selection = narrowed(selection, kept, group_rows);
             }
             if selection.is_empty() {
                 return Ok(());
@@ -724,6 +726,15 @@ impl PhysicalTableScan {
         }
         Ok(())
     }
+}
+
+/// The rows of a group that `kept` (positions in `selection`) are: `kept` itself while `selection` is all
+/// `group_rows` of the group in order.
+fn narrowed(selection: Arc<Vec<u32>>, kept: Arc<Vec<u32>>, group_rows: usize) -> Arc<Vec<u32>> {
+    if selection.len() == group_rows {
+        return kept;
+    }
+    Arc::new(kept.iter().map(|&k| selection[k as usize]).collect())
 }
 
 /// The values of the column at `position` that `conjunct` keeps, as an inclusive range, if it is only comparisons
@@ -812,9 +823,22 @@ fn constant_range(conjunct: &BoundExpr, position: usize) -> Option<(i64, i64)> {
 fn select_range(vector: &Vector, count: usize, (lower, upper): (i64, i64)) -> Option<Vec<u32>> {
     let unified = vector.to_unified(count);
     let mut kept = Vec::with_capacity(count);
+    let flat = unified.sel.is_identity() && unified.validity.all_valid();
     macro_rules! keep {
         ($t:ty) => {{
             let data = unified.data::<$t>();
+            if flat {
+                // every row is written, and the count moves past the ones in the range: no branch per row
+                kept.resize(count, 0);
+                let mut matched = 0;
+                for (row, &value) in data[..count].iter().enumerate() {
+                    let value = i64::from(value);
+                    kept[matched] = row as u32;
+                    matched += usize::from(value >= lower && value <= upper);
+                }
+                kept.truncate(matched);
+                return Some(kept);
+            }
             for row in 0..count {
                 let index = unified.sel.get(row);
                 let value = i64::from(data[index]);
