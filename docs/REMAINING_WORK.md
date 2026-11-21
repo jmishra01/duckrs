@@ -693,7 +693,8 @@ Each item gives the number of failing files in `test/` that it should fix, where
   partition: Q18 1.07s from 1.49s, Q10 0.37s from 0.40s. Q01 took 4.4s of CPU warm where C++ takes 1.2s: a
   sum over few groups adds a chunk into four banks of sums per group, so that an addition doesn't wait for the
   one of the row before, and a binary operation over dictionaries without NULLs loops by the kind of selection
-  of each side: 3.5s. duckrs
+  of each side: 3.5s. A range of a dictionary is a window on its selection rather than a copy of its indices,
+  and sums take the banks too where a column has a validity mask without NULLs: 3.4s. duckrs
   had no way to load SF10 itself, as an append kept its rows in memory (more than 2 GiB failed); appends now write
   their full row groups to blocks as they fill (an INSERT of 80M rows takes 90MB). duckrs now loads SF10 into its
   own file (COPY of the `.tbl` files: lineitem 24s against C++'s 22s, the rest under 5s each; at most 710MB

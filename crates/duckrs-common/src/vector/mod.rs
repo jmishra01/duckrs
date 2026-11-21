@@ -383,7 +383,8 @@ impl Vector {
             Repr::Dictionary { sel, child } => Vector {
                 ty: self.ty.clone(),
                 repr: Repr::Dictionary {
-                    sel: SelectionVector::from_vec((start..start + count).map(|i| sel.get(i) as u32).collect()),
+                    // the rows of its selection from `start` on, without a copy of their indices
+                    sel: sel.window(start, count),
                     child: child.clone(),
                 },
                 shredded: false,

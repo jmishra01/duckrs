@@ -1575,26 +1575,46 @@ fn add_integers<T: NativeType + Into<i128>>(
         let mut overflow = false;
         // a sum of values of 64 bits or fewer can't overflow 128 bits; one of 128-bit values can
         let narrow = std::mem::size_of::<T>() <= std::mem::size_of::<i64>();
-        if narrow && u.validity.all_valid() {
+        if narrow {
             // rows in turn go to one of `BANKS` sums and counts of their group, so that an addition doesn't wait for
             // the one of the row before, which is often of the same group
             const BANKS: usize = 4;
             let groups = states.len();
             let mut bank_sums = vec![0i128; BANKS * groups];
             let mut bank_seen = vec![0u64; BANKS * groups];
-            match &u.sel {
-                SelectionVector::Identity => {
+            let validity = &u.validity;
+            match (&u.sel, validity.all_valid()) {
+                (SelectionVector::Identity, true) => {
                     for &(row, group) in rows {
                         let slot = (row & (BANKS - 1)) * groups + group;
                         bank_sums[slot] += data[row].into();
                         bank_seen[slot] += 1;
                     }
                 }
-                sel => {
+                (sel, true) => match sel.indices() {
+                    Some(indices) => {
+                        for &(row, group) in rows {
+                            let slot = (row & (BANKS - 1)) * groups + group;
+                            bank_sums[slot] += data[indices[row] as usize].into();
+                            bank_seen[slot] += 1;
+                        }
+                    }
+                    None => {
+                        for &(row, group) in rows {
+                            let slot = (row & (BANKS - 1)) * groups + group;
+                            bank_sums[slot] += data[sel.get(row)].into();
+                            bank_seen[slot] += 1;
+                        }
+                    }
+                },
+                (sel, false) => {
                     for &(row, group) in rows {
-                        let slot = (row & (BANKS - 1)) * groups + group;
-                        bank_sums[slot] += data[sel.get(row)].into();
-                        bank_seen[slot] += 1;
+                        let index = sel.get(row);
+                        if validity.is_valid(index) {
+                            let slot = (row & (BANKS - 1)) * groups + group;
+                            bank_sums[slot] += data[index].into();
+                            bank_seen[slot] += 1;
+                        }
                     }
                 }
             }

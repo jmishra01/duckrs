@@ -243,7 +243,7 @@ where
         let out = result.data_mut::<R>();
         // no NULL on either side: a loop for the kind of selection of each, with no check of a row's validity
         if lu.validity.all_valid() && ru.validity.all_valid() {
-            use crate::vector::SelectionVector::{Explicit, Identity, Zero};
+            use crate::vector::SelectionVector::{Identity, Zero};
             macro_rules! each {
                 ($left:expr, $right:expr) => {{
                     for (i, slot) in out.iter_mut().enumerate().take(count) {
@@ -254,13 +254,13 @@ where
                     }
                 }};
             }
-            match (&lu.sel, &ru.sel) {
-                (Explicit(x), Explicit(y)) => each!(|i: usize| x[i] as usize, |i: usize| y[i] as usize),
-                (Explicit(x), Identity) => each!(|i: usize| x[i] as usize, |i: usize| i),
-                (Identity, Explicit(y)) => each!(|i: usize| i, |i: usize| y[i] as usize),
-                (Explicit(x), Zero) => each!(|i: usize| x[i] as usize, |_| 0),
-                (Zero, Explicit(y)) => each!(|_| 0, |i: usize| y[i] as usize),
-                (left, right) => each!(|i: usize| left.get(i), |i: usize| right.get(i)),
+            match ((&lu.sel, lu.sel.indices()), (&ru.sel, ru.sel.indices())) {
+                ((_, Some(x)), (_, Some(y))) => each!(|i: usize| x[i] as usize, |i: usize| y[i] as usize),
+                ((_, Some(x)), (Identity, _)) => each!(|i: usize| x[i] as usize, |i: usize| i),
+                ((Identity, _), (_, Some(y))) => each!(|i: usize| i, |i: usize| y[i] as usize),
+                ((_, Some(x)), (Zero, _)) => each!(|i: usize| x[i] as usize, |_| 0),
+                ((Zero, _), (_, Some(y))) => each!(|_| 0, |i: usize| y[i] as usize),
+                ((left, _), (right, _)) => each!(|i: usize| left.get(i), |i: usize| right.get(i)),
             }
             nulls.into_iter().for_each(|i| result.set_null(i, true));
             return Ok(());
