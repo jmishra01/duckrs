@@ -10,7 +10,7 @@
 
 use super::conjunction_of;
 use crate::execution::expression_executor::try_evaluate_scalar;
-use crate::function::date_part_call_of;
+use crate::function::{date_part_call_of, ScalarFunction};
 use crate::planner::expression::{BoundExpr, BoundExprKind, BoundOperator, ColumnBinding};
 use crate::planner::logical::{LogicalOperator, LogicalOperatorKind};
 use duckrs_common::types::{LogicalType, LogicalTypeId};
@@ -1618,58 +1618,95 @@ pub(crate) fn expressions_equal(a: &BoundExpr, b: &BoundExpr) -> bool {
     }
 }
 
-/// The functions that never fail on any input. C++ marks the ones that can
-/// (`FunctionErrors::CAN_THROW_RUNTIME_ERROR`); the opposite is the safe side here, since an
-/// expression that can fail only stays where it is.
-const INFALLIBLE_FUNCTIONS: &[&str] = &[
-    "constant_or_null",
-    // `InstrFun` and its aliases are not `SetFallible`
-    "instr",
-    "position",
-    "strpos",
-    "~~",
-    "!~~",
-    "~~*",
-    "!~~*",
-    "floor",
-    "ceil",
-    "ceiling",
-    "year",
-    "decade",
-    "century",
-    "millennium",
-    "lower",
-    "upper",
-    "lcase",
-    "ucase",
-    "length",
-    "strlen",
-    "concat",
-    "||",
-    "prefix",
-    "suffix",
-    "contains",
-    "starts_with",
-    "ends_with",
-    "~~",
-    "!~~",
-    "isnan",
-    "isinf",
-    "isfinite",
-    "greatest",
-    "least",
-    "year",
-    "month",
-    "day",
-    "quarter",
-    "sign",
-    "left",
-    "dayofmonth",
-    "dayofweek",
-    "dayofyear",
-    "hour",
-    "minute",
+/// The scalar functions C++ declares fallible (`SetFallible`, `FunctionErrors::CAN_THROW_RUNTIME_ERROR`),
+/// by name: an overload of one is taken to fail as the most fallible one does. The list functions
+/// that are `list_aggr` macros in C++ fail as it does. Every other function cannot fail, as C++'s
+/// default `FunctionErrors::CANNOT_ERROR` has it.
+const FALLIBLE_FUNCTIONS: &[&str] = &[
+    "!__postfix", "%", "&", "*", "**", "+", "-", "->>", "/", "//", "<<", ">>", "@", "__internal_barrier",
+    "__internal_try_rethrow", "abs", "acos", "add", "age", "aggregate", "apply", "array_aggr", "array_aggregate",
+    "array_apply", "array_cosine_distance", "array_cosine_similarity", "array_cross_product", "array_distance",
+    "array_dot_product", "array_filter", "array_inner_product", "array_length", "array_negative_dot_product",
+    "array_negative_inner_product", "array_reduce", "array_resize", "array_select", "array_slice", "array_to_json",
+    "array_transform", "array_value", "array_where", "asin", "atanh", "bar", "binom", "bitstring", "century", "chr",
+    "cos", "cot", "currval", "date_diff", "date_part", "date_sub", "date_trunc", "datediff", "datepart", "datesub",
+    "datetrunc", "day", "dayofmonth", "dayofweek", "dayofyear", "decade", "decimal_division", "decode", "divide",
+    "epoch_ms", "epoch_ns", "epoch_us", "equi_width_bins", "era", "error", "factorial", "filter", "fmod", "format",
+    "from_base64", "from_binary", "from_hex", "from_json", "from_json_strict", "gamma", "gcd", "generate_series",
+    "get_bit", "get_current_time", "greatest_common_divisor", "hamming", "ilike_escape", "invoke", "isodow",
+    "isoyear", "jaccard", "json_array", "json_array_length", "json_contains", "json_deep_merge",
+    "json_deserialize_sql", "json_exists", "json_extract", "json_extract_path", "json_extract_path_text",
+    "json_extract_string", "json_insert", "json_keys", "json_merge_patch_diff", "json_object", "json_quote",
+    "json_remove", "json_replace", "json_set", "json_structure", "json_transform", "json_transform_strict",
+    "json_type", "json_value", "last_day", "lcm", "least_common_multiple", "left", "left_grapheme", "lgamma",
+    "like_escape", "list_aggr", "list_aggregate", "list_any_value", "list_apply", "list_approx_count_distinct",
+    "list_avg", "list_bit_and", "list_bit_or", "list_bit_xor", "list_bool_and", "list_bool_or",
+    "list_cosine_distance", "list_cosine_similarity", "list_count", "list_distance", "list_dot_product",
+    "list_entropy", "list_filter", "list_first", "list_histogram", "list_inner_product", "list_kurtosis",
+    "list_kurtosis_pop", "list_last", "list_mad", "list_max", "list_median", "list_min", "list_mode",
+    "list_negative_dot_product", "list_negative_inner_product", "list_product", "list_reduce", "list_resize",
+    "list_select", "list_sem", "list_skewness", "list_slice", "list_stddev_pop", "list_stddev_samp",
+    "list_string_agg", "list_sum", "list_transform", "list_var_pop", "list_var_samp", "list_where", "ln", "log",
+    "log10", "log2", "lpad", "make_date", "make_time", "make_timestamp", "make_timestamp_ms", "make_timestamp_ns",
+    "make_timestamptz", "map", "map_from_entries", "map_keys", "map_values", "millennium", "mismatches", "mod",
+    "month", "multiply", "nextval", "not_ilike_escape", "not_like_escape", "parse_formatted_bytes", "path_join",
+    "pow", "power", "printf", "quarter", "range", "reduce", "regexp_extract", "regexp_extract_all",
+    "regexp_full_match", "regexp_matches", "regexp_replace", "regexp_split_to_array", "repeat", "right",
+    "right_grapheme", "round", "round_even", "roundbankers", "row_to_json", "rpad", "set_bit", "setseed", "setval",
+    "sin", "sqrt", "st_asgeojson", "st_geomfromgeojson", "st_geomfromwkb", "str_split_regex", "strftime",
+    "string_split_regex", "strptime", "subtract", "tan", "time_bucket", "timezone", "timezone_hour",
+    "timezone_minute", "to_base", "to_centuries", "to_days", "to_decades", "to_hours", "to_json", "to_microseconds",
+    "to_millennia", "to_milliseconds", "to_minutes", "to_months", "to_quarters", "to_seconds", "to_timestamp",
+    "to_weeks", "to_years", "translate", "unbin", "unhex", "url_decode", "uuid_extract_timestamp",
+    "variant_extract_string", "variant_normalize", "week", "weekday", "weekofyear", "write_log", "xor", "year",
+    "yearweek", "|", "~",
 ];
+
+/// ICU's date parts: the overloads of TIMESTAMP WITH TIME ZONE are fallible (`ICUDatePart`).
+const ICU_DATE_PARTS: &[&str] = &[
+    "century", "date_part", "datepart", "day", "dayname", "dayofmonth", "dayofweek", "dayofyear", "decade", "epoch",
+    "era", "hour", "isodow", "isoyear", "julian", "last_day", "microsecond", "millennium", "millisecond", "minute",
+    "month", "monthname", "quarter", "second", "timezone", "timezone_hour", "timezone_minute", "week", "weekday",
+    "weekofyear", "year", "yearweek",
+];
+
+/// `BoundFunctionExpression::CanThrow` of the function itself, by its overload where C++ decides
+/// it by the arguments.
+fn function_can_throw(function: &ScalarFunction, children: &[BoundExpr], return_type: &LogicalType) -> bool {
+    use LogicalTypeId::*;
+    if function.cannot_error {
+        return false;
+    }
+    let name = function.name.as_str();
+    let first = children.first().map(|c| c.return_type.id());
+    match name {
+        // `StringExtractBind`: a constant index in substring's range cannot fail; `array_extract` of
+        // a LIST, STRUCT or tuple cannot fail, `list_extract` of a LIST can
+        "array_extract" | "list_extract" | "list_element" if first == Some(Varchar) => {
+            children.len() != 2 || !offset_in_range(&children[1], None)
+        }
+        "array_extract" => false,
+        "list_extract" | "list_element" => true,
+        // `SubstringBind`: constants in the supported range cannot fail
+        "substring" | "substr" | "substring_grapheme" => !substring_in_range(name, children),
+        // unary `+` is `NopFunction`; negating a DECIMAL or BIGNUM, and subtracting BIGNUMs, cannot fail
+        "+" if children.len() == 1 => false,
+        "-" if children.len() == 1 => !matches!(first, Some(Decimal | Bignum)),
+        "-" if children.iter().all(|c| c.return_type.id() == Bignum) => false,
+        // `ListValueResolveTypes`: the arguments are cast to the child type when it runs
+        "list_value" | "list_pack" => return_type.child_type().is_some_and(|child| {
+            children.iter().any(|c| cast_can_throw(&c.return_type, child))
+        }),
+        _ if ICU_DATE_PARTS.contains(&name)
+            && children.iter().any(|c| matches!(c.return_type.id(), TimestampTz | TimestampTzNs)) =>
+        {
+            true
+        }
+        // compressed materialization's functions throw when assertions are on (`CMIntegralCompressFun`)
+        _ if name.starts_with("__internal_compress") => true,
+        _ => FALLIBLE_FUNCTIONS.contains(&name),
+    }
+}
 
 /// `Expression::CanThrow`, leaning towards true.
 /// `ExpressionBarrier::Contains`.
@@ -1682,26 +1719,7 @@ pub(crate) fn can_throw(expr: &BoundExpr) -> bool {
     let own = match &expr.kind {
         BoundExprKind::Subquery { .. } | BoundExprKind::ListLambda { .. } | BoundExprKind::Sequence { .. } => true,
         BoundExprKind::Cast { child, try_cast } => !try_cast && cast_can_throw(&child.return_type, &expr.return_type),
-        BoundExprKind::Function { function, children, .. } => {
-            let floating = matches!(function.name.as_str(), "+" | "-" | "*")
-                && children
-                    .iter()
-                    .all(|c| matches!(c.return_type.id(), LogicalTypeId::Float | LogicalTypeId::Double));
-            // `ListExtractFunction`: an index past the end is NULL
-            let extract = matches!(function.name.as_str(), "list_extract" | "array_extract" | "list_element");
-            let list_extract = extract && children.first().is_some_and(|c| c.return_type.id() == LogicalTypeId::List);
-            // `StringExtractBind`: a constant index in substring's range cannot fail
-            let string_extract = extract
-                && children.len() == 2
-                && children[0].return_type.id() == LogicalTypeId::Varchar
-                && offset_in_range(&children[1], None);
-            !floating
-                && !list_extract
-                && !string_extract
-                && !function.cannot_error
-                && !substring_in_range(&function.name, children)
-                && !INFALLIBLE_FUNCTIONS.contains(&function.name.as_str())
-        }
+        BoundExprKind::Function { function, children, .. } => function_can_throw(function, children, &expr.return_type),
         _ => false,
     };
     own || expr.children().into_iter().any(can_throw)

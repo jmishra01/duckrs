@@ -199,7 +199,9 @@ Each item gives the number of failing files in `test/` that it should fix, where
     string `a[i]` with a constant index cannot throw, as in C++ (`test_no_pushdown_cast_into_cte`)
   - [ ] scalar functions pushed into Parquet scans, a filter on the right of a SEMI join through a subquery's
     projection
-  - [ ] `can_throw` as C++ has it: only the functions C++ marks `SetFallible` (duckrs lists those that can't)
+  - [x] `can_throw` as C++ has it: only the functions C++ marks `SetFallible` can fail, by overload where C++ decides
+    it at bind time (extracts, substring, unary `+`/`-`, `list_value`, ICU date parts of TIMESTAMPTZ)
+  - [ ] `CanThrow` of aggregates and window functions (`sum`, `avg`, `ntile`, ... are fallible in C++)
 - [ ] 15. Statistics propagation (`optimizer/statistics`: 4 failing, 91.8% pass)
   - [x] row groups of the database's `ROW_GROUP_SIZE`; zone maps through CASE, COALESCE, greatest/least,
     arithmetic with constants, month/quarter, prefix, left, sign, two-column comparisons
