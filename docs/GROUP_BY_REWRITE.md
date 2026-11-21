@@ -1,6 +1,6 @@
 # GROUP BY hash table rewrite (plan)
 
-Status: planned 2026-11-21, not started. Stage 4, after part 46.
+Status: step 1 done (part 48, `execution::group_table`, not used by the aggregate yet). Stage 4, after part 46.
 
 ## Why
 

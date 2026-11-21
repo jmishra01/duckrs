@@ -13,6 +13,7 @@ pub mod csv_state_machine;
 pub mod expression_executor;
 pub mod external_sort;
 pub mod file_system;
+pub mod group_table;
 pub mod join;
 pub mod join_filter;
 pub mod json_scan;
