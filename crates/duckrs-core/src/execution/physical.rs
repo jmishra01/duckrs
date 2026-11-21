@@ -3179,36 +3179,14 @@ struct AggregateSinkState {
     reserved: usize,
     /// whether the memory limit gave no more, so that the rows of new groups spill
     full: bool,
-    /// the groups as they are found while rows come in, in place of `group_ids`, until something needs keys
-    /// ([`Self::into_keys`])
+    /// the groups and their values, in place of `group_ids` and `group_values`, for an aggregate that has its
+    /// groups in tables (`PhysicalAggregate::spills_by_hash`): every state of it has one or no group
     table: Option<GroupTable>,
     /// what the table took when `bytes` last counted it
     table_bytes: usize,
 }
 
 impl AggregateSinkState {
-    /// The keys of the groups a table found, in `group_ids`, by which states are merged, split and spilled: a key
-    /// per group, where finding them by keys made one per row.
-    fn into_keys(&mut self) -> Result<()> {
-        let Some(table) = self.table.take() else {
-            return Ok(());
-        };
-        // the values of the groups, which the table held
-        for chunk in table.scan() {
-            self.group_values.append(&chunk);
-        }
-        self.group_ids.reserve(self.group_count);
-        let mut id = 0;
-        for chunk in self.group_values.chunks() {
-            let columns: Vec<&Vector> = chunk.columns().iter().collect();
-            for key in create_row_keys(&columns, chunk.len())? {
-                self.group_ids.insert(key, id);
-                id += 1;
-            }
-        }
-        Ok(())
-    }
-
     fn new(group_types: Vec<LogicalType>, aggregates: &[BoundAggregate]) -> Self {
         // a set without groups has its one group from the start, so it has a row for no input
         let group_count = usize::from(group_types.is_empty());
@@ -3498,7 +3476,6 @@ impl PhysicalAggregate {
             }
             return Ok(taken);
         }
-        state.into_keys()?;
         let old = std::mem::replace(state, new_state());
         state.full = old.full;
         let mut keys: Vec<Option<RowKey>> = vec![None; old.group_count];
@@ -4280,9 +4257,8 @@ impl PhysicalAggregate {
     }
 
     /// The groups of `state` in `partitions` states, by the hash of their key.
-    fn split_state(&self, mut state: AggregateSinkState, partitions: usize) -> Result<Vec<AggregateSinkState>> {
+    fn split_state(&self, state: AggregateSinkState, partitions: usize) -> Result<Vec<AggregateSinkState>> {
         use std::hash::{BuildHasher, BuildHasherDefault};
-        state.into_keys()?;
         let AggregateSinkState {
             group_ids,
             group_values,
@@ -4347,13 +4323,16 @@ impl PhysicalAggregate {
         if local.table.is_none() && local.group_count == 0 && !local.group_values.types().is_empty() {
             return Ok(());
         }
-        if local.table.is_some() && (state.table.is_some() || state.group_count == 0) {
-            let table = local.table.take().expect("checked above");
+        if let Some(table) = local.table.take() {
             let ids: Vec<usize> = (0..table.len()).collect();
             return self.absorb(state, &table, &ids, local.states);
         }
-        state.into_keys()?;
-        local.into_keys()?;
+        if state.table.is_some() {
+            return Err(Error::new(
+                ErrorKind::Internal,
+                "groups by key can't join groups in a table",
+            ));
+        }
         let AggregateSinkState {
             group_ids,
             ordered_keys,

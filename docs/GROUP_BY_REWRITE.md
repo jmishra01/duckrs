@@ -1,9 +1,10 @@
 # GROUP BY hash table rewrite (plan)
 
-Status: steps 1 to 4 done (parts 48, 49 and 51). The plain GROUP BY finds its groups in a `GroupTable`, merges
-threads' tables by partition, and spills by the hash of its groups, so its states keep their tables throughout.
-The aggregates with keys (DISTINCT, ORDER BY, grouping sets, VARIANT and BIT groups) are as they were. Step 5 is
-left: `into_keys` is reached only by a key state now, and can go with the rest of what no path uses.
+Status: done (parts 48, 49, 51 and 52). A plain GROUP BY finds its groups in a `GroupTable`, merges threads'
+tables by partition, and spills by the hash of its groups, so its states keep their tables throughout; the
+aggregates with keys (DISTINCT, ORDER BY, grouping sets, VARIANT and BIT groups) are as they were. A state is
+one or the other for its whole life: step 5 removed the conversion from a table to keys
+(`AggregateSinkState::into_keys`), and a merge of the two kinds is an internal error.
 
 Step 4: whether an aggregate spills by hash or by key is decided once for it (`spills_by_hash`), as the rows it
 spills and the groups that join them must go to the same partitions. The rows of groups a full state doesn't
