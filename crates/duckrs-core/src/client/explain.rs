@@ -18,11 +18,14 @@ use duckrs_common::sort_key::OrderType;
 use super::text_tree_renderer::{self, TextTreeConfig, TreeNode, split_lines, strip_outer_parens};
 
 /// `RenderTreeNode`.
+#[derive(Debug)]
 pub(super) struct ExplainNode {
     name: String,
     /// keys and values; a value can have several lines
     info: Vec<(String, String)>,
     estimate: Option<u64>,
+    /// the rows the operator gave on, of a run of EXPLAIN ANALYZE
+    rows: Option<u64>,
     children: Vec<ExplainNode>,
 }
 
@@ -37,6 +40,7 @@ impl ExplainNode {
                 ("Run To Completion".to_string(), "true".to_string()),
             ],
             estimate: None,
+            rows: None,
             children: vec![body, query],
         }
     }
@@ -720,6 +724,7 @@ pub(super) fn logical_tree(op: &LogicalOperator, estimate: Option<&PlanEstimate>
         name: logical_name(op).to_string(),
         info: operator_info(op, false),
         estimate: estimate.map(|e| e.cardinality),
+        rows: None,
         children: op
             .children
             .iter()
@@ -733,6 +738,27 @@ thread_local! {
     /// The working and recurring tables of the recursive CTEs being rendered, and their table
     /// indexes.
     static RECURSIVE_TABLES: std::cell::RefCell<Vec<(usize, usize, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// What the operators of the plan being rendered did when EXPLAIN ANALYZE ran it.
+    static ANALYZED: std::cell::RefCell<Option<std::sync::Arc<crate::execution::profiler::OperatorProfiler>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// [`physical_tree`] of a plan that ran with `profiler`, whose operators show the rows they gave on.
+pub(super) fn analyzed_tree(
+    op: &dyn PhysicalOperator,
+    logical: Option<&LogicalOperator>,
+    estimate: Option<&PlanEstimate>,
+    profiler: std::sync::Arc<crate::execution::profiler::OperatorProfiler>,
+) -> ExplainNode {
+    let previous = ANALYZED.with(|a| a.borrow_mut().replace(profiler));
+    let tree = physical_tree(op, logical, estimate, true);
+    ANALYZED.with(|a| *a.borrow_mut() = previous);
+    tree
+}
+
+/// `OperatorProfiler`'s `operator_cardinality` of `op`, when the plan ran.
+fn analyzed_rows(op: &dyn PhysicalOperator) -> Option<u64> {
+    ANALYZED.with(|a| a.borrow().as_ref().map(|profiler| profiler.metrics(op).rows))
 }
 
 /// What a scan of `table` is: `REC_CTE_SCAN` of a working table or `REC_REC_CTE_SCAN` of a
@@ -798,6 +824,7 @@ pub(super) fn physical_tree(
             name: op.name().to_string(),
             info: operator_info(cte, true),
             estimate: estimate.map(|e| e.cardinality),
+            rows: analyzed_rows(op),
             children: vec![anchor, rounds],
         };
     }
@@ -850,6 +877,7 @@ pub(super) fn physical_tree(
             name: op.name().to_string(),
             info: operator_info(aggregate, true),
             estimate: estimate.map(|e| e.cardinality),
+            rows: analyzed_rows(op),
             children: vec![physical_tree(
                 children[0].children()[0].as_ref(),
                 Some(&logical_children[0]),
@@ -870,6 +898,7 @@ pub(super) fn physical_tree(
             name: op.name().to_string(),
             info: vec![("Limit".to_string(), options.sample_size.clone())],
             estimate: estimate.map(|e| e.cardinality),
+            rows: analyzed_rows(op),
             children: vec![physical_tree(children[0].as_ref(), logical, estimate, analyze)],
         };
     }
@@ -893,6 +922,7 @@ pub(super) fn physical_tree(
             name: op.name().to_string(),
             info,
             estimate: estimate.map(|e| e.cardinality),
+            rows: analyzed_rows(op),
             children: vec![physical_tree(children[0].as_ref(), Some(window), estimate, analyze)],
         };
     }
@@ -910,6 +940,7 @@ pub(super) fn physical_tree(
             name: op.name().to_string(),
             info: vec![("Projections".to_string(), lines(references))],
             estimate: estimate.map(|e| e.cardinality),
+            rows: analyzed_rows(op),
             children: vec![physical_tree(children[0].as_ref(), logical, estimate, analyze)],
         };
     }
@@ -923,7 +954,14 @@ pub(super) fn physical_tree(
             None => physical_tree(children[0].as_ref(), logical, estimate, analyze),
         };
     }
+    let ran = ANALYZED.with(|a| a.borrow().is_some());
     let name = match logical.map(|l| &l.kind) {
+        // the profiler names an operator by its `PhysicalOperatorType`, and a scan of a table or a table
+        // function is a TABLE_SCAN
+        Some(K::Get { .. } | K::ParquetScan { .. } | K::JsonScan { .. } | K::CsvScan { .. }) if ran => {
+            "TABLE_SCAN".to_string()
+        }
+        _ if ran && crate::execution::profiler::operator_type(op) == "TABLE_SCAN" => "TABLE_SCAN".to_string(),
         Some(K::Get { .. }) => "SEQ_SCAN".to_string(),
         // `PhysicalTableScan::GetName`
         Some(K::ParquetScan { scan, .. }) => scan.function_name.to_uppercase(),
@@ -954,6 +992,7 @@ pub(super) fn physical_tree(
         name,
         info,
         estimate: estimate.map(|e| e.cardinality),
+        rows: analyzed_rows(op),
         children: children
             .iter()
             .enumerate()
@@ -971,7 +1010,9 @@ pub(super) fn physical_tree(
 
 /// `Dynamic Filters` of the table scans, from a run of the statement, in the order of the scans.
 pub(super) fn add_dynamic_filters(node: &mut ExplainNode, recorded: &mut impl Iterator<Item = Option<String>>) {
+    // of the scans of tables, not of table functions, which are TABLE_SCANs too once the plan ran
     if matches!(node.name.as_str(), "SEQ_SCAN" | "TABLE_SCAN")
+        && node.info.iter().any(|(key, _)| key == "Table")
         && let Some(Some(filters)) = recorded.next()
     {
         let at = node
@@ -1005,7 +1046,7 @@ fn text_tree(node: &ExplainNode) -> TreeNode {
     TreeNode {
         name: node.name.clone(),
         details,
-        rows: None,
+        rows: node.rows,
         estimated_rows: node.estimate,
         children: node.children.iter().map(text_tree).collect(),
     }

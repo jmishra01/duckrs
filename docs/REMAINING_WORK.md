@@ -209,14 +209,16 @@ Each item gives the number of failing files in `test/` that it should fix, where
     (`NotNullExpressionAnalyzer`)
   - [x] the same for Parquet scans: their filters go in before statistics, which check them; count/min/max
     from a single file's row groups take the filters in its scan into account
-  - [ ] EXPLAIN ANALYZE row counts: the operators' real cardinalities and `TABLE_SCAN` names, from running the
-    plan it renders under the profiler (`table_or_pushdown`, `parquet_or_pushdown`)
+  - [x] EXPLAIN ANALYZE row counts: the plan it renders is the one that ran, under the profiler, with each
+    operator's rows and scans as `TABLE_SCAN`; under an OR, what is never true but can be NULL stays
+    `constant_or_null(false, ...)` (`table_or_pushdown`, `parquet_or_pushdown`)
+  - [ ] the rest of C++'s analyzed plan: the `QUERY` / `EXPLAIN_ANALYZE` nodes, `Total Time`, operator timings
   - [ ] the order of a join's conditions where an inequality comes before IS DISTINCT FROM (`issue_17042`)
   - [ ] filters through the row numbers of EXCEPT ALL / INTERSECT ALL on a collation key
     (`pushdown_window_partition_expression`); dynamic filters of blockwise NL joins (`join_filter_pushdown_any_join`)
   - [ ] the operator log and profiler output a few tests read (`join_filter_pushdown_integer_chain`,
     `cte_domain_join_filter`); `read_csv`'s `schema`; `COLUMNS(json_keys(getvariable(...)))` (`issue_16671`);
-    EXPLAIN ANALYZE row counts of operators (`parquet_or_pushdown`); a filter on the right of a SEMI join through
+    a filter on the right of a SEMI join through
     a subquery's projection
   - [x] `can_throw` as C++ has it: only the functions C++ marks `SetFallible` can fail, by overload where C++ decides
     it at bind time (extracts, substring, unary `+`/`-`, `list_value`, ICU date parts of TIMESTAMPTZ)

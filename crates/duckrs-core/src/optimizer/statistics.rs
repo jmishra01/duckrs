@@ -1006,6 +1006,9 @@ impl StatisticsPropagator {
             BoundExprKind::Comparison { .. } => self.comparison(expr, in_filter),
             BoundExprKind::Between { .. } => self.between(expr, in_filter),
             BoundExprKind::Conjunction { children, and } => {
+                // C++ makes `constant_or_null(false, ...)` of what is never true but can be NULL, and only the
+                // filter it is all of drops it; under an OR it stays
+                let in_filter = in_filter && *and;
                 for child in children.iter_mut() {
                     self.expression(child, in_filter);
                 }

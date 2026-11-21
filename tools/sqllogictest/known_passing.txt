@@ -624,6 +624,7 @@ test/optimizer/pushdown/join_filter_pushdown_sample.test
 test/optimizer/pushdown/join_filter_target_cardinality.test
 test/optimizer/pushdown/lateral_projection_evaluation.test
 test/optimizer/pushdown/no_mark_to_semi_if_mark_index_is_projected.test
+test/optimizer/pushdown/parquet_or_pushdown.test
 test/optimizer/pushdown/prefix_pushdown_null_constant.test
 test/optimizer/pushdown/pushdown_after_statistics.test
 test/optimizer/pushdown/pushdown_in_to_parquet.test
@@ -633,9 +634,11 @@ test/optimizer/pushdown/pushdown_window_partition_filter.test
 test/optimizer/pushdown/semi_anti_join_implied_filters.test
 test/optimizer/pushdown/starts_with_pushdown.test
 test/optimizer/pushdown/table_filter_pushdown.test
+test/optimizer/pushdown/table_or_pushdown.test
 test/optimizer/pushdown/test_constant_or_null_pushdown.test
 test/optimizer/pushdown/test_pushdown_cte_group_by_all.test
 test/optimizer/pushdown/timestamp_to_date_infinity_pushdown.test
+test/optimizer/pushdown/timestamp_to_date_pushdown.test
 test/optimizer/pushdown/type_pushdown_projection_index.test
 test/optimizer/pushdown/type_pushdown_virtual_column.test
 test/optimizer/pushdown/volatile_filter_aggregate_distinct.test
@@ -3200,6 +3203,7 @@ test/sql/optimizer/test_not_comparison_simplification.test
 test/sql/optimizer/test_rollup_column_pruning.test
 test/sql/optimizer/test_rowid_pruning.test
 test/sql/optimizer/test_rowid_pushdown_deletes.test
+test/sql/optimizer/test_rowid_pushdown_plan.test
 test/sql/optimizer/test_rowid_vector_pruning_results.test
 test/sql/optimizer/test_window_join_pushdown.test
 test/sql/optimizer/test_window_self_join.test
@@ -4276,12 +4280,14 @@ test/sql/topn/test_top_n_lists.test
 test/sql/topn/test_top_n_medium.test
 test/sql/topn/test_top_n_nested_struct.test
 test/sql/topn/test_top_n_nulls_first.test
+test/sql/topn/test_top_n_nulls_first_row_group_reorderer_edge_cases.test
 test/sql/topn/test_top_n_nulls_row_group_pruner.test
 test/sql/topn/test_top_n_nulls_small.test
 test/sql/topn/test_top_n_offset_no_limit_pruner.test
 test/sql/topn/test_top_n_structs.test
 test/sql/topn/test_top_n_window_row_group_pruner.test
 test/sql/topn/top_n_materialization.test
+test/sql/topn/top_n_pruning_read_ahead.test
 test/sql/topn/tpcds_q14_topn.test
 test/sql/topn/tpcds_q59_topn.test
 test/sql/transactions/aborted_transaction_commit.test
