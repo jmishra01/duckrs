@@ -1152,6 +1152,78 @@ CTE revenue                                                 ~1,000
 - **22,830**: Line items shipped in that quarter, from all 1,000 suppliers. The estimate was ~120,114, the default guess of 20% for a range.
 - **0.004 s**: Q15 with the optimizer on, median of 11 warm runs. Switching off compressed_materialization, statistics_propagation or cte_inlining gave 0.004–0.005 s. The load average was above 120, so small differences can't be read from these runs.
 
+## TPC-H Q16, with the optimizer off and on
+
+Q16 counts, for each brand, type and size of part, how many suppliers sell it, leaving out suppliers with customer complaints. It has three kinds of condition the other walkthroughs don't combine: a negated `LIKE`, an `IN` list of eight sizes, and a `NOT IN` subquery. It also shows a gap: in duckrs the IN list keeps the part filters out of the part scan. The plans are from the same build as Q15 (`1ed6cc1`) and the same SF0.1 data.
+
+```
+SELECT p_brand, p_type, p_size, count(DISTINCT ps_suppkey) AS supplier_cnt
+FROM partsupp, part
+WHERE p_partkey = ps_partkey
+  AND p_brand <> 'Brand#45'
+  AND p_type NOT LIKE 'MEDIUM POLISHED%'
+  AND p_size IN (49, 14, 23, 45, 19, 3, 36, 9)
+  AND ps_suppkey NOT IN (SELECT s_suppkey FROM supplier
+                         WHERE s_comment LIKE '%Customer%Complaints%')
+GROUP BY p_brand, p_type, p_size
+ORDER BY supplier_cnt DESC, p_brand, p_type, p_size;
+```
+
+**Optimizer off: PRAGMA disable_optimizer**
+
+```
+Order By supplier_cnt DESC, p_brand, p_type, p_size        ~30,569
+└ Hash Group By p_brand, p_type, p_size, count(DISTINCT ps_suppkey)   ~30,569
+  └ Filter (5 conditions, including NOT #mark)      ~320,000,000
+    └ Hash Join  MARK  ps_suppkey = s_suppkey             ~1,600,000,000
+      ├ Cross Product  partsupp × part  (all columns)   ~1,600,000,000
+      └ Filter  s_comment ~~ '%Customer%Complaints%'       ~200
+        └ Seq Scan supplier  (all 7 columns)                ~1,000
+```
+
+> The planner already turns `NOT IN (subquery)` into a MARK join: each partsupp row is marked with whether its supplier is in the list, and a filter keeps the unmarked ones.
+
+**Optimizer on: default settings**
+
+```
+Projection __internal_decompress_string(p_brand), p_type, CAST(p_size AS INTEGER), supplier_cnt
+└ Order By supplier_cnt DESC, p_brand, p_type, p_size      ~1,862
+  └ Projection __internal_compress_string_uhugeint(p_brand), ..., CAST(p_size AS TINYINT)
+    └ Hash Group By p_brand, p_type, p_size, count(DISTINCT ps_suppkey)   ~1,862
+      └ Projection ..., __internal_compress_string_uhugeint(p_brand), CAST(p_size AS TINYINT)
+        └ Filter  NOT #mark                                 ~1,873
+          └ Hash Join  MARK  ps_suppkey = s_suppkey      ~9,365
+            ├ Hash Join  ps_partkey = p_partkey         ~9,365
+            │ ├ Seq Scan partsupp  [ps_partkey, ps_suppkey]   ~80,000
+            │ └ Filter  IN (...), p_brand != 'Brand#45', NOT prefix(p_type, 'MEDIUM POLISHED')   ~4,000
+            │   └ Hash Join  MARK  p_size = #value        ~20,000
+            │     ├ Seq Scan part  (all 9 columns)          ~20,000
+            │     │   Filters: optional: p_size IN (49, 14, 23, 45, 19, 3, 36, 9)
+            │     └ Column Data Scan  (the 8 sizes)              ~8
+            └ Seq Scan supplier  [s_suppkey]                ~200
+                Filters: s_comment ~~ '%Customer%Complaints%'
+```
+
+> The first child of each hash join probes and the second child is the build side. The Filter above the IN join and the part scan with all 9 columns are the gap described below.
+
+### What each pass changed
+
+1. **filter_pushdown** turned the cross product into a hash join on the part key, put the complaints filter into the supplier scan, and moved the part conditions below the join.
+2. **expression_rewriter** turned `p_type NOT LIKE 'MEDIUM POLISHED%'` into `NOT prefix(p_type, 'MEDIUM POLISHED')`, which only compares the start of the string.
+3. **in_clause** turned `p_size IN (8 values)` into a MARK join with the 8 values as a small table, so each part costs one hash lookup instead of up to 8 comparisons. The scan also gets the list as an optional filter for its zone maps. DuckDB does both too.
+4. **The NOT IN** stays a MARK join, now a hash join on `ps_suppkey = s_suppkey`. The supplier list is the build side: one supplier at this scale has a complaint.
+5. **compressed_materialization** packs `p_brand` into a 16-byte integer and `p_size` into a TINYINT for the GROUP BY and the ORDER BY. `p_type` is too long to pack.
+
+### Where duckrs differs from DuckDB 1.5.6
+
+1. **The part filters stay above the IN join.** In DuckDB, `p_brand != 'Brand#45'` and the `prefix` test are scan filters on part, and only the IN result is checked above its MARK join. In duckrs all three sit in one Filter above that join. The cause is the order of the passes: C++ moves filters into scans inside FILTER_PUSHDOWN, which runs before IN_CLAUSE (`optimizer.cpp`), while duckrs does it later, in `scan_filters::push_into_scans` (`optimizer/mod.rs`, after `in_clause`). By then the MARK join sits between the Filter and the scan. With `SET disabled_optimizers = 'in_clause'`, both filters do go into the part scan.
+2. **The part scan reads all 9 columns.** DuckDB reads 4. In duckrs the scan under the IN join still outputs `p_name`, `p_container`, `p_comment` and the rest. With in_clause switched off it reads 4 columns, as DuckDB does, and in a smaller query with the same IN list it reads only what it needs, so it has to do with how unused_columns handles the MARK join under the other joins. I haven't pinned it down further.
+3. **The estimates differ.** duckrs estimates ~4,000 parts after the filters and ~1,862 groups; DuckDB ~800 and ~639. In fact 2,911 parts pass, 11,644 partsupp rows join them, and there are 2,762 groups.
+
+- **2,762**: Rows returned, the same as DuckDB. The top ones are sold by 12 suppliers each, starting with Brand#14 SMALL ANODIZED NICKEL, size 45.
+- **1**: Supplier with a customer complaint at SF0.1, against an estimate of ~200. The NOT IN removes its partsupp rows.
+- **Not measured**: The load average was above 120 during these runs. Q16 took 0.018–0.069 s with the default settings and 0.013–0.053 s with in_clause off, too noisy to say what the gap costs.
+
 ## TPC-H Q18, with the optimizer off and on
 
 Q18 finds the 100 largest orders whose line items add up to a quantity over 300. Unlike Q5 and Q9, it has an `IN` subquery, and both the subquery and the outer query compute `sum(l_quantity)` per order. The setup is the same: the duckrs Stage 3 release build and TPC-H SF0.1 data.
