@@ -142,6 +142,95 @@ Projection __internal_decompress_string(l_returnflag), __internal_decompress_str
 
 > **Fixed, merged into phase-55-optimizer-rewriters (a74af3f, merge 0426536):** a port of `CommonAggregateOptimizer` (`COMMON_AGGREGATE`) now runs where C++ runs it, after the statistics, and merges identical aggregates. Q1's GROUP BY drops from 11 aggregates to 6. Compressed GROUP BY columns now carry the value range of their compressed form, as C++'s `UpdateAggregateStats` does, and the perfect hash decision is made again from those ranges. Q1's plan now shows **Perfect Hash Group By**, as DuckDB's does. In duckrs that operator is only a name over the same hash table, so this second fix makes the plans match but doesn't make Q1 faster. The plans above are from before the fix.
 
+## TPC-H Q2, with the optimizer off and on
+
+Q2 finds, for each brass part of size 15, the European suppliers that sell it at the lowest European price. The lowest price comes from a correlated scalar subquery that repeats most of the outer query's joins. So Q2 shows two passes no other walkthrough here does: **common_subplan**, which computes a piece both halves share only once, and the deliminator on a subquery with an aggregate. The plans are from the same build as Q4 (`1ed6cc1`) and the same SF0.1 data.
+
+```
+SELECT s_acctbal, s_name, n_name, p_partkey, p_mfgr, s_address, s_phone, s_comment
+FROM part, supplier, partsupp, nation, region
+WHERE p_partkey = ps_partkey
+  AND s_suppkey = ps_suppkey
+  AND p_size = 15
+  AND p_type LIKE '%BRASS'
+  AND s_nationkey = n_nationkey
+  AND n_regionkey = r_regionkey
+  AND r_name = 'EUROPE'
+  AND ps_supplycost = (SELECT min(ps_supplycost)
+                       FROM partsupp, supplier, nation, region
+                       WHERE p_partkey = ps_partkey
+                         AND s_suppkey = ps_suppkey
+                         AND s_nationkey = n_nationkey
+                         AND n_regionkey = r_regionkey
+                         AND r_name = 'EUROPE')
+ORDER BY s_acctbal DESC, n_name, s_name, p_partkey
+LIMIT 100;
+```
+
+**Optimizer off: PRAGMA disable_optimizer**
+
+```
+Top N 100 BY s_acctbal DESC, n_name, s_name, p_partkey
+└ Filter  (8 conditions) AND ps_supplycost = #subquery
+  └ Left Delim Join  p_partkey IS NOT DISTINCT FROM p_partkey
+    ├ Cross Product × 4  part × supplier × partsupp × nation × region   (all columns)
+    └ Hash Group By p_partkey, min(ps_supplycost)
+      └ Filter (5 conditions)
+        └ Cross Product × 4  partsupp × supplier × nation × region × (the outer p_partkey values)
+```
+
+> As in Q4, the planner has already flattened the subquery into a Delim Join: the outer query's distinct `p_partkey` values are joined into the subquery, which then groups by them.
+
+**Optimizer on: default settings**
+
+```
+Top N 100 BY s_acctbal DESC, n_name, s_name, p_partkey     ~32
+└ Projection s_acctbal, s_name, n_name, p_partkey, ...
+  └ Filter  ps_supplycost = min                             ~32
+    └ CTE __common_subplan_1
+      ├ Hash Join  n_regionkey = r_regionkey   ← the European nations, computed once   ~5
+      │ ├ Seq Scan nation  [n_nationkey, n_name, n_regionkey]
+      │ └ Seq Scan region  [r_regionkey]  Filters: r_name = 'EUROPE'
+      └ Left Delim Join  p_partkey IS NOT DISTINCT FROM p_partkey   ~161
+        ├ Hash Join  ps_suppkey = s_suppkey                ~161
+        │ ├ Hash Join  ps_partkey = p_partkey              ~1,041
+        │ │ ├ Seq Scan partsupp  [ps_partkey, ps_suppkey, ps_supplycost]   ~80,000
+        │ │ └ Seq Scan part  [p_partkey, p_mfgr]
+        │ │     Filters: suffix(p_type, 'BRASS'), p_size = 15   ~445
+        │ └ Hash Join  s_nationkey = n_nationkey            ~192
+        │   ├ Seq Scan supplier  [s_suppkey, s_name, s_address, s_nationkey, ...]
+        │   └ CTE Scan __common_subplan_1                  ~5
+        └ Projection min, p_partkey
+          └ Hash Group By p_partkey, min(ps_supplycost)
+            └ Hash Join  ps_suppkey = s_suppkey              ~58
+              ├ Hash Join  ps_partkey = p_partkey            ~378
+              │ ├ Seq Scan partsupp  [ps_partkey, ps_suppkey, ps_supplycost]
+              │ └ Delim Scan  (the outer p_partkey values)   ~161
+              └ Hash Join  s_nationkey = n_nationkey          ~192
+                ├ Seq Scan supplier  [s_suppkey, s_nationkey]
+                └ CTE Scan __common_subplan_1                ~5
+```
+
+> The first child of each hash join probes and the second child is the build side. duckrs's EXPLAIN labels the Delim Scan as a CTE Scan without an index.
+
+### What each pass changed
+
+1. **filter_pushdown** turned the cross products in both halves into hash joins and put each one-table filter in its scan: the part size and type, and the region name. `LIKE '%BRASS'` became `suffix(p_type, 'BRASS')`, the same rule that makes Q14's `LIKE 'PROMO%'` a `prefix`.
+2. **common_subplan** found that both halves join nation to region with `r_name = 'EUROPE'`. It computes that join once, as the CTE `__common_subplan_1` (5 nations), and both halves read it. With `SET disabled_optimizers = 'common_subplan'` each half runs its own nation and region scans and join.
+3. **join_order** works in both halves. The outer half starts from the 445 brass parts (73 in fact) and joins partsupp to them, then the European suppliers. The subquery starts from the outer part keys (Delim Scan) and joins partsupp to them, then the European suppliers. In each half, only the partsupp rows of those parts go on to the supplier join.
+4. **deliminator** can't remove this Delim Join, since the subquery has an aggregate the outer rows depend on. But it removes one join inside: without it, the subquery's grouped result is joined to the outer part keys once more, which adds another join and another scan of the keys.
+5. **unused_columns** cut partsupp to 3 of its 5 columns and part to 2 of 9 in both halves. The subquery's supplier scan reads 2 columns; the outer one reads the 7 the query returns.
+
+### Where duckrs differs from DuckDB 1.5.6
+
+1. **DuckDB shares a larger piece.** Its common subplan is the European suppliers (supplier ⋈ nation ⋈ region, ~192 rows), where duckrs shares only the European nations (~5) and joins supplier again in each half.
+2. **DuckDB packs the subquery's group key.** It narrows `p_partkey` to a 2-byte integer for the subquery's GROUP BY. duckrs groups on the full BIGINT.
+3. **The estimates differ.** duckrs estimates ~161 outer rows and ~32 results; DuckDB ~274 and ~276. In fact 63 rows reach the price filter and 44 pass it. Both engines estimate ~445 brass parts where there are 73.
+
+- **0.006 s**: Q2 with the optimizer on, median of 11 warm runs, with a load average of about 4. It returns 44 rows, one per brass part that has a European supplier.
+- **0.036 s**: Q2 with `SET disabled_optimizers = 'join_order'`, 6 times slower in all 11 runs (0.035–0.037 s). The joins then follow the FROM clause, which starts with a cross product of the brass parts and all 1,000 suppliers (~445,000 rows estimated), probed by partsupp on two keys.
+- **0.006 s**: Q2 with `common_subplan` or with `deliminator` switched off. What they save, one join of 25 nations and one join of 44 keys, is too small to show at this size.
+
 ## TPC-H Q3, with the optimizer off and on
 
 Q3 is the simplest of the join queries here. It finds the 10 unshipped orders with the highest revenue for the BUILDING market segment, from three tables with one filter each. The plans are from a release build of `phase-55-optimizer-rewriters` at `081d0b9`, on the same TPC-H SF0.1 data as the other walkthroughs.
