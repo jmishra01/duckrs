@@ -207,8 +207,10 @@ Each item gives the number of failing files in `test/` that it should fix, where
     statistics rewrite only the one above; statistics check the scan's table filters, optional ones too
     (`PropagateStatistics(LogicalGet)`); `constant_or_null` folds only of columns and constants
     (`NotNullExpressionAnalyzer`)
-  - [ ] the same for Parquet scans, whose filters statistics do not check yet; EXPLAIN ANALYZE row counts
-    (`table_or_pushdown`)
+  - [x] the same for Parquet scans: their filters go in before statistics, which check them; count/min/max
+    from a single file's row groups take the filters in its scan into account
+  - [ ] EXPLAIN ANALYZE row counts: the operators' real cardinalities and `TABLE_SCAN` names, from running the
+    plan it renders under the profiler (`table_or_pushdown`, `parquet_or_pushdown`)
   - [ ] the order of a join's conditions where an inequality comes before IS DISTINCT FROM (`issue_17042`)
   - [ ] filters through the row numbers of EXCEPT ALL / INTERSECT ALL on a collation key
     (`pushdown_window_partition_expression`); dynamic filters of blockwise NL joins (`join_filter_pushdown_any_join`)

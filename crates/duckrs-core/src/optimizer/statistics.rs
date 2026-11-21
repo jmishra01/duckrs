@@ -56,6 +56,22 @@ pub(crate) fn has_ordered_statistics(ty: &LogicalType) -> bool {
 }
 
 /// The statistics of a table's columns, from its rows, or those at `positions`, in order.
+/// The table filters and optional filters of a scan of a table or of Parquet files.
+fn scan_filters_mut(op: &mut LogicalOperator) -> Option<(&mut Vec<BoundExpr>, &mut Vec<BoundExpr>)> {
+    match &mut op.kind {
+        K::Get {
+            filters,
+            optional_filters,
+            ..
+        } => Some((filters, optional_filters)),
+        K::ParquetScan { scan, .. } => {
+            let scan = Arc::make_mut(scan);
+            Some((&mut scan.filters, &mut scan.optional_filters))
+        }
+        _ => None,
+    }
+}
+
 fn compute_statistics(table: &Arc<TableCatalogEntry>, positions: Option<Vec<usize>>) -> Option<Vec<Stats>> {
     // a file knows these already, and reading its rows for them would read the whole table
     if positions.is_none()
@@ -2027,11 +2043,14 @@ impl StatisticsPropagator {
         }
         // an optional filter that statistics tell is always true goes; it narrows nothing, as it may be wider
         // than the filter it came from
-        if let K::Get { optional_filters, .. } = &op.kind
-            && !optional_filters.is_empty()
-        {
+        let optional_filters = match &op.kind {
+            K::Get { optional_filters, .. } => optional_filters.clone(),
+            K::ParquetScan { scan, .. } => scan.optional_filters.clone(),
+            _ => return,
+        };
+        if !optional_filters.is_empty() {
             let mut kept = Vec::new();
-            for optional in optional_filters.clone() {
+            for optional in optional_filters {
                 let mut probe = optional.clone();
                 let outer = std::mem::replace(&mut self.filter_on_scan, true);
                 let saved = self.stats.clone();
@@ -2042,11 +2061,11 @@ impl StatisticsPropagator {
                     kept.push(optional);
                 }
             }
-            if let K::Get { optional_filters, .. } = &mut op.kind {
+            if let Some((_, optional_filters)) = scan_filters_mut(op) {
                 *optional_filters = kept;
             }
         }
-        let K::Get { filters, .. } = &mut op.kind else {
+        let Some((filters, _)) = scan_filters_mut(op) else {
             return;
         };
         if filters.is_empty() {
@@ -2059,7 +2078,7 @@ impl StatisticsPropagator {
         *op = match filter.kind {
             K::Filter { expressions } => {
                 let mut scan = filter.children.remove(0);
-                if let K::Get { filters, .. } = &mut scan.kind {
+                if let Some((filters, _)) = scan_filters_mut(&mut scan) {
                     *filters = expressions;
                 }
                 scan
@@ -2515,6 +2534,7 @@ impl StatisticsPropagator {
                         self.stats.insert(ColumnBinding::new(*table_index, column), stats);
                     }
                 }
+                self.table_filters(op);
             }
             K::Filter { .. } => self.filter(op),
             K::Join { .. } => self.join(op),
