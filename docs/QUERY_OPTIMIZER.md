@@ -424,6 +424,83 @@ Projection __internal_decompress_string(supp_nation), (cust_nation), l_year, rev
 - **643**: Rows that reach the GROUP BY, out of 1,270 line items whose supplier and customer are both French or German. The full OR drops the half where both are from the same nation.
 - **Not measured**: The machine's load average was above 70 during these runs, and Q7's times ranged from 0.018 s to 0.141 s, too noisy to compare the passes.
 
+## TPC-H Q8, with the optimizer off and on
+
+Q8 works out Brazil's share of one part type's sales in the Americas, for 1995 and 1996. It joins eight tables, the most of any walkthrough here, with nation twice. Three small filters (one part type, one region, two years of orders) are spread over different ends of the join graph, so join order matters more here than anywhere else. The plans are from the same build as Q7 (`1ed6cc1`) and the same SF0.1 data.
+
+```
+SELECT o_year,
+       sum(CASE WHEN nation = 'BRAZIL' THEN volume ELSE 0 END) / sum(volume) AS mkt_share
+FROM (SELECT extract(year FROM o_orderdate) AS o_year,
+             l_extendedprice * (1 - l_discount) AS volume,
+             n2.n_name AS nation
+      FROM part, supplier, lineitem, orders, customer, nation n1, nation n2, region
+      WHERE p_partkey = l_partkey
+        AND s_suppkey = l_suppkey
+        AND l_orderkey = o_orderkey
+        AND o_custkey = c_custkey
+        AND c_nationkey = n1.n_nationkey
+        AND n1.n_regionkey = r_regionkey
+        AND r_name = 'AMERICA'
+        AND s_nationkey = n2.n_nationkey
+        AND o_orderdate BETWEEN CAST('1995-01-01' AS date) AND CAST('1996-12-31' AS date)
+        AND p_type = 'ECONOMY ANODIZED STEEL') AS all_nations
+GROUP BY o_year
+ORDER BY o_year;
+```
+
+**Optimizer off: PRAGMA disable_optimizer**
+
+```
+Order By o_year                                             ~2,811
+└ Hash Group By o_year, sum(CASE ...), sum(volume)          ~2,811
+  └ Projection ...                         ~18,446,744,073,709,551,615
+    └ Filter (10 conditions)                 ~18,446,744,073,709,551,615
+      └ Cross Product × 7  part × supplier × lineitem × orders × customer
+                           × nation × nation × region   (all columns of every table)
+```
+
+**Optimizer on: default settings**
+
+```
+Order By o_year                                             ~2
+└ Projection o_year, CAST(sum AS DOUBLE) / CAST(sum AS DOUBLE)
+  └ Perfect Hash Group By  year(o_orderdate)             ~2
+      sum(CASE WHEN nation = 'BRAZIL' THEN volume ELSE 0 END), sum(volume)
+    └ Hash Join  s_nationkey = n2.n_nationkey             ~70
+      ├ Hash Join  s_suppkey = l_suppkey                  ~73
+      │ ├ Seq Scan supplier  [s_suppkey, s_nationkey]     ~1,000
+      │ └ Hash Join  c_nationkey = n1.n_nationkey         ~90
+      │   ├ Hash Join  c_custkey = o_custkey              ~472
+      │   │ ├ Seq Scan customer  [c_custkey, c_nationkey]  Filters: c_custkey <= 14999
+      │   │ └ Hash Join  o_orderkey = l_orderkey          ~442
+      │   │   ├ Seq Scan orders  [o_orderkey, o_custkey, o_orderdate]   ~30,000
+      │   │   │   Filters: o_orderdate BETWEEN 1995-01-01 AND 1996-12-31
+      │   │   └ Hash Join  l_partkey = p_partkey          ~4,409
+      │   │     ├ Seq Scan lineitem  [l_orderkey, l_partkey, l_suppkey, l_extendedprice, l_discount]   ~600,572
+      │   │     └ Seq Scan part  [p_partkey]  Filters: p_type = 'ECONOMY ANODIZED STEEL'   ~137
+      │   └ Hash Join  n1.n_regionkey = r_regionkey       ~5
+      │     ├ Seq Scan nation n1  [n_nationkey, n_regionkey]   ~25
+      │     └ Seq Scan region  [r_regionkey]  Filters: r_name = 'AMERICA'
+      └ Seq Scan nation n2  [n_nationkey, n_name]          ~25
+```
+
+> The first child of each hash join probes and the second child is the build side.
+
+### What each pass changed
+
+1. **filter_pushdown** turned the seven cross products into hash joins on the seven key conditions and put each one-table filter in its scan: the part type, the region name and the order date range.
+2. **join_order** starts where the filters are. The 137 parts of one type (147 in fact) build the first hash table, which all of lineitem probes, so only 4,485 line items go on. Orders of 1995–96 build the next table, and that leaves 1,429. They then meet customers, and those customers are joined to the American nations (n1 with region, 5 nations) in a small join of their own, which leaves 282 rows. Supplier and its nation (n2), which filter nothing, come last. DuckDB 1.5.6 picks exactly the same order.
+3. **statistics_propagation** did two things. It added `c_custkey <= 14999` to the customer scan, as in the other queries with customer. And from the order date range it knows `year(o_orderdate)` is 1995 or 1996, so the GROUP BY becomes a **Perfect Hash Group By** over that two-value range, as in DuckDB.
+4. **unused_columns** cut part to 1 of its 9 columns, region to 1 of 3, and lineitem to 5 of 16. The filter columns `p_type`, `r_name` and `o_orderdate` are read in their scans; `o_orderdate` also goes up for the year.
+5. **join_filter_pushdown** doesn't show in EXPLAIN. At run time the part join hands the lineitem scan the range and a Bloom filter of the 147 part keys, so line items of other parts can be dropped in the scan.
+
+- **0.012 s**: Q8 with the optimizer on, median of 11 warm runs. Brazil's share was 2.86% in 1995 and 1.83% in 1996.
+- **0.116 s**: Q8 with `SET disabled_optimizers = 'join_order'`, about 10 times slower in all 11 runs. Without it the joins follow the FROM clause: part and supplier make a cross product of 137,000 rows, lineitem probes it on two keys, and region, the most selective filter, is joined last.
+- **0.014 s**: Q8 with `SET disabled_optimizers = 'join_filter_pushdown'`, slower in all 11 runs (0.013–0.015 s against 0.011–0.012 s). The filter of part keys lets the lineitem scan drop rows before they reach the join.
+
+> The estimates are about half of DuckDB's at every join above part (e.g. ~442 against ~828 for orders, ~70 against ~143 at the top). Both are below the actual 282 rows at the top, and the plan is the same.
+
 ## TPC-H Q9, with the optimizer off and on
 
 Q9 works out the profit on "green" parts per nation and year. It also joins six tables, but its filter is a `LIKE` on part names, and partsupp joins lineitem on two keys at once. The setup is the same as for Q5: the duckrs Stage 3 release build and TPC-H SF0.1 data.
