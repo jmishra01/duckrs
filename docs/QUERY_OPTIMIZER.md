@@ -1078,6 +1078,80 @@ Projection CAST(100.00 * sum AS DOUBLE) / CAST(sum AS DOUBLE)   ~1
 
 > DuckDB 1.5.6 makes the same plan: a hash join that builds on part, the same three lineitem columns and `prefix(p_type, 'PROMO')`. It estimates the join at ~120,114 rows where duckrs says ~128,746, and puts the CASE in a projection under the aggregate where duckrs evaluates it inside the aggregate.
 
+## TPC-H Q15, with the optimizer off and on
+
+Q15 finds the supplier with the most revenue in one quarter of 1996. It defines that revenue once, in a `WITH` clause, and reads it twice: once to join suppliers to it and once for its maximum. It is the only walkthrough built on a CTE the query writes itself, and it shows how statistics turn a GROUP BY into a perfect hash group-by. The plans are from the same build as Q13 (`1ed6cc1`) and the same SF0.1 data.
+
+```
+WITH revenue AS (
+    SELECT l_suppkey AS supplier_no,
+           sum(l_extendedprice * (1 - l_discount)) AS total_revenue
+    FROM lineitem
+    WHERE l_shipdate >= CAST('1996-01-01' AS date)
+      AND l_shipdate <  CAST('1996-04-01' AS date)
+    GROUP BY supplier_no)
+SELECT s_suppkey, s_name, s_address, s_phone, total_revenue
+FROM supplier, revenue
+WHERE s_suppkey = supplier_no
+  AND total_revenue = (SELECT max(total_revenue) FROM revenue)
+ORDER BY s_suppkey;
+```
+
+**Optimizer off: PRAGMA disable_optimizer**
+
+```
+CTE revenue                                                 ~246,400
+├ Hash Group By l_suppkey, sum(...)                         ~1,232
+│ └ Filter  l_shipdate (2 conditions)                ~120,114
+│   └ Seq Scan lineitem  (all 16 columns)             ~600,572
+└ Order By s_suppkey
+  └ Filter  s_suppkey = supplier_no AND total_revenue = max   ~246,400
+    └ Cross Product                                 ~1,232,000
+      ├ Cross Product  supplier (all 7 columns) × CTE Scan revenue   ~1,232,000
+      └ Ungrouped Aggregate max(total_revenue)
+        └ CTE Scan revenue                                  ~1,232
+```
+
+> The CTE is materialized in both plans. A CTE that the query reads more than once is computed once and stored, as in DuckDB, before any optimizer pass.
+
+**Optimizer on: default settings**
+
+```
+CTE revenue                                                 ~1,000
+├ Projection  0, total_revenue
+│ └ Perfect Hash Group By  l_suppkey                  ~1,232
+│     sum(l_extendedprice * (1.00 - l_discount))
+│   └ Projection CAST(l_suppkey AS SMALLINT), l_extendedprice, l_discount
+│     └ Seq Scan lineitem  [l_suppkey, l_extendedprice, l_discount]   ~120,114
+│         Filters: l_shipdate >= '1996-01-01', l_shipdate < '1996-04-01'
+└ Projection CAST(s_suppkey AS BIGINT), ..., __internal_decompress_string(s_phone), total_revenue
+  └ Order By s_suppkey ASC                                  ~1,000
+    └ Projection CAST(s_suppkey AS SMALLINT), ..., __internal_compress_string_uhugeint(s_phone)
+      └ Hash Join  s_suppkey = supplier_no              ~1,000
+        ├ Seq Scan supplier  [s_suppkey, s_name, s_address, s_phone]   ~1,000
+        └ Hash Join  total_revenue = max              ~1,232
+          ├ CTE Scan revenue                                ~1,232
+          └ Ungrouped Aggregate max(total_revenue)          ~1
+            └ CTE Scan revenue                              ~1,232
+```
+
+> The first child of each hash join probes and the second child is the build side. EXPLAIN prints the CTE's key column as `0` in the projection above the GROUP BY. The query returns the right supplier, so this is how the column is printed, not its value; I haven't tracked down why.
+
+### What each pass changed
+
+1. **filter_pushdown** moved the ship date range into the lineitem scan, inside the CTE. It turned the outer cross products into two hash joins: one on `s_suppkey = supplier_no`, and one on `total_revenue = max`, an equality with the one-row result of the subquery.
+2. **cte_inlining** left the CTE materialized. It is read twice, and computing it means scanning lineitem and aggregating a quarter of it, so it is worth storing its 1,000 rows rather than running it twice.
+3. **statistics_propagation** knows `l_suppkey` lies between 1 and 1,000, a range small enough for an array. So the GROUP BY becomes a **Perfect Hash Group By**, which puts each supplier's sum at a fixed index instead of hashing. With `SET disabled_optimizers = 'statistics_propagation'` it is an ordinary Hash Group By.
+4. **compressed_materialization** narrows `l_suppkey` to a SMALLINT below the GROUP BY. In the outer query it narrows `s_suppkey` to a SMALLINT and packs `s_phone` (15 characters) into a 16-byte integer for the ORDER BY, and unpacks both at the top.
+5. **The build sides** follow the row counts: the first hash table holds the one-row maximum, which the 1,000 CTE rows probe, and the one revenue row that matches is the build side for the supplier join.
+6. **unused_columns** cut lineitem to 3 of its 16 columns and supplier to 4 of its 7.
+
+> DuckDB 1.5.6 makes the same plan: the materialized CTE, the perfect hash group-by, the equality join with the maximum, and the same compression, with a 2-byte unsigned integer and an offset where duckrs uses a SMALLINT. Like Q11, it adds a check that the subquery returns one row, and it uses `sum_no_overflow` where duckrs uses `sum`.
+
+- **1 row**: Supplier 677, with 1,614,410.29 of revenue from January to March 1996, the same answer DuckDB gives.
+- **22,830**: Line items shipped in that quarter, from all 1,000 suppliers. The estimate was ~120,114, the default guess of 20% for a range.
+- **0.004 s**: Q15 with the optimizer on, median of 11 warm runs. Switching off compressed_materialization, statistics_propagation or cte_inlining gave 0.004–0.005 s. The load average was above 120, so small differences can't be read from these runs.
+
 ## TPC-H Q18, with the optimizer off and on
 
 Q18 finds the 100 largest orders whose line items add up to a quantity over 300. Unlike Q5 and Q9, it has an `IN` subquery, and both the subquery and the outer query compute `sum(l_quantity)` per order. The setup is the same: the duckrs Stage 3 release build and TPC-H SF0.1 data.
