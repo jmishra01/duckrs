@@ -26,24 +26,17 @@ fn for_each_valid<E>(
     count: usize,
     mut op: impl FnMut(usize) -> Result<(), E>,
 ) -> Result<(), E> {
-    let Some(entries) = validity.entries() else {
-        for i in 0..count {
-            op(i)?;
+    // one call of `op`, so that it inlines; whether an entry is all valid doesn't change along its rows
+    let entries = validity.entries();
+    for start in (0..count).step_by(ENTRY) {
+        let entry = entries.map_or(u64::MAX, |entries| entries.get(start / ENTRY).copied().unwrap_or(0));
+        if entry == 0 {
+            continue;
         }
-        return Ok(());
-    };
-    for (entry_idx, &entry) in entries.iter().enumerate().take(count.div_ceil(ENTRY)) {
-        let start = entry_idx * ENTRY;
         let end = (start + ENTRY).min(count);
-        if entry == u64::MAX {
-            for i in start..end {
+        for i in start..end {
+            if entry == u64::MAX || entry & (1 << (i - start)) != 0 {
                 op(i)?;
-            }
-        } else if entry != 0 {
-            for i in start..end {
-                if entry & (1 << (i - start)) != 0 {
-                    op(i)?;
-                }
             }
         }
     }

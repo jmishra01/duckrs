@@ -567,8 +567,7 @@ pub fn try_cast_string_to_double(input: &[u8]) -> Option<f64> {
     if text.contains('_') {
         let bytes = text.as_bytes();
         let separated = bytes.iter().enumerate().all(|(i, b)| {
-            *b != b'_'
-                || (i > 0 && bytes[i - 1].is_ascii_digit() && bytes.get(i + 1).is_some_and(u8::is_ascii_digit))
+            *b != b'_' || (i > 0 && bytes[i - 1].is_ascii_digit() && bytes.get(i + 1).is_some_and(u8::is_ascii_digit))
         });
         if !separated {
             return None;
@@ -927,7 +926,7 @@ fn decimal_at(data: &duckrs_common::vector::UnifiedFormat, physical: PhysicalTyp
 /// larger scale, as integers multiplied by a power of ten. `false` (and nothing written) when a value
 /// does not fit, which the cast by value then reports.
 fn decimal_scale_up(source: &Vector, result: &mut Vector, count: usize) -> Result<bool> {
-    let (Some((_, from_scale)), Some((to_width, to_scale))) = (
+    let (Some((from_width, from_scale)), Some((to_width, to_scale))) = (
         source.logical_type().decimal_properties(),
         result.logical_type().decimal_properties(),
     ) else {
@@ -938,49 +937,66 @@ fn decimal_scale_up(source: &Vector, result: &mut Vector, count: usize) -> Resul
     }
     let factor = 10i128.pow(u32::from(to_scale - from_scale));
     let limit = 10i128.pow(u32::from(to_width));
-    let (source_physical, target_physical) = (source.physical_type(), result.physical_type());
-    if !matches!(
-        source_physical,
-        PhysicalType::Int16 | PhysicalType::Int32 | PhysicalType::Int64 | PhysicalType::Int128
-    ) {
-        return Ok(false);
-    }
+    // `DecimalScaleUp` where no value can outgrow the target, `DecimalScaleUpCheck` otherwise
+    let unchecked = u32::from(from_width) + u32::from(to_scale - from_scale) <= u32::from(to_width);
     let constant = source.vector_type() == duckrs_common::vector::VectorType::Constant;
     let rows = if constant { 1 } else { count };
     let data = source.to_unified(rows);
-    let mut values = Vec::with_capacity(rows);
-    for row in 0..rows {
-        let index = data.sel.get(row);
-        if !data.validity.is_valid(index) {
-            values.push(None);
-            continue;
-        }
-        match decimal_at(&data, source_physical, index).checked_mul(factor) {
-            Some(value) if value.abs() < limit => values.push(Some(value)),
-            _ => return Ok(false),
-        }
-    }
     result.prepare_flat(rows.max(1));
-    macro_rules! write {
-        ($t:ty) => {{
-            let out = result.data_mut::<$t>();
-            for (row, value) in values.iter().enumerate() {
-                if let Some(value) = value {
-                    out[row] = *value as $t;
+    let all_valid = data.validity.all_valid();
+    // the values, each scaled up, into `$target`; false at the first that doesn't fit
+    macro_rules! scale {
+        ($source:ty, $target:ty) => {{
+            let values = data.data::<$source>();
+            let out = result.data_mut::<$target>();
+            let mut fits = true;
+            for (row, slot) in out.iter_mut().enumerate().take(rows) {
+                let index = data.sel.get(row);
+                if !all_valid && !data.validity.is_valid(index) {
+                    continue;
+                }
+                let value = i128::from(values[index]);
+                if unchecked {
+                    *slot = (value * factor) as $target;
+                } else {
+                    match value.checked_mul(factor) {
+                        Some(value) if value.abs() < limit => *slot = value as $target,
+                        _ => {
+                            fits = false;
+                            break;
+                        }
+                    }
                 }
             }
+            fits
         }};
     }
-    match target_physical {
-        PhysicalType::Int16 => write!(i16),
-        PhysicalType::Int32 => write!(i32),
-        PhysicalType::Int64 => write!(i64),
-        PhysicalType::Int128 => write!(i128),
-        _ => return Ok(false),
+    macro_rules! to_target {
+        ($source:ty) => {
+            match result.physical_type() {
+                PhysicalType::Int16 => scale!($source, i16),
+                PhysicalType::Int32 => scale!($source, i32),
+                PhysicalType::Int64 => scale!($source, i64),
+                PhysicalType::Int128 => scale!($source, i128),
+                _ => return Ok(false),
+            }
+        };
     }
-    for (row, value) in values.iter().enumerate() {
-        if value.is_none() {
-            result.set_null(row, true);
+    let fits = match source.physical_type() {
+        PhysicalType::Int16 => to_target!(i16),
+        PhysicalType::Int32 => to_target!(i32),
+        PhysicalType::Int64 => to_target!(i64),
+        PhysicalType::Int128 => to_target!(i128),
+        _ => return Ok(false),
+    };
+    if !fits {
+        return Ok(false);
+    }
+    if !all_valid {
+        for row in 0..rows {
+            if !data.validity.is_valid(data.sel.get(row)) {
+                result.set_null(row, true);
+            }
         }
     }
     if constant {
@@ -1177,9 +1193,7 @@ fn is_ported_scalar(ty: &LogicalType) -> bool {
 pub(super) fn contains_type(ty: &LogicalType) -> bool {
     match ty.id() {
         LogicalTypeId::Type => true,
-        LogicalTypeId::List | LogicalTypeId::Array | LogicalTypeId::Map => {
-            ty.child_type().is_some_and(contains_type)
-        }
+        LogicalTypeId::List | LogicalTypeId::Array | LogicalTypeId::Map => ty.child_type().is_some_and(contains_type),
         LogicalTypeId::Struct | LogicalTypeId::Tuple | LogicalTypeId::Union => {
             ty.struct_children().iter().any(|(_, child)| contains_type(child))
         }
@@ -1305,7 +1319,9 @@ pub fn cast_vector(source: &Vector, result: &mut Vector, count: usize, mode: Cas
         result.prepare_flat(count.max(1));
         for row in 0..count {
             if unified.is_valid(row) && mode != CastMode::Try {
-                return Err(conversion_error(format!("Unimplemented type for cast ({from} -> VARIANT)")));
+                return Err(conversion_error(format!(
+                    "Unimplemented type for cast ({from} -> VARIANT)"
+                )));
             }
             result.set_null(row, true);
         }

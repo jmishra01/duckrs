@@ -1743,7 +1743,25 @@ impl AggregateFunction {
     ) -> Result<()> {
         use AggregateKind::*;
         let Some(input) = input else {
-            // count_star counts rows, whatever they hold
+            // count_star counts rows, whatever they hold: for few groups, counted apart and then added to the states
+            if states.len() == 1 {
+                if let AggregateState::Count(n) = &mut states[0] {
+                    *n += rows.len() as i64;
+                }
+                return Ok(());
+            }
+            if states.len() <= LOCAL_SUM_GROUPS && rows.len() >= states.len() {
+                let mut counts = vec![0i64; states.len()];
+                for &(_, group) in rows {
+                    counts[group] += 1;
+                }
+                for (state, added) in states.iter_mut().zip(counts) {
+                    if let AggregateState::Count(n) = state {
+                        *n += added;
+                    }
+                }
+                return Ok(());
+            }
             for &(_, group) in rows {
                 if let AggregateState::Count(n) = &mut states[group] {
                     *n += 1;
@@ -1953,4 +1971,3 @@ impl AggregateFunction {
         })
     }
 }
-
