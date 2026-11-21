@@ -408,7 +408,8 @@ unsafe fn gather(
             .iter()
             .map(|r| !layout.can_have_null() || unsafe { row_is_valid(r.as_ptr(), column) })
             .collect();
-        if let Some(store) = nested.lists.get(&column) {
+        // with no valid row there may be no value in the store for a NULL row's 0 to read
+        if let Some(store) = nested.lists.get(&column).filter(|_| valid.iter().any(|&v| v)) {
             let sel: Vec<u32> = rows
                 .iter()
                 .zip(&valid)

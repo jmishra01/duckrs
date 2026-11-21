@@ -687,8 +687,9 @@ Each item gives the number of failing files in `test/` that it should fix, where
   each from its entry, where all of the group's were; that takes 20% of the CPU off (2.6s). A join's build side
   keeps the strings of its input where they are rather than copying them under its lock, and a Top-N compares a
   row's key with its boundary in one buffer: warm Q10 takes 0.49s from 0.57s, against C++'s 0.23s, with 2.5s of
-  CPU against 1.1s. What is left is most of all the GROUP BY, which copies the values of its groups when they
-  come in, when a thread's are split by partition, when the partitions merge, and into its output. duckrs
+  CPU against 1.1s. A plain GROUP BY now finds its groups in a hash table over the row format, by the hash of
+  their columns and a comparison with their rows (docs/GROUP_BY_REWRITE.md), and merges threads' tables by
+  partition: Q18 1.07s from 1.49s, Q10 0.37s from 0.40s. duckrs
   had no way to load SF10 itself, as an append kept its rows in memory (more than 2 GiB failed); appends now write
   their full row groups to blocks as they fill (an INSERT of 80M rows takes 90MB). duckrs now loads SF10 into its
   own file (COPY of the `.tbl` files: lineitem 24s against C++'s 22s, the rest under 5s each; at most 710MB

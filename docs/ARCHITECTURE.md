@@ -121,9 +121,12 @@ A statement goes `parse_ast` → `Binder` (bound expressions, `LogicalOperator` 
 - **Aggregates** bind like `BaseSelectBinder`: groups naming a select list entry swap places with
   it, expressions matching a group or an aggregate become column references of the aggregate
   operator, equal aggregates are computed once, and a column outside of them is DuckDB's "must
-  appear in the GROUP BY clause" error. `PhysicalAggregate` finds groups by sort key and keeps a
-  state per group and aggregate (`function::aggregates`); min, max and DISTINCT compare sort
-  keys. This is simple rather than fast: DuckDB's vectorized hash table comes with Phase 8.
+  appear in the GROUP BY clause" error. `PhysicalAggregate` keeps a state per group and aggregate
+  (`function::aggregates`). With one grouping set and no DISTINCT or ORDER BY aggregate it finds
+  groups in a `GroupTable` (`execution::group_table`, C++'s `GroupedAggregateHashTable`): the hash of
+  their columns, then a comparison with the rows of the row format that hold them; threads' tables
+  merge by partition of that hash. Otherwise, and once spilling or a merge of states by key needs
+  them, groups are found by sort key; min, max and DISTINCT compare sort keys.
 - **Settings** are generated from DuckDB's `settings.json` (`tools/generate_settings.py`) with
   their aliases, types, scopes and defaults, and kept per database and per connection.
   Settings that only tune performance, storage, extensions or logging are stored; the

@@ -1,6 +1,12 @@
 # GROUP BY hash table rewrite (plan)
 
-Status: step 1 done (part 48, `execution::group_table`, not used by the aggregate yet). Stage 4, after part 46.
+Status: steps 1 to 3 done (parts 48 and 49). The plain GROUP BY finds its groups in a `GroupTable` and merges
+threads' tables by partition; spilling and the other paths still go by keys, which a state gets from its table
+when one of them needs them (`AggregateSinkState::into_keys`). Steps 4 and 5 are left.
+
+Measured after step 3 on SF10, 8 threads, against part 46: Q18 1.49s to 1.07s (CPU 9.6s to 6.3s), Q10 0.40s
+to 0.37s (CPU 7% less), Q13 4% less, Q01 the same. Step 2 alone was slower (Q10 15% more CPU), as the values
+were kept twice and keys made for the merge.
 
 ## Why
 
@@ -91,9 +97,9 @@ exactly the same values together:
    normalized intervals, TIMETZ, VARIANT, BIT, and nested NULLs. Where it doesn't, either fix the
    hash to C++'s (C++ normalizes in `HashOp` for floats and intervals), or keep the old path for
    that type.
-3. **Partitioning while collecting:** each thread's table writes its new groups to the partition
-   given by the hash's radix bits (C++'s `PartitionedTupleData`). The partition choice moves
-   from `split_state` to the sink.
+3. **Partitioning:** done at finalize instead of while collecting. The table keeps each
+   group's hash, so a pass over the hashes gives each group's partition (bits 32 and up), with
+   no copy (`merge_tables`).
 4. **Finalize, per partition on its own thread:** insert the rows of every thread's partition `p`
    into a fresh `GroupTable`, gathered from the source rows (one copy, as in C++), and combine
    states. `set_output` scans the merged collection into chunks. This replaces `split_state` and

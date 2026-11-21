@@ -248,6 +248,24 @@ impl GroupTable {
     pub fn scan(&self) -> impl Iterator<Item = DataChunk> + '_ {
         self.data.scan()
     }
+
+    /// The hash of each group, by its id.
+    pub fn hashes(&self) -> &[u64] {
+        &self.hashes
+    }
+
+    /// The values of the groups `ids`, in that order (`TupleDataCollection::Gather`).
+    pub fn gather(&self, ids: &[usize]) -> DataChunk {
+        let rows: Vec<RowPtr> = ids.iter().map(|&id| self.rows[id]).collect();
+        let types = self.data.layout().types().to_vec();
+        let mut chunk = DataChunk::with_capacity(&types, rows.len().max(1));
+        for column in 0..types.len() {
+            // SAFETY: the rows are rows of `self.data`, alive while `self` is
+            unsafe { self.data.gather(&rows, column, chunk.column_mut(column)) };
+        }
+        chunk.set_len(rows.len());
+        chunk
+    }
 }
 
 #[cfg(test)]
