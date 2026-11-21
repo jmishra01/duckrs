@@ -668,10 +668,11 @@ Each item gives the number of failing files in `test/` that it should fix, where
 - [ ] 48. v1 gate: TPC-H SF10 geometric mean ≤ 1.5× C++ DuckDB, and no query slower than 3×. The runner
   prints the gate after `--engine=both`. On TPC-H SF1 (8 threads, all 22 answers correct) duckrs is at
   1.53× (none above 3×: Q21 2.7×; Q02 0.5×, Q08 0.95×), from 12.7× at the start of item 47.
-  SF10, both engines on the file C++ wrote: 0.67× on 2026-11-20 after part 44, all 22 answers correct (none
-  above 3×: Q01 1.38×, Q10 1.31×, Q18 1.31×; 19 of the 22 faster than C++, Q15 0.18×, Q11 0.32×, Q17 0.36×),
-  with the machine's load average rising from 45 to 157 during the run, which slowed C++ more than duckrs (its
-  Q15 took 2.1s, from 0.68s): this one says least of all. Earlier the same day: 0.89× after part 42 (Q10 1.97×)
+  SF10, both engines on the file C++ wrote: 0.71× on 2026-11-21 after part 49, all 22 answers correct (none
+  above 3×: Q22 1.41×, Q01 1.25×, Q18 1.14×; 19 of the 22 faster than C++, Q10 0.91×, Q15 0.28×, Q11 0.34×),
+  with the machine's load average between 20 and 53, which slowed C++ well past its usual times (its Q13 took
+  3.1s, from about 0.9s). On 2026-11-20: 0.67× after part 44 (Q10 1.31×) under a load rising from 45 to 157,
+  which says least of all, 0.89× after part 42 (Q10 1.97×)
   with the load falling from 43 to 14, 1.09× after parts 39 and 40, 1.20×, and before that 1.27× and 1.37×
   under heavier load, with Q18 and Q14 above 3× in them. The gate passes; measure once more on a quiet machine
   before ticking this. Q10 then took 18% less: a GROUP BY writes the keys of a
