@@ -2872,6 +2872,9 @@ pub struct PhysicalAggregate {
     state: Mutex<Vec<AggregateSinkState>>,
     /// the states of threads that are put together by partition when the aggregate finishes
     locals: Mutex<Vec<AggregateSinkState>>,
+    /// whether the state of a thread went into `state` (one that spilled), so that `state` has more
+    /// than what pipelines on one thread sank
+    merged_locals: AtomicBool,
     output: Mutex<Vec<DataChunk>>,
     /// where rows go past the memory limit, for an aggregate that can spill
     spill: Option<AggregateSpill>,
@@ -3074,6 +3077,7 @@ impl PhysicalAggregate {
             grouping_sets: sets,
             state: Mutex::new(state),
             locals: Mutex::default(),
+            merged_locals: AtomicBool::new(false),
             output: Mutex::default(),
         }
         .with_spill()
@@ -3630,6 +3634,7 @@ impl PhysicalOperator for PhysicalAggregate {
             self.locals.lock().push(local.remove(0));
             return Ok(());
         }
+        self.merged_locals.store(true, Ordering::Relaxed);
         let mut states = self.state.lock();
         for (state, local) in states.iter_mut().zip(local) {
             self.merge_groups(state, local)?;
@@ -3638,11 +3643,20 @@ impl PhysicalOperator for PhysicalAggregate {
     }
     fn finalize(&self) -> Result<()> {
         let mut states = self.state.lock();
-        let locals = std::mem::take(&mut *self.locals.lock());
+        let mut locals = std::mem::take(&mut *self.locals.lock());
         if !locals.is_empty() {
+            // what a pipeline on one thread sank, such as the rows a RIGHT join found no match
+            // for after its probe, is put together with the states of threads like one of them
+            let serial = !states[0].full && !self.merged_locals.load(Ordering::Relaxed);
+            if serial && states[0].group_count > 0 {
+                let types = states[0].group_values.types().to_vec();
+                locals.push(std::mem::replace(
+                    &mut states[0],
+                    AggregateSinkState::new(types, &self.aggregates),
+                ));
+            }
             let groups: usize = locals.iter().map(|l| l.group_count).sum();
-            let untouched = states[0].group_count == 0 && !states[0].full;
-            if untouched && locals.len() > 1 && groups >= PARTITIONED_MERGE_GROUPS {
+            if serial && locals.len() > 1 && groups >= PARTITIONED_MERGE_GROUPS {
                 let output = self.merge_partitioned(locals)?;
                 if let Some(spill) = &self.spill {
                     spill.spilled.store(false, Ordering::Relaxed);
