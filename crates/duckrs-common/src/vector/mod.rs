@@ -250,6 +250,21 @@ impl Vector {
         Arc::make_mut(&mut self.flat_mut().data).as_mut_slice()
     }
 
+    /// The values of a flat or constant vector of integers or floats as their bytes, in the machine's order;
+    /// copies the buffer first if it is shared. Any bytes are such a value, so writing them is safe.
+    pub fn number_bytes_mut(&mut self) -> &mut [u8] {
+        use PhysicalType::*;
+        assert!(
+            matches!(
+                self.physical_type(),
+                Int8 | Int16 | Int32 | Int64 | Int128 | UInt8 | UInt16 | UInt32 | UInt64 | UInt128 | Float | Double
+            ),
+            "{} is not stored as a number",
+            self.ty
+        );
+        Arc::make_mut(&mut self.flat_mut().data).as_mut_slice::<u8>()
+    }
+
     /// Mutable strings of a flat VARCHAR/BLOB vector.
     ///
     /// # Safety

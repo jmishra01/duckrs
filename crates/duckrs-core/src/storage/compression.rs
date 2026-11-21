@@ -317,6 +317,40 @@ fn load_bits(data: &[u8], bit: usize, mask: u64) -> u64 {
     (word >> (bit % 8)) & mask
 }
 
+/// Where a decoder puts the bytes of its values, in order: a buffer that grows, or a vector's own memory.
+pub trait ByteSink {
+    fn push(&mut self, bytes: &[u8]);
+}
+
+impl ByteSink for Vec<u8> {
+    #[inline]
+    fn push(&mut self, bytes: &[u8]) {
+        self.extend_from_slice(bytes);
+    }
+}
+
+/// A [`ByteSink`] of memory of a given size: what is pushed past its end is dropped, as a column's values past its
+/// rows are.
+pub struct SliceSink<'a> {
+    target: &'a mut [u8],
+    written: usize,
+}
+
+impl<'a> SliceSink<'a> {
+    pub fn new(target: &'a mut [u8]) -> Self {
+        Self { target, written: 0 }
+    }
+}
+
+impl ByteSink for SliceSink<'_> {
+    #[inline]
+    fn push(&mut self, bytes: &[u8]) {
+        let fits = bytes.len().min(self.target.len() - self.written);
+        self.target[self.written..self.written + fits].copy_from_slice(&bytes[..fits]);
+        self.written += fits;
+    }
+}
+
 /// [`unpack`] of values of at most 57 bits into values of at most 8 bytes, with the frame (and for
 /// DELTA_FOR the running sum) added, written at their width 32 at a time.
 #[allow(clippy::too_many_arguments, reason = "the parts of a FOR group")]
@@ -328,9 +362,8 @@ fn unpack_narrow(
     delta: bool,
     mut carry: u64,
     width: usize,
-    out: &mut Vec<u8>,
+    out: &mut impl ByteSink,
 ) {
-    out.reserve(rows * width);
     macro_rules! write_all {
         ($ty:ty) => {{
             const SIZE: usize = std::mem::size_of::<$ty>();
@@ -347,15 +380,16 @@ fn unpack_narrow(
                         *slot = value.wrapping_add(frame) as $ty;
                     }
                 }
-                let spare = &mut out.spare_capacity_mut()[..group.len() * SIZE];
-                for (bytes, value) in spare.chunks_exact_mut(SIZE).zip(group.iter()) {
-                    for (byte, value) in bytes.iter_mut().zip(value.to_le_bytes()) {
-                        byte.write(value);
+                if cfg!(target_endian = "little") {
+                    // SAFETY: an integer has no padding, so its memory is `SIZE` initialized bytes, which on a
+                    // little-endian machine are those of the file
+                    let bytes = unsafe { std::slice::from_raw_parts(group.as_ptr().cast::<u8>(), group.len() * SIZE) };
+                    out.push(bytes);
+                } else {
+                    for value in group.iter() {
+                        out.push(&value.to_le_bytes());
                     }
                 }
-                let written = out.len() + group.len() * SIZE;
-                // SAFETY: the bytes up to `written` were reserved above and have just been written
-                unsafe { out.set_len(written) };
             });
         }};
     }
@@ -479,7 +513,7 @@ pub fn bitpacking_rows(segment: &[u8], count: usize, width: usize, rows: &[u32],
 
 /// `BitpackingScanPartial`. A segment is groups of 2048 values, each with its own mode, and a table
 /// at the end of where they are, last group first.
-pub fn scan_bitpacking(segment: &[u8], count: usize, width: usize, out: &mut Vec<u8>) -> Result<()> {
+pub fn scan_bitpacking(segment: &[u8], count: usize, width: usize, out: &mut impl ByteSink) -> Result<()> {
     const HEADER_SIZE: usize = 8;
     const CONSTANT: u32 = 2;
     const CONSTANT_DELTA: u32 = 3;
@@ -529,7 +563,7 @@ pub fn scan_bitpacking(segment: &[u8], count: usize, width: usize, out: &mut Vec
         }
         let data = &segment[offset..end];
         let rows = METADATA_GROUP_SIZE.min(count - index * METADATA_GROUP_SIZE);
-        let mut push = |value: u128| out.extend_from_slice(&(value & mask).to_le_bytes()[..width]);
+        let mut push = |value: u128| out.push(&(value & mask).to_le_bytes()[..width]);
         match mode {
             CONSTANT => {
                 let value = number(data, 0)?;

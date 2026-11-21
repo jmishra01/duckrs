@@ -309,6 +309,38 @@ fn scan_fixed(
     }
 }
 
+/// Whether the values of a vector of `physical` are the bytes the file has: integers and floats on a
+/// little-endian machine (booleans and intervals are read value by value).
+fn numbers_as_in_file(physical: PhysicalType) -> bool {
+    use PhysicalType::*;
+    cfg!(target_endian = "little")
+        && matches!(
+            physical,
+            Int8 | Int16 | Int32 | Int64 | Int128 | UInt8 | UInt16 | UInt32 | UInt64 | UInt128 | Float | Double
+        )
+}
+
+/// [`scan_fixed`] into `target`, the memory of the segment's rows: a bit-packed segment is decoded there, others
+/// by way of a buffer. Bytes the segment doesn't have stay zero, and those past `target` are dropped.
+fn scan_fixed_into(
+    buffer: &BufferManager,
+    pointer: &DataPointer,
+    ty: PhysicalType,
+    width: usize,
+    target: &mut [u8],
+) -> Result<()> {
+    if pointer.compression == COMPRESSION_BITPACKING {
+        let handle = segment(buffer, pointer)?;
+        let mut sink = SliceSink::new(target);
+        return scan_bitpacking(&handle[pointer.offset..], pointer.tuple_count, width, &mut sink);
+    }
+    let mut data = Vec::with_capacity(pointer.tuple_count * width);
+    scan_fixed(buffer, pointer, ty, width, &mut data)?;
+    let fits = data.len().min(target.len());
+    target[..fits].copy_from_slice(&data[..fits]);
+    Ok(())
+}
+
 fn scan_strings(
     buffer: &BufferManager,
     pointer: &DataPointer,
@@ -641,13 +673,25 @@ fn scan_column_as(
         }
         _ => {
             let width = fixed_width(physical).ok_or_else(|| not_ported_column(ty))?;
-            let mut data = Vec::with_capacity(rows * width);
-            for pointer in &column.pointers {
-                scan_fixed(buffer, pointer, physical, width, &mut data)?;
-            }
             let mut vector = Vector::new(ty.clone(), rows);
-            fill_vector(&mut vector, &data)?;
-            vector
+            if numbers_as_in_file(physical) {
+                // each segment straight into the vector's memory, where the file's bytes are its values
+                let target = vector.number_bytes_mut();
+                let mut at = 0;
+                for pointer in &column.pointers {
+                    let end = (at + pointer.tuple_count * width).min(target.len());
+                    scan_fixed_into(buffer, pointer, physical, width, &mut target[at..end])?;
+                    at = end;
+                }
+                vector
+            } else {
+                let mut data = Vec::with_capacity(rows * width);
+                for pointer in &column.pointers {
+                    scan_fixed(buffer, pointer, physical, width, &mut data)?;
+                }
+                fill_vector(&mut vector, &data)?;
+                vector
+            }
         }
     };
     for (row, &valid) in valid.iter().enumerate() {
