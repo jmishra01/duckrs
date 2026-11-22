@@ -133,6 +133,7 @@ fn order_plan(
     orders: Vec<crate::planner::logical::BoundOrderByNode>,
     top: Option<(u64, u64)>,
     child: Box<dyn PhysicalOperator>,
+    dynamic: Option<Arc<join_filter::TopNFilter>>,
 ) -> Box<dyn PhysicalOperator> {
     let modifiers: Vec<_> = orders.iter().map(|o| o.modifiers).collect();
     let (child, keys, columns) = computed_targets(child, orders.into_iter().map(|o| o.expr).collect());
@@ -141,7 +142,9 @@ fn order_plan(
         .zip(modifiers)
         .map(|(expr, modifiers)| crate::planner::logical::BoundOrderByNode { modifiers, expr })
         .collect();
-    drop_computed(Box::new(PhysicalOrder::new(orders, top, child)), columns)
+    let mut order = PhysicalOrder::new(orders, top, child);
+    order.dynamic = dynamic;
+    drop_computed(Box::new(order), columns)
 }
 
 /// `PhysicalPlanGenerator::CreatePlan`.
@@ -295,8 +298,10 @@ fn create_physical(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             extracts,
             ..
         } => {
+            // a Top-N's filter, whose boundary moves while the scan runs, skips no row groups here
             let all: Vec<_> = filters
                 .iter()
+                .filter(|f| !matches!(f.kind, crate::planner::expression::BoundExprKind::TopNFilter { .. }))
                 .chain(&zone_filters)
                 .chain(&optional_filters)
                 .cloned()
@@ -322,7 +327,13 @@ fn create_physical(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             let all: Vec<_> = scan
                 .filters
                 .iter()
-                .filter(|f| !matches!(f.kind, crate::planner::expression::BoundExprKind::JoinFilter { .. }))
+                .filter(|f| {
+                    !matches!(
+                        f.kind,
+                        crate::planner::expression::BoundExprKind::JoinFilter { .. }
+                            | crate::planner::expression::BoundExprKind::TopNFilter { .. }
+                    )
+                })
                 .chain(&scan.optional_filters)
                 .cloned()
                 .collect();
@@ -457,10 +468,13 @@ fn create_physical(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
         LogicalOperatorKind::MatchRecognize { data, .. } => {
             Box::new(match_recognize::PhysicalMatchRecognize::new(types, data, children))
         }
-        LogicalOperatorKind::Order { orders } => order_plan(orders, None, children.remove(0)),
-        LogicalOperatorKind::TopN { orders, limit, offset } => {
-            order_plan(orders, Some((limit, offset)), children.remove(0))
-        }
+        LogicalOperatorKind::Order { orders } => order_plan(orders, None, children.remove(0), None),
+        LogicalOperatorKind::TopN {
+            orders,
+            limit,
+            offset,
+            dynamic,
+        } => order_plan(orders, Some((limit, offset)), children.remove(0), dynamic),
         LogicalOperatorKind::Limit { limit, offset, failure } => Box::new(PhysicalLimit {
             types,
             children,

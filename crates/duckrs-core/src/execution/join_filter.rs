@@ -54,6 +54,162 @@ pub fn set_enabled(enabled: bool) {
     ENABLED.store(enabled, Ordering::Relaxed);
 }
 
+/// `DynamicFilterData` of a Top-N (`TopN::PushdownDynamicFilters`): the scans below drop the rows whose sort key
+/// sorts after the boundary of the rows the Top-N keeps, once it has one.
+pub struct TopNFilter {
+    /// the type of the sort key
+    pub ty: LogicalType,
+    /// how a row's sort key compares to the boundary for the row to pass: `<` or `>`, `<=` or `>=` with
+    /// more than one order
+    pub comparison: duckrs_parser::ast::ComparisonOp,
+    /// `NULLS FIRST`: a NULL sort key can be among the first rows, and passes
+    pub nulls_first: bool,
+    /// the first sort key of the last row the Top-N keeps, once it keeps as many as it needs
+    boundary: parking_lot::RwLock<Option<Value>>,
+}
+
+impl TopNFilter {
+    pub fn new(ty: LogicalType, ascending: bool, single: bool, nulls_first: bool) -> Self {
+        use duckrs_parser::ast::ComparisonOp as C;
+        let comparison = match (ascending, single) {
+            (true, true) => C::LessThan,
+            (true, false) => C::LessThanOrEqual,
+            (false, true) => C::GreaterThan,
+            (false, false) => C::GreaterThanOrEqual,
+        };
+        Self {
+            ty,
+            comparison,
+            nulls_first,
+            boundary: parking_lot::RwLock::new(None),
+        }
+    }
+
+    /// `DynamicFilterData::SetValue`. A NULL boundary is not one a comparison can use: the filter stays as it was.
+    pub fn set(&self, value: Value) {
+        if !value.is_null() {
+            *self.boundary.write() = Some(value);
+        }
+    }
+
+    /// `DynamicFilterData::ToExpression` of the input at `Reference(0)`: what a row passes, or `None` while every
+    /// row does.
+    pub fn expression(&self) -> Option<BoundExpr> {
+        self.expression_on(BoundExpr::new(BoundExprKind::Reference(0), self.ty.clone()))
+    }
+
+    /// What a row passes, with `input` its sort key, or `None` while every row does.
+    pub fn expression_on(&self, input: BoundExpr) -> Option<BoundExpr> {
+        let boundary = self.boundary.read().clone()?;
+        let compare = BoundExpr::new(
+            BoundExprKind::Comparison {
+                op: self.comparison,
+                left: Box::new(input.clone()),
+                right: Box::new(BoundExpr::constant(boundary)),
+            },
+            LogicalType::BOOLEAN,
+        );
+        if !self.nulls_first {
+            return Some(compare);
+        }
+        let is_null = BoundExpr::new(
+            BoundExprKind::Operator {
+                op: crate::planner::expression::BoundOperator::IsNull,
+                children: vec![input],
+            },
+            LogicalType::BOOLEAN,
+        );
+        Some(BoundExpr::new(
+            BoundExprKind::Conjunction {
+                and: false,
+                children: vec![is_null, compare],
+            },
+            LogicalType::BOOLEAN,
+        ))
+    }
+}
+
+impl fmt::Debug for TopNFilter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "TopNFilter({:?} {:?})", self.comparison, self.boundary.read())
+    }
+}
+
+/// The filter `FindFilterTargets` puts into the scans: a join's, or a Top-N's, which only goes where every scan
+/// can take it (`ok`).
+enum Pushed<'a> {
+    Join(&'a std::sync::Arc<JoinFilter>),
+    TopN(&'a std::sync::Arc<TopNFilter>, &'a std::cell::Cell<bool>),
+}
+
+impl Pushed<'_> {
+    /// The filter on the scan's column at `position`, of type `ty`, reached through `casts`.
+    fn on_column(&self, position: usize, ty: &LogicalType, name: &str, casts: &[(LogicalType, bool)]) -> Option<BoundExpr> {
+        match self {
+            Pushed::Join(filter) => {
+                let (input, keep_null) = filter_input(position, ty, name, casts, filter)?;
+                Some(BoundExpr::new(
+                    BoundExprKind::JoinFilter {
+                        child: Box::new(input),
+                        filter: (*filter).clone(),
+                        keep_null,
+                    },
+                    LogicalType::BOOLEAN,
+                ))
+            }
+            // the sort key rebuilt on the column, through casts that keep its order: no TRY_CAST, and none that
+            // can fail
+            Pushed::TopN(filter, ok) => {
+                let mut input = BoundExpr::new(BoundExprKind::Reference(position), ty.clone()).with_alias(name.to_string());
+                let mut source = ty.clone();
+                for (target, try_cast) in casts {
+                    if *try_cast || cast_can_fail(&source, target) {
+                        ok.set(false);
+                        return None;
+                    }
+                    if source != *target {
+                        input = input.cast_to(target, false);
+                    }
+                    source = target.clone();
+                }
+                if source != filter.ty {
+                    ok.set(false);
+                    return None;
+                }
+                Some(BoundExpr::new(
+                    BoundExprKind::TopNFilter {
+                        child: Box::new(input),
+                        filter: (*filter).clone(),
+                    },
+                    LogicalType::BOOLEAN,
+                ))
+            }
+        }
+    }
+
+    /// Whether `existing` is this filter on the same input already.
+    fn same(&self, existing: &BoundExpr, pushed: &BoundExpr) -> bool {
+        match (&existing.kind, &pushed.kind) {
+            (
+                BoundExprKind::JoinFilter { child, filter, .. },
+                BoundExprKind::JoinFilter {
+                    child: other_child,
+                    filter: other,
+                    ..
+                },
+            ) => std::sync::Arc::ptr_eq(filter, other) && format!("{child:?}") == format!("{other_child:?}"),
+            (
+                BoundExprKind::TopNFilter { child, filter },
+                BoundExprKind::TopNFilter {
+                    child: other_child,
+                    filter: other,
+                },
+            ) => std::sync::Arc::ptr_eq(filter, other) && format!("{child:?}") == format!("{other_child:?}"),
+            _ => false,
+        }
+    }
+}
+
 /// What a join filter knows of the build keys of its join.
 pub struct JoinFilter {
     /// `IS NOT DISTINCT FROM`: a NULL can match
@@ -823,6 +979,10 @@ fn push_join_filters_with(op: &mut LogicalOperator, estimates: Option<&[u64]>, n
     for child in &mut op.children {
         push_join_filters_with(child, estimates, next);
     }
+    if let LogicalOperatorKind::TopN { .. } = op.kind {
+        push_top_n_filter(op);
+        return;
+    }
     let LogicalOperatorKind::Join {
         join_type: JoinType::Inner | JoinType::Semi | JoinType::RightSemi | JoinType::Right,
         conditions,
@@ -860,9 +1020,53 @@ fn push_join_filters_with(op: &mut LogicalOperator, estimates: Option<&[u64]>, n
                 key_name: condition.right.to_string(),
             },
         ));
-        if push_into(&mut op.children[0], column, &casts, &filter) {
+        if push_into(&mut op.children[0], column, &casts, &Pushed::Join(&filter)) {
             condition.filter = Some(filter);
         }
+    }
+}
+
+/// `TopN::PushdownDynamicFilters`: a Top-N on a column of numbers or strings gives the scans its values come from
+/// a filter of its boundary, where each of them can rebuild the sort key on its column.
+fn push_top_n_filter(op: &mut LogicalOperator) {
+    let LogicalOperatorKind::TopN { orders, dynamic, .. } = &op.kind else {
+        return;
+    };
+    if dynamic.is_some() {
+        return;
+    }
+    let Some(first) = orders.first() else {
+        return;
+    };
+    let BoundExprKind::Reference(column) = first.expr.kind else {
+        return;
+    };
+    let ty = first.expr.return_type.clone();
+    // `TypeIsNumeric` of its physical type, or VARCHAR
+    use duckrs_common::types::PhysicalType as P;
+    let numeric = matches!(
+        ty.physical_type(),
+        P::Int8 | P::Int16 | P::Int32 | P::Int64 | P::Int128 | P::UInt8 | P::UInt16 | P::UInt32 | P::UInt64 | P::UInt128
+            | P::Float | P::Double
+    );
+    if !(numeric || ty.id() == LogicalTypeId::Varchar) {
+        return;
+    }
+    let filter = std::sync::Arc::new(TopNFilter::new(
+        ty,
+        first.modifiers.order == OrderType::Ascending,
+        orders.len() == 1,
+        first.modifiers.nulls == NullOrder::NullsFirst,
+    ));
+    // all scans or none
+    let ok = std::cell::Cell::new(true);
+    let mut child = op.children[0].clone();
+    if !push_into(&mut child, column, &[], &Pushed::TopN(&filter, &ok)) || !ok.get() {
+        return;
+    }
+    op.children[0] = child;
+    if let LogicalOperatorKind::TopN { dynamic, .. } = &mut op.kind {
+        *dynamic = Some(filter);
     }
 }
 
@@ -941,7 +1145,7 @@ fn push_into(
     op: &mut LogicalOperator,
     column: usize,
     casts: &[(LogicalType, bool)],
-    filter: &std::sync::Arc<JoinFilter>,
+    filter: &Pushed,
 ) -> bool {
     use LogicalOperatorKind as K;
     if has_volatile_expressions(op) {
@@ -972,26 +1176,17 @@ fn push_into(
             let Some(definition) = table.columns.get(*column_id) else {
                 return false;
             };
-            let Some((input, keep_null)) = filter_input(position, &definition.ty, &definition.name, casts, filter) else {
+            let Some(pushed) = filter.on_column(position, &definition.ty, &definition.name, casts) else {
                 return false;
             };
-            let already = filters.iter().any(|f| {
-                matches!(&f.kind, BoundExprKind::JoinFilter { child, filter: other, .. }
-                    if std::sync::Arc::ptr_eq(other, filter) && format!("{child:?}") == format!("{input:?}"))
-            });
-            if table.row_count() >= MIN_BLOOM_TABLE_ROWS {
-                filter.bloom.store(true, Ordering::Relaxed);
+            if let Pushed::Join(filter) = filter {
+                if table.row_count() >= MIN_BLOOM_TABLE_ROWS {
+                    filter.bloom.store(true, Ordering::Relaxed);
+                }
+                filter.scan_estimate.fetch_max(table.row_count() as u64, Ordering::Relaxed);
             }
-            filter.scan_estimate.fetch_max(table.row_count() as u64, Ordering::Relaxed);
-            if !already {
-                filters.push(BoundExpr::new(
-                    BoundExprKind::JoinFilter {
-                        child: Box::new(input),
-                        filter: filter.clone(),
-                        keep_null,
-                    },
-                    LogicalType::BOOLEAN,
-                ));
+            if !filters.iter().any(|f| filter.same(f, &pushed)) {
+                filters.push(pushed);
             }
             true
         }
@@ -1007,22 +1202,11 @@ fn push_into(
             let (Some(ty), Some(name)) = (scan.types.get(position), scan.names.get(position)) else {
                 return false;
             };
-            let Some((input, keep_null)) = filter_input(position, ty, name, casts, filter) else {
+            let Some(pushed) = filter.on_column(position, ty, name, casts) else {
                 return false;
             };
-            let already = scan.filters.iter().any(|f| {
-                matches!(&f.kind, BoundExprKind::JoinFilter { child, filter: other, .. }
-                    if std::sync::Arc::ptr_eq(other, filter) && format!("{child:?}") == format!("{input:?}"))
-            });
-            if !already {
-                std::sync::Arc::make_mut(scan).filters.push(BoundExpr::new(
-                    BoundExprKind::JoinFilter {
-                        child: Box::new(input),
-                        filter: filter.clone(),
-                        keep_null,
-                    },
-                    LogicalType::BOOLEAN,
-                ));
+            if !scan.filters.iter().any(|f| filter.same(f, &pushed)) {
+                std::sync::Arc::make_mut(scan).filters.push(pushed);
             }
             true
         }

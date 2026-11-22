@@ -151,6 +151,12 @@ pub enum BoundExprKind {
         /// a NULL of `child` passes: it is a value a cast failed on, for the query to fail on
         keep_null: bool,
     },
+    /// The dynamic filter a Top-N pushes into a scan (`TopN::PushdownDynamicFilters`): whether `child`, the sort
+    /// key, can be among the first rows. Until the Top-N has a boundary every row passes.
+    TopNFilter {
+        child: Box<BoundExpr>,
+        filter: Arc<crate::execution::join_filter::TopNFilter>,
+    },
     /// `BoundCastExpression` to the expression's return type.
     Cast { child: Box<BoundExpr>, try_cast: bool },
     /// `BoundComparisonExpression`: both sides have the same type.
@@ -345,7 +351,9 @@ impl BoundExpr {
     pub fn children(&self) -> Vec<&BoundExpr> {
         match &self.kind {
             BoundExprKind::Constant(_) | BoundExprKind::ColumnRef { .. } | BoundExprKind::Reference(_) => Vec::new(),
-            BoundExprKind::Cast { child, .. } | BoundExprKind::JoinFilter { child, .. } => vec![child],
+            BoundExprKind::Cast { child, .. }
+            | BoundExprKind::JoinFilter { child, .. }
+            | BoundExprKind::TopNFilter { child, .. } => vec![child],
             BoundExprKind::Subquery { child, correlated, .. } => child.iter().map(|c| &**c).chain(correlated).collect(),
             BoundExprKind::Comparison { left, right, .. } => vec![left, right],
             BoundExprKind::Between { input, lower, upper } => vec![input, lower, upper],
@@ -377,7 +385,9 @@ impl BoundExpr {
     pub fn children_mut(&mut self) -> Vec<&mut BoundExpr> {
         match &mut self.kind {
             BoundExprKind::Constant(_) | BoundExprKind::ColumnRef { .. } | BoundExprKind::Reference(_) => Vec::new(),
-            BoundExprKind::Cast { child, .. } | BoundExprKind::JoinFilter { child, .. } => vec![child],
+            BoundExprKind::Cast { child, .. }
+            | BoundExprKind::JoinFilter { child, .. }
+            | BoundExprKind::TopNFilter { child, .. } => vec![child],
             BoundExprKind::Subquery { child, correlated, .. } => {
                 child.iter_mut().map(|c| &mut **c).chain(correlated).collect()
             }
@@ -553,7 +563,9 @@ impl fmt::Display for BoundExpr {
                 write!(f, "#[{}.{}]", binding.table_index, binding.column_index)
             }
             BoundExprKind::Reference(index) => write!(f, "#{index}"),
-            BoundExprKind::JoinFilter { child, .. } => write!(f, "optional: Dynamic Filter ({child})"),
+            BoundExprKind::JoinFilter { child, .. } | BoundExprKind::TopNFilter { child, .. } => {
+                write!(f, "optional: Dynamic Filter ({child})")
+            }
             BoundExprKind::Cast { child, try_cast } => {
                 let name = if *try_cast { "TRY_CAST" } else { "CAST" };
                 write!(f, "{name}({child} AS {})", self.return_type)
