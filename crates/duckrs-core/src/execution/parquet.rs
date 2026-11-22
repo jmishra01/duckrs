@@ -1104,7 +1104,30 @@ fn row_groups_to_scan(
         .row_groups()
         .iter()
         .enumerate()
-        .filter(|(_, group)| {
+        .filter(|(index, group)| {
+            // `ColumnReader::Stats` of a VARIANT column in the row group, which the paths of it filtered on have
+            // bounds by; each worked out once
+            let variant_stats = std::cell::RefCell::new(HashMap::new());
+            let variant = |column: usize| -> Option<crate::catalog::ColumnStatistics> {
+                let is_variant = scan
+                    .types
+                    .get(column)
+                    .is_some_and(|ty| ty.id() == LogicalTypeId::Variant)
+                    && column < scan.names.len()
+                    && scan.schema.is_none()
+                    && !scan
+                        .hive_overrides
+                        .iter()
+                        .any(|(_, key)| key.eq_ignore_ascii_case(&scan.names[column]));
+                if !is_variant {
+                    return None;
+                }
+                variant_stats
+                    .borrow_mut()
+                    .entry(column)
+                    .or_insert_with(|| variant_stats::variant_statistics(metadata, &scan.names[column], Some(*index)))
+                    .clone()
+            };
             let zone = |at: usize| -> Option<crate::catalog::ColumnZone> {
                 if let Some((leaf, element)) = element_leaves.get(at).and_then(Option::as_ref) {
                     // `TransformColumnStatistics` of a LIST or MAP: unknown validity, the elements' statistics
@@ -1128,8 +1151,17 @@ fn row_groups_to_scan(
                     ..Default::default()
                 })
             };
-            !crate::execution::zone_map::never_true(&zone, filter)
-                && !bloom_rules_out(scan, &leaves, &element_leaves, group, filter, &mut file, path, normalized)
+            !crate::execution::zone_map::never_true_with_variants(&zone, &variant, filter)
+                && !bloom_rules_out(
+                    scan,
+                    &leaves,
+                    &element_leaves,
+                    group,
+                    filter,
+                    &mut file,
+                    path,
+                    normalized,
+                )
         })
         .map(|(at, _)| at)
         .collect();

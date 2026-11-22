@@ -266,6 +266,31 @@ pub(super) fn compress_info(stats: &Stats) -> Option<(LogicalType, Stats)> {
     Some((structured, typed_stats))
 }
 
+/// What the statistics of the VARIANT columns that `column` gives say of `expr`, where it is a path of one
+/// (`variant_extract`s with constant paths) cast to a primitive type: the statistics `ExpressionFilter::
+/// CheckStatistics` takes of a filter's expression. `None` for any other expression, or where nothing is known.
+pub(crate) fn variant_path_statistics(
+    expr: &crate::planner::expression::BoundExpr,
+    column: &dyn Fn(usize) -> Option<Stats>,
+) -> Option<Stats> {
+    use crate::planner::expression::BoundExprKind;
+    match &expr.kind {
+        BoundExprKind::Reference(at) if expr.return_type.id() == LogicalTypeId::Variant => column(*at),
+        BoundExprKind::Function { function, children, .. }
+            if function.name == "variant_extract" && children.len() == 2 =>
+        {
+            let BoundExprKind::Constant(key) = &children[1].kind else {
+                return None;
+            };
+            extract(&variant_path_statistics(&children[0], column)?, key)
+        }
+        BoundExprKind::Cast { child, try_cast: false } if child.return_type.id() == LogicalTypeId::Variant => {
+            cast_from_variant(&variant_path_statistics(child, column)?, &expr.return_type)
+        }
+        _ => None,
+    }
+}
+
 /// `VariantExtractPropagateStats`: the statistics of a field (`key`) or an element (`index`) of a VARIANT.
 pub(super) fn extract(stats: &Stats, key: &Value) -> Option<Stats> {
     let Some(VariantStatistics::Shredded(ty, shredded)) = stats.variant.as_deref() else {

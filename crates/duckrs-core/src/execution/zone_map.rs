@@ -404,6 +404,8 @@ enum Range {
 /// The zones of a scan's output columns for one group: what is known of the column at each position.
 struct Group<'a> {
     zone: &'a dyn Fn(usize) -> Option<ColumnZone>,
+    /// the statistics of the VARIANT columns, where they are known
+    variant: Option<&'a dyn Fn(usize) -> Option<crate::catalog::ColumnStatistics>>,
 }
 
 /// The zone of the output column `index` of a scan of `table` reading `column_ids`, in row group `group`.
@@ -434,7 +436,21 @@ fn table_zone(
 /// Whether no row can make `filter` true, where `zone` gives what is known of the column at each position of
 /// the rows `filter` reads (`ExpressionFilter::CheckStatistics`).
 pub fn never_true(zone: &dyn Fn(usize) -> Option<ColumnZone>, filter: &BoundExpr) -> bool {
-    Group { zone }.never_true(filter)
+    Group { zone, variant: None }.never_true(filter)
+}
+
+/// [`never_true`], where `variant` gives the statistics of the VARIANT columns, which the paths of them cast to
+/// a type have bounds by (`VariantExtractPropagateStats`, `StatisticsPropagateVariant`).
+pub fn never_true_with_variants(
+    zone: &dyn Fn(usize) -> Option<ColumnZone>,
+    variant: &dyn Fn(usize) -> Option<crate::catalog::ColumnStatistics>,
+    filter: &BoundExpr,
+) -> bool {
+    Group {
+        zone,
+        variant: Some(variant),
+    }
+    .never_true(filter)
 }
 
 impl Group<'_> {
@@ -457,6 +473,16 @@ impl Group<'_> {
     }
 
     fn range(&self, expr: &BoundExpr) -> Range {
+        if let Some(variant) = self.variant
+            && matches!(expr.kind, BoundExprKind::Cast { try_cast: false, .. })
+            && let Some(stats) = crate::optimizer::variant_statistics::variant_path_statistics(expr, variant)
+        {
+            return match (stats.min, stats.max) {
+                _ if !stats.can_be_valid => Range::Null,
+                (Some(min), Some(max)) => Range::Bounds(min, max),
+                _ => Range::Unknown,
+            };
+        }
         match &expr.kind {
             BoundExprKind::Reference(index) => self.column_range(*index),
             BoundExprKind::Cast { child, .. } if child.return_type == expr.return_type => self.range(child),
@@ -556,7 +582,11 @@ impl Group<'_> {
             } if captures.is_empty() => {
                 let inner = self.elements(list)?;
                 let zone = move |index: usize| (index == 0).then(|| inner.clone());
-                let range = Group { zone: &zone }.range(body);
+                let range = Group {
+                    zone: &zone,
+                    variant: None,
+                }
+                .range(body);
                 match range {
                     Range::Bounds(min, max) => Some(ColumnZone {
                         min: Some(min),
