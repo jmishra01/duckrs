@@ -1176,6 +1176,7 @@ fn extract_join_conditions(
             };
             if let Some((l, r)) = sides {
                 conditions.push(JoinCondition {
+                    bound: None,
                     left: (**l).clone(),
                     right: (**r).clone(),
                     comparison: JoinCondition::equality(null_safe),

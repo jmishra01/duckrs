@@ -66,6 +66,9 @@ pub struct TopNFilter {
     pub nulls_first: bool,
     /// the first sort key of the last row the Top-N keeps, once it keeps as many as it needs
     boundary: parking_lot::RwLock<Option<Value>>,
+    /// a join's bound of its build keys rather than a Top-N's (`CreateDynamicMinMaxFilters`), which the plan shows
+    /// as one of the scan's `Dynamic Filters` once the join has it
+    pub join_bound: bool,
 }
 
 impl TopNFilter {
@@ -82,7 +85,21 @@ impl TopNFilter {
             comparison,
             nulls_first,
             boundary: parking_lot::RwLock::new(None),
+            join_bound: false,
         }
+    }
+
+    /// `CreateDynamicMinMaxFilters` of an inequality of a join: the rows of the scan are at least the smallest key
+    /// of the build side (`lower`) or at most the largest.
+    pub fn join_bound(ty: LogicalType, lower: bool) -> Self {
+        let mut filter = Self::new(ty, !lower, false, false);
+        filter.join_bound = true;
+        filter
+    }
+
+    /// The boundary, once there is one.
+    pub fn boundary(&self) -> Option<Value> {
+        self.boundary.read().clone()
     }
 
     /// `DynamicFilterData::SetValue`. A NULL boundary is not one a comparison can use: the filter stays as it was.
@@ -236,6 +253,17 @@ pub struct JoinFilter {
     runtime: OnceLock<Option<RuntimeFilter>>,
     /// `published` with its keys cast to the type of a scan's column, by that type
     converted: parking_lot::Mutex<Vec<(LogicalType, Option<Published>)>>,
+    /// `PrefixRangeFilter` of strings: a bit per four-byte prefix from the smallest prefix of a key on
+    prefixes: OnceLock<Option<(u32, Vec<u64>)>>,
+}
+
+/// `GetPrefixIntegerComparable`: the first four bytes of a string, as an integer that sorts as they do.
+fn string_prefix(text: &[u8]) -> u32 {
+    let mut bytes = [0u8; 4];
+    for (at, byte) in text.iter().take(4).enumerate() {
+        bytes[at] = *byte;
+    }
+    u32::from_be_bytes(bytes)
 }
 
 /// What of its join decides which filters of the build keys a join filter publishes.
@@ -512,6 +540,7 @@ impl JoinFilter {
             scan_estimate: AtomicU64::new(0),
             runtime: OnceLock::new(),
             converted: parking_lot::Mutex::new(Vec::new()),
+            prefixes: OnceLock::new(),
             null_safe,
             ty,
             in_threshold: IN_FILTER_THRESHOLD.load(Ordering::Relaxed),
@@ -576,6 +605,30 @@ impl JoinFilter {
             });
             keys_found.exact = Some(bits);
         }
+        // of strings, the prefix-range filter has a bit per prefix of the keys
+        let prefixes = (runtime == Some(RuntimeFilter::PrefixRange)
+            && complete
+            && keys.logical_type().id() == LogicalTypeId::Varchar)
+            .then(|| {
+                let unified = keys.to_unified(count);
+                let prefixes: Vec<u32> = (0..count)
+                    .filter(|&row| unified.is_valid(row))
+                    .map(|row| string_prefix(unified.str_at(row)))
+                    .collect();
+                let (min, max) = (*prefixes.iter().min()?, *prefixes.iter().max()?);
+                let span = u64::from(max - min) + 1;
+                if u128::from(span) > SMALL_EXACT_PRF_BITS {
+                    return None;
+                }
+                let mut bits = vec![0u64; span.div_ceil(64) as usize];
+                for prefix in prefixes {
+                    let at = u64::from(prefix - min);
+                    bits[(at / 64) as usize] |= 1 << (at % 64);
+                }
+                Some((min, bits))
+            })
+            .flatten();
+        let _ = self.prefixes.set(prefixes);
         if self.keys.set(value).is_err() || self.published.set(published).is_err() || self.runtime.set(runtime).is_err()
         {
             // a join that runs twice would give a scan the keys of the time before
@@ -826,10 +879,35 @@ impl JoinFilter {
                     active
                 })
             });
+        let null_passes = self.null_safe || keep_null;
+        // the prefix-range filter of strings: a row passes if a key has its first four bytes
+        if published.is_none()
+            && keys.is_none()
+            && values.logical_type().id() == LogicalTypeId::Varchar
+            && self.bloom.load(Ordering::Relaxed)
+            && let Some(Some((min, bits))) = self.prefixes.get()
+        {
+            let mut kept = Vec::with_capacity(count);
+            let unified = values.to_unified(count);
+            for row in 0..count {
+                let pass = if !unified.is_valid(row) {
+                    null_passes
+                } else {
+                    let prefix = string_prefix(unified.str_at(row));
+                    prefix >= *min && {
+                        let at = u64::from(prefix - min);
+                        bits.get((at / 64) as usize).is_some_and(|word| word & (1 << (at % 64)) != 0)
+                    }
+                };
+                if pass {
+                    kept.push(row as u32);
+                }
+            }
+            return Some(kept);
+        }
         if published.is_none() && keys.is_none() {
             return None;
         }
-        let null_passes = self.null_safe || keep_null;
         let mut kept = Vec::with_capacity(count);
         if supported(values.logical_type()) {
             let int = |key: &Key| key.int.unwrap_or_default();
@@ -1046,6 +1124,28 @@ fn push_join_filters_with(op: &mut LogicalOperator, estimates: Option<&[u64]>, n
     let probe_estimate =
         noted.unwrap_or_else(|| crate::optimizer::join_order::estimated_cardinality(&op.children[0]));
     let build_filtered = is_filtering(&op.children[1]);
+    // `CreateDynamicMinMaxFilters` of an inequality: the bound of the build keys on the column of the probe side
+    for condition in conditions.iter_mut() {
+        use duckrs_parser::ast::ComparisonOp as C;
+        let lower = match condition.comparison {
+            C::GreaterThan | C::GreaterThanOrEqual => true,
+            C::LessThan | C::LessThanOrEqual => false,
+            _ => continue,
+        };
+        if condition.bound.is_some() || condition.left.return_type != condition.right.return_type {
+            continue;
+        }
+        let Some((column, casts)) = peel_casts(&condition.left) else {
+            continue;
+        };
+        let filter = std::sync::Arc::new(TopNFilter::join_bound(condition.left.return_type.clone(), lower));
+        let ok = std::cell::Cell::new(true);
+        let mut probe = op.children[0].clone();
+        if push_into(&mut probe, column, &casts, &Pushed::TopN(&filter, &ok)) && ok.get() {
+            op.children[0] = probe;
+            condition.bound = Some(filter);
+        }
+    }
     for condition in conditions.iter_mut() {
         let Some((column, casts)) = peel_casts(&condition.left) else {
             continue;

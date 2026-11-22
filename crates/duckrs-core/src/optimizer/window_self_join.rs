@@ -245,6 +245,7 @@ fn visit(op: &mut LogicalOperator, next: &mut usize, replacements: &mut HashMap<
             .iter()
             .enumerate()
             .map(|(i, partition)| JoinCondition {
+                bound: None,
                 left: partition.clone(),
                 right: BoundExpr::column_ref(ColumnBinding::new(group_index, i), partition.return_type.clone(), ""),
                 comparison: ComparisonOp::NotDistinctFrom,

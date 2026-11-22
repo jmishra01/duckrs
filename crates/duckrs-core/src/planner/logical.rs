@@ -444,6 +444,8 @@ pub struct JoinCondition {
     pub comparison: ComparisonOp,
     /// what the join tells a scan below its left side of its keys on the right
     pub filter: Option<std::sync::Arc<crate::execution::join_filter::JoinFilter>>,
+    /// of an inequality, the bound of the right side's keys the join gives that scan (`CreateDynamicMinMaxFilters`)
+    pub bound: Option<std::sync::Arc<crate::execution::join_filter::TopNFilter>>,
 }
 
 impl JoinCondition {

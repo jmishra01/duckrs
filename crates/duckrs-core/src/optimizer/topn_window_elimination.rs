@@ -447,6 +447,7 @@ fn rewrite(
             duckrs_parser::ast::JoinType::Semi
         };
         let condition = crate::planner::logical::JoinCondition {
+            bound: None,
             left: BoundExpr::column_ref(
                 ColumnBinding::new(late.lhs_index, late.lhs_types.len() - 1),
                 LogicalType::BIGINT,

@@ -724,6 +724,7 @@ impl Binder<'_> {
         let mut conditions = Vec::with_capacity(compared.len());
         for (i, ty) in compared.iter().enumerate() {
             conditions.push(crate::planner::logical::JoinCondition {
+                bound: None,
                 left: collate(BoundExpr::column_ref(left_bindings[i], ty.clone(), ""), ty)?,
                 right: collate(BoundExpr::column_ref(right_bindings[i], ty.clone(), ""), ty)?,
                 comparison: duckrs_parser::ast::ComparisonOp::NotDistinctFrom,
