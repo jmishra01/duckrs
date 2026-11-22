@@ -1161,6 +1161,7 @@ test/sql/attach/attach_macros.test
 test/sql/attach/attach_modify_multiple_databases.test
 test/sql/attach/attach_multi_identifiers.test
 test/sql/attach/attach_nested_types.test
+test/sql/attach/attach_new_compression.test
 test/sql/attach/attach_no_wal_writes_mode.test
 test/sql/attach/attach_null.test
 test/sql/attach/attach_or_replace.test
@@ -1187,6 +1188,7 @@ test/sql/attach/attach_use_string_literal.test
 test/sql/attach/attach_view_search_path.test
 test/sql/attach/attach_views.test
 test/sql/attach/attach_volatile_expression.test
+test/sql/attach/attach_wal_alter.test
 test/sql/attach/attach_wal_alter_sequence.test
 test/sql/attach/detach_keyword.test
 test/sql/attach/detach_manager_default_database.test
@@ -1898,6 +1900,7 @@ test/sql/copy/parquet/parquet_shredding_unsupported_types.test
 test/sql/copy/parquet/parquet_signed_zero.test
 test/sql/copy/parquet/parquet_silly.test
 test/sql/copy/parquet/parquet_sqlnull_write.test
+test/sql/copy/parquet/parquet_string_stats.test
 test/sql/copy/parquet/parquet_union_by_name.test
 test/sql/copy/parquet/parquet_virtual_columns.test
 test/sql/copy/parquet/parquet_virtual_file_row_number.test
@@ -3831,6 +3834,7 @@ test/sql/storage/compression/dictionary/dictionary_empty_segment.test
 test/sql/storage/compression/dictionary/dictionary_storage_info.test
 test/sql/storage/compression/dictionary/fetch_row.test
 test/sql/storage/compression/dictionary/force_dictionary.test
+test/sql/storage/compression/dictionary/total_string_length_dictionary.test
 test/sql/storage/compression/fsst/fsst_corrupt_decoded_length.test
 test/sql/storage/compression/fsst/fsst_corrupt_escape_symbol_index.test
 test/sql/storage/compression/fsst/fsst_greedy_long_strings.test
@@ -3967,6 +3971,7 @@ test/sql/storage/list_length_stats_old_version.test
 test/sql/storage/many_checkpoints.test
 test/sql/storage/many_self_append.test
 test/sql/storage/metadata/full_table_metadata_reuse.test
+test/sql/storage/metadata/full_table_metadata_reuse_v7.test
 test/sql/storage/metadata/multi_table_metadata_reuse.test
 test/sql/storage/metadata/partial_column_metadata_reuse_drop_column.test
 test/sql/storage/metadata/partial_column_metadata_reuse_small_block.test
@@ -3997,6 +4002,7 @@ test/sql/storage/partial_blocks/many_columns_strings.test
 test/sql/storage/partial_blocks/many_columns_validity.test
 test/sql/storage/partial_blocks/partial_block_tail_memory.test
 test/sql/storage/piecemeal_delete_checkpoint_compress.test
+test/sql/storage/pragma_storage_info_scan_type.test
 test/sql/storage/prefetch/async_native_scan_positional.test
 test/sql/storage/prefetch/async_native_scan_read_ahead_concurrent.test
 test/sql/storage/read_duckdb/read_duckdb_basic.test
