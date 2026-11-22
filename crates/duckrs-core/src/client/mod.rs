@@ -920,9 +920,48 @@ pub struct ClientContext {
     trigger_tables: Vec<String>,
     /// what the plan of the statement being profiled did: its phases and its operators
     pending_profile: Option<PendingProfile>,
+    /// of the statement EXPLAIN ANALYZE ran: its profile tree, what the profiler saw, and how long it took
+    analyzed_profile: Option<(
+        Option<crate::execution::profiler::ProfileNode>,
+        Arc<crate::execution::profiler::OperatorProfiler>,
+        std::time::Duration,
+    )>,
     /// EXPLAIN ANALYZE asks the statement it runs to keep the tree of its plan, with what each operator did
     capture_analyzed: bool,
     analyzed: Option<explain::ExplainNode>,
+}
+
+/// `FileSystem::ExtractExtension`: what follows the last `.` of the file's name.
+fn file_extension(path: &str) -> String {
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    match name.rsplit_once('.') {
+        Some((_, extension)) => extension.to_string(),
+        None => String::new(),
+    }
+}
+
+/// `LookupProfilerPrintFormat`: the formats a profile or plan can be rendered in.
+fn check_print_format(given: &str) -> Result<()> {
+    const FORMATS: [&str; 11] = [
+        "default",
+        "text",
+        "query_tree",
+        "query_tree_optimizer",
+        "no_output",
+        "json",
+        "html",
+        "graphviz",
+        "yaml",
+        "mermaid",
+        "compact",
+    ];
+    if FORMATS.contains(&given.to_lowercase().as_str()) {
+        return Ok(());
+    }
+    Err(Error::new(
+        ErrorKind::InvalidInput,
+        format!("\"{given}\" is not a valid FORMAT argument, valid options are: {}", FORMATS.join(", ")),
+    ))
 }
 
 /// The phases (with their times) and the operator tree of a profiled statement.
@@ -1054,6 +1093,7 @@ impl ClientContext {
             statement_transaction: 0,
             profiling: false,
             pending_profile: None,
+            analyzed_profile: None,
             trigger_tables: Vec::new(),
             capture_analyzed: false,
             analyzed: None,
@@ -1395,8 +1435,17 @@ impl ClientContext {
                 })
             });
             self.end_statement_logging();
+            // EXPLAIN ANALYZE gives its profile as its result, and leaves `profiling_output` as it is
+            let explain_analyze = matches!(
+                statement,
+                Statement::Explain {
+                    explain_type: ExplainType::Analyze,
+                    ..
+                }
+            );
             if let (Some(start), Some(profiler)) = (profiled, &profiler)
                 && self.profiling
+                && !explain_analyze
             {
                 self.write_profile(text.trim(), start.elapsed(), profiler)?;
             }
@@ -2914,6 +2963,7 @@ impl ClientContext {
         if explain_type == ExplainType::Sql {
             return self.explain_sql(statement);
         }
+        check_print_format(format)?;
         let upper = self
             .setting_text("profiling_renderer_settings")
             .to_lowercase()
@@ -2935,7 +2985,32 @@ impl ClientContext {
             // the plan that ran, where the statement planned one; else the one planned to show
             let mut physical = self.analyzed.take().unwrap_or(physical);
             explain::add_dynamic_filters(&mut physical, &mut recorded.into_iter());
-            explain::render(&physical, format, upper)
+            // without a FORMAT of its own, EXPLAIN ANALYZE prints the profile as `enable_profiling` would
+            let profiling = self.setting_text("enable_profiling").to_ascii_lowercase();
+            let shown = if format == "default"
+                && matches!(profiling.as_str(), "json" | "html" | "graphviz" | "mermaid" | "yaml" | "compact")
+            {
+                profiling
+            } else {
+                format.to_ascii_lowercase()
+            };
+            match self.analyzed_profile.take() {
+                // `EXPLAIN (ANALYZE, FORMAT JSON)`: the profile of the run, as `QueryProfiler::ToJSON` gives it
+                Some((root, profiler, time)) if shown == "json" => {
+                    let sql = self.current_query.clone();
+                    self.profile_json(&sql, time, &profiler, Vec::new(), root)
+                }
+                // the other formats render the profiling tree (`RenderProfilingNodeTree`)
+                Some((root, _, time)) if matches!(shown.as_str(), "html" | "graphviz" | "mermaid" | "yaml" | "compact") => {
+                    let tree = explain::profile_tree(root);
+                    let sql = self.current_query.clone();
+                    explain::render_with_query(&tree, &shown, upper, Some((time, sql.as_str())))
+                }
+                Some(..) if shown == "no_output" => String::new(),
+                // the text profile: the summary box, then the tree (`RenderQueryTree`)
+                Some((_, _, time)) => explain::summary_box(time) + &explain::render(&physical, format, upper),
+                None => explain::render(&physical, format, upper),
+            }
         } else {
             explain::render(&physical, format, upper)
         };
@@ -3157,6 +3232,67 @@ impl ClientContext {
                 {
                     transaction.invalidation_policy = value.try_to_string()?.to_uppercase();
                 }
+                // `ProfilingOutputSetting::SetLocal`: a file of the format the profile is in, or text
+                if name.eq_ignore_ascii_case("profiling_output") {
+                    let output = value.try_to_string()?;
+                    let format = match self.setting_text("enable_profiling").to_lowercase() {
+                        text if text.is_empty() || text == "null" => "query_tree".to_string(),
+                        text => text,
+                    };
+                    if !output.is_empty() && format != "no_output" {
+                        let file_type = file_extension(&output);
+                        if file_type != "txt" && check_print_format(&file_type).is_err() {
+                            return Err(Error::new(
+                                ErrorKind::Parser,
+                                format!("Invalid output file type: {file_type}"),
+                            ));
+                        }
+                        if file_type != format && file_type != "txt" {
+                            return Err(Error::new(
+                                ErrorKind::Parser,
+                                format!(
+                                    "Profiler file type ({output}) must either have the same file extension as the \
+                                     profiling output type ({format}), or be a '.txt' file. Set \"enable_profiling = \
+                                     '{file_type}'\" first."
+                                ),
+                            ));
+                        }
+                    }
+                }
+                // `TextTreeRenderer::Configure`: the values of the settings the text renderer knows
+                if name.eq_ignore_ascii_case("profiling_renderer_settings")
+                    && let duckrs_common::value::ValueData::List(entries) = value.data()
+                {
+                    for entry in entries {
+                        let duckrs_common::value::ValueData::Struct(pair) = entry.data() else { continue };
+                        let (Some(key), Some(setting)) = (pair.first(), pair.get(1)) else { continue };
+                        let key = key.try_to_string()?.to_lowercase();
+                        let text = setting.try_to_string()?;
+                        let invalid = |message: String| Err(Error::new(ErrorKind::InvalidInput, message));
+                        match key.as_str() {
+                            "thousand_separator" if text.len() > 1 => {
+                                return invalid(format!(
+                                    "Renderer setting \"{key}\" must be a single character, got \"{text}\""
+                                ));
+                            }
+                            "decimal_separator" if text.len() != 1 => {
+                                return invalid(format!(
+                                    "Renderer setting \"{key}\" must be a single character, got \"{text}\""
+                                ));
+                            }
+                            "operator_casing" => {
+                                let casing = text.to_lowercase();
+                                if casing != "upper" && casing != "title" {
+                                    return invalid(format!(
+                                        "Renderer setting \"{key}\" must be either 'title' or 'upper', got \"{casing}\""
+                                    ));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                let profiling_output = self.setting_text("profiling_output");
                 let mut global = self.home.settings.write();
                 if let Some(setting) = logging::is_logging_setting(name) {
                     // checked as for any setting, and then given to the log manager
@@ -3169,30 +3305,23 @@ impl ClientContext {
                 }
                 // `EnableProfilingSetting::SetLocal`: a format the profiler knows, and profiling on
                 if name.eq_ignore_ascii_case("enable_profiling") {
-                    // `LookupProfilerPrintFormat`
-                    const FORMATS: [&str; 11] = [
-                        "default",
-                        "text",
-                        "query_tree",
-                        "query_tree_optimizer",
-                        "no_output",
-                        "json",
-                        "html",
-                        "graphviz",
-                        "yaml",
-                        "mermaid",
-                        "compact",
-                    ];
                     let given = value.try_to_string()?;
                     let format = given.to_lowercase();
-                    if !FORMATS.contains(&format.as_str()) {
-                        return Err(Error::new(
-                            ErrorKind::InvalidInput,
-                            format!(
-                                "\"{given}\" is not a valid FORMAT argument, valid options are: {}",
-                                FORMATS.join(", ")
-                            ),
-                        ));
+                    check_print_format(&given)?;
+                    // the file the profile goes to has to be of its format, or text
+                    if format != "no_output" && !profiling_output.is_empty() {
+                        let output = &profiling_output;
+                        let file_type = file_extension(output);
+                        if file_type != format && file_type != "txt" {
+                            return Err(Error::new(
+                                ErrorKind::Parser,
+                                format!(
+                                    "Profiler file type ({output}) must either have the same file extension as the \
+                                     profiling output type ({format}), or be a '.txt' file. Set 'profiling_output' to \
+                                     a '{format}' file or run \"RESET profiling_output\" first."
+                                ),
+                            ));
+                        }
                     }
                     settings::set_variable(name, *scope, &Value::varchar(format), &mut global, &mut self.settings)?;
                     self.profiling = true;
@@ -3622,6 +3751,7 @@ impl ClientContext {
         let physical = profiling.map(|_| std::time::Instant::now());
         let collector = PhysicalResultCollector::new(plan);
         let threads = self.thread_count();
+        let analyze_start = std::time::Instant::now();
         let mut operator_profiler = profiling.and_then(|_| crate::execution::profiler::current());
         if analyzed.is_some() && operator_profiler.is_none() {
             operator_profiler = Some(Arc::new(crate::execution::profiler::OperatorProfiler::default()));
@@ -3642,12 +3772,36 @@ impl ClientContext {
         })?;
         crate::execution::join_filter::record(&collector);
         if let (Some((logical, estimate)), Some(profiler)) = (&analyzed, &operator_profiler) {
-            self.analyzed = Some(explain::analyzed_tree(
+            let (tree, infos) = explain::analyzed_tree_with_infos(
                 collector.children[0].as_ref(),
                 Some(logical),
                 Some(estimate),
                 profiler.clone(),
-            ));
+            );
+            self.analyzed = Some(tree);
+            // `EXPLAIN (ANALYZE, FORMAT JSON)` is the profile of the run
+            let select_coverage = !self.setting_text("profiling_coverage").eq_ignore_ascii_case("all");
+            let root = crate::execution::profiler::ProfileNode::of_with(
+                collector.children[0].as_ref(),
+                profiler,
+                select_coverage,
+                Some(&infos),
+            )
+            .into_iter()
+            .next();
+            // the statement runs under a materializing collector and EXPLAIN ANALYZE, which the profile shows above it
+            let wrap = |name: &str, child: Option<crate::execution::profiler::ProfileNode>| {
+                crate::execution::profiler::ProfileNode {
+                    op_type: name.to_string(),
+                    name: name.to_string(),
+                    extra_info: Vec::new(),
+                    metrics: Default::default(),
+                    row_groups: (0, 0),
+                    children: child.into_iter().collect(),
+                }
+            };
+            let root = Some(wrap("RESULT_COLLECTOR", Some(wrap("EXPLAIN_ANALYZE", root))));
+            self.analyzed_profile = Some((root, profiler.clone(), analyze_start.elapsed()));
         }
         if let (Some(start), Some(planned), Some(optimized), Some(physical), Some(operators)) =
             (profiling, planned, optimized, physical, &operator_profiler)
@@ -3705,6 +3859,22 @@ impl ClientContext {
         if let Some(access) = self.file_access() {
             access.check(&output, false)?;
         }
+        let json = self.profile_json(sql, total, profiler, phases, root);
+        std::fs::write(&output, json)
+            .map_err(|error| Error::new(ErrorKind::Io, format!("Cannot open file \"{output}\": {error}")))
+    }
+
+    /// `QueryProfiler::ToJSON`: the profile of a statement with the metrics `tracked_metrics` asks for, in the format
+    /// of `legacy_metrics_format`.
+    fn profile_json(
+        &self,
+        sql: &str,
+        total: std::time::Duration,
+        profiler: &crate::execution::profiler::OperatorProfiler,
+        phases: Vec<(String, std::time::Duration)>,
+        root: Option<crate::execution::profiler::ProfileNode>,
+    ) -> String {
+        use crate::execution::profiler::{Metric, QueryProfile, TrackedMetrics};
         // `QueryMetrics::FinalizeMetrics`: the live counters and the system peaks are always there,
         // the timings and counters only when something recorded them
         let mut metrics = std::collections::BTreeMap::new();
@@ -3766,9 +3936,7 @@ impl ClientContext {
             _ => TrackedMetrics::new(vec!["*".to_string()]),
         };
         let legacy = self.setting_text("legacy_metrics_format") == "true";
-        let profile = QueryProfile { metrics, root };
-        std::fs::write(&output, profile.to_json(&tracked, legacy))
-            .map_err(|error| Error::new(ErrorKind::Io, format!("Cannot open file \"{output}\": {error}")))
+        QueryProfile { metrics, root }.to_json(&tracked, legacy)
     }
 }
 

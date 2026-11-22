@@ -92,7 +92,7 @@ pub fn time_metric<T>(name: &'static str, body: impl FnOnce() -> T) -> T {
     result
 }
 
-fn key(op: &dyn PhysicalOperator) -> usize {
+pub(crate) fn key(op: &dyn PhysicalOperator) -> usize {
     std::ptr::from_ref(op).cast::<()>() as usize
 }
 
@@ -265,24 +265,59 @@ impl ProfileNode {
     /// The tree of `op`, with what the profiler saw of each operator. With `select_coverage`, the
     /// operators C++ doesn't profile then are left out, their children taking their place.
     pub fn of(op: &dyn PhysicalOperator, profiler: &OperatorProfiler, select_coverage: bool) -> Vec<ProfileNode> {
+        Self::of_with(op, profiler, select_coverage, None)
+    }
+
+    /// [`ProfileNode::of`], with the details EXPLAIN shows of each operator, by its address, as its `extra_info`.
+    pub fn of_with(
+        op: &dyn PhysicalOperator,
+        profiler: &OperatorProfiler,
+        select_coverage: bool,
+        infos: Option<&std::collections::HashMap<usize, Vec<(String, String)>>>,
+    ) -> Vec<ProfileNode> {
+        let details = |op: &dyn PhysicalOperator| -> Vec<(String, String)> {
+            if let Some(info) = infos.and_then(|infos| infos.get(&key(op))) {
+                return info.iter().filter(|(_, value)| !value.is_empty()).cloned().collect();
+            }
+            op.explain_details()
+                .into_iter()
+                .enumerate()
+                .map(|(i, detail)| match detail.split_once(": ") {
+                    Some((key, value)) => (key.to_string(), value.to_string()),
+                    None => (format!("{i}"), detail),
+                })
+                .collect()
+        };
+        // `CollapseSecureViews`: of a secure view only the boundary is left, with the time of all that is inside it;
+        // the other metrics of what is inside describe the view's contents and are dropped
+        if op.name() == "SECURE_VIEW" {
+            fn subtree_time(op: &dyn PhysicalOperator, profiler: &OperatorProfiler) -> Duration {
+                op.children()
+                    .iter()
+                    .map(|child| profiler.metrics(child.as_ref()).time + subtree_time(child.as_ref(), profiler))
+                    .sum()
+            }
+            let mut metrics = profiler.metrics(op);
+            metrics.time += subtree_time(op, profiler);
+            return vec![ProfileNode {
+                op_type: operator_type(op).to_string(),
+                name: operator_name(op).to_string(),
+                extra_info: details(op),
+                metrics,
+                row_groups: (0, 0),
+                children: Vec::new(),
+            }];
+        }
         let children: Vec<ProfileNode> = op
             .children()
             .iter()
-            .flat_map(|child| Self::of(child.as_ref(), profiler, select_coverage))
+            .flat_map(|child| Self::of_with(child.as_ref(), profiler, select_coverage, infos))
             .collect();
         let op_type = operator_type(op);
         if op.name() == "COLUMN_SELECT" || (select_coverage && !select_operator(op_type)) {
             return children;
         }
-        let extra_info = op
-            .explain_details()
-            .into_iter()
-            .enumerate()
-            .map(|(i, detail)| match detail.split_once(": ") {
-                Some((key, value)) => (key.to_string(), value.to_string()),
-                None => (format!("{i}"), detail),
-            })
-            .collect();
+        let extra_info = details(op);
         vec![ProfileNode {
             op_type: op_type.to_string(),
             name: operator_name(op).to_string(),
@@ -519,6 +554,12 @@ fn operator_json(node: &ProfileNode, tracked: &TrackedMetrics, legacy: bool) -> 
             JsonEntry::Value(format!("[{}]", children.join(", "))),
         ));
     }
+    // `QueryProfileResultToJSON`: the keys in order, the values before what nests
+    let nested = |(key, entry): &(String, JsonEntry)| match entry {
+        JsonEntry::Object(_) => true,
+        JsonEntry::Value(text) => key == "children" || text.starts_with('{') || text.starts_with('['),
+    };
+    object.entries.sort_by(|a, b| nested(a).cmp(&nested(b)).then_with(|| a.0.cmp(&b.0)));
     object
 }
 
