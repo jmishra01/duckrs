@@ -614,6 +614,7 @@ test/optimizer/pushdown/filter_cannot_pushdown.test
 test/optimizer/pushdown/filters_on_limit_optimizer.test
 test/optimizer/pushdown/issue_16104.test
 test/optimizer/pushdown/issue_16863.test
+test/optimizer/pushdown/issue_17042.test
 test/optimizer/pushdown/issue_18202.test
 test/optimizer/pushdown/issue_18603.test
 test/optimizer/pushdown/join_filter_pushdown.test
