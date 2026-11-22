@@ -44,8 +44,35 @@ pub fn push_down(plan: &mut LogicalOperator, statistics: Option<&mut super::stat
     if candidates.is_empty() {
         return;
     }
+    // `CheckPushdownExtract` of a `LOGICAL_PROJECTION`: a projection that only passes a column on (a view's
+    // `SELECT *`) passes its paths on instead, so what reads them through it reads them of the scan
+    let mut aliases: Vec<(ColumnBinding, ColumnBinding)> = Vec::new();
+    collect_aliases(plan, &mut candidates, &mut aliases);
+    let alias_of: HashMap<ColumnBinding, ColumnBinding> = aliases.iter().copied().collect();
+    let base_of = |mut binding: ColumnBinding| {
+        while let Some(source) = alias_of.get(&binding) {
+            binding = *source;
+        }
+        binding
+    };
     let mut uses: HashMap<ColumnBinding, Uses> = HashMap::new();
-    gather_plan(plan, &candidates, &mut uses);
+    gather_plan(plan, &candidates, &alias_of, &mut uses);
+    // the result reads the columns of the plan by position, as a whole, as do the operators that read their
+    // children by position (a UNION, a CTE's definition)
+    for binding in plan.column_bindings() {
+        if candidates.contains_key(&binding) {
+            uses.entry(binding).or_default().whole = true;
+        }
+    }
+    read_by_position(plan, true, &candidates, &mut uses);
+    // the uses of an alias are those of the column it passes on
+    for (alias, _) in &aliases {
+        if let Some(alias_uses) = uses.remove(alias) {
+            let base = uses.entry(base_of(*alias)).or_default();
+            base.whole |= alias_uses.whole;
+            base.paths.extend(alias_uses.paths);
+        }
+    }
     // `ReferencedColumn::AddPath`: per column, the paths no other pushed path leads into
     let mut pushed: HashMap<ColumnBinding, Vec<(Path, usize)>> = HashMap::new();
     for (binding, uses) in uses {
@@ -66,7 +93,17 @@ pub fn push_down(plan: &mut LogicalOperator, statistics: Option<&mut super::stat
         return;
     }
     add_positions(plan, &candidates, &mut pushed);
+    // the projections pass on the pushed fields of what they pass on, bottom up
+    let scans: Vec<ColumnBinding> = pushed.keys().copied().collect();
+    for (alias, source) in &aliases {
+        let Some(paths) = pushed.get(source).cloned() else {
+            continue;
+        };
+        let added = pass_fields(plan, *alias, *source, &paths, &candidates);
+        pushed.insert(*alias, added);
+    }
     rewrite_plan(plan, &pushed);
+    pushed.retain(|binding, _| scans.contains(binding));
     // `WritePushdownExtractColumns` keeps the statistics: the fields have those of their extracts
     if let Some(statistics) = statistics {
         for (binding, paths) in &pushed {
@@ -152,6 +189,111 @@ fn collect_candidates(op: &LogicalOperator, candidates: &mut HashMap<ColumnBindi
     }
 }
 
+/// The columns that operators read of their children by position, which they read as a whole: as
+/// `RemoveUnusedColumns` has it, all but those of projections and aggregates, and of the operators that pass
+/// their children's columns on, those their parent reads so.
+fn read_by_position(
+    op: &LogicalOperator,
+    by_position: bool,
+    candidates: &HashMap<ColumnBinding, LogicalType>,
+    uses: &mut HashMap<ColumnBinding, Uses>,
+) {
+    let reads = match op.kind {
+        K::Projection { .. } | K::Aggregate { .. } => false,
+        K::Filter { .. }
+        | K::Order { .. }
+        | K::TopN { .. }
+        | K::Limit { .. }
+        | K::Distinct { .. }
+        | K::CrossProduct
+        | K::Join { .. }
+        | K::DelimJoin { .. }
+        | K::MarkJoin { .. }
+        | K::Window { .. }
+        | K::Unnest { .. }
+        | K::SecureView { .. }
+        | K::ColumnSelect { .. } => by_position,
+        _ => true,
+    };
+    for child in &op.children {
+        if reads {
+            for binding in child.column_bindings() {
+                if candidates.contains_key(&binding) {
+                    uses.entry(binding).or_default().whole = true;
+                }
+            }
+        }
+        read_by_position(child, reads, candidates, uses);
+    }
+}
+
+/// The columns of projections that are a column of a candidate (or of such a projection) as it is: by their
+/// binding, the binding of what they pass on, bottom up.
+fn collect_aliases(
+    op: &LogicalOperator,
+    candidates: &mut HashMap<ColumnBinding, LogicalType>,
+    aliases: &mut Vec<(ColumnBinding, ColumnBinding)>,
+) {
+    for child in &op.children {
+        collect_aliases(child, candidates, aliases);
+    }
+    if let K::Projection {
+        table_index,
+        expressions,
+    } = &op.kind
+    {
+        for (at, expr) in expressions.iter().enumerate() {
+            if let BoundExprKind::ColumnRef { binding, depth: 0 } = &expr.kind
+                && let Some(ty) = candidates.get(binding).cloned()
+            {
+                let alias = ColumnBinding::new(*table_index, at);
+                aliases.push((alias, *binding));
+                candidates.insert(alias, ty);
+            }
+        }
+    }
+}
+
+/// In the projection whose column `alias` passes `source` on: the fields of `source` at `paths`, as columns
+/// after its others, in place of the column, which nothing reads as a whole. The fields' positions there.
+fn pass_fields(
+    op: &mut LogicalOperator,
+    alias: ColumnBinding,
+    source: ColumnBinding,
+    paths: &[(Path, usize)],
+    candidates: &HashMap<ColumnBinding, LogicalType>,
+) -> Vec<(Path, usize)> {
+    if let K::Projection {
+        table_index,
+        expressions,
+    } = &mut op.kind
+        && *table_index == alias.table_index
+        && expressions.get(alias.column_index).is_some_and(
+            |e| matches!(&e.kind, BoundExprKind::ColumnRef { binding, depth: 0 } if *binding == source),
+        )
+    {
+        let column_type = &candidates[&source];
+        let mut added = Vec::with_capacity(paths.len());
+        for (path, at) in paths {
+            let ty = path_expression_of(column_type, path).map_or_else(|| column_type.clone(), |(e, _)| e.return_type);
+            let name = expressions[alias.column_index].alias.clone();
+            added.push((path.clone(), expressions.len()));
+            let field = ColumnBinding::new(source.table_index, *at);
+            expressions.push(BoundExpr::column_ref(field, ty, &name));
+        }
+        let whole = &mut expressions[alias.column_index];
+        *whole = BoundExpr::constant(duckrs_common::value::Value::null(whole.return_type.clone()));
+        return added;
+    }
+    for child in &mut op.children {
+        let added = pass_fields(child, alias, source, paths, candidates);
+        if !added.is_empty() {
+            return added;
+        }
+    }
+    Vec::new()
+}
+
 /// The expressions of an operator that read its children, with the conditions of joins.
 fn reading_expressions(op: &mut LogicalOperator) -> Vec<&mut BoundExpr> {
     let conditions: Vec<*mut BoundExpr> = match &mut op.kind {
@@ -174,12 +316,25 @@ fn reading_expressions(op: &mut LogicalOperator) -> Vec<&mut BoundExpr> {
     result
 }
 
-fn gather_plan(op: &mut LogicalOperator, candidates: &HashMap<ColumnBinding, LogicalType>, uses: &mut HashMap<ColumnBinding, Uses>) {
-    for expr in reading_expressions(op) {
+fn gather_plan(
+    op: &mut LogicalOperator,
+    candidates: &HashMap<ColumnBinding, LogicalType>,
+    aliases: &HashMap<ColumnBinding, ColumnBinding>,
+    uses: &mut HashMap<ColumnBinding, Uses>,
+) {
+    // the columns of a projection that pass a column on are no use of it
+    let passing = match &op.kind {
+        K::Projection { table_index, .. } => Some(*table_index),
+        _ => None,
+    };
+    for (at, expr) in reading_expressions(op).into_iter().enumerate() {
+        if passing.is_some_and(|table_index| aliases.contains_key(&ColumnBinding::new(table_index, at))) {
+            continue;
+        }
         gather(expr, candidates, uses, false);
     }
     for child in &mut op.children {
-        gather_plan(child, candidates, uses);
+        gather_plan(child, candidates, aliases, uses);
     }
 }
 
