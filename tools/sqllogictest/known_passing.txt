@@ -3110,6 +3110,7 @@ test/sql/merge/merge_multi_match_error.test
 test/sql/merge/merge_not_matched_by_source_join_order.test
 test/sql/multi_file/multi_file_schema_filter_casts.test
 test/sql/optimizer/aggregate_group_domain_cardinality.test
+test/sql/optimizer/aggregate_stats_propagation.test
 test/sql/optimizer/anti_join_empty_rhs_projection_map.test
 test/sql/optimizer/any_extremum_rewrite.test
 test/sql/optimizer/array_extract_row_group_pruning.test
@@ -3122,11 +3123,13 @@ test/sql/optimizer/case_zonemap_pruning.test
 test/sql/optimizer/coalesce_zonemap_pruning.test
 test/sql/optimizer/constant_function_zonemap_pruning.test
 test/sql/optimizer/contains_row_group_pruning.test
+test/sql/optimizer/cross_column_expression_stats_pruning.test
 test/sql/optimizer/cse_error_capture.test
 test/sql/optimizer/date_part_row_group_pruning.test
 test/sql/optimizer/distinct_sibling_column_pruning.test
 test/sql/optimizer/distinctness_statistics.test
 test/sql/optimizer/distinctness_statistics_nested.test
+test/sql/optimizer/distinctness_statistics_plan.test
 test/sql/optimizer/divide_zonemap_pruning.test
 test/sql/optimizer/empty_string_concat_pruning.test
 test/sql/optimizer/expression/date_trunc_non_interval_parts.test
@@ -3174,6 +3177,7 @@ test/sql/optimizer/monotone_preimage_tinyint_boundaries.test
 test/sql/optimizer/multiple_column_stats_pruning.test
 test/sql/optimizer/narrowing_cast_not_invertible.test
 test/sql/optimizer/not_conjunction_simplification.test
+test/sql/optimizer/null_check_statistics_propagation.test
 test/sql/optimizer/nullable_row_group_pruning.test
 test/sql/optimizer/or_null_simplification.test
 test/sql/optimizer/plan/dense_or_filter_pushdown.test

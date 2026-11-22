@@ -229,7 +229,8 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] EXPLAIN ANALYZE row counts: the plan it renders is the one that ran, under the profiler, with each
     operator's rows and scans as `TABLE_SCAN`; under an OR, what is never true but can be NULL stays
     `constant_or_null(false, ...)` (`table_or_pushdown`, `parquet_or_pushdown`)
-  - [ ] the rest of C++'s analyzed plan: the `QUERY` / `EXPLAIN_ANALYZE` nodes, `Total Time`, operator timings
+  - [x] the `QUERY` / `EXPLAIN_ANALYZE` nodes and the `Summary` box with `Total Time` of C++'s analyzed plan
+  - [ ] operator timings in the text of EXPLAIN ANALYZE
   - [x] the order of a join's conditions where an inequality comes before IS DISTINCT FROM (`issue_17042`)
   - [x] filters through the row numbers of EXCEPT ALL / INTERSECT ALL on a collation key: filters on the
     partitions of ranking windows pulled up through them (`PullupWindow`; `pushdown_window_partition_expression`)
@@ -249,6 +250,17 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] `CanThrow` of aggregates and window functions: `sum`/`avg` of HUGEINT and wide DECIMAL, `string_agg`, the
     `n` variants of min/max/arg_min/arg_max, `ntile`, ... (common subplans, window pushdown)
 - [ ] 15. Statistics propagation (`optimizer/statistics`: 4 failing, 91.8% pass)
+  - [x] `PropagateInputValueStats`: first, last, any_value, arg_min/arg_max and their kin, mode, median and
+    the quantiles have the range of their input (cast to their type), as min and max had; the column of an
+    aggregate is named by its alias (`BindAggregate`)
+  - [x] `SimplifyDistinctComparison`: IS [NOT] DISTINCT FROM of two sides without NULLs is `=` / `!=`, in a
+    join with one side for NOT DISTINCT, not in a MARK join, in the predicate of a join too; IS [NOT] NULL is
+    not folded over a cast of variable-size values to VARIANT (`CanFoldNullCheck`)
+  - [x] multi-column filters skip row groups only if they can't throw (`CanPropagateExpressionStatistics`), and
+    through a TRY_CAST between numbers
+  - [ ] filters derived from joins have no selectivity in the estimate of the scan (`current_domain_semi_anti`);
+    JSON of table filters without the parentheses of `ExpressionFilter::ToString` (`statistics_early_join_range`);
+    `< ANY` planned as a filter on the scan, not an ANY join (`statistics_join`)
   - [x] row groups of the database's `ROW_GROUP_SIZE`; zone maps through CASE, COALESCE, greatest/least,
     arithmetic with constants, month/quarter, prefix, left, sign, two-column comparisons
   - [x] statistics of least/greatest, of sum (rows times the bounds), min and max; `constant_or_null` keeps both

@@ -1153,12 +1153,22 @@ impl StatisticsPropagator {
         let BoundExprKind::Comparison { op, left, right } = &mut expr.kind else {
             unreachable!()
         };
-        let op = *op;
         let left_stats = self.expression(left, false);
         let right_stats = self.expression(right, false);
+        // `SimplifyDistinctComparison` with `ComparisonContext::SCALAR`: without NULLs on either side, NULLs are
+        // not compared
         if matches!(op, ComparisonOp::DistinctFrom | ComparisonOp::NotDistinctFrom) {
-            return unknown();
+            let nested = |e: &BoundExpr| matches!(e.return_type.id(), LogicalTypeId::Union | LogicalTypeId::Tuple);
+            if nested(left) || nested(right) || left_stats.can_be_null || right_stats.can_be_null {
+                return unknown();
+            }
+            *op = if *op == ComparisonOp::NotDistinctFrom {
+                ComparisonOp::Equal
+            } else {
+                ComparisonOp::NotEqual
+            };
         }
+        let op = *op;
         let can_be_null = left_stats.can_be_null || right_stats.can_be_null;
         // a side that is only NULL makes NULL; one without any value (a column of an empty table)
         // prunes a filter (`FILTER_ALWAYS_FALSE`), but a projection keeps the comparison
@@ -1266,8 +1276,10 @@ impl StatisticsPropagator {
         } else {
             None
         };
+        // `CanFoldNullCheck`: folding drops the child, so not of what is volatile or can throw
         if let Some(answer) = is_always
             && !children[0].is_volatile()
+            && !contains_throwing_variant_cast(&children[0])
         {
             let alias = expr.alias.clone();
             *expr = BoundExpr::constant(Value::boolean(answer)).with_alias(alias);
@@ -2660,7 +2672,8 @@ impl StatisticsPropagator {
         let mut range_filters: [Vec<BoundExpr>; 2] = [Vec::new(), Vec::new()];
         // `SimplifyDistinctComparison` with `ComparisonContext::JOIN`: a join rejects the NULL pairs too,
         // so with one side without NULLs `IS NOT DISTINCT FROM` is `=`
-        for condition in conditions.iter_mut() {
+        // a MARK join gives on what the comparison is, NULL too
+        for condition in conditions.iter_mut().filter(|_| join_type != JoinType::Mark) {
             if !matches!(condition.comparison, ComparisonOp::NotDistinctFrom | ComparisonOp::DistinctFrom) {
                 continue;
             }
@@ -2737,7 +2750,23 @@ impl StatisticsPropagator {
                         let BoundExprKind::Comparison { op: comparison, left, right } = &mut conjunct.kind else {
                             unreachable!()
                         };
+                        let nested = |e: &BoundExpr| {
+                            matches!(e.return_type.id(), LogicalTypeId::Union | LogicalTypeId::Tuple)
+                        };
+                        let any_nested = nested(left) || nested(right);
                         let (left, right) = (self.expression(left, false), self.expression(right, false));
+                        // `SimplifyDistinctComparison` with `ComparisonContext::JOIN`
+                        if !any_nested && join_type != JoinType::Mark {
+                            *comparison = match *comparison {
+                                ComparisonOp::NotDistinctFrom if !left.can_be_null || !right.can_be_null => {
+                                    ComparisonOp::Equal
+                                }
+                                ComparisonOp::DistinctFrom if !left.can_be_null && !right.can_be_null => {
+                                    ComparisonOp::NotEqual
+                                }
+                                other => other,
+                            };
+                        }
                         let distinct = matches!(comparison, ComparisonOp::DistinctFrom | ComparisonOp::NotDistinctFrom);
                         match (!distinct).then(|| decide(*comparison, &string_stats_bounds(&left), &string_stats_bounds(&right))).flatten() {
                             Some(true) if !left.can_be_null && !right.can_be_null => continue,
@@ -3530,16 +3559,70 @@ impl StatisticsPropagator {
     }
 
     fn aggregate_stats(&mut self, aggregate: &BoundAggregate, rows: Option<u64>) -> Option<Stats> {
+        // `PropagateInputValueStats`: the result is one of the values, or between them
+        let input_value = matches!(
+            aggregate.function.name.as_str(),
+            "min"
+                | "max"
+                | "first"
+                | "last"
+                | "any_value"
+                | "arbitrary"
+                | "arg_min"
+                | "arg_max"
+                | "argmin"
+                | "argmax"
+                | "min_by"
+                | "max_by"
+                | "arg_min_null"
+                | "arg_max_null"
+                | "mode"
+                | "median"
+                | "quantile"
+                | "quantile_cont"
+                | "quantile_disc"
+        );
+        if input_value && let Some(child) = aggregate.children.first() {
+            // the arguments of an aggregate of several go into it as one struct: the value is its first field
+            let child = match &child.kind {
+                BoundExprKind::Function { function, children, .. }
+                    if function.name == "struct_pack" && child.return_type != aggregate.return_type =>
+                {
+                    children.first().unwrap_or(child)
+                }
+                _ => child,
+            };
+            let mut stats = self.expression(&mut child.clone(), false);
+            if aggregate.return_type != child.return_type {
+                // `CastStatistics::TryPropagate`: the bounds cast, of what is not nested
+                if aggregate.return_type.is_nested() || child.return_type.is_nested() {
+                    return None;
+                }
+                let cast = |value: &Option<Value>| -> Option<Value> {
+                    let value = BoundExpr::constant(value.clone()?).cast_to(&aggregate.return_type, false);
+                    crate::execution::expression_executor::try_evaluate_scalar(&value)
+                };
+                let (min, max) = (cast(&stats.min)?, cast(&stats.max)?);
+                stats = Stats {
+                    min: Some(min),
+                    max: Some(max),
+                    lists: None,
+                    variant: None,
+                    geometry: None,
+                    strings: None,
+                    children: Vec::new(),
+                    ..stats
+                };
+            }
+            // `ResetAdditiveStatistics`, and NULL where the aggregate sees no valid rows
+            stats.distinct = None;
+            stats.can_be_null = true;
+            return (stats.min.is_some() && stats.max.is_some()).then_some(stats);
+        }
         if aggregate.children.len() != 1 {
             return None;
         }
         let child = &aggregate.children[0];
-        // `MinMaxPropagateStats`: the smallest or largest value is one of the values
-        if matches!(aggregate.function.name.as_str(), "min" | "max") && aggregate.return_type == child.return_type {
-            let mut stats = self.expression(&mut child.clone(), false);
-            stats.can_be_null = true;
-            return (stats.min.is_some() && stats.max.is_some()).then_some(stats);
-        }
         if aggregate.function.name != "sum" || aggregate.distinct {
             return None;
         }
@@ -4045,4 +4128,17 @@ pub(crate) fn power_bounds(base: Option<(f64, f64)>, (exponent_min, exponent_max
     } else {
         (power_min, power_max)
     })
+}
+
+/// `ContainsThrowingVariantCast`: a variable-size value cast to VARIANT throws if its row is too large, even under
+/// TRY_CAST.
+fn contains_throwing_variant_cast(expr: &BoundExpr) -> bool {
+    if let BoundExprKind::Cast { child, .. } = &expr.kind
+        && expr.return_type.id() == LogicalTypeId::Variant
+        && child.return_type.id() != LogicalTypeId::Variant
+        && !child.return_type.physical_type().is_constant_size()
+    {
+        return true;
+    }
+    expr.children().into_iter().any(contains_throwing_variant_cast)
 }
