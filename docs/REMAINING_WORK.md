@@ -173,7 +173,9 @@ Each item gives the number of failing files in `test/` that it should fix, where
     theirs (`MarkBlockAsUsed`). An append of 80M rows takes 90MB rather than refusing to keep more than 2 GiB.
     `enable_optimistic_write` turns it off. Not for tables with a key or an index, nor in an explicit
     transaction, whose appends go in at the commit
-  - [ ] a one-row VARCHAR column: C++ stores it as DICT_FSST, duckrs uncompressed
+  - [x] a one-row VARCHAR column is UNCOMPRESSED, as the baseline scores it (DICT_FSST's analyze charges a segment
+    as the partial block manager stores it, 48 bytes against 9 for one 5-byte string). The 2.0.0 release
+    (`d54cbbe3df`) stores it as DICT_FSST: its analyze predates that change (`1ed7c0e2b03`, `9cd38959030`)
   - [x] the ART layouts of files before v2.0.0, in checkpoints and the WAL: from v1.2.0 the current nodes with
     the 264-byte `Node256Leaf` (`GetNode256LeafSegmentSize`), before it `ART::TransformToDeprecated` (chains of
     `Leaf` of 4 row ids, 15-byte prefixes, 6 allocators); the `storage_version` option is the file's
