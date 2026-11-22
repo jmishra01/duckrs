@@ -490,6 +490,7 @@ test/optimizer/arithmetic_simplification.test
 test/optimizer/avg_rewrite_profitability.test
 test/optimizer/case_simplification.test
 test/optimizer/case_simplification_errors.test
+test/optimizer/catalog_function_binding.test
 test/optimizer/column_lifetime_analyzer/must_visit_operator_expressions_first.test
 test/optimizer/column_lifetime_analyzer/no_unnecessary_projections.test
 test/optimizer/column_lifetime_analyzer/summary_column_lifetime.test
@@ -2158,6 +2159,7 @@ test/sql/export/parquet/export_parquet_list.test
 test/sql/export/parquet/export_parquet_map.test
 test/sql/export/parquet/export_parquet_struct.test
 test/sql/export/parquet_export.test
+test/sql/extensions/concurrent_failed_aliased_load.test
 test/sql/filter/between_nested_exponential.test
 test/sql/filter/default_boolean_selection.test
 test/sql/filter/dense_integral_selection.test
@@ -3609,6 +3611,7 @@ test/sql/show_select/test_summarize.test
 test/sql/show_select/test_summarize_quoted.test
 test/sql/sql_export/aggregate_literals.test
 test/sql/sql_export/aggregate_results.test
+test/sql/sql_export/aggregate_topn_rewrites.test
 test/sql/sql_export/alias.test
 test/sql/sql_export/basic_plan_shapes.test
 test/sql/sql_export/call_values.test
@@ -3623,6 +3626,7 @@ test/sql/sql_export/copy_empty_filename_pattern.test
 test/sql/sql_export/correlated_sql_export.test
 test/sql/sql_export/cte_names.test
 test/sql/sql_export/execution_once.test
+test/sql/sql_export/explain_sql_formatting.test
 test/sql/sql_export/explain_sql_scopes.test
 test/sql/sql_export/grouped_mark_roundtrip.test
 test/sql/sql_export/grouped_tuple_mark_roundtrip.test

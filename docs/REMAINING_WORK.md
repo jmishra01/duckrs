@@ -287,7 +287,10 @@ Each item gives the number of failing files in `test/` that it should fix, where
     BLOBs and BITs (`bitagg_memory_limit`)
   - [ ] EXPLAIN shapes: join-dependent filters, projection placement, filter pullup join order, recursive CTE join
     order, zone maps of ORs over joins, grouping sets of the common aggregate
-  - [ ] `duckdb_extensions()`, named table function arguments (`materialized_cte_column_count`)
+  - [x] `duckdb_extensions()`: the default extensions with their aliases, and parquet, json and core_functions as
+    statically linked and loaded; an ungrouped aggregate none of whose aggregates are read computes a
+    COUNT(*) of its own (`catalog_function_binding`)
+  - [ ] named table function arguments (`materialized_cte_column_count`)
 - [ ] 18. Optimizer-dependent SQL tests (`sql/optimizer`: 62 failing, 63.7% pass)
   - [x] uncorrelated scalar subqueries planned as cross products (`PlanUncorrelatedSubquery`), with first() and
     the multiple-rows check where they may not return one row
