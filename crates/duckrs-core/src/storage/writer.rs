@@ -1304,6 +1304,9 @@ struct Writer<'a> {
     /// Which columns of each row group written of the table are loaded: all of one that was written, and of
     /// one that was kept, those that were.
     group_loaded: Vec<Vec<bool>>,
+    /// Of the table being written, the `DistinctStatistics` counted from the values written of the columns it has
+    /// none of (one an ALTER added or changed the type of), while every row group of them is written from values
+    counted_distinct: Vec<Option<DistinctState>>,
     /// That of each table, by schema and name, for the table read back from the file.
     pub(super) loaded: HashMap<(String, String), Vec<Vec<bool>>>,
     /// Of each table whose statistics the file has less of than they are (before v2.0.0, strings to 8 bytes), the
@@ -1815,6 +1818,7 @@ impl<'a> Writer<'a> {
             in_file: None,
             stored_loaded: Vec::new(),
             group_loaded: Vec::new(),
+            counted_distinct: Vec::new(),
             loaded: HashMap::new(),
             memory_statistics: HashMap::new(),
             segments_in_block: HashMap::new(),
@@ -3041,11 +3045,23 @@ impl<'a> Writer<'a> {
         let mut column_blocks: Vec<Vec<u64>> = Vec::with_capacity(parts.len());
         for (column, (parts, reused)) in parts.iter().zip(reused).enumerate() {
             if let Some((pointer, extras)) = reused {
+                // what it has isn't read again, so it can't be counted
+                if let Some(counted) = self.counted_distinct.get_mut(column) {
+                    *counted = None;
+                }
                 pointers.push(pointer);
                 column_blocks.push(extras);
                 continue;
             }
             let ty = &table.columns[column].ty;
+            if let Some(counted) = self.counted_distinct.get_mut(column)
+                && let Some(state) = counted
+            {
+                let complete = written.is_none() && parts.iter().all(|part| state.update(ty, &part.vector, part.count));
+                if !complete {
+                    *counted = None;
+                }
+            }
             // rows written ahead of the commit are in their blocks already (`ColumnData::HasChanges`)
             let out = match written {
                 Some(columns) => {
@@ -3489,10 +3505,21 @@ impl<'a> Writer<'a> {
         };
         let mut statistics: Vec<Option<Stats>> = vec![None; types.len()];
         // `ColumnStatistics::distinct_stats`, which only files of v1.2.0 on keep (`HLL_V2`)
-        let distinct = (self.version >= StorageVersion::V1_2_0)
+        let mut distinct = (self.version >= StorageVersion::V1_2_0)
             .then(|| table.distinct_states())
             .flatten()
             .unwrap_or_default();
+        // `InitializeAddColumn`, `InitializeAlterType`: a column without them starts empty and counts the values the
+        // row groups are written with
+        self.counted_distinct = (0..types.len())
+            .map(|column| {
+                (self.version >= StorageVersion::V1_2_0
+                    && !distinct.is_empty()
+                    && distinct.get(column).is_some_and(Option::is_none)
+                    && type_is_supported(&types[column]))
+                .then(DistinctState::default)
+            })
+            .collect();
         let mut row_groups = Vec::new();
         let size = self.chunks_per_row_group * STANDARD_VECTOR_SIZE;
         let (mut stored_rows, mut next_row_id) = (0u64, 0u64);
@@ -3544,6 +3571,11 @@ impl<'a> Writer<'a> {
                 .collect();
             self.memory_statistics
                 .insert((table.schema.clone(), table.name.clone()), columns);
+        }
+        for (state, counted) in distinct.iter_mut().zip(std::mem::take(&mut self.counted_distinct)) {
+            if state.is_none() {
+                *state = counted;
+            }
         }
         let mut s = serializer(self.version);
         s.write_object_value(|s| {
