@@ -332,6 +332,10 @@ impl FilterPushdown {
             LogicalOperatorKind::DelimJoin { .. } | LogicalOperatorKind::MarkJoin { .. } => {
                 self.pushdown_delim_join(op)
             }
+            LogicalOperatorKind::LateralJoin {
+                join_type: JoinType::Inner | JoinType::Left,
+                ..
+            } => self.pushdown_lateral_join(op),
             LogicalOperatorKind::Projection { .. } => self.pushdown_projection(op),
             LogicalOperatorKind::Union { .. } | LogicalOperatorKind::ExceptIntersect { .. } => {
                 self.pushdown_set_operation(op)
@@ -381,6 +385,28 @@ impl FilterPushdown {
         let left_child = op.children.pop().expect("a join has two children");
         op.children.push(FilterPushdown { filters: left }.rewrite(left_child));
         op.children.push(FilterPushdown::default().rewrite(right));
+        FilterPushdown { filters: rest }.push_final_filters(op)
+    }
+
+    /// An INNER or LEFT lateral join keeps or drops each left row as a whole, with all the rows its
+    /// right side gives for it, so what reads only the left side can go there. C++ plans the join as
+    /// a DELIM join, which its `PushdownLeftJoin` / `PushdownInnerJoin` pass this way; here it also
+    /// keeps the right side from running for rows the filter throws away.
+    fn pushdown_lateral_join(self, mut op: LogicalOperator) -> LogicalOperator {
+        let left_tables = plan_tables(&op.children[0]);
+        let (left, rest): (Vec<_>, Vec<_>) = self
+            .filters
+            .into_iter()
+            .partition(|f| !f.tables.is_empty() && f.tables.is_subset(&left_tables));
+        let left_child = op.children.pop().expect("a lateral join has a left side");
+        op.children.push(FilterPushdown { filters: left }.rewrite(left_child));
+        if let LogicalOperatorKind::LateralJoin { right, .. } = &mut op.kind {
+            let plan = std::mem::replace(
+                &mut **right,
+                LogicalOperator::new(LogicalOperatorKind::CrossProduct, vec![]),
+            );
+            **right = push_down(plan);
+        }
         FilterPushdown { filters: rest }.push_final_filters(op)
     }
 

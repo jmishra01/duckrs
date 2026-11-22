@@ -4186,6 +4186,7 @@ test/sql/subquery/exists/test_uncorrelated_exists_subquery.test
 test/sql/subquery/lateral/lateral_arrays.test
 test/sql/subquery/lateral/lateral_asof_join.test
 test/sql/subquery/lateral/lateral_binding_views.test
+test/sql/subquery/lateral/lateral_domain_filter.test
 test/sql/subquery/lateral/lateral_domain_join_filter_semantics.test
 test/sql/subquery/lateral/lateral_empty_grouping_sets.test
 test/sql/subquery/lateral/lateral_fuzzer_1463.test
@@ -4197,6 +4198,7 @@ test/sql/subquery/lateral/lateral_large_lists.test
 test/sql/subquery/lateral/lateral_left_join.test
 test/sql/subquery/lateral/lateral_null_propagation_shortcut.test
 test/sql/subquery/lateral/lateral_qualify.test
+test/sql/subquery/lateral/lateral_recursive_filter_pushdown.test
 test/sql/subquery/lateral/lateral_values.test
 test/sql/subquery/lateral/test_lateral_join.test
 test/sql/subquery/scalar/array_order_subquery.test
