@@ -401,12 +401,56 @@ impl FilterCombiner {
         Some(self.remaining.remove(at))
     }
 
+    /// `GenerateEquivalentFilters`: `filter` again for each column of it that is in an equivalence set, with the
+    /// column replaced by each other expression of the set.
+    fn equivalent_filters(&self, filter: &BoundExpr, result: &mut Vec<BoundExpr>) {
+        if filter.is_volatile() {
+            return;
+        }
+        let set_of_column = |column: &BoundExpr| {
+            self.nodes
+                .iter()
+                .find(|(node, _)| expressions_equal(node, column))
+                .map(|(_, set)| *set)
+        };
+        let mut columns: Vec<BoundExpr> = Vec::new();
+        filter.clone().walk_mut(&mut |e| {
+            if matches!(e.kind, BoundExprKind::ColumnRef { .. })
+                && set_of_column(e).is_some()
+                && !columns.iter().any(|c| expressions_equal(c, e))
+            {
+                columns.push(e.clone());
+            }
+        });
+        for column in &columns {
+            let Some(set) = set_of_column(column) else { continue };
+            let Some((members, _)) = self.sets.get(&set) else { continue };
+            for &member in members {
+                let other = &self.nodes[member].0;
+                // an expression of the column itself (`c - 0 = c`) would only nest the filter in itself, deeper
+                // each time the filters are combined
+                let mut contains = false;
+                other.clone().walk_mut(&mut |e| contains |= expressions_equal(e, column));
+                if contains {
+                    continue;
+                }
+                let mut copy = filter.clone();
+                copy.walk_mut(&mut |e| {
+                    if expressions_equal(e, column) {
+                        *e = other.clone();
+                    }
+                });
+                result.push(copy);
+            }
+        }
+    }
+
     /// `GenerateFilters`: the remaining filters, then each set's equalities and bounds.
     pub(super) fn generate(self) -> Vec<BoundExpr> {
         let bound = |info: &ValueInfo, entry: &BoundExpr| {
             comparison(info.op, entry.clone(), BoundExpr::constant(info.constant.clone())).with_alias(info.alias.clone())
         };
-        let mut result = self.remaining;
+        let mut result = self.remaining.clone();
         for (members, constants) in self.sets.values() {
             for (i, &member) in members.iter().enumerate() {
                 let entry = &self.nodes[member].0;
@@ -420,7 +464,12 @@ impl FilterCombiner {
                     } else if is_less(info.op) {
                         upper = Some(info);
                     } else {
-                        result.push(bound(info, entry));
+                        let filter = bound(info, entry);
+                        // column refs are already covered by the equalities of their set
+                        if !matches!(entry.kind, BoundExprKind::ColumnRef { .. }) {
+                            self.equivalent_filters(&filter, &mut result);
+                        }
+                        result.push(filter);
                     }
                 }
                 match (lower, upper) {

@@ -632,6 +632,7 @@ test/optimizer/pushdown/no_mark_to_semi_if_mark_index_is_projected.test
 test/optimizer/pushdown/parquet_or_pushdown.test
 test/optimizer/pushdown/prefix_pushdown_null_constant.test
 test/optimizer/pushdown/pushdown_after_statistics.test
+test/optimizer/pushdown/pushdown_filter_on_coalesced_equal_outer_join_keys.test
 test/optimizer/pushdown/pushdown_in_to_parquet.test
 test/optimizer/pushdown/pushdown_unnest_into_cte.test
 test/optimizer/pushdown/pushdown_window_decreasing_partition.test
@@ -3185,6 +3186,7 @@ test/sql/optimizer/plan/plan_struct_projection_pushdown.test
 test/sql/optimizer/plan/test_anti_join_empty_child.test
 test/sql/optimizer/plan/test_anti_join_projection_map.test
 test/sql/optimizer/plan/test_disable_build_side_probe_side.test
+test/sql/optimizer/plan/test_equivalent_filter_mirroring.test
 test/sql/optimizer/plan/test_except_empty_rhs.test
 test/sql/optimizer/plan/test_filter_pushdown.test
 test/sql/optimizer/plan/test_filter_pushdown_duplicate.test

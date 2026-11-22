@@ -209,6 +209,15 @@ Each item gives the number of failing files in `test/` that it should fix, where
 ## Phase 7: Optimizer
 
 - [ ] 14. Filter pushdown and pullup (`optimizer/pushdown`: 19 failing, 55.8% pass)
+  - [x] `PushdownOuterJoin`: a filter of `coalesce(l, r)` over the keys of a FULL join's `l = r` goes to both
+    sides as a filter of `l` and of `r`; `GenerateEquivalentFilters`: `expr = constant` again for the other
+    columns of its equivalence set; an inner join's conditions go through the filter combiner with the filters
+    above it (`PushdownInnerJoin`'s `GenerateFilters`)
+  - [ ] table filters are put into scans after the projection pullup (`push_into_table_scans`), so a filter that
+    can throw, which stays above a projection, goes into the scan once the projection is pulled up
+    (`tuple_cast_pushdown`, `pushdown_safe_decimal_cast`); C++ sets them in `PushdownGet` only
+  - [ ] `RegexRangeFilter` (needs RE2's `PossibleMatchRange`); `invoke` of a lambda kept as a call
+    (`or_range_merge`); a derived OR filter added again by each pushdown (`join_dependent_filter`)
   - [x] OR range merge, monotone preimage, filter reordering (`ExpressionHeuristics`), BETWEEN of a column as two comparisons
   - [x] a filter that can throw stays above the projection of an inlined CTE: `position`/`instr`/`strpos` and a
     string `a[i]` with a constant index cannot throw, as in C++ (`test_no_pushdown_cast_into_cte`)

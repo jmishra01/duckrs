@@ -326,6 +326,7 @@ impl FilterPushdown {
             LogicalOperatorKind::Join { join_type, .. } => match join_type {
                 JoinType::Inner => self.pushdown_inner_join(op),
                 JoinType::Left => self.pushdown_left_join(op),
+                JoinType::Outer => self.pushdown_outer_join(op),
                 JoinType::Semi | JoinType::Anti => self.pushdown_semi_anti_join(op),
                 _ => self.finish_pushdown(op),
             },
@@ -611,7 +612,52 @@ impl FilterPushdown {
                 return empty_result(&op);
             }
         }
+        // `GenerateFilters`: the conditions and the filters together, through the combiner
+        if !self.combine() {
+            return empty_result(&op);
+        }
         self.pushdown_cross_product(LogicalOperator::new(LogicalOperatorKind::CrossProduct, op.children))
+    }
+
+    /// `FilterPushdown::PushdownOuterJoin`: a filter `P(coalesce(l, r))` of the keys of a condition `l = r` holds of
+    /// the row of each side that makes up a joined row, so `P(l)` goes to the left and `P(r)` to the right
+    /// (`PushDownFiltersOnCoalescedEqualJoinKeys`).
+    fn pushdown_outer_join(mut self, mut op: LogicalOperator) -> LogicalOperator {
+        let LogicalOperatorKind::Join { conditions, .. } = &op.kind else {
+            unreachable!()
+        };
+        let keys: Vec<(BoundExpr, BoundExpr)> = conditions
+            .iter()
+            .filter(|c| c.comparison == ComparisonOp::Equal)
+            .map(|c| (c.left.clone(), c.right.clone()))
+            .collect();
+        if keys.is_empty() {
+            return self.finish_pushdown(op);
+        }
+        let (mut left, mut right) = (FilterPushdown::default(), FilterPushdown::default());
+        let mut applied = false;
+        let mut kept = Vec::new();
+        for filter in std::mem::take(&mut self.filters) {
+            match coalesced_key_filters(&filter.filter, &keys) {
+                Some((on_left, on_right)) => {
+                    left.add_filter(on_left);
+                    right.add_filter(on_right);
+                    applied = true;
+                }
+                None => kept.push(filter),
+            }
+        }
+        self.filters = kept;
+        if !applied {
+            return self.finish_pushdown(op);
+        }
+        if !left.combine() || !right.combine() {
+            return empty_result(&op);
+        }
+        let right_child = op.children.remove(1);
+        let left_child = op.children.remove(0);
+        op.children = vec![left.rewrite(left_child), right.rewrite(right_child)];
+        self.push_final_filters(op)
     }
 
     /// `FilterPushdown::PushdownLeftJoin`: filters on the left go below the join. One that
@@ -909,6 +955,100 @@ impl FilterPushdown {
 
 /// What `(a1 AND b1) OR (a2 AND b2)` says of the side `a` of a join alone: `a1 OR a2`, which each row
 /// has that the whole has. `None` if some alternative says nothing of that side.
+/// `FlattenedCoalesce::Of`: the arguments of a COALESCE, those of COALESCEs in it in their place.
+fn flattened_coalesce<'a>(expr: &'a BoundExpr, out: &mut Vec<&'a BoundExpr>) {
+    match &expr.kind {
+        BoundExprKind::Operator {
+            op: BoundOperator::Coalesce,
+            children,
+        } => children.iter().for_each(|child| flattened_coalesce(child, out)),
+        _ => out.push(expr),
+    }
+}
+
+/// `PushDownFiltersOnCoalescedEqualJoinKeys` of one filter: the filter with its COALESCEs of the keys of one
+/// condition `l = r` as `l`, and as `r`, if it is a function of those alone.
+fn coalesced_key_filters(filter: &BoundExpr, keys: &[(BoundExpr, BoundExpr)]) -> Option<(BoundExpr, BoundExpr)> {
+    if filter.is_volatile() || super::rewriter::can_throw(filter) {
+        return None;
+    }
+    // `Expression::Equals`, which leaves aliases out
+    let shape = |expr: &BoundExpr| {
+        let mut copy = expr.clone();
+        copy.walk_mut(&mut |e| e.alias.clear());
+        format!("{copy:?}")
+    };
+    let same = |a: &[&BoundExpr], b: &[&BoundExpr]| {
+        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| shape(x) == shape(y))
+    };
+    let key_of = |expr: &BoundExpr| -> Option<usize> {
+        if !matches!(expr.kind, BoundExprKind::Operator { op: BoundOperator::Coalesce, .. }) {
+            return None;
+        }
+        let mut args = Vec::new();
+        flattened_coalesce(expr, &mut args);
+        keys.iter().position(|(l, r)| {
+            let mut lr = Vec::new();
+            flattened_coalesce(l, &mut lr);
+            flattened_coalesce(r, &mut lr);
+            let mut rl = Vec::new();
+            flattened_coalesce(r, &mut rl);
+            flattened_coalesce(l, &mut rl);
+            same(&args, &lr) || same(&args, &rl)
+        })
+    };
+    // the COALESCEs of the keys, all of the same condition
+    let mut found: Option<usize> = None;
+    let mut several = false;
+    fn visit(expr: &BoundExpr, f: &mut impl FnMut(&BoundExpr) -> bool) {
+        if f(expr) {
+            return;
+        }
+        for child in expr.children() {
+            visit(child, f);
+        }
+    }
+    visit(filter, &mut |expr| match key_of(expr) {
+        Some(key) => {
+            several |= found.is_some_and(|k| k != key);
+            found = Some(key);
+            true
+        }
+        None => false,
+    });
+    let key = found.filter(|_| !several)?;
+    let replaced = |with: &BoundExpr| {
+        let mut copy = filter.clone();
+        replace_coalesce(&mut copy, &key_of, key, with);
+        copy
+    };
+    // `ExprIsFunctionOnlyOf`: with the COALESCEs as constants, nothing else of the rows is left
+    let constant = BoundExpr::constant(Value::null(keys[key].0.return_type.clone()));
+    let mut scalar = true;
+    replaced(&constant).walk_mut(&mut |e| {
+        if matches!(e.kind, BoundExprKind::ColumnRef { .. } | BoundExprKind::Subquery { .. }) {
+            scalar = false;
+        }
+    });
+    scalar.then(|| (replaced(&keys[key].0), replaced(&keys[key].1)))
+}
+
+/// `ReplaceIn`: the COALESCEs of the keys of condition `key` in `expr` become `with`.
+fn replace_coalesce(
+    expr: &mut BoundExpr,
+    key_of: &impl Fn(&BoundExpr) -> Option<usize>,
+    key: usize,
+    with: &BoundExpr,
+) {
+    if key_of(expr) == Some(key) {
+        *expr = with.clone();
+        return;
+    }
+    for child in expr.children_mut() {
+        replace_coalesce(child, key_of, key, with);
+    }
+}
+
 fn side_of_disjunction(expr: &BoundExpr, side: &BTreeSet<usize>) -> Option<BoundExpr> {
     let BoundExprKind::Conjunction { and: false, children } = &expr.kind else {
         return None;
