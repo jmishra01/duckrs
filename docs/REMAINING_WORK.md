@@ -280,7 +280,11 @@ Each item gives the number of failing files in `test/` that it should fix, where
     (`CollapseSecureViews`); EXPLAIN ANALYZE in the profiler's JSON (`secure_view_explain`)
   - [x] the prefix-range join filter of keys close together is exact: a bit per value between the smallest and the
     largest key, so only keys pass where the Bloom filter let others through
-  - [ ] dynamic filters of the build side's bounds through inequality joins (`secure_view_join_filter_pushdown`)
+  - [x] dynamic filters of the build side's bounds through inequality joins (`CreateDynamicMinMaxFilters`): `>=` the
+    smallest key for `>`/`>=`, `<=` the largest for `<`/`<=`, set once the build side is done, through nested loop,
+    piecewise merge and IE joins; the prefix-range filter of VARCHAR keys, by their first four bytes (`table_filters`)
+  - [ ] join filters through an ANY join inside a secure view, on a key whose cast can fail
+    (`secure_view_join_filter_pushdown`)
   - [x] temporal casts of a column compared with a constant give the scan an optional filter on the column, by
     the cast's margin (`TryPushdownTemporalCastFilter`, also of filters that can throw); TIMESTAMPTZ_NS columns have
     zone maps and `stats()` (`temporal_cast_zonemap`, `timestamp_unit_cast_zonemap_pruning`)

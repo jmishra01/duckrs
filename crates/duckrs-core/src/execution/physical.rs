@@ -4765,6 +4765,20 @@ impl PhysicalOperator for PhysicalResultCollector {
 pub(crate) fn dynamic_filters_of(filter: Option<&BoundExpr>) -> Option<String> {
     let mut found: Vec<(String, Vec<String>)> = Vec::new();
     let mut visit = |expr: &BoundExpr| {
+        // a join's bound of its build keys, once it has one
+        if let BoundExprKind::TopNFilter { child, filter } = &expr.kind
+            && filter.join_bound
+            && let Some(bound) = filter.boundary()
+        {
+            let op = if filter.comparison == duckrs_parser::ast::ComparisonOp::GreaterThanOrEqual { ">=" } else { "<=" };
+            let text = format!("optional: {child} {op} {}", BoundExpr::constant(bound));
+            let name = child.to_string();
+            match found.iter_mut().find(|(n, _)| *n == name) {
+                Some((_, texts)) => texts.push(text),
+                None => found.push((name, vec![text])),
+            }
+            return;
+        }
         if let BoundExprKind::JoinFilter {
             child,
             filter,
@@ -4804,7 +4818,7 @@ pub(crate) fn top_n_filters_of(filter: Option<&BoundExpr>) -> Vec<String> {
     };
     conjuncts
         .into_iter()
-        .filter(|c| matches!(c.kind, BoundExprKind::TopNFilter { .. }))
+        .filter(|c| matches!(&c.kind, BoundExprKind::TopNFilter { filter, .. } if !filter.join_bound))
         .map(|c| c.to_string())
         .collect()
 }

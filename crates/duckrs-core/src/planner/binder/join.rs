@@ -233,6 +233,7 @@ pub(super) fn extract_join_conditions(
         let null_safe = op == ComparisonOp::NotDistinctFrom;
         if only(&first, &left_tables, &right_tables) && only(&second, &right_tables, &left_tables) {
             conditions.push(JoinCondition {
+                bound: None,
                 left: *first,
                 right: *second,
                 comparison: JoinCondition::equality(null_safe),
@@ -240,6 +241,7 @@ pub(super) fn extract_join_conditions(
             });
         } else if only(&first, &right_tables, &left_tables) && only(&second, &left_tables, &right_tables) {
             conditions.push(JoinCondition {
+                bound: None,
                 left: *second,
                 right: *first,
                 comparison: JoinCondition::equality(null_safe),

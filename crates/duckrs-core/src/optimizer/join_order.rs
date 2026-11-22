@@ -1116,6 +1116,7 @@ impl Tree {
                 {
                     let (a, b) = if subset(first, left_set) { (a, b) } else { (b, a) };
                     conditions.push(JoinCondition {
+                        bound: None,
                         left: *a,
                         right: *b,
                         comparison: op,

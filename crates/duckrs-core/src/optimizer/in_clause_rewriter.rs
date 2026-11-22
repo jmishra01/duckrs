@@ -364,6 +364,7 @@ impl Rewriter<'_> {
             K::MarkJoin {
                 table_index: mark_index,
                 conditions: vec![JoinCondition {
+                    bound: None,
                     left: input,
                     right: BoundExpr::column_ref(ColumnBinding::new(chunk_index, 0), in_type, ""),
                     comparison: duckrs_parser::ast::ComparisonOp::Equal,

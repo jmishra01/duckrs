@@ -405,6 +405,7 @@ impl Pass {
             .iter()
             .zip(&keys[1])
             .map(|((left, left_type), (right, right_type))| JoinCondition {
+                bound: None,
                 left: BoundExpr::column_ref(lower_binding(&lower_operators[0], *left), left_type.clone(), ""),
                 right: BoundExpr::column_ref(lower_binding(&lower_operators[1], *right), right_type.clone(), ""),
                 comparison: ComparisonOp::Equal,
