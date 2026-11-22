@@ -1486,7 +1486,13 @@ impl Binder<'_> {
                         null_text(),
                         Value::boolean(volatile),
                         true,
-                        text(if volatile { "VOLATILE" } else { "CONSISTENT" }),
+                        text(if volatile {
+                            "VOLATILE"
+                        } else if crate::planner::expression::CONSISTENT_WITHIN_QUERY_FUNCTIONS.contains(&name) {
+                            "CONSISTENT_WITHIN_QUERY"
+                        } else {
+                            "CONSISTENT"
+                        }),
                     ))
                 };
                 let functions_ref = &mut functions;

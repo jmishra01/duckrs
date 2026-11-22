@@ -86,8 +86,12 @@ Each item gives the number of failing files in `test/` that it should fix, where
     errors; multi-file cast errors as C++; VARCHAR read as BLOB by its bytes (`union_by_name`)
   - [x] `allow_empty`; `schema` turns off hive detection; hive columns that are file columns aren't cast from it;
     unknown COPY options of Parquet and CSV with C++'s suggestions; signed zeros apart in dictionaries
-  - [ ] INT96 out of range (the crate wraps), `timestamp_ns` saturation, legacy `ConvertedType` 24, `stats()` of
-    VARCHAR, recursive `UNNEST` of structs (`metadata_full`), `WITH ORDINALITY`
+  - [ ] INT96 out of range (the crate wraps), `timestamp_ns` saturation, legacy `ConvertedType` 24, recursive
+    `UNNEST` of structs (`metadata_full`), `WITH ORDINALITY`
+  - [x] `stats()` of Parquet VARCHAR / BLOB columns: string statistics from the footers (exact bounds, a constant's
+    lengths), unknown ones where none; JSON the file marks as such keeps them under a repairing `utf8_validation`
+  - [ ] float statistics of Parquet columns by `nan_count` and `can_have_nan` (`parquet_stats_function`,
+    `parquet_nan_setting`)
   - [x] `parquet_metadata` stats in the column's DuckDB type (decimals, UUID, TIMETZ, INT96, blobs; NULL for infinities and out-of-range values)
   - [x] `int96_as` (`timestamp` by default, `timestamp_ns`, `struct`)
   - [x] the native Parquet writer (`execution/parquet_writer`): DuckDB's encodings, dictionaries, pages, statistics, bloom filters and footer, written with our own Thrift; TIMETZ as TIME in UTC
@@ -171,7 +175,10 @@ Each item gives the number of failing files in `test/` that it should fix, where
     (which merges into what the others are), and the row groups a delete emptied dropped in files before
     v2.0.0, the rows after them taking new ids where no index keeps them
   - [ ] shredded GEOMETRY columns, Patas and Chimp segments (8), `read_duckdb` (8)
-  - [ ] string and list-length statistics for `stats()` (~10 files), per-column `USING COMPRESSION`
+  - [x] list-length statistics: the shortest, longest and total length of a table's lists, kept through appends,
+    checkpoints (v2.1.0, with the lists' `ListPersistentColumnData`) and WAL replay; checkpoints write v2.1.0 when
+    asked; a table's statistics keep those of what is in its nested columns
+  - [ ] string statistics for `stats()` from database files, per-column `USING COMPRESSION`
   - [x] `read_duckdb` and the replacement scan of `.db` files; `enable_view_dependencies` (DROP ... CASCADE,
     refused DROP and ALTER, CREATE OR REPLACE of a view that reads itself)
   - [ ] `vector_type` (~20 files) and `duckdb_memory` (~17) report engine internals duckrs does not model
@@ -197,8 +204,31 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] OR range merge, monotone preimage, filter reordering (`ExpressionHeuristics`), BETWEEN of a column as two comparisons
   - [x] a filter that can throw stays above the projection of an inlined CTE: `position`/`instr`/`strpos` and a
     string `a[i]` with a constant index cannot throw, as in C++ (`test_no_pushdown_cast_into_cte`)
-  - [ ] scalar functions pushed into Parquet scans, a filter on the right of a SEMI join through a subquery's
-    projection
+  - [x] LIKE/ILIKE prefixes as ranges in the scan (`TryPushdownLikeFilter`), dense IN ranges and optional OR filters
+    in Parquet scans too; `now()` and its kin are `CONSISTENT_WITHIN_QUERY`, not volatile, so they move into scans;
+    statistics compare strings by the 12-byte bounds C++ keeps; a comparison of both sides of a join is kept unless
+    it is always true (`JoinCondition`); `nextval('s')` shown as C++ shows it
+  - [x] `ScalarFnPushdown`: `strlen`/`octet_length` of a Parquet column, when it is the only use of the column, is
+    read by the scan as the byte lengths of the values (one file, no filter on the column, no
+    `DELTA_LENGTH_BYTE_ARRAY`); a projection that only forwards the columns a Parquet scan reads, directly or
+    through a LIMIT, is omitted, as the scan outputs just those (`projection_ids`)
+  - [x] filters into table scans before statistics, as C++ does, so the scan keeps the filter as it was and
+    statistics rewrite only the one above; statistics check the scan's table filters, optional ones too
+    (`PropagateStatistics(LogicalGet)`); `constant_or_null` folds only of columns and constants
+    (`NotNullExpressionAnalyzer`)
+  - [x] the same for Parquet scans: their filters go in before statistics, which check them; count/min/max
+    from a single file's row groups take the filters in its scan into account
+  - [x] EXPLAIN ANALYZE row counts: the plan it renders is the one that ran, under the profiler, with each
+    operator's rows and scans as `TABLE_SCAN`; under an OR, what is never true but can be NULL stays
+    `constant_or_null(false, ...)` (`table_or_pushdown`, `parquet_or_pushdown`)
+  - [ ] the rest of C++'s analyzed plan: the `QUERY` / `EXPLAIN_ANALYZE` nodes, `Total Time`, operator timings
+  - [ ] the order of a join's conditions where an inequality comes before IS DISTINCT FROM (`issue_17042`)
+  - [ ] filters through the row numbers of EXCEPT ALL / INTERSECT ALL on a collation key
+    (`pushdown_window_partition_expression`); dynamic filters of blockwise NL joins (`join_filter_pushdown_any_join`)
+  - [ ] the operator log and profiler output a few tests read (`join_filter_pushdown_integer_chain`,
+    `cte_domain_join_filter`); `read_csv`'s `schema`; `COLUMNS(json_keys(getvariable(...)))` (`issue_16671`);
+    a filter on the right of a SEMI join through
+    a subquery's projection
   - [x] `can_throw` as C++ has it: only the functions C++ marks `SetFallible` can fail, by overload where C++ decides
     it at bind time (extracts, substring, unary `+`/`-`, `list_value`, ICU date parts of TIMESTAMPTZ)
   - [x] `CanThrow` of aggregates and window functions: `sum`/`avg` of HUGEINT and wide DECIMAL, `string_agg`, the
@@ -229,8 +259,15 @@ Each item gives the number of failing files in `test/` that it should fix, where
     and `read_json`; predicate factoring of ORs in filters
   - [ ] secure views (7 files), `json_serialize_plan`, gamma's errors without IEEE
   - [x] string statistics in `stats()`: bounds, unicode, lengths and totals of tables and constants; `approx_unique`
-  - [ ] string statistics through functions (contains, suffix, upper/lower, length), struct/list/map extracts,
-    EXPLAIN ANALYZE metrics of other operators (~190 EXPLAIN-shape files under `test/optimizer`, `sql/optimizer`)
+  - [x] string statistics through functions (contains, suffix, upper/lower, length)
+  - [x] list lengths through `length` / `array_length` (a `constant_or_null` where all lists are as long),
+    `list_value`, `list_concat`, `flatten` and ARRAY to LIST casts
+  - [x] struct/list/map extracts: MAP columns have statistics (`stats(m)`, their keys' and values'), which
+    `m[k]` / `map_extract_value` and `map_values` carry; `struct_concat`, `struct_insert` and `struct_update` keep
+    their fields'; `list_position` of a value no element can be is NULL (`ListPositionPropagateStats`); Parquet row
+    groups skipped by the elements of a LIST and the values of a MAP (`list_contains`, `m[k]`), and by the bloom
+    filter of those leaves (`TryGetNestedBloomFilterLeaf`)
+  - [ ] EXPLAIN ANALYZE metrics of other operators (EXPLAIN-shape files under `test/optimizer`, `sql/optimizer`)
 - [ ] 16. Join order and cardinality estimation (`optimizer/joins`: 1 failing)
   - [x] LEFT join equality groups, `debug_force_no_cross_product`, `approximate_join_order_threshold`
   - [ ] LEFT joins reordered inside the join graph (C++'s CD-C conflict detector, `left_join_cardinality_estimation`)
@@ -246,8 +283,6 @@ Each item gives the number of failing files in `test/` that it should fix, where
     join's predicate become MARK joins; `EXPLAIN (FORMAT yaml)`; scan filters of a column as one conjunction
   - [ ] struct fields pushed into a scan through a view's projection (`unused_columns/deliver_child_columns`)
   - [ ] the ORDER BY of DISTINCT ON inside the DISTINCT, so its keys can be dropped (`remove_redundant_order_keys`)
-  - [ ] an OR whose NULL check statistics remove is a table filter in full, as C++ pushes it before statistics
-    (`date_trunc_simplification` IS DISTINCT FROM)
   - [x] the values aggregates keep for their rows count toward `memory_limit` with the bytes of their strings,
     BLOBs and BITs (`bitagg_memory_limit`)
   - [ ] EXPLAIN shapes: join-dependent filters, projection placement, filter pullup join order, recursive CTE join
@@ -261,7 +296,8 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] late materialization of Top-N, LIMIT and SAMPLE over tables (a SEMI join on the rowid; the second
     scan's filters are `optional:`)
   - [x] late materialization over `read_parquet`, on `file_index` and `file_row_number`
-  - [ ] the second parquet scan's filters as filters that only skip row groups (they are applied again)
+  - [x] the second parquet scan's filters as filters that only skip row groups (`CreateLHSGet`); a Parquet
+    scan applies its optional filters only to skip row groups, as table scans do
   - [x] TopN window elimination: `row_number() <= k` per partition as a grouped `arg_min`/`arg_max` of `k`,
     unnested back into rows
   - [x] its late-materialization variant: a payload of several columns of one table fetched by rowid, through
@@ -276,7 +312,9 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] compressed materialization of POINT-XY GEOMETRY columns (`__internal_compress_geometry_point`)
   - [x] compressed materialization of VARIANT columns fully shredded on a primitive type: cast to it and
     compressed further, also as grouped by (`variant_comparator`); joins of them compare the integers
-  - [ ] `stats()` of a VARCHAR read from several parquet files with `union_by_name` (NULL here)
+  - [x] `stats()` of a VARCHAR read from several parquet files with `union_by_name`: the statistics and row
+    counts of several files only when the bind opens them all (`union_by_name`, `maximum_files_for_stats`), empty
+    files skipped; with a `schema`, of a column it names that the file stores as the same type
   - [x] partitioned execution: a large aggregate, ORDER BY or window over a table as a UNION ALL of parts by
     ranges of a column, cut where the row groups' zones overlap little
   - [x] list comprehension rewrite: a list comprehension whose result reads no field of the filter's struct

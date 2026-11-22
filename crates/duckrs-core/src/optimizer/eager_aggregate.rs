@@ -117,9 +117,14 @@ pub(super) fn try_execute(op: &LogicalOperator) -> Option<LogicalOperator> {
             table_partitions(table, column_ids)?
         }
         K::ParquetScan { table_index, scan } => {
-            if !scan.extracts.is_empty() || scan.files.len() != 1 || scan.union_by_name {
+            if !scan.extracts.is_empty()
+                || scan.files.len() != 1
+                || scan.union_by_name
+                || !scan.optional_filters.is_empty()
+            {
                 return None;
             }
+            filters.extend(&scan.filters);
             for want in &wanted {
                 if let Wanted::Min(column) | Wanted::Max(column) = want
                     && (column.binding.table_index != *table_index || column.binding.column_index >= scan.names.len())
@@ -332,7 +337,7 @@ fn table_filter(filter: &BoundExpr, scan_index: usize) -> bool {
     if other || columns.len() != 1 || filter.is_volatile() {
         return false;
     }
-    !matches!(table_pushdown(filter), TablePushdown::Optional(_))
+    !matches!(table_pushdown(filter), TablePushdown::Optional(_) | TablePushdown::Partially(_))
 }
 
 /// Whether C++'s statistics can tell a filter is always true (`NumericStats::CheckZonemap`): a comparison,

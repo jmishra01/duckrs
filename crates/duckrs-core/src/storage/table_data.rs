@@ -130,6 +130,23 @@ fn read_persistent_column(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalTyp
                     d.read_optional_property::<LogicalType>(101, "storage_type")
                 })
             })?;
+        } else if ty.is_some_and(|ty| ty.physical_type() == PhysicalType::List) && d.has_property(99)? {
+            // `ListPersistentColumnData`: the lengths of the lists, which the table's statistics have as well
+            d.read_object_field(99, "extra_data", |d| {
+                if !bool::read_value(d)? {
+                    return Ok(());
+                }
+                d.read_object_value(|d| {
+                    const LIST: u8 = 3;
+                    if d.read_optional_property::<u8>(100, "type")? != Some(LIST) {
+                        return Err(corrupt("LIST column data has extra data of another type"));
+                    }
+                    for (field, name) in [(101, "min_list_length"), (102, "max_list_length"), (103, "total_list_length")] {
+                        d.read_optional_property::<u64>(field, name)?;
+                    }
+                    Ok(())
+                })
+            })?;
         } else if d.has_property(99)? {
             return Err(Error::not_implemented(
                 "reading extra column data from a database file is not yet ported to duckrs",
@@ -823,6 +840,7 @@ fn column_statistics_of(stored: &BaseStatistics, ty: &LogicalType) -> Option<Col
         }),
         distinct: None,
         children,
+        lists: stored.lists,
     })
 }
 
@@ -1074,6 +1092,7 @@ impl TableSource for DiskTable {
                 match stored {
                     Some(stored) => column_statistics_of(stored, ty),
                     None => Some(ColumnStatistics {
+                        lists: None,
                         variant: None,
                         min: None,
                         max: None,

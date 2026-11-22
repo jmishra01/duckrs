@@ -44,6 +44,7 @@ mod variant_statistics;
 pub mod top_n;
 pub mod row_number_rewriter;
 pub mod type_pushdown;
+pub mod scalar_fn_pushdown;
 pub mod monotone_preimage;
 pub mod or_range_merge;
 pub mod reorder_filter;
@@ -75,6 +76,7 @@ pub struct OptimizerOptions {
     pub unused_columns: bool,
     pub row_number_rewriter: bool,
     pub type_pushdown: bool,
+    pub scalar_fn_pushdown: bool,
     pub unnest_rewriter: bool,
     /// `REORDER_FILTER`
     pub reorder_filter: bool,
@@ -151,6 +153,7 @@ impl Default for OptimizerOptions {
             unused_columns: true,
             row_number_rewriter: true,
             type_pushdown: true,
+            scalar_fn_pushdown: true,
             unnest_rewriter: true,
             reorder_filter: true,
             common_subplan: true,
@@ -212,6 +215,7 @@ impl OptimizerOptions {
             unused_columns: false,
             row_number_rewriter: false,
             type_pushdown: false,
+            scalar_fn_pushdown: false,
             unnest_rewriter: false,
             reorder_filter: false,
             common_subplan: false,
@@ -272,6 +276,7 @@ impl OptimizerOptions {
             unused_columns: !off("unused_columns"),
             row_number_rewriter: !off("window_rewriter"),
             type_pushdown: !off("type_pushdown"),
+            scalar_fn_pushdown: !off("scalar_fn_pushdown"),
             unnest_rewriter: !off("unnest_rewriter"),
             reorder_filter: !off("reorder_filter"),
             common_subplan: !off("common_subplan"),
@@ -453,6 +458,11 @@ pub fn optimize_timed(
     if options.redundant_order_keys {
         plan = run("redundant_order_keys", plan, &mut redundant_order_keys::remove);
     }
+    // `PushdownGet` has put the filters into the scans by the time statistics see them, as table filters that
+    // statistics check while the copies of what went in partly stay above
+    if options.filter_pushdown && options.statistics_propagation {
+        scan_filters::push_into_table_scans(&mut plan);
+    }
     let mut statistics_map = None;
     if options.statistics_propagation {
         plan = run("statistics_propagation", plan, &mut |mut plan| {
@@ -554,6 +564,13 @@ pub fn optimize_timed(
     if options.type_pushdown {
         plan = run("type_pushdown", plan, &mut |mut plan| {
             type_pushdown::push_down_types(&mut plan);
+            plan
+        });
+    }
+    // scalar functions in SELECT pushed into Parquet readers, e.g. `SELECT strlen(str) FROM 'f.parquet'`
+    if options.scalar_fn_pushdown {
+        plan = run("scalar_fn_pushdown", plan, &mut |mut plan| {
+            scalar_fn_pushdown::push_down_scalar_functions(&mut plan);
             plan
         });
     }

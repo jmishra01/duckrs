@@ -230,6 +230,11 @@ pub(crate) const VOLATILE_FUNCTIONS: &[&str] = &[
     "gen_random_uuid",
     "uuidv4",
     "uuidv7",
+];
+
+/// The functions that give the same in one query, but not in the next (`FunctionStability::CONSISTENT_WITHIN_QUERY`):
+/// they may move as other expressions do, but are not worked out when the query is planned.
+pub(crate) const CONSISTENT_WITHIN_QUERY_FUNCTIONS: &[&str] = &[
     "now",
     "get_current_timestamp",
     "transaction_timestamp",
@@ -426,6 +431,11 @@ impl BoundExpr {
             | BoundExprKind::Reference(_)
             | BoundExprKind::Sequence { .. }
             | BoundExprKind::Subquery { .. } => false,
+            BoundExprKind::Function { function, .. }
+                if CONSISTENT_WITHIN_QUERY_FUNCTIONS.contains(&function.name.as_str()) =>
+            {
+                false
+            }
             _ => self.children().into_iter().all(BoundExpr::is_foldable),
         }
     }
@@ -489,6 +499,19 @@ impl fmt::Display for BoundExpr {
     /// `Expression::ToString`, as far as error messages need it.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.kind {
+            // `BoundFunctionExpression::ToString` of `nextval('name')` and its kin
+            BoundExprKind::Sequence { op, sequence, arguments } => {
+                let name = match op {
+                    SequenceOp::Next => "nextval",
+                    SequenceOp::Current => "currval",
+                    SequenceOp::Set => "setval",
+                };
+                write!(f, "{name}('{}'", sequence.name.replace('\'', "''"))?;
+                for argument in arguments {
+                    write!(f, ", {argument}")?;
+                }
+                f.write_str(")")
+            }
             // `Value::ToSQLString`: a NULL with its type, unless it has none
             BoundExprKind::Constant(value) if value.is_null() => {
                 if value.logical_type().id() == duckrs_common::types::LogicalTypeId::SqlNull {

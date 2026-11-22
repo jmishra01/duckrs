@@ -18,11 +18,14 @@ use duckrs_common::sort_key::OrderType;
 use super::text_tree_renderer::{self, TextTreeConfig, TreeNode, split_lines, strip_outer_parens};
 
 /// `RenderTreeNode`.
+#[derive(Debug)]
 pub(super) struct ExplainNode {
     name: String,
     /// keys and values; a value can have several lines
     info: Vec<(String, String)>,
     estimate: Option<u64>,
+    /// the rows the operator gave on, of a run of EXPLAIN ANALYZE
+    rows: Option<u64>,
     children: Vec<ExplainNode>,
 }
 
@@ -37,6 +40,7 @@ impl ExplainNode {
                 ("Run To Completion".to_string(), "true".to_string()),
             ],
             estimate: None,
+            rows: None,
             children: vec![body, query],
         }
     }
@@ -145,6 +149,12 @@ fn aggregate_text(aggregate: &BoundAggregate) -> String {
 /// The filters of a scan as `GetFilterInfo` shows them: a BETWEEN of a column is its two
 /// comparisons (`FilterCombiner::GenerateTableScanFilters`), in one conjunction.
 fn scan_filter_lines(filters: &[BoundExpr]) -> String {
+    let marked: Vec<(BoundExpr, bool)> = filters.iter().map(|f| (f.clone(), false)).collect();
+    scan_filter_lines_marked(&marked)
+}
+
+/// [`scan_filter_lines`] of filters some of which are optional (`OptionalFilterScalarFun::ToString`).
+fn scan_filter_lines_marked(filters: &[(BoundExpr, bool)]) -> String {
     use crate::planner::expression::BoundExprKind as E;
     let text = |filter: &BoundExpr| match &filter.kind {
         E::Between { input, lower, upper } if matches!(input.kind, E::ColumnRef { .. }) => {
@@ -163,13 +173,21 @@ fn scan_filter_lines(filters: &[BoundExpr]) -> String {
         (columns.len() == 1).then(|| columns.into_iter().next()).flatten()
     };
     // an OR among them keeps its parentheses; the same filter twice is pushed once
-    let part = |filter: &BoundExpr| match &filter.kind {
-        E::Conjunction { and: false, .. } => format!("({})", text(filter)),
+    let whole = |(filter, optional): &(BoundExpr, bool)| {
+        if *optional {
+            format!("optional: {}", text(filter))
+        } else {
+            text(filter)
+        }
+    };
+    let part = |(filter, optional): &(BoundExpr, bool)| match (&filter.kind, optional) {
+        (_, true) => format!("optional: {}", text(filter)),
+        (E::Conjunction { and: false, .. }, false) => format!("({})", text(filter)),
         _ => text(filter),
     };
-    let mut groups: Vec<(Option<crate::planner::expression::ColumnBinding>, Vec<&BoundExpr>)> = Vec::new();
+    let mut groups: Vec<(Option<crate::planner::expression::ColumnBinding>, Vec<&(BoundExpr, bool)>)> = Vec::new();
     for filter in filters {
-        let key = column(filter);
+        let key = column(&filter.0);
         match groups.iter_mut().find(|(k, _)| key.is_some() && *k == key) {
             Some((_, members)) => {
                 if !members.iter().any(|m| part(m) == part(filter)) {
@@ -180,7 +198,7 @@ fn scan_filter_lines(filters: &[BoundExpr]) -> String {
         }
     }
     lines(groups.into_iter().map(|(_, members)| match members.as_slice() {
-        [only] => text(only),
+        [only] => whole(only),
         _ => members.iter().map(|m| part(m)).collect::<Vec<_>>().join(" AND "),
     }))
 }
@@ -466,16 +484,12 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
             let filters = &renamed;
             // `FormatOptionalFilterString`
             let filter_text = {
-                let mut text: Vec<String> = Vec::new();
-                if !filters.is_empty() {
-                    text.push(scan_filter_lines(filters));
-                }
-                text.extend(
-                    optional_filters
-                        .iter()
-                        .map(|f| format!("optional: {}", scan_filter_lines(&[rename(f)]))),
-                );
-                lines(text)
+                let marked: Vec<(BoundExpr, bool)> = filters
+                    .iter()
+                    .map(|f| (f.clone(), false))
+                    .chain(optional_filters.iter().map(|f| (rename(f), true)))
+                    .collect();
+                scan_filter_lines_marked(&marked)
             };
             // `LogicalGet::ParamsToString` has the filters, then what `TableScanToString` adds
             if !physical {
@@ -566,8 +580,14 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
             }
             let projected = order.into_iter().map(|at| names[at].clone());
             info.extend(entry("Projections", lines(projected)));
-            if !scan.filters.is_empty() {
-                info.extend(entry("Filters", lines(scan.filters.iter().map(filter_text))));
+            if !scan.filters.is_empty() || !scan.optional_filters.is_empty() {
+                let marked: Vec<(BoundExpr, bool)> = scan
+                    .filters
+                    .iter()
+                    .map(|f| (f.clone(), false))
+                    .chain(scan.optional_filters.iter().map(|f| (f.clone(), true)))
+                    .collect();
+                info.extend(entry("Filters", scan_filter_lines_marked(&marked)));
             }
             if !scan.file_filters.is_empty() {
                 info.extend(entry("File Filters", scan.file_filters.clone()));
@@ -704,6 +724,7 @@ pub(super) fn logical_tree(op: &LogicalOperator, estimate: Option<&PlanEstimate>
         name: logical_name(op).to_string(),
         info: operator_info(op, false),
         estimate: estimate.map(|e| e.cardinality),
+        rows: None,
         children: op
             .children
             .iter()
@@ -717,6 +738,27 @@ thread_local! {
     /// The working and recurring tables of the recursive CTEs being rendered, and their table
     /// indexes.
     static RECURSIVE_TABLES: std::cell::RefCell<Vec<(usize, usize, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// What the operators of the plan being rendered did when EXPLAIN ANALYZE ran it.
+    static ANALYZED: std::cell::RefCell<Option<std::sync::Arc<crate::execution::profiler::OperatorProfiler>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// [`physical_tree`] of a plan that ran with `profiler`, whose operators show the rows they gave on.
+pub(super) fn analyzed_tree(
+    op: &dyn PhysicalOperator,
+    logical: Option<&LogicalOperator>,
+    estimate: Option<&PlanEstimate>,
+    profiler: std::sync::Arc<crate::execution::profiler::OperatorProfiler>,
+) -> ExplainNode {
+    let previous = ANALYZED.with(|a| a.borrow_mut().replace(profiler));
+    let tree = physical_tree(op, logical, estimate, true);
+    ANALYZED.with(|a| *a.borrow_mut() = previous);
+    tree
+}
+
+/// `OperatorProfiler`'s `operator_cardinality` of `op`, when the plan ran.
+fn analyzed_rows(op: &dyn PhysicalOperator) -> Option<u64> {
+    ANALYZED.with(|a| a.borrow().as_ref().map(|profiler| profiler.metrics(op).rows))
 }
 
 /// What a scan of `table` is: `REC_CTE_SCAN` of a working table or `REC_REC_CTE_SCAN` of a
@@ -782,6 +824,7 @@ pub(super) fn physical_tree(
             name: op.name().to_string(),
             info: operator_info(cte, true),
             estimate: estimate.map(|e| e.cardinality),
+            rows: analyzed_rows(op),
             children: vec![anchor, rounds],
         };
     }
@@ -834,6 +877,7 @@ pub(super) fn physical_tree(
             name: op.name().to_string(),
             info: operator_info(aggregate, true),
             estimate: estimate.map(|e| e.cardinality),
+            rows: analyzed_rows(op),
             children: vec![physical_tree(
                 children[0].children()[0].as_ref(),
                 Some(&logical_children[0]),
@@ -854,6 +898,7 @@ pub(super) fn physical_tree(
             name: op.name().to_string(),
             info: vec![("Limit".to_string(), options.sample_size.clone())],
             estimate: estimate.map(|e| e.cardinality),
+            rows: analyzed_rows(op),
             children: vec![physical_tree(children[0].as_ref(), logical, estimate, analyze)],
         };
     }
@@ -877,6 +922,7 @@ pub(super) fn physical_tree(
             name: op.name().to_string(),
             info,
             estimate: estimate.map(|e| e.cardinality),
+            rows: analyzed_rows(op),
             children: vec![physical_tree(children[0].as_ref(), Some(window), estimate, analyze)],
         };
     }
@@ -894,6 +940,7 @@ pub(super) fn physical_tree(
             name: op.name().to_string(),
             info: vec![("Projections".to_string(), lines(references))],
             estimate: estimate.map(|e| e.cardinality),
+            rows: analyzed_rows(op),
             children: vec![physical_tree(children[0].as_ref(), logical, estimate, analyze)],
         };
     }
@@ -907,7 +954,14 @@ pub(super) fn physical_tree(
             None => physical_tree(children[0].as_ref(), logical, estimate, analyze),
         };
     }
+    let ran = ANALYZED.with(|a| a.borrow().is_some());
     let name = match logical.map(|l| &l.kind) {
+        // the profiler names an operator by its `PhysicalOperatorType`, and a scan of a table or a table
+        // function is a TABLE_SCAN
+        Some(K::Get { .. } | K::ParquetScan { .. } | K::JsonScan { .. } | K::CsvScan { .. }) if ran => {
+            "TABLE_SCAN".to_string()
+        }
+        _ if ran && crate::execution::profiler::operator_type(op) == "TABLE_SCAN" => "TABLE_SCAN".to_string(),
         Some(K::Get { .. }) => "SEQ_SCAN".to_string(),
         // `PhysicalTableScan::GetName`
         Some(K::ParquetScan { scan, .. }) => scan.function_name.to_uppercase(),
@@ -938,6 +992,7 @@ pub(super) fn physical_tree(
         name,
         info,
         estimate: estimate.map(|e| e.cardinality),
+        rows: analyzed_rows(op),
         children: children
             .iter()
             .enumerate()
@@ -955,7 +1010,9 @@ pub(super) fn physical_tree(
 
 /// `Dynamic Filters` of the table scans, from a run of the statement, in the order of the scans.
 pub(super) fn add_dynamic_filters(node: &mut ExplainNode, recorded: &mut impl Iterator<Item = Option<String>>) {
+    // of the scans of tables, not of table functions, which are TABLE_SCANs too once the plan ran
     if matches!(node.name.as_str(), "SEQ_SCAN" | "TABLE_SCAN")
+        && node.info.iter().any(|(key, _)| key == "Table")
         && let Some(Some(filters)) = recorded.next()
     {
         let at = node
@@ -989,7 +1046,7 @@ fn text_tree(node: &ExplainNode) -> TreeNode {
     TreeNode {
         name: node.name.clone(),
         details,
-        rows: None,
+        rows: node.rows,
         estimated_rows: node.estimate,
         children: node.children.iter().map(text_tree).collect(),
     }

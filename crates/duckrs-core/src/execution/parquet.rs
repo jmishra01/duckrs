@@ -66,6 +66,8 @@ pub struct ParquetScanData {
     pub arguments: String,
     /// `table_filters`: conditions on one column each, over the columns of [`Self::output_types`]
     pub filters: Vec<crate::planner::expression::BoundExpr>,
+    /// `OptionalFilter`s: implied by a filter above the scan, they only let it skip what none of their rows pass
+    pub optional_filters: Vec<crate::planner::expression::BoundExpr>,
     /// by output column, those the operators above read (`projection_ids`), once unused columns are known
     pub projected: Option<Vec<bool>>,
     /// `ExtraOperatorInfo::file_filters`: the filters that left files out, as text
@@ -77,6 +79,15 @@ pub struct ParquetScanData {
     /// the fields of columns pushed into the scan (`IsPushdownExtract`): the output column they are of, and
     /// what gives them; they are output columns after all others
     pub extracts: Vec<(usize, Arc<crate::planner::logical::PushedExtract>)>,
+    /// `ParquetReaderProjectionExpressionType::BYTE_LENGTH`: the columns from the files read as the byte length of
+    /// their values (`strlen`, `octet_length` pushed into the scan), which are BIGINT in [`Self::types`]
+    pub byte_lengths: Vec<usize>,
+    /// `projection_ids`: once a projection of just these is omitted, the columns of
+    /// [`Self::output_types`] the scan emits, in order
+    pub output: Option<Vec<usize>>,
+    /// `maximum_files_for_stats`: a scan of at most this many files opens them all at bind, for their statistics
+    /// and row counts (0: never)
+    pub files_for_stats: usize,
 }
 
 impl ParquetScanData {
@@ -128,6 +139,15 @@ impl ParquetScanData {
         types.extend(crate::execution::multi_file::virtual_types(&self.virtual_columns));
         types.extend(self.extracts.iter().map(|(_, e)| e.expression.return_type.clone()));
         types
+    }
+
+    /// The types of the columns the scan emits: [`Self::output_types`], or those of [`Self::output`].
+    pub fn emitted_types(&self) -> Vec<LogicalType> {
+        let types = self.output_types();
+        match &self.output {
+            Some(output) => output.iter().map(|&at| types[at].clone()).collect(),
+            None => types,
+        }
     }
 }
 
@@ -1073,7 +1093,10 @@ fn row_groups_to_scan(
         return None;
     }
     let leaves: Vec<Option<usize>> = (0..scan.names.len())
-        .map(|column| statistics_leaf(scan, metadata, column))
+        .map(|column| statistics_leaf(scan, metadata, column, path))
+        .collect();
+    let element_leaves: Vec<Option<(usize, LogicalType)>> = (0..scan.names.len())
+        .map(|column| element_leaf(scan, metadata, column, path))
         .collect();
     let normalized = normalized_interval_blooms(metadata);
     let mut file = None;
@@ -1083,8 +1106,17 @@ fn row_groups_to_scan(
         .enumerate()
         .filter(|(_, group)| {
             let zone = |at: usize| -> Option<crate::catalog::ColumnZone> {
+                if let Some((leaf, element)) = element_leaves.get(at).and_then(Option::as_ref) {
+                    // `TransformColumnStatistics` of a LIST or MAP: unknown validity, the elements' statistics
+                    let elements = group_zone(scan, metadata, group, *leaf, element)?;
+                    return (!elements.unknown).then(|| crate::catalog::ColumnZone {
+                        has_null: true,
+                        elements: Some(Box::new(elements)),
+                        ..Default::default()
+                    });
+                }
                 if let Some(leaf) = leaves.get(at) {
-                    let zone = group_zone(scan, metadata, group, (*leaf)?, at)?;
+                    let zone = group_zone(scan, metadata, group, (*leaf)?, &scan.types[at])?;
                     return (!zone.unknown).then_some(zone);
                 }
                 let value = scan.known_value(at, path)?;
@@ -1097,7 +1129,7 @@ fn row_groups_to_scan(
                 })
             };
             !crate::execution::zone_map::never_true(&zone, filter)
-                && !bloom_rules_out(scan, &leaves, group, filter, &mut file, path, normalized)
+                && !bloom_rules_out(scan, &leaves, &element_leaves, group, filter, &mut file, path, normalized)
         })
         .map(|(at, _)| at)
         .collect();
@@ -1109,6 +1141,7 @@ fn row_groups_to_scan(
 fn bloom_rules_out(
     scan: &ParquetScanData,
     leaves: &[Option<usize>],
+    elements: &[Option<(usize, LogicalType)>],
     group: &parquet::file::metadata::RowGroupMetaData,
     expr: &crate::planner::expression::BoundExpr,
     file: &mut Option<File>,
@@ -1120,7 +1153,7 @@ fn bloom_rules_out(
         E::Conjunction { and: true, children } => {
             if children
                 .iter()
-                .any(|child| bloom_rules_out(scan, leaves, group, child, file, path, normalized))
+                .any(|child| bloom_rules_out(scan, leaves, elements, group, child, file, path, normalized))
             {
                 return true;
             }
@@ -1152,12 +1185,12 @@ fn bloom_rules_out(
                         },
                         LogicalType::BOOLEAN,
                     );
-                    matched && bloom_rules_out(scan, leaves, group, &equal, file, path, normalized)
+                    matched && bloom_rules_out(scan, leaves, elements, group, &equal, file, path, normalized)
                 })
         }
         E::Conjunction { and: false, children } => children
             .iter()
-            .all(|child| bloom_rules_out(scan, leaves, group, child, file, path, normalized)),
+            .all(|child| bloom_rules_out(scan, leaves, elements, group, child, file, path, normalized)),
         // `x BETWEEN c AND c` is `x = c`
         E::Between { input, lower, upper } => match (&input.kind, &lower.kind, &upper.kind) {
             (E::Reference(_), E::Constant(low), E::Constant(high)) if low == high => {
@@ -1169,7 +1202,7 @@ fn bloom_rules_out(
                     },
                     LogicalType::BOOLEAN,
                 );
-                bloom_rules_out(scan, leaves, group, &equal, file, path, normalized)
+                bloom_rules_out(scan, leaves, elements, group, &equal, file, path, normalized)
             }
             _ => false,
         },
@@ -1179,16 +1212,34 @@ fn bloom_rules_out(
             left,
             right,
         } => {
-            let (column, value) = match (&left.kind, &right.kind) {
-                (E::Reference(column), E::Constant(value)) | (E::Constant(value), E::Reference(column)) => {
-                    (*column, value)
+            let (target, value) = match (&left.kind, &right.kind) {
+                (_, E::Constant(value)) => (left.as_ref(), value),
+                (E::Constant(value), _) => (right.as_ref(), value),
+                _ => return false,
+            };
+            // `TryGetNestedBloomFilterLeaf`: a column, an element of a LIST column or a value of a MAP column
+            let (leaf, ty) = match &target.kind {
+                E::Reference(column) => match leaves.get(*column) {
+                    Some(Some(leaf)) => (*leaf, &scan.types[*column]),
+                    _ => return false,
+                },
+                E::Function { function, children, .. } if children.len() == 2 => {
+                    let E::Reference(column) = children[0].kind else {
+                        return false;
+                    };
+                    let extract = match scan.types[column].id() {
+                        LogicalTypeId::List => matches!(function.name.as_str(), "list_extract" | "array_extract"),
+                        LogicalTypeId::Map => matches!(function.name.as_str(), "map_extract_value" | "array_extract"),
+                        _ => false,
+                    };
+                    match elements.get(column) {
+                        Some(Some((leaf, element))) if extract => (*leaf, element),
+                        _ => return false,
+                    }
                 }
                 _ => return false,
             };
-            let Some(Some(leaf)) = leaves.get(column) else {
-                return false;
-            };
-            let ty = &scan.types[column];
+            let leaf = &leaf;
             let Some(value) = try_cast_value(value, ty).filter(|v| !v.is_null()) else {
                 return false;
             };
@@ -1372,6 +1423,18 @@ fn batch_chunk(
         for row in 0..count {
             vector.set_value(row, &array_value(array, row, file_type)?)?;
         }
+        if scan.byte_lengths.contains(&index) {
+            let mut lengths = Vector::new(LogicalType::BIGINT, count);
+            for row in 0..count {
+                let length = match vector.get_value(row).data() {
+                    ValueData::Bytes(bytes) => Value::bigint(bytes.len() as i64),
+                    _ => Value::null(LogicalType::BIGINT),
+                };
+                lengths.set_value(row, &length)?;
+            }
+            columns.push(lengths);
+            continue;
+        }
         // a VARIANT the file has shredded into a `typed_value` reads as a SHREDDED_VECTOR
         if file_type.id() == LogicalTypeId::Variant
             && array.as_struct_opt().is_some_and(|group| group.column_by_name("typed_value").is_some())
@@ -1472,8 +1535,10 @@ fn cast_error(
 pub struct PhysicalParquetScan {
     pub types: Vec<LogicalType>,
     pub scan: Arc<ParquetScanData>,
-    /// the conjunction of the scan's filters
+    /// the conjunction of the scan's filters, which each row passes
     pub filter: Option<crate::planner::expression::BoundExpr>,
+    /// the conjunction of those and the optional filters, which only skip row groups
+    pub prune: Option<crate::planner::expression::BoundExpr>,
 }
 
 impl PhysicalOperator for PhysicalParquetScan {
@@ -1490,14 +1555,14 @@ impl PhysicalOperator for PhysicalParquetScan {
         Box::new(ParquetScanState::default())
     }
     fn row_groups_scanned(&self) -> Option<(usize, usize)> {
-        self.filter.as_ref()?;
+        self.prune.as_ref()?;
         let (mut scanned, mut total) = (0, 0);
         for path in &self.scan.files {
             let (metadata, _) = read_metadata(path).ok()?;
             let groups = metadata.num_row_groups();
             total += groups;
             scanned +=
-                row_groups_to_scan(&self.scan, self.filter.as_ref(), &metadata, path).map_or(groups, |g| g.len());
+                row_groups_to_scan(&self.scan, self.prune.as_ref(), &metadata, path).map_or(groups, |g| g.len());
         }
         (total > 0).then_some((scanned, total))
     }
@@ -1508,7 +1573,7 @@ impl PhysicalOperator for PhysicalParquetScan {
                 return Ok(None);
             };
             if state.reader.is_none() {
-                open_file(&self.scan, self.filter.as_ref(), state, path)?;
+                open_file(&self.scan, self.prune.as_ref(), state, path)?;
             }
             let reader = state.reader.as_mut().expect("just opened");
             match guarded(path, || Ok(reader.next()))? {
@@ -1541,6 +1606,10 @@ impl PhysicalOperator for PhysicalParquetScan {
                                 let input = DataChunk::from_columns(vec![chunk.column(*base).clone()], chunk.len());
                                 columns.push(crate::execution::expression_executor::execute(&extract.expression, &input)?);
                             }
+                            chunk = DataChunk::from_columns(columns, chunk.len());
+                        }
+                        if let Some(output) = &self.scan.output {
+                            let columns = output.iter().map(|&at| chunk.column(at).clone()).collect();
                             chunk = DataChunk::from_columns(columns, chunk.len());
                         }
                         return Ok(Some(chunk));
@@ -2507,7 +2576,7 @@ pub fn partition_statistics(scan: &ParquetScanData) -> Option<Vec<(u64, Vec<Opti
     };
     let (metadata, _) = read_metadata(file).ok()?;
     let leaves: Vec<Option<usize>> = (0..scan.names.len())
-        .map(|column| statistics_leaf(scan, &metadata, column))
+        .map(|column| statistics_leaf(scan, &metadata, column, file))
         .collect();
     let groups = metadata
         .row_groups()
@@ -2516,7 +2585,7 @@ pub fn partition_statistics(scan: &ParquetScanData) -> Option<Vec<(u64, Vec<Opti
             let zones = leaves
                 .iter()
                 .enumerate()
-                .map(|(at, leaf)| group_zone(scan, &metadata, group, (*leaf)?, at).filter(|z| !z.unknown))
+                .map(|(at, leaf)| group_zone(scan, &metadata, group, (*leaf)?, &scan.types[at]).filter(|z| !z.unknown))
                 .collect();
             let exact = leaves.iter().all(|leaf| {
                 leaf.and_then(|leaf| group.column(leaf).statistics())
@@ -2532,7 +2601,7 @@ pub fn partition_statistics(scan: &ParquetScanData) -> Option<Vec<(u64, Vec<Opti
 /// file it opened (`ReadSingleParquetFileCardinality`; the footer's total is not what the scan
 /// reads), which is the one file, or all of them with `union_by_name`.
 pub fn scan_max_cardinality(scan: &ParquetScanData) -> Option<u64> {
-    if scan.files.is_empty() || (scan.files.len() > 1 && !scan.union_by_name) {
+    if scan.files.is_empty() || !all_files_opened(scan) {
         return None;
     }
     scan.files.iter().try_fold(0u64, |total, file| {
@@ -2544,8 +2613,9 @@ pub fn scan_max_cardinality(scan: &ParquetScanData) -> Option<u64> {
     })
 }
 
-/// `ParquetMultiFileInfo::GetCardinality`: the rows of the one file, or of the first for each file, at least 1000
-/// (there are no file sizes to tell more by).
+/// `MultiFileCardinality`: the rows of the one file, or of all files when the bind opened them all; otherwise
+/// `ParquetMultiFileInfo::GetCardinality`, the rows of the first for each file, at least 1000 (there are no file
+/// sizes to tell more by).
 pub fn scan_cardinality(scan: &ParquetScanData) -> Option<u64> {
     let Some(first) = scan.files.first() else {
         return Some(0);
@@ -2555,31 +2625,52 @@ pub fn scan_cardinality(scan: &ParquetScanData) -> Option<u64> {
     if scan.files.len() == 1 {
         return Some(rows);
     }
+    // the files opened at bind: their footers' totals
+    if all_files_opened(scan) {
+        let mut total = 0u64;
+        for file in &scan.files {
+            let (metadata, _) = read_metadata(file).ok()?;
+            total = total.checked_add(metadata.file_metadata().num_rows().max(0) as u64)?;
+        }
+        return Some(total);
+    }
     Some(rows.max(1000) * scan.files.len() as u64)
 }
 
-/// The most files whose footers statistics are read from (`parquet_metadata_cache` aside, each is a read).
-const MAX_FILES_FOR_STATISTICS: usize = 64;
+/// Whether the bind opened every file of the scan (`union_readers` of them all): one file, `union_by_name`, or no
+/// more than `maximum_files_for_stats`. Only then do their statistics and row counts describe the scan.
+fn all_files_opened(scan: &ParquetScanData) -> bool {
+    scan.files.len() <= 1
+        || scan.union_by_name
+        || (scan.files_for_stats > 0 && scan.files.len() <= scan.files_for_stats)
+}
 
 /// `ParquetReader::ReadStatistics` over the files of a scan: what the footers say of each column from the
 /// files, `None` where they don't say it.
 pub fn scan_statistics(scan: &ParquetScanData) -> Vec<Option<crate::catalog::ColumnStatistics>> {
     let unknown = vec![None; scan.names.len()];
-    if scan.files.len() > MAX_FILES_FOR_STATISTICS || scan.schema.is_some() {
+    if !all_files_opened(scan) {
         return unknown;
     }
     let mut result: Vec<Option<crate::catalog::ColumnStatistics>> = Vec::new();
-    for (file_index, path) in scan.files.iter().enumerate() {
+    let mut first = true;
+    for path in &scan.files {
         let Ok((metadata, _)) = read_metadata(path) else {
             return unknown;
         };
+        // an empty file of several has no statistics, and no values the merged bounds must cover
+        let rows: i64 = metadata.row_groups().iter().map(|group| group.num_rows()).sum();
+        if scan.files.len() > 1 && rows == 0 {
+            continue;
+        }
         let mut file_stats = Vec::with_capacity(scan.names.len());
         for column in 0..scan.names.len() {
-            let Some(leaf) = statistics_leaf(scan, &metadata, column) else {
+            let Some(leaf) = statistics_leaf(scan, &metadata, column, path) else {
                 file_stats.push(None);
                 continue;
             };
             let mut stats = crate::catalog::ColumnStatistics {
+                lists: None,
                 variant: None,
                 min: None,
                 max: None,
@@ -2592,11 +2683,21 @@ pub fn scan_statistics(scan: &ParquetScanData) -> Vec<Option<crate::catalog::Col
             };
             let mut bounds_known = true;
             let mut usable = true;
+            // `StringStats` of each row group (`TransformParquetStatistics`), merged
+            let string_column = matches!(scan.types[column].id(), LogicalTypeId::Varchar | LogicalTypeId::Blob);
+            let mut strings: Option<crate::catalog::StringStatistics> = None;
             for group in metadata.row_groups() {
-                let Some(zone) = group_zone(scan, &metadata, group, leaf, column) else {
+                let Some(zone) = group_zone(scan, &metadata, group, leaf, &scan.types[column]) else {
                     usable = false;
                     break;
                 };
+                if string_column {
+                    let group_strings = row_group_strings(&zone, scan.types[column].id() == LogicalTypeId::Varchar);
+                    strings = Some(match strings {
+                        Some(merged) => merged.merge(&group_strings, false),
+                        None => group_strings,
+                    });
+                }
                 stats.can_be_null |= zone.has_null;
                 stats.can_be_valid |= zone.min.is_some() || zone.unknown;
                 match (zone.min, zone.max) {
@@ -2624,10 +2725,15 @@ pub fn scan_statistics(scan: &ParquetScanData) -> Vec<Option<crate::catalog::Col
                 stats.min = None;
                 stats.max = None;
             }
+            if string_column {
+                stats.strings = Some(strings.unwrap_or_else(unknown_strings));
+                string_bounds_only(&mut stats);
+            }
             file_stats.push(usable.then_some(stats));
         }
-        if file_index == 0 {
+        if first {
             result = file_stats;
+            first = false;
             continue;
         }
         // `MergeStatistics`
@@ -2652,6 +2758,10 @@ pub fn scan_statistics(scan: &ParquetScanData) -> Vec<Option<crate::catalog::Col
                         (None, y) if !a.can_be_valid => y,
                         _ => None,
                     };
+                    if let (Some(x), Some(y)) = (&a.strings, &b.strings) {
+                        a.strings = Some(x.merge(y, false));
+                        string_bounds_only(&mut a);
+                    }
                     Some(a)
                 }
                 _ => None,
@@ -2664,27 +2774,138 @@ pub fn scan_statistics(scan: &ParquetScanData) -> Vec<Option<crate::catalog::Col
     result
 }
 
+/// `StringStats::CreateUnknown`: no bounds or lengths, and maybe unicode.
+fn unknown_strings() -> crate::catalog::StringStatistics {
+    crate::catalog::StringStatistics {
+        bounds: None,
+        has_unicode: true,
+        min_length: None,
+        max_length: None,
+        total_length: None,
+    }
+}
+
+/// The string statistics of a row group: its exact bounds, a constant where they are the same
+/// (`StringStats::FromConstant`); none without exact bounds, or with only NULLs.
+fn row_group_strings(zone: &crate::catalog::ColumnZone, varchar: bool) -> crate::catalog::StringStatistics {
+    let bytes = |value: &Option<Value>| match value.as_ref().map(|v| v.data()) {
+        Some(ValueData::Bytes(bytes)) => Some(bytes.clone()),
+        _ => None,
+    };
+    match (bytes(&zone.min), bytes(&zone.max)) {
+        (Some(min), Some(max)) if !zone.unknown => {
+            if min == max {
+                crate::catalog::StringStatistics::of_constant(&min, varchar)
+            } else {
+                crate::catalog::StringStatistics {
+                    bounds: Some((min, max)),
+                    ..unknown_strings()
+                }
+            }
+        }
+        _ => unknown_strings(),
+    }
+}
+
+/// Strings have bounds only where their string statistics do.
+fn string_bounds_only(stats: &mut crate::catalog::ColumnStatistics) {
+    if stats.strings.as_ref().is_some_and(|strings| strings.bounds.is_none()) {
+        stats.min = None;
+        stats.max = None;
+    }
+}
+
 /// The leaf of the file that the scan's column `column` reads and whose statistics are its own: a top-level column
 /// that is a leaf, not overridden by a hive partition, and not repaired as it is read.
-fn statistics_leaf(scan: &ParquetScanData, metadata: &ParquetMetaData, column: usize) -> Option<usize> {
-    let (name, ty) = (scan.names.get(column)?, &scan.types[column]);
-    if scan.schema.is_some()
-        || scan
+/// With a `schema`, the column is the file's column of the name its key gives (`MatchesPhysicalColumn`): not
+/// one found by field id, a nested one, or one the file stores as another type.
+fn statistics_leaf(scan: &ParquetScanData, metadata: &ParquetMetaData, column: usize, path: &str) -> Option<usize> {
+    let (name, ty) = match &scan.schema {
+        Some(schema) => {
+            let defined = schema.get(column)?;
+            let crate::execution::parquet_schema::SchemaKey::Name(name) = &defined.key else {
+                return None;
+            };
+            if !defined.children.is_empty() || stored_type(scan, path, name).as_ref() != Some(&defined.ty) {
+                return None;
+            }
+            (name, &defined.ty)
+        }
+        None => (scan.names.get(column)?, &scan.types[column]),
+    };
+    if scan
             .hive_overrides
             .iter()
             .any(|(_, key)| key.eq_ignore_ascii_case(name))
     {
         return None;
     }
-    // repaired strings no longer lie within the bounds of the stored bytes
-    if scan.utf8_validation.repairs() && ty.id() == LogicalTypeId::Varchar {
+    let descriptor = metadata.file_metadata().schema_descr();
+    let leaf = (0..descriptor.num_columns()).find(|&i| {
+        let path = descriptor.column(i).path().parts().to_vec();
+        path.len() == 1 && path[0].eq_ignore_ascii_case(name)
+    })?;
+    // repaired strings no longer lie within the bounds of the stored bytes (`StringColumnType::VARCHAR`; JSON, which
+    // the file marks as such, is validated but not repaired)
+    let json = ty.alias() == Some("JSON")
+        || descriptor.column(leaf).converted_type() == parquet::basic::ConvertedType::JSON
+        || matches!(descriptor.column(leaf).logical_type_ref(), Some(parquet::basic::LogicalType::Json));
+    if scan.utf8_validation.repairs() && ty.id() == LogicalTypeId::Varchar && !json {
+        return None;
+    }
+    Some(leaf)
+}
+
+/// The leaf that holds the elements of the LIST column `column`, or the values of the MAP column, with their type:
+/// `None` for other columns, or elements that are nested themselves.
+fn element_leaf(
+    scan: &ParquetScanData,
+    metadata: &ParquetMetaData,
+    column: usize,
+    path: &str,
+) -> Option<(usize, LogicalType)> {
+    let ty = scan.types.get(column)?;
+    let element = match ty.id() {
+        LogicalTypeId::List => ty.child_type()?.clone(),
+        LogicalTypeId::Map => ty.child_type()?.struct_children().get(1)?.1.clone(),
+        _ => return None,
+    };
+    if scan.schema.is_some() || element.is_nested() {
+        return None;
+    }
+    let name = scan.names.get(column)?;
+    if scan.hive_overrides.iter().any(|(_, key)| key.eq_ignore_ascii_case(name)) {
+        return None;
+    }
+    if stored_type(scan, path, name).as_ref() != Some(ty) {
         return None;
     }
     let descriptor = metadata.file_metadata().schema_descr();
-    (0..descriptor.num_columns()).find(|&i| {
-        let path = descriptor.column(i).path().parts().to_vec();
-        path.len() == 1 && path[0].eq_ignore_ascii_case(name)
-    })
+    let leaves: Vec<usize> = (0..descriptor.num_columns())
+        .filter(|&i| {
+            let column = descriptor.column(i);
+            let parts = column.path().parts();
+            parts.len() == 3 && parts[0].eq_ignore_ascii_case(name)
+        })
+        .collect();
+    // a list has one leaf, a map its keys and then its values
+    let leaf = match (ty.id(), leaves.as_slice()) {
+        (LogicalTypeId::List, [leaf]) | (LogicalTypeId::Map, [_, leaf]) => *leaf,
+        _ => return None,
+    };
+    if scan.utf8_validation.repairs() && element.id() == LogicalTypeId::Varchar {
+        return None;
+    }
+    Some((leaf, element))
+}
+
+/// The DuckDB type the file at `path` stores its top-level column `name` as.
+fn stored_type(scan: &ParquetScanData, path: &str, name: &str) -> Option<LogicalType> {
+    let builder = open_builder(path).ok()?;
+    let special = special_columns(&builder);
+    let schema = Arc::clone(builder.schema());
+    let index = schema.fields().iter().position(|field| field.name().eq_ignore_ascii_case(name))?;
+    column_type(schema.field(index), &special, index, scan.binary_as_string, scan.int96_as).ok()
 }
 
 /// What the statistics of row group `group` say of the scan's column `column`, stored in `leaf`: `None` where
@@ -2694,10 +2915,9 @@ fn group_zone(
     metadata: &ParquetMetaData,
     group: &parquet::file::metadata::RowGroupMetaData,
     leaf: usize,
-    column: usize,
+    ty: &LogicalType,
 ) -> Option<crate::catalog::ColumnZone> {
     use parquet::basic::Type as Physical;
-    let ty = &scan.types[column];
     let descriptor = metadata.file_metadata().schema_descr().column(leaf);
     let statistics = group.column(leaf).statistics()?;
     let rows = group.num_rows() as u64;
@@ -3768,4 +3988,36 @@ pub fn file_metadata_row(path: &str) -> Result<String> {
         metadata.num_row_groups(),
         file.version(),
     ))
+}
+
+/// The part of `ParquetScanFunction::ProjectionExpressionPushdown` that reads the file: whether the column of the
+/// scan's (only) file at `column` can be read as the byte lengths of its values. Its values are stored without
+/// `DELTA_LENGTH_BYTE_ARRAY` in every row group.
+pub fn reads_byte_length(scan: &ParquetScanData, column: usize) -> bool {
+    let (Some(path), Some(name)) = (scan.files.first(), scan.names.get(column)) else {
+        return false;
+    };
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    let Ok(metadata) = ParquetMetaDataReader::new().parse_and_finish(&file) else {
+        return false;
+    };
+    let schema = metadata.file_metadata().schema_descr();
+    let fields = schema.root_schema().get_fields();
+    let Some(root) = fields.iter().position(|field| field.name().eq_ignore_ascii_case(name)) else {
+        return false;
+    };
+    if !fields[root].is_primitive() {
+        return false;
+    }
+    let Some(leaf) = (0..schema.num_columns()).find(|leaf| schema.get_column_root_idx(*leaf) == root) else {
+        return false;
+    };
+    metadata.row_groups().iter().all(|group| {
+        group
+            .column(leaf)
+            .encodings()
+            .all(|encoding| encoding != parquet::basic::Encoding::DELTA_LENGTH_BYTE_ARRAY)
+    })
 }
