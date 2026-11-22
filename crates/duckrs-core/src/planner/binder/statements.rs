@@ -2550,7 +2550,7 @@ impl Binder<'_> {
                     && Self::is_system_table(&name.name)
                     && crate::catalog::defaults::default_view(None, &name.name).is_none()
                 {
-                    return self.bind_system_table(table_ref, &name.name);
+                    return self.bind_system_table(table_ref, &name.name).map(|op| table_function_rows(op, &name.name));
                 }
                 // `BindBaseTableRef`: a file that is there, but that no reader is for
                 if entry.is_err()
@@ -2567,7 +2567,7 @@ impl Binder<'_> {
                 }
                 // the `duckdb_logs` view of `default_views.cpp`
                 if entry.is_err() && name.qualification.is_empty() && name.name.eq_ignore_ascii_case("duckdb_logs") {
-                    return self.bind_log_table("duckdb_logs", true, table_ref);
+                    return self.bind_log_table("duckdb_logs", true, table_ref).map(|op| table_function_rows(op, "duckdb_logs"));
                 }
                 // the other views of the system catalog (`DefaultViewGenerator`), by their query
                 if entry.is_err() {
@@ -2647,6 +2647,7 @@ impl Binder<'_> {
                 });
                 Ok(LogicalOperator::new(
                     LogicalOperatorKind::ExpressionGet {
+                        function: None,
                         table_index,
                         types,
                         expressions,
@@ -2794,14 +2795,16 @@ impl Binder<'_> {
                         name: parts.pop().unwrap_or_default(),
                         qualification: parts,
                     };
-                    return self.bind_pragma_table_info(table_ref, &call.name.name, &table);
+                    return self
+                        .bind_pragma_table_info(table_ref, &call.name.name, &table)
+                        .map(|op| table_function_rows(op, &call.name.name));
                 }
                 if let ExprKind::Function(call) = &function.kind
                     && call.name.qualification.is_empty()
                     && call.args.is_empty()
                     && Self::is_system_table(&call.name.name)
                 {
-                    return self.bind_system_table(table_ref, &call.name.name);
+                    return self.bind_system_table(table_ref, &call.name.name).map(|op| table_function_rows(op, &call.name.name));
                 }
                 self.bind_range(function, table_ref)
             }
@@ -2887,13 +2890,13 @@ impl Binder<'_> {
         };
         let name = call.name.name.to_lowercase();
         if name == "duckdb_settings" {
-            return self.bind_duckdb_settings(call, table_ref);
+            return self.bind_duckdb_settings(call, table_ref).map(|op| table_function_rows(op, &name));
         }
         if name == "duckdb_logs" || name == "duckdb_log_contexts" {
-            return self.bind_duckdb_logs(&name, call, table_ref);
+            return self.bind_duckdb_logs(&name, call, table_ref).map(|op| table_function_rows(op, &name));
         }
         if name == "pragma_storage_info" {
-            return self.bind_storage_info(call, table_ref);
+            return self.bind_storage_info(call, table_ref).map(|op| table_function_rows(op, &name));
         }
         let generate_series = name == "generate_series";
         if !(generate_series || name == "range") || !call.name.qualification.is_empty() {
@@ -3515,6 +3518,7 @@ impl Binder<'_> {
                             table_index,
                             types,
                             expressions,
+                            function: None,
                         },
                         vec![],
                     )
@@ -4083,3 +4087,11 @@ const CPP_TABLE_FUNCTIONS: &[&str] = &[
     "unnest",
     "which_secret",
 ];
+
+/// Rows a table function computed while binding: EXPLAIN shows them as a scan of `name`.
+fn table_function_rows(mut op: LogicalOperator, name: &str) -> LogicalOperator {
+    if let LogicalOperatorKind::ExpressionGet { function, .. } = &mut op.kind {
+        *function = Some(name.to_lowercase());
+    }
+    op
+}

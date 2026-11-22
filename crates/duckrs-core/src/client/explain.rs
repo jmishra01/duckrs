@@ -414,6 +414,10 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
         info
     };
     match &op.kind {
+        // `PhysicalTableScan::ParamsToString` of a table function without `to_string`
+        K::ExpressionGet {
+            function: Some(function), ..
+        } if physical => entry("Function", function.to_uppercase()),
         K::MaterializedCte { name, table_index, .. } => {
             let mut info = entry("CTE Name", name.clone());
             info.extend(entry("Table Index", table_index.to_string()));
@@ -958,14 +962,19 @@ pub(super) fn physical_tree(
     let name = match logical.map(|l| &l.kind) {
         // the profiler names an operator by its `PhysicalOperatorType`, and a scan of a table or a table
         // function is a TABLE_SCAN
-        Some(K::Get { .. } | K::ParquetScan { .. } | K::JsonScan { .. } | K::CsvScan { .. }) if ran => {
-            "TABLE_SCAN".to_string()
-        }
+        Some(
+            K::Get { .. }
+            | K::ParquetScan { .. }
+            | K::JsonScan { .. }
+            | K::CsvScan { .. }
+            | K::ExpressionGet { function: Some(_), .. },
+        ) if ran => "TABLE_SCAN".to_string(),
         _ if ran && crate::execution::profiler::operator_type(op) == "TABLE_SCAN" => "TABLE_SCAN".to_string(),
         Some(K::Get { .. }) => "SEQ_SCAN".to_string(),
         // `PhysicalTableScan::GetName`
         Some(K::ParquetScan { scan, .. }) => scan.function_name.to_uppercase(),
         Some(K::JsonScan { scan, .. }) => scan.function_name.to_uppercase(),
+        Some(K::ExpressionGet { function: Some(function), .. }) => function.to_uppercase(),
         Some(K::WorkingTable { working, .. }) => match recursive_scan(working) {
             Some((name, _)) => name.to_string(),
             None => op.name().to_string(),

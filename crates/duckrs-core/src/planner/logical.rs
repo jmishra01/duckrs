@@ -116,6 +116,9 @@ pub enum LogicalOperatorKind {
         table_index: usize,
         types: Vec<LogicalType>,
         expressions: Vec<Vec<BoundExpr>>,
+        /// the table function whose rows these are, computed while binding (`duckdb_types()`), which
+        /// EXPLAIN names the scan after as C++'s `PhysicalTableScan` does
+        function: Option<String>,
     },
     /// `LogicalFilter`: keeps the rows for which all expressions are true.
     Filter { expressions: Vec<BoundExpr> },

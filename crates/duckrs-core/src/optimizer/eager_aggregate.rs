@@ -215,6 +215,7 @@ pub(super) fn try_execute(op: &LogicalOperator) -> Option<LogicalOperator> {
         .collect();
     Some(LogicalOperator::new(
         K::ExpressionGet {
+            function: None,
             table_index: *aggregate_index,
             types,
             expressions: vec![row],
