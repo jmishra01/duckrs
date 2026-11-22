@@ -292,7 +292,7 @@ pub fn typeof_constant(argument: &LogicalType) -> Value {
 pub fn stats_supported(ty: &LogicalType) -> bool {
     match ty.id() {
         // the statistics of any child at least know its NULLs
-        LogicalTypeId::List | LogicalTypeId::Array | LogicalTypeId::Struct => true,
+        LogicalTypeId::List | LogicalTypeId::Array | LogicalTypeId::Map | LogicalTypeId::Struct => true,
         _ => {
             matches!(
                 ty.id(),

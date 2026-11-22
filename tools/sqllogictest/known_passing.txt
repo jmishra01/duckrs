@@ -1797,6 +1797,8 @@ test/sql/copy/parquet/issue_27456_constant_stats.test
 test/sql/copy/parquet/json_parquet.test
 test/sql/copy/parquet/kv_metadata.test
 test/sql/copy/parquet/kv_metadata_null.test
+test/sql/copy/parquet/list_contains_row_group_pruning.test
+test/sql/copy/parquet/map_extract_row_group_pruning.test
 test/sql/copy/parquet/multi_file/multi_file_filter_integer_types.test
 test/sql/copy/parquet/multi_file/multi_file_filter_mixed.test
 test/sql/copy/parquet/multi_file/multi_file_filter_struct.test

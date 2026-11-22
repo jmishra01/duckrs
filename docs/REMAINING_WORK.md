@@ -262,8 +262,12 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] string statistics through functions (contains, suffix, upper/lower, length)
   - [x] list lengths through `length` / `array_length` (a `constant_or_null` where all lists are as long),
     `list_value`, `list_concat`, `flatten` and ARRAY to LIST casts
-  - [ ] struct/list/map extracts, EXPLAIN ANALYZE metrics of other operators (EXPLAIN-shape files under
-    `test/optimizer`, `sql/optimizer`)
+  - [x] struct/list/map extracts: MAP columns have statistics (`stats(m)`, their keys' and values'), which
+    `m[k]` / `map_extract_value` and `map_values` carry; `struct_concat`, `struct_insert` and `struct_update` keep
+    their fields'; `list_position` of a value no element can be is NULL (`ListPositionPropagateStats`); Parquet row
+    groups skipped by the elements of a LIST and the values of a MAP (`list_contains`, `m[k]`), and by the bloom
+    filter of those leaves (`TryGetNestedBloomFilterLeaf`)
+  - [ ] EXPLAIN ANALYZE metrics of other operators (EXPLAIN-shape files under `test/optimizer`, `sql/optimizer`)
 - [ ] 16. Join order and cardinality estimation (`optimizer/joins`: 1 failing)
   - [x] LEFT join equality groups, `debug_force_no_cross_product`, `approximate_join_order_threshold`
   - [ ] LEFT joins reordered inside the join graph (C++'s CD-C conflict detector, `left_join_cardinality_estimation`)
