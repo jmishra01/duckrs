@@ -369,6 +369,10 @@ pub struct JoinBuild {
     spilled_rows: usize,
     /// what the rows in memory took of the memory limit
     reserved: usize,
+    /// per column, the vectors of the chunks that came in and are not in `columns` yet, each with the row it starts
+    /// at and its rows: threads hand their chunks over while they hold the build, and the copying waits for
+    /// [`Self::materialize`], which does it a column per thread
+    pending: Vec<Vec<(Vector, usize, usize)>>,
 }
 
 impl JoinBuild {
@@ -385,7 +389,41 @@ impl JoinBuild {
             spilled: vec![false; PARTITIONS],
             spilled_rows: 0,
             reserved: 0,
+            pending: types.iter().map(|_| Vec::new()).collect(),
         }
+    }
+
+    /// Copies the chunks that came in into `columns`, each column on a thread of its own when there are many rows.
+    fn materialize(&mut self) {
+        let rows: usize = self
+            .pending
+            .first()
+            .map_or(0, |column| column.iter().map(|&(_, _, len)| len).sum());
+        if rows == 0 {
+            return;
+        }
+        let count = self.count;
+        let copy = |target: &mut Vector, sources: Vec<(Vector, usize, usize)>| {
+            if target.capacity() < count {
+                target.resize(count.next_power_of_two());
+            }
+            for (source, offset, len) in sources {
+                let sel = SelectionVector::from_vec((0..len as u32).collect());
+                target.copy_from(&source, &sel, len, offset, StringCopy::Reference);
+            }
+        };
+        let pending: Vec<_> = self.pending.iter_mut().map(std::mem::take).collect();
+        if rows < MIN_PARALLEL_BUILD_ROWS || self.columns.len() < 2 {
+            for (target, sources) in self.columns.iter_mut().zip(pending) {
+                copy(target, sources);
+            }
+            return;
+        }
+        std::thread::scope(|scope| {
+            for (target, sources) in self.columns.iter_mut().zip(pending) {
+                scope.spawn(move || copy(target, sources));
+            }
+        });
     }
 
     /// The build rows listed in `rows`, as a chunk of their own.
@@ -470,6 +508,26 @@ impl Partition {
     fn rows(&self, group: usize) -> &[u32] {
         &self.rows[self.offsets[group] as usize..self.offsets[group + 1] as usize]
     }
+
+    /// Asks for where the rows of `group` are.
+    #[inline]
+    fn prefetch_offsets(&self, group: usize) {
+        if let Some(offset) = self.offsets.get(group) {
+            super::prefetch(offset);
+        }
+    }
+
+    /// Asks for the rows of `group`, reading where they are.
+    #[inline]
+    fn prefetch_rows(&self, group: usize) {
+        if let Some(row) = self
+            .offsets
+            .get(group)
+            .and_then(|&offset| self.rows.get(offset as usize))
+        {
+            super::prefetch(row);
+        }
+    }
 }
 
 /// The build side once all of it is there, which threads probe at once.
@@ -530,6 +588,20 @@ impl FinishedBuild {
             );
         }
         groups
+    }
+
+    /// Asks for what [`Partition::rows`] reads for the probe rows ahead of `row`, whose groups are `groups`: where
+    /// the rows of the group of a row further on are, and the rows of the group of one nearer, whose place was asked
+    /// for before. Probe rows find groups all over the table, and the reads overlap so.
+    #[inline]
+    fn prefetch_chains(&self, groups: &[Option<(usize, usize)>], row: usize) {
+        const AHEAD: usize = 16;
+        if let Some(&Some((partition, group))) = groups.get(row + 2 * AHEAD) {
+            self.partitions[partition].prefetch_offsets(group);
+        }
+        if let Some(&Some((partition, group))) = groups.get(row + AHEAD) {
+            self.partitions[partition].prefetch_rows(group);
+        }
     }
 
     fn set_matched(&self, row: u32) {
@@ -846,13 +918,15 @@ impl PhysicalJoin {
         Ok(())
     }
 
-    /// Adds `chunk` to the build rows in memory. Its strings stay where they are, in the buffers of the chunk,
-    /// which the build columns keep: copying them is what the threads would take turns at.
+    /// Adds `chunk` to the build rows in memory, to be copied into the build columns later
+    /// ([`JoinBuild::materialize`]): copying is what threads would take turns at here. Its strings stay where they
+    /// are, in the buffers of the chunk, which the build columns keep.
     fn append_rows(build: &mut JoinBuild, chunk: &DataChunk, keys: Vec<BuildKey>) {
         let offset = build.count;
-        let sel = SelectionVector::from_vec((0..chunk.len() as u32).collect());
-        for (target, source) in build.columns.iter_mut().zip(chunk.columns()) {
-            target.copy_from(source, &sel, chunk.len(), offset, StringCopy::Reference);
+        if !chunk.is_empty() {
+            for (pending, source) in build.pending.iter_mut().zip(chunk.columns()) {
+                pending.push((source.clone(), offset, chunk.len()));
+            }
         }
         build.count += chunk.len();
         for (row, key) in keys.into_iter().enumerate() {
@@ -866,6 +940,7 @@ impl PhysicalJoin {
     /// Writes the largest partitions in memory to their files, about half of the rows with keys,
     /// and keeps the rest of the build rows in their order.
     fn spill_partitions(&self, build: &mut JoinBuild, spill: &JoinSpill) -> Result<()> {
+        build.materialize();
         if !build.partitioned {
             for (key, row) in std::mem::take(&mut build.keys[0]) {
                 build.keys[partition_of(&key)].push((key, row));
@@ -928,6 +1003,7 @@ impl PhysicalJoin {
 
     /// The build side, done.
     fn finish_build(build: &mut JoinBuild, threads: usize, total_count: usize, has_null_key: bool) -> FinishedBuild {
+        build.materialize();
         let count = build.count;
         FinishedBuild {
             data: DataChunk::from_columns(std::mem::take(&mut build.columns), count),
@@ -1336,6 +1412,7 @@ impl PhysicalJoin {
         let mut right = Vec::new();
         while left.len() < STANDARD_VECTOR_SIZE && probe.row < probe.found.len() {
             let row = probe.row;
+            build.prefetch_chains(&probe.groups, row);
             let chain: &[u32] = match probe.groups[row] {
                 Some((partition, group)) if !(self.first_match_only() && probe.found[row]) => {
                     build.partitions[partition].rows(group)
@@ -1367,6 +1444,7 @@ impl PhysicalJoin {
         let mut right = Vec::new();
         while left.len() < STANDARD_VECTOR_SIZE && probe.row < probe.found.len() {
             let row = probe.row;
+            build.prefetch_chains(&probe.groups, row);
             let chain: &[u32] = match probe.groups[row] {
                 Some((partition, group)) => build.partitions[partition].rows(group),
                 None => &[],
