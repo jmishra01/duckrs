@@ -89,6 +89,11 @@ pub struct DatabaseInstance {
     query_number: AtomicU64,
     /// `global_transaction_id`: the transactions so far, an auto-commit statement being one
     transaction_number: AtomicU64,
+    /// `AttachVisibility::HIDDEN`: the listings of databases and of what is in them leave it out, while names still
+    /// reach it
+    hidden: bool,
+    /// the options of its ATTACH that went to its storage, by name, as given
+    attach_options: Vec<(String, String)>,
 }
 
 /// What `ATTACH` can say of a file.
@@ -107,6 +112,25 @@ pub struct AttachOptions {
     settings: Option<Arc<RwLock<SettingValues>>>,
     /// Whoever opens it sets what writes appends ahead, once it is done changing it.
     no_write_ahead: bool,
+    /// `DEFAULT_TABLE`, by its schema (if given) and name
+    pub default_table: Option<(Option<String>, String)>,
+    /// `HIDDEN`
+    pub hidden: bool,
+    /// `StorageOptions`: the options that go to the storage, by name, as given (`AttachOptions::options`)
+    pub listed: Vec<(String, String)>,
+}
+
+/// `BooleanValue::Get(DefaultCastAs(BOOLEAN))` of an ATTACH option: one without a value is true.
+fn attach_bool(value: &duckrs_parser::ast::Literal) -> Result<bool> {
+    if value.text.is_empty() {
+        return Ok(true);
+    }
+    crate::function::cast::try_cast_string_to_bool(value.text.as_bytes()).ok_or_else(|| {
+        Error::new(
+            ErrorKind::Conversion,
+            format!("Could not convert string '{}' to BOOL", value.text),
+        )
+    })
 }
 
 /// `OptimisticDataWriter` of a database in a file: row groups of appends go to blocks of their own, as the settings say.
@@ -244,6 +268,8 @@ impl DatabaseInstance {
             log_manager: Arc::default(),
             query_number: AtomicU64::new(0),
             transaction_number: AtomicU64::new(0),
+            hidden: false,
+            attach_options: Vec::new(),
         }
     }
 
@@ -264,6 +290,7 @@ impl DatabaseInstance {
             vacuum_rebuild_indexes: None,
             settings: None,
             no_write_ahead: false,
+            ..AttachOptions::default()
         };
         Self::open_with(path, &options)
     }
@@ -289,6 +316,7 @@ impl DatabaseInstance {
             vacuum_rebuild_indexes: None,
             settings: None,
             no_write_ahead: false,
+            ..AttachOptions::default()
         };
         Self::open_with(path, &options)
     }
@@ -520,6 +548,7 @@ impl DatabaseInstance {
             free_blocks: 0,
             wal_size: 0,
             storage_version: None,
+            options: self.attach_options.clone(),
         };
         if let Some(file) = &self.file {
             listing.storage_version = Some(file.storage_version.display_name(true));
@@ -2644,6 +2673,7 @@ impl ClientContext {
         let path = crate::execution::file_system::expand_path(&path);
         let mut options = AttachOptions::default();
         let mut mode_given = false;
+        let mut compress_given = false;
         // the options given as expressions, such as `TYPE getvariable('t')`, by their values
         let mut given: Vec<(String, duckrs_parser::ast::Literal)> = info.options.clone();
         for (name, expression) in &info.parsed_options {
@@ -2661,7 +2691,14 @@ impl ClientContext {
         }
         for (name, value) in &given {
             let text = value.text.to_lowercase();
-            match name.to_lowercase().as_str() {
+            let lower = name.to_lowercase();
+            if matches!(
+                lower.as_str(),
+                "block_size" | "row_group_size" | "storage_version" | "compress" | "io_mode" | "mmap_reserve_size"
+            ) {
+                options.listed.push((lower.clone(), value.text.clone()));
+            }
+            match lower.as_str() {
                 "readonly" | "read_only" => {
                     options.read_only = text != "false";
                     mode_given = true;
@@ -2737,16 +2774,49 @@ impl ClientContext {
                     let modes = [(false, "DEFAULT"), (true, "NO_WAL_WRITES")];
                     options.no_wal_writes = crate::logging::enum_from(&modes, "RecoveryMode", &value.text)?;
                 }
-                // `AttachOptions` and `StorageOptions::Initialize` have these
-                other @ ("default_table"
-                | "hidden"
-                | "access_mode"
-                | "encryption_key"
-                | "encryption_cipher"
-                | "compress"
-                | "debug_encryption_version"
-                | "io_mode"
-                | "mmap_reserve_size") => return Err(crate::unported(format!("ATTACH with {other}"))),
+                // `QualifiedName::Parse`
+                "default_table" => {
+                    // `QualifiedName::FromPath`: the last part is the name and the one before the schema
+                    let parts = crate::catalog::parse_qualified_name(&value.text)?;
+                    options.default_table = match parts.as_slice() {
+                        [] => None,
+                        [name] => Some((None, name.clone())),
+                        [.., schema, name] => Some((Some(schema.clone()), name.clone())),
+                    };
+                }
+                "hidden" => options.hidden = attach_bool(value)?,
+                // `CompressInMemory`: what a database in memory does with its blocks; duckrs keeps those of a
+                // database in memory as rows either way, so it only checks the value
+                "compress" => {
+                    attach_bool(value)?;
+                    compress_given = true;
+                }
+                // `FileIOMode`: the file is read the same way whichever it is
+                "io_mode" => {
+                    if !["BUFFERED_IO", "MMAP", "DIRECT_IO"].contains(&value.text.to_uppercase().as_str()) {
+                        return Err(Error::new(
+                            ErrorKind::Binder,
+                            format!(
+                                "Unrecognized IO_MODE \"{}\". Valid values are 'BUFFERED_IO', 'MMAP', or 'DIRECT_IO'.",
+                                value.text
+                            ),
+                        ));
+                    }
+                }
+                // `DBConfig::ParseMemoryLimitOrMaximum`
+                "mmap_reserve_size" => {
+                    let size = crate::execution::temporary::parse_memory_limit(&value.text)?;
+                    if size.is_none_or(|size| size > i64::MAX as u64) {
+                        return Err(Error::new(
+                            ErrorKind::Binder,
+                            format!("MMAP_RESERVE_SIZE \"{}\" is out of range", value.text),
+                        ));
+                    }
+                }
+                // `StorageOptions::Initialize` has these
+                other @ ("encryption_key" | "encryption_cipher" | "debug_encryption_version") => {
+                    return Err(crate::unported(format!("ATTACH with {other}")));
+                }
                 other => {
                     return Err(Error::new(
                         ErrorKind::Binder,
@@ -2756,6 +2826,13 @@ impl ClientContext {
             }
         }
         let in_memory = path.is_empty() || path == ":memory:";
+        // `StorageManager::Initialize`
+        if compress_given && !in_memory {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "COMPRESS can only be set for in-memory databases",
+            ));
+        }
         // the storage extension opens the file through the opener file system
         if !in_memory && let Some(access) = self.file_access() {
             access.check(&path, false)?;
@@ -2799,6 +2876,12 @@ impl ClientContext {
                         mode(options.read_only)
                     ),
                 ));
+            }
+            // `DatabaseManager::AttachDatabase`: the attachment that stays takes the default table given
+            if let Some((schema, table)) = options.default_table.clone()
+                && info.on_conflict != Conflict::Error
+            {
+                existing.catalog.set_default_table(schema, table);
             }
             if info.on_conflict == Conflict::Ignore {
                 return Ok(());
@@ -2864,6 +2947,8 @@ impl ClientContext {
         }
         let database = if in_memory {
             let mut database = DatabaseInstance::with_file_access(None);
+            database.hidden = options.hidden;
+            database.attach_options.clone_from(&options.listed);
             database.name.clone_from(&name);
             database.settings = self.home.settings.clone();
             if let Some(rows) = options.row_group_size {
@@ -2877,11 +2962,16 @@ impl ClientContext {
             let Some(database) = Arc::get_mut(&mut opened) else {
                 return Err(Error::new(ErrorKind::Internal, "a new database is in use"));
             };
+            database.hidden = options.hidden;
+            database.attach_options.clone_from(&options.listed);
             database.name.clone_from(&name);
             DatabaseInstance::write_ahead_with(&opened);
             opened
         };
         database.catalog.set_database_list(self.database_list());
+        if let Some((schema, table)) = options.default_table.clone() {
+            database.catalog.set_default_table(schema, table);
+        }
         // `checkpoint_on_shutdown` is an option of the instance, which the attached databases share.
         let on_shutdown = self.home.checkpoint_on_shutdown.load(AtomicOrdering::SeqCst);
         database
@@ -4244,6 +4334,7 @@ impl DatabaseList for DatabaseInstance {
         std::iter::once(self)
             .filter(|home| !home.is_detached())
             .chain(attached.values().map(Arc::as_ref))
+            .filter(|database| !database.hidden)
             .map(DatabaseInstance::listing)
             .collect()
     }

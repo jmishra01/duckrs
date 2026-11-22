@@ -34,6 +34,59 @@ pub const DEFAULT_CATALOG: &str = "memory";
 /// The schema used when a name is not qualified (`DEFAULT_SCHEMA`).
 pub const DEFAULT_SCHEMA: &str = "main";
 
+/// `QualifiedName::ParseComponents`: the parts of a dotted name, of which a part with a `.` is in double quotes (a
+/// doubled one standing for itself); anything else is taken as it is, keywords and spaces included.
+pub fn parse_qualified_name(input: &str) -> Result<Vec<String>> {
+    let fail = |what: &str| Err(Error::new(ErrorKind::Parser, format!("{what} (input: {input})")));
+    let chars: Vec<char> = input.chars().collect();
+    let mut result = Vec::new();
+    let mut index = 0;
+    while index < chars.len() {
+        let mut entry = String::new();
+        if chars[index] == '"' {
+            // `StringUtil::TryParseQuotedString`
+            index += 1;
+            let mut closed = false;
+            while index < chars.len() {
+                if chars[index] == '"' {
+                    if chars.get(index + 1) == Some(&'"') {
+                        entry.push('"');
+                        index += 2;
+                        continue;
+                    }
+                    index += 1;
+                    closed = true;
+                    break;
+                }
+                entry.push(chars[index]);
+                index += 1;
+            }
+            if !closed {
+                return fail("Unterminated quote in qualified name!");
+            }
+            if entry.is_empty() {
+                return fail("Zero-length delimited identifier in qualified name!");
+            }
+            if index < chars.len() && chars[index] != '.' {
+                return fail("Unexpected character after a quoted identifier in a qualified name!");
+            }
+        } else {
+            while index < chars.len() && chars[index] != '.' {
+                if chars[index] == '"' {
+                    return fail("Unexpected quote in the middle of a qualified name component!");
+                }
+                entry.push(chars[index]);
+                index += 1;
+            }
+        }
+        result.push(entry);
+        if index < chars.len() {
+            index += 1;
+        }
+    }
+    Ok(result)
+}
+
 /// The part of a connection's `CatalogSearchPath` that is about the catalog a statement runs in: the schema
 /// what is created without a schema goes into (`GetDefaultSchema`), and the schemas a name without one is looked
 /// up in, after the temporary one (`GetSchemasForCatalog`). The client sets it while it runs a statement.
@@ -279,6 +332,8 @@ pub struct DatabaseListing {
     pub wal_size: u64,
     /// `tags['storage_version']`, of a database in a file
     pub storage_version: Option<String>,
+    /// `AttachedDatabase::GetAttachOptions`: the options of its ATTACH that went to its storage, by name, as given
+    pub options: Vec<(String, String)>,
 }
 
 /// `TypeVisitor`: `visit` for a type and all types in it.
@@ -2725,6 +2780,9 @@ pub struct Catalog {
     pub(crate) row_group_rows: Arc<std::sync::atomic::AtomicUsize>,
     /// what writes appends ahead of a checkpoint, of a database in a file
     ahead: AheadSlot,
+    /// `DEFAULT_TABLE`: the table, by its schema (if given) and name, that the name of the database stands for in a
+    /// query (`Catalog::SetDefaultTable`)
+    default_table: RwLock<Option<(Option<String>, String)>>,
 }
 
 thread_local! {
@@ -2864,6 +2922,19 @@ impl Catalog {
         *self.database_list.write() = Some(list);
     }
 
+    /// `Catalog::SetDefaultTable`.
+    pub fn set_default_table(&self, schema: Option<String>, name: String) {
+        *self.default_table.write() = Some((schema, name));
+    }
+
+    /// `Catalog::HasDefaultTable`: the schema (`main` unless given) and name of the default table, if there is one.
+    pub fn default_table(&self) -> Option<(String, String)> {
+        let default = self.default_table.read();
+        let (schema, name) = default.as_ref()?;
+        let schema = schema.clone().unwrap_or_else(|| DEFAULT_SCHEMA.to_string());
+        Some((schema, name.clone()))
+    }
+
     /// All databases, or none if this one is on its own.
     pub fn databases(&self) -> Vec<DatabaseListing> {
         let list = self.database_list.read().as_ref().and_then(std::sync::Weak::upgrade);
@@ -2963,6 +3034,7 @@ impl Catalog {
             storage_version: RwLock::new(None),
             row_group_rows: Arc::new(std::sync::atomic::AtomicUsize::new(ROW_GROUP_ROWS)),
             ahead: AheadSlot::default(),
+            default_table: RwLock::new(None),
         };
         for name in [DEFAULT_SCHEMA, TEMP_SCHEMA] {
             // temporary tables aren't in the file

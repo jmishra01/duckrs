@@ -1130,9 +1130,11 @@ test/sql/attach/attach_conflicting_options.test
 test/sql/attach/attach_copy.test
 test/sql/attach/attach_create_index.test
 test/sql/attach/attach_cross_catalog.test
+test/sql/attach/attach_database_options.test
 test/sql/attach/attach_database_size.test
 test/sql/attach/attach_dbname_quotes.test
 test/sql/attach/attach_default_database_case.test
+test/sql/attach/attach_default_table.test
 test/sql/attach/attach_defaults.test
 test/sql/attach/attach_dependencies.test
 test/sql/attach/attach_detach_in_transaction.test
@@ -1158,6 +1160,7 @@ test/sql/attach/attach_issue_21491.test
 test/sql/attach/attach_issue_7660.test
 test/sql/attach/attach_lambda_view.test
 test/sql/attach/attach_macros.test
+test/sql/attach/attach_mmap_reserve_size_range.test
 test/sql/attach/attach_modify_multiple_databases.test
 test/sql/attach/attach_multi_identifiers.test
 test/sql/attach/attach_nested_types.test
@@ -3681,6 +3684,7 @@ test/sql/storage/alter/alter_column_constraint.test
 test/sql/storage/alter/alter_lazy_metadata_load.test
 test/sql/storage/append_strings_to_persistent.test
 test/sql/storage/attach/attach_invalidation_default_db.test
+test/sql/storage/attach_mmap.test
 test/sql/storage/bc/null_rows_v1_5_or_filter.test
 test/sql/storage/bc/test_broken_view_v092.test
 test/sql/storage/bc/test_null_stats_v1_5.test
@@ -3970,6 +3974,7 @@ test/sql/storage/list_length_stats_checkpoint.test
 test/sql/storage/list_length_stats_old_version.test
 test/sql/storage/many_checkpoints.test
 test/sql/storage/many_self_append.test
+test/sql/storage/memory/in_memory_disabled_zstd.test
 test/sql/storage/metadata/full_table_metadata_reuse.test
 test/sql/storage/metadata/full_table_metadata_reuse_v7.test
 test/sql/storage/metadata/multi_table_metadata_reuse.test

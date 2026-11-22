@@ -2101,6 +2101,18 @@ impl Binder<'_> {
                     ]);
                     Value::new(tags.clone(), duckrs_common::value::ValueData::List(vec![entry]))
                 };
+                let map_of = |entries: &[(String, String)]| -> Result<Value> {
+                    let entries = entries
+                        .iter()
+                        .map(|(key, value)| {
+                            Value::struct_value(vec![
+                                ("key".to_string(), text(key)),
+                                ("value".to_string(), text(value)),
+                            ])
+                        })
+                        .collect();
+                    Value::new(tags.clone(), duckrs_common::value::ValueData::List(entries))
+                };
                 let database = |name: &str, oid: i64, path: Option<&str>, internal: bool, read_only: bool| {
                     vec![
                         text(name),
@@ -2111,6 +2123,10 @@ impl Binder<'_> {
                         Value::boolean(internal),
                         text("duckdb"),
                         Value::boolean(read_only),
+                        // nothing is encrypted yet
+                        Value::boolean(false),
+                        null_text(),
+                        Value::null(tags.clone()),
                     ]
                 };
                 let mut rows = vec![
@@ -2125,6 +2141,7 @@ impl Binder<'_> {
                     let oid = if index == 0 { 1 } else { index as i64 + 3 };
                     let mut row = database(&listed.name, oid, listed.path.as_deref(), false, listed.read_only);
                     row[4] = tags_of(listed.storage_version.as_deref())?;
+                    row[10] = map_of(&listed.options)?;
                     rows.insert(index.min(rows.len()), row);
                 }
                 (
@@ -2137,6 +2154,9 @@ impl Binder<'_> {
                         ("internal", boolean.clone()),
                         ("type", varchar.clone()),
                         ("readonly", boolean.clone()),
+                        ("encrypted", boolean.clone()),
+                        ("cipher", varchar.clone()),
+                        ("options", tags.clone()),
                     ],
                     rows,
                 )

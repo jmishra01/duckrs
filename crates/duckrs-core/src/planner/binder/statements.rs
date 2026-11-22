@@ -2555,15 +2555,62 @@ impl Binder<'_> {
                 };
                 // `CatalogEntryRetriever::GetEntry`: past the search path of the statement's (or view's)
                 // database comes that of the connection, in its default database
+                let mut entry_catalog = self.catalog.name.clone();
                 let entry = match entry {
                     Err(error) if foreign.is_none() && other.is_none() && name.qualification.is_empty() => {
                         match self.default_database_entry(&name.name) {
-                            Some(found) => Ok(found),
+                            Some(found) => {
+                                if let Some(session) = &self.session {
+                                    entry_catalog.clone_from(&session.default_database);
+                                }
+                                Ok(found)
+                            }
                             None => Err(error),
                         }
                     }
                     entry => entry,
                 };
+                // `Catalog::TryLookupDefaultTable`: the bare name of a database that has a default table stands for
+                // that table, once it is there; an entry of that name as well makes the name ambiguous
+                if name.qualification.is_empty()
+                    && foreign.is_none()
+                    && let Some(session) = &self.session
+                    && let Some(database) = (session.attached_catalog)(&name.name)
+                    && let Some((schema, table)) = database.default_table()
+                    && database.get_entry(Some(&schema), None, &table).is_ok()
+                {
+                    // (the catalog of an attached file goes by the name it was attached under, which only the
+                    // database knows)
+                    let default_name = [name.name.as_str(), &schema, &table].map(ast::sql_identifier).join(".");
+                    if let Ok(found) = &entry {
+                        let (kind, found_schema, found_name) = match found {
+                            TableOrView::Table(table) => ("Table", &table.schema, &table.name),
+                            TableOrView::View(view) => ("View", &view.schema, &view.name),
+                        };
+                        let found_qualified = [entry_catalog.as_str(), found_schema, found_name]
+                            .map(ast::sql_identifier)
+                            .join(".");
+                        let n = &name.name;
+                        return Err(Error::new(
+                            ErrorKind::Catalog,
+                            format!(
+                                "Ambiguity detected for '{n}': this could either refer to the '{kind}' '{n}', or the \
+                                 attached catalog '{n}' which has a default table. To avoid this error, either detach \
+                                 the catalog and reattach under a different name, or use a fully qualified name for \
+                                 the '{kind}': '{found_qualified}' or for the Catalog Default Table: '{default_name}'."
+                            ),
+                        ));
+                    }
+                    let mut rewritten = table_ref.clone();
+                    rewritten.kind = TableRefKind::BaseTable {
+                        name: ast::QualifiedName {
+                            qualification: vec![name.name.clone(), schema],
+                            name: table,
+                        },
+                        at_clause: None,
+                    };
+                    return self.bind_unsampled_table_ref(&rewritten);
+                }
                 if entry.is_err()
                     && name.qualification.is_empty()
                     && self
