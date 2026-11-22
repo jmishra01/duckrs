@@ -20,6 +20,8 @@ pub struct OperatorMetrics {
     pub rows_scanned: u64,
     /// `DataChunk::GetDataSize` of what it gave on
     pub size_bytes: u64,
+    /// the bytes of its files a scan read (`operator.bytes_scanned`)
+    pub bytes_scanned: u64,
 }
 
 /// `Vector::GetDataSize`, near enough: the width of each row's slot (16 for strings, the
@@ -122,6 +124,11 @@ impl OperatorProfiler {
         if let Some(rows) = op.rows_read().filter(|_| is_scan(op)) {
             self.operators.lock().entry(key(op)).or_default().rows_scanned = rows;
         }
+    }
+
+    /// A scan read `bytes` of its files (`OperatorProfiler::AddBytesScanned`).
+    pub fn add_bytes_scanned(&self, op: &dyn PhysicalOperator, bytes: u64) {
+        self.operators.lock().entry(key(op)).or_default().bytes_scanned += bytes;
     }
 
     /// `op` took `time`, without giving on rows (a sink taking its input).
@@ -258,6 +265,8 @@ pub struct ProfileNode {
     pub metrics: OperatorMetrics,
     /// of a table scan: the row groups it scanned, of those it could have
     pub row_groups: (u64, u64),
+    /// of a scan that counts the bytes it reads, those it read (`bytes_scanned_reported`)
+    pub bytes_scanned: Option<u64>,
     pub children: Vec<ProfileNode>,
 }
 
@@ -305,6 +314,7 @@ impl ProfileNode {
                 extra_info: details(op),
                 metrics,
                 row_groups: (0, 0),
+                bytes_scanned: None,
                 children: Vec::new(),
             }];
         }
@@ -326,8 +336,22 @@ impl ProfileNode {
             row_groups: op
                 .row_groups_scanned()
                 .map_or((0, 0), |(scanned, total)| (scanned as u64, total as u64)),
+            bytes_scanned: op.reports_bytes_scanned().then(|| profiler.metrics(op).bytes_scanned),
             children,
         }]
+    }
+
+    /// `query.total_bytes_scanned`: the bytes the scans of the tree read, unless one of them doesn't count them
+    /// (`HasScanWithoutBytesScanned`).
+    pub fn total_bytes_scanned(&self) -> Option<u64> {
+        if self.op_type == "TABLE_SCAN" && self.bytes_scanned.is_none() {
+            return None;
+        }
+        let mut total = self.bytes_scanned.unwrap_or(0);
+        for child in &self.children {
+            total += child.total_bytes_scanned()?;
+        }
+        Some(total)
     }
 
     /// `MergeOperatorMeasurements`: the sums over the tree.
@@ -509,6 +533,9 @@ fn operator_json(node: &ProfileNode, tracked: &TrackedMetrics, legacy: bool) -> 
         ));
         metrics.push(("row_groups_scanned", Metric::UBigInt(node.row_groups.0), ""));
         metrics.push(("total_row_groups_to_scan", Metric::UBigInt(node.row_groups.1), ""));
+        if let Some(bytes) = node.bytes_scanned {
+            metrics.push(("bytes_scanned", Metric::UBigInt(bytes), ""));
+        }
     }
     metrics.push(("extra_info", Metric::Map(node.extra_info.clone()), "extra_info"));
     for (name, value, legacy_name) in metrics {

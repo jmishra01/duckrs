@@ -19,6 +19,8 @@ use duckrs_common::{Error, ErrorKind, Result};
 use std::sync::Arc;
 
 const CHUNK_ROWS: usize = duckrs_common::STANDARD_VECTOR_SIZE;
+/// `CSVBuffer::ROWS_PER_BUFFER` lines of the longest a line can be: the size of a buffer, unless `buffer_size` says.
+const CSV_BUFFER_SIZE: usize = 16 * 2_000_000;
 
 /// What `read_csv` was told (`CSVReaderOptions`).
 #[derive(Debug, Clone)]
@@ -377,6 +379,35 @@ pub struct CsvScanState {
     rejects: Vec<Reject>,
     flushed: bool,
     virtual_rows: crate::execution::multi_file::VirtualRows,
+    /// the size of the file being read, and how much of it was counted as scanned
+    file_bytes: u64,
+    bytes_counted: u64,
+    /// the bytes scanned not yet given to the profiler
+    bytes_pending: u64,
+}
+
+/// The bytes of its files the scan read since this was last asked (`CSVFileScan::CountBytesScanned`).
+pub fn take_bytes_scanned(state: &mut CsvScanState) -> u64 {
+    std::mem::take(&mut state.bytes_pending)
+}
+
+/// `CSVBufferManager`: what of the file the buffers read so far hold, the file being read in buffers of
+/// `buffer_size` up to where the scanner is.
+fn count_bytes(state: &mut CsvScanState, buffer_size: usize, done: bool) {
+    let read = match (&state.scanner, &state.data) {
+        _ if done => state.file_bytes,
+        (Some(scanner), Some(data)) if !data.is_empty() => {
+            let at = (scanner.machine.position.min(data.len()) as f64 / data.len() as f64 * state.file_bytes as f64)
+                as u64;
+            let buffer = buffer_size.max(1) as u64;
+            (at / buffer + 1).saturating_mul(buffer).min(state.file_bytes)
+        }
+        _ => state.bytes_counted,
+    };
+    if read > state.bytes_counted {
+        state.bytes_pending += read - state.bytes_counted;
+        state.bytes_counted = read;
+    }
 }
 
 /// `CSVFileScan`: a file after the first, as sniffing it finds it, with its columns found by name.
@@ -512,6 +543,8 @@ fn scan_file_chunk(scan: &CsvScanData, state: &mut CsvScanState) -> Result<Optio
             } else {
                 None
             };
+            state.file_bytes = std::fs::metadata(&file.path).map_or(data.len() as u64, |m| m.len());
+            state.bytes_counted = 0;
             let file = state.current.as_ref().unwrap_or(file);
             let machine = Machine::new(file.dialect.clone(), bom);
             let rows = usize::from(file.header) + file.skip;
@@ -529,9 +562,13 @@ fn scan_file_chunk(scan: &CsvScanData, state: &mut CsvScanState) -> Result<Optio
             Some(chunk) => {
                 state.data = Some(data);
                 state.current = current;
+                count_bytes(state, scan.options.buffer_size.unwrap_or(CSV_BUFFER_SIZE), false);
                 return Ok(Some(chunk));
             }
-            None => state.file += 1,
+            None => {
+                count_bytes(state, 0, true);
+                state.file += 1;
+            }
         }
     }
 }

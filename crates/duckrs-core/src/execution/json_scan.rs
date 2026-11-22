@@ -665,6 +665,9 @@ impl PhysicalOperator for PhysicalJsonScan {
     fn source_state(&self) -> SourceState {
         Box::new(JsonScanState::default())
     }
+    fn reports_bytes_scanned(&self) -> bool {
+        true
+    }
     fn get_data(&self, state: &mut SourceState) -> Result<Option<DataChunk>> {
         let state: &mut JsonScanState = state.downcast_mut().expect("json scan state");
         let scan = &self.scan;
@@ -686,6 +689,11 @@ impl PhysicalOperator for PhysicalJsonScan {
             };
             if state.records.is_none() {
                 state.data = read_file(path, scan.compression)?;
+                // the buffers read all of the file
+                let bytes = std::fs::metadata(path).map_or(state.data.len() as u64, |m| m.len());
+                if let Some(profiler) = super::profiler::current() {
+                    profiler.add_bytes_scanned(self, bytes);
+                }
                 // `JSONCommon::NumbersAsRaw`: a DECIMAL reads numbers from their text
                 let raw = scan.types.iter().any(crate::function::json::contains_decimal);
                 let (records, format) = read_records_with(&state.data, scan.format, raw);

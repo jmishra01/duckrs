@@ -3797,6 +3797,7 @@ impl ClientContext {
                     extra_info: Vec::new(),
                     metrics: Default::default(),
                     row_groups: (0, 0),
+                    bytes_scanned: None,
                     children: child.into_iter().collect(),
                 }
             };
@@ -3928,6 +3929,9 @@ impl ClientContext {
             let (scanned, to_scan) = row_group_totals(root);
             metrics.insert("query.total_row_groups_scanned".to_string(), Metric::UBigInt(scanned));
             metrics.insert("query.total_row_groups_to_scan".to_string(), Metric::UBigInt(to_scan));
+            if let Some(bytes) = root.total_bytes_scanned() {
+                metrics.insert("query.total_bytes_scanned".to_string(), Metric::UBigInt(bytes));
+            }
         }
         let tracked = match self.setting("tracked_metrics").map(|value| value.data().clone()) {
             Some(duckrs_common::value::ValueData::List(items)) => {
