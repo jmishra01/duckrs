@@ -222,7 +222,7 @@ Each item gives the number of failing files in `test/` that it should fix, where
     operator's rows and scans as `TABLE_SCAN`; under an OR, what is never true but can be NULL stays
     `constant_or_null(false, ...)` (`table_or_pushdown`, `parquet_or_pushdown`)
   - [ ] the rest of C++'s analyzed plan: the `QUERY` / `EXPLAIN_ANALYZE` nodes, `Total Time`, operator timings
-  - [ ] the order of a join's conditions where an inequality comes before IS DISTINCT FROM (`issue_17042`)
+  - [x] the order of a join's conditions where an inequality comes before IS DISTINCT FROM (`issue_17042`)
   - [ ] filters through the row numbers of EXCEPT ALL / INTERSECT ALL on a collation key
     (`pushdown_window_partition_expression`); dynamic filters of blockwise NL joins (`join_filter_pushdown_any_join`)
   - [ ] the operator log and profiler output a few tests read (`join_filter_pushdown_integer_chain`,

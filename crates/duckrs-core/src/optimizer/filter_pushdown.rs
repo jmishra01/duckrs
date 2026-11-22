@@ -632,16 +632,24 @@ impl FilterPushdown {
         let right_tables = plan_tables(&op.children[1]);
         let mut left = FilterPushdown::default();
         let mut remaining = Vec::new();
-        let filters = std::mem::take(&mut self.filters);
-        let removes_null = filters.iter().any(|f| {
+        let mut filters = std::mem::take(&mut self.filters);
+        let removes_null = filters.iter().position(|f| {
             join_side(&f.tables, &left_tables, &right_tables) != JoinSide::Left
                 && filter_removes_null(&f.filter, &right_tables)
         });
-        if removes_null {
+        if let Some(at) = removes_null {
             let LogicalOperatorKind::Join { join_type, .. } = &mut op.kind else {
                 unreachable!()
             };
             *join_type = JoinType::Inner;
+            // C++ goes on from the filter that removes NULLs, then the filters of the left side before it, then
+            // the others before it
+            let before: Vec<_> = filters.drain(..at).collect();
+            let (left_before, others): (Vec<_>, Vec<_>) = before
+                .into_iter()
+                .partition(|f| join_side(&f.tables, &left_tables, &right_tables) == JoinSide::Left);
+            filters.extend(left_before);
+            filters.extend(others);
             self.filters = filters;
             return self.pushdown_inner_join(op);
         }
