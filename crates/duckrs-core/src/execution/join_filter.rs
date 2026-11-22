@@ -760,7 +760,7 @@ pub fn take_recorded() -> Vec<Option<String>> {
 /// Keeps what the table scans of `op` were given, once, if [`start_recording`] asked for it.
 pub fn record(op: &dyn crate::execution::physical::PhysicalOperator) {
     fn collect(op: &dyn crate::execution::physical::PhysicalOperator, list: &mut Vec<Option<String>>) {
-        if op.name() == "TABLE_SCAN" {
+        if matches!(op.name(), "TABLE_SCAN" | "READ_PARQUET") {
             list.push(op.dynamic_filters());
         }
         for child in op.children() {
@@ -900,6 +900,40 @@ fn can_skip(op: &mut LogicalOperator) -> bool {
     op.children.iter_mut().all(can_skip)
 }
 
+/// `CreateRuntimeFilterInputExpression`: what a join filter on the scan's column at `position`, of type `ty`, reads
+/// through `casts`, and whether a row whose cast fails stays for the query's own cast to fail on. None where the
+/// casts do not lead to the filter's type.
+fn filter_input(
+    position: usize,
+    ty: &LogicalType,
+    name: &str,
+    casts: &[(LogicalType, bool)],
+    filter: &JoinFilter,
+) -> Option<(BoundExpr, bool)> {
+    if casts.last().map_or(ty, |(ty, _)| ty) != &filter.ty {
+        return None;
+    }
+    // a cast that can fail is a TRY_CAST, and where the query's own cast would have failed the row
+    // stays for it (`preserves_cast_errors`)
+    let column_ref = BoundExpr::new(BoundExprKind::Reference(position), ty.clone()).with_alias(name.to_string());
+    let mut input = column_ref.clone();
+    let (mut reconstruct, mut keep_null) = (false, false);
+    let mut source = ty.clone();
+    for (target, try_cast) in casts {
+        let can_fail = cast_can_fail(&source, target);
+        if source != *target {
+            input = input.cast_to(target, *try_cast || can_fail);
+        }
+        reconstruct |= can_fail;
+        keep_null |= !try_cast && can_fail;
+        source = target.clone();
+    }
+    // `RequiresRuntimeFilterExpressionReconstruction`: without a cast that can fail the column itself is
+    // compared, with the keys cast to its type
+    let input = if reconstruct || filter.null_safe { input } else { column_ref };
+    Some((input, keep_null))
+}
+
 /// `FindFilterTargets`: puts `filter` on output column `column` of `op` into the scans its values
 /// come from, where the way there keeps them as they are and drops no row that a row of the scan
 /// would make. Gives whether it went anywhere.
@@ -938,28 +972,9 @@ fn push_into(
             let Some(definition) = table.columns.get(*column_id) else {
                 return false;
             };
-            if casts.last().map_or(&definition.ty, |(ty, _)| ty) != &filter.ty {
+            let Some((input, keep_null)) = filter_input(position, &definition.ty, &definition.name, casts, filter) else {
                 return false;
-            }
-            // `CreateRuntimeFilterInputExpression`: a cast that can fail is a TRY_CAST, and where
-            // the query's own cast would have failed the row stays for it (`preserves_cast_errors`)
-            let column_ref = BoundExpr::new(BoundExprKind::Reference(position), definition.ty.clone())
-                .with_alias(definition.name.clone());
-            let mut input = column_ref.clone();
-            let (mut reconstruct, mut keep_null) = (false, false);
-            let mut source = definition.ty.clone();
-            for (target, try_cast) in casts {
-                let can_fail = cast_can_fail(&source, target);
-                if source != *target {
-                    input = input.cast_to(target, *try_cast || can_fail);
-                }
-                reconstruct |= can_fail;
-                keep_null |= !try_cast && can_fail;
-                source = target.clone();
-            }
-            // `RequiresRuntimeFilterExpressionReconstruction`: without a cast that can fail the
-            // column itself is compared, with the keys cast to its type
-            let input = if reconstruct || filter.null_safe { input } else { column_ref };
+            };
             let already = filters.iter().any(|f| {
                 matches!(&f.kind, BoundExprKind::JoinFilter { child, filter: other, .. }
                     if std::sync::Arc::ptr_eq(other, filter) && format!("{child:?}") == format!("{input:?}"))
@@ -970,6 +985,37 @@ fn push_into(
             filter.scan_estimate.fetch_max(table.row_count() as u64, Ordering::Relaxed);
             if !already {
                 filters.push(BoundExpr::new(
+                    BoundExprKind::JoinFilter {
+                        child: Box::new(input),
+                        filter: filter.clone(),
+                        keep_null,
+                    },
+                    LogicalType::BOOLEAN,
+                ));
+            }
+            true
+        }
+        // `FindScanFilterTargets` of a `read_parquet` scan: a column of the files, before the fields pushed into it
+        K::ParquetScan { scan, .. } => {
+            let position = match &scan.output {
+                Some(output) => match output.get(column) {
+                    Some(position) => *position,
+                    None => return false,
+                },
+                None => column,
+            };
+            let (Some(ty), Some(name)) = (scan.types.get(position), scan.names.get(position)) else {
+                return false;
+            };
+            let Some((input, keep_null)) = filter_input(position, ty, name, casts, filter) else {
+                return false;
+            };
+            let already = scan.filters.iter().any(|f| {
+                matches!(&f.kind, BoundExprKind::JoinFilter { child, filter: other, .. }
+                    if std::sync::Arc::ptr_eq(other, filter) && format!("{child:?}") == format!("{input:?}"))
+            });
+            if !already {
+                std::sync::Arc::make_mut(scan).filters.push(BoundExpr::new(
                     BoundExprKind::JoinFilter {
                         child: Box::new(input),
                         filter: filter.clone(),

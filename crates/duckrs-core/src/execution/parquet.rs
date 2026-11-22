@@ -1554,6 +1554,9 @@ impl PhysicalOperator for PhysicalParquetScan {
     fn source_state(&self) -> SourceState {
         Box::new(ParquetScanState::default())
     }
+    fn dynamic_filters(&self) -> Option<String> {
+        crate::execution::physical::dynamic_filters_of(self.filter.as_ref())
+    }
     fn row_groups_scanned(&self) -> Option<(usize, usize)> {
         self.prune.as_ref()?;
         let (mut scanned, mut total) = (0, 0);
