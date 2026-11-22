@@ -18,6 +18,7 @@ clap.workspace = true
 md-5.workspace = true
 regex.workspace = true
 walkdir.workspace = true
+libc.workspace = true
 libduckdb-sys = { workspace = true, optional = true }
 
 [lints]
