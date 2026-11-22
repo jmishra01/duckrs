@@ -1853,7 +1853,13 @@ impl Binder<'_> {
                 if builtin_qualification(&function.name.qualification)
                     && BuiltinFunctions::get().aggregate(&function.name.name).is_some() =>
             {
-                self.bind_aggregate(function)?
+                // `BindAggregate`: the column of the aggregate has the name of its alias
+                let bound = self.bind_aggregate(function)?;
+                if expr.alias.is_empty() {
+                    bound
+                } else {
+                    bound.with_alias(expr.alias.clone())
+                }
             }
             ExprKind::Function(function) => {
                 if !builtin_qualification(&function.name.qualification) {

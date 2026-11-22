@@ -653,7 +653,9 @@ impl Group<'_> {
                     other => other,
                 }
             }
-            BoundExprKind::Cast { child, try_cast: false } if keeps_order(&child.return_type, &expr.return_type) => {
+            // a TRY_CAST gives NULL for what doesn't fit, and the order of the rest; of bounds that don't fit
+            // nothing is known
+            BoundExprKind::Cast { child, .. } if keeps_order(&child.return_type, &expr.return_type) => {
                 self.through(expr, child)
             }
             // the date parts of an INTERVAL do not follow its order (1 year and 400 days)

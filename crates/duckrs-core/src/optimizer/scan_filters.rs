@@ -600,7 +600,13 @@ fn push_into(op: &mut LogicalOperator, before_statistics: bool) {
             let mut outer = false;
             columns_of(expr, &mut columns, &mut outer);
             let several = columns.iter().any(|c| *c != columns[0]);
-            if several && !outer && columns.iter().all(|c| scan.contains(c)) && !expr.is_volatile() {
+            // `CanPropagateExpressionStatistics`: not of what is volatile or can throw
+            if several
+                && !outer
+                && columns.iter().all(|c| scan.contains(c))
+                && !expr.is_volatile()
+                && !super::rewriter::can_throw(expr)
+            {
                 zone_filters.push(expr.clone());
             }
         }
