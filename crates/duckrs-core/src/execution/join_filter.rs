@@ -26,8 +26,18 @@ const MIN_BLOOM_TABLE_ROWS: usize = 1 << 16;
 /// Bits of the Bloom filter per key.
 const BITS_PER_KEY: usize = 16;
 
-/// A filter checks this many rows before it can find that it keeps too many.
-const ROWS_TO_JUDGE: u64 = 1 << 20;
+/// `BF_CHECK_N`: the vectors a Bloom filter checks before it can pause.
+const VECTORS_TO_CHECK: u32 = 6;
+
+/// `BF_THRESHOLD`: a Bloom filter that lets this share of the rows through pauses.
+const SELECTIVITY_THRESHOLD: f64 = 0.5;
+
+/// `VECTOR_PAUSE`: a paused filter checks again after this many vectors, times how many times in a
+/// row it paused.
+const VECTOR_PAUSE: u32 = 10;
+
+/// Gives each join filter its own number, which the selectivity of each thread is kept by.
+static NEXT_FILTER_ID: AtomicU64 = AtomicU64::new(0);
 
 /// `dynamic_or_filter_threshold`: a build side of at most this many rows gives an IN filter. Set by
 /// the client for the plans it runs.
@@ -56,12 +66,10 @@ pub struct JoinFilter {
     keys: OnceLock<Option<Keys>>,
     /// what `JoinFilterPushdownInfo::FinalizeFilters` gives the scans, once the build side is done
     published: OnceLock<Option<Published>>,
-    checked: AtomicU64,
-    passed: AtomicU64,
     /// whether the filter gave up: its join was built twice
     off: AtomicBool,
-    /// whether the Bloom filter gave up: it let most rows through
-    bloom_off: AtomicBool,
+    /// what the selectivity of the Bloom filter on each thread is kept by
+    id: u64,
     /// whether a scan it went to is large enough for the Bloom filter
     bloom: AtomicBool,
     /// what decides on a Bloom or prefix-range filter (`CanUseBloomFilter`)
@@ -346,10 +354,8 @@ impl JoinFilter {
             in_threshold: IN_FILTER_THRESHOLD.load(Ordering::Relaxed),
             keys: OnceLock::new(),
             published: OnceLock::new(),
-            checked: AtomicU64::new(0),
-            passed: AtomicU64::new(0),
             off: AtomicBool::new(false),
-            bloom_off: AtomicBool::new(false),
+            id: NEXT_FILTER_ID.fetch_add(1, Ordering::Relaxed),
             bloom: AtomicBool::new(false),
         }
     }
@@ -601,15 +607,26 @@ impl JoinFilter {
         }
         let converted = self.published_for(values.logical_type());
         let published = converted.as_ref();
-        // the Bloom filter only where it is complete, and while it drops enough rows
+        // an IN list and a range are optional filters (`CreateOptionalFilterExpression`), which C++
+        // only prunes row groups by: only one key drops rows, and then exactly
+        let published = published.filter(|p| matches!(p, Published::Single(_)));
+        // the Bloom filter where it is complete, and on each thread while it drops enough rows
+        // (`BloomFilterSelect`)
         let keys = self
             .keys
             .get()
             .and_then(Option::as_ref)
-            .filter(|_| self.bloom.load(Ordering::Relaxed) && !self.bloom_off.load(Ordering::Relaxed));
-        // an IN list and a range are optional filters (`CreateOptionalFilterExpression`), which C++
-        // only prunes row groups by: only one key drops rows
-        let published = published.filter(|p| matches!(p, Published::Single(_)));
+            .filter(|_| published.is_none() && self.bloom.load(Ordering::Relaxed))
+            .filter(|_| {
+                selectivity(self.id, |stats| {
+                    // a paused filter lets every row through, and only counts the vector
+                    let active = stats.is_active();
+                    if !active {
+                        stats.update(0, 0);
+                    }
+                    active
+                })
+            });
         if published.is_none() && keys.is_none() {
             return None;
         }
@@ -652,13 +669,76 @@ impl JoinFilter {
                 }
             }
         }
-        let checked = self.checked.fetch_add(count as u64, Ordering::Relaxed) + count as u64;
-        let passed = self.passed.fetch_add(kept.len() as u64, Ordering::Relaxed) + kept.len() as u64;
-        if checked >= ROWS_TO_JUDGE && passed * 10 > checked * 8 {
-            self.bloom_off.store(true, Ordering::Relaxed);
+        if keys.is_some() {
+            selectivity(self.id, |stats| stats.update(kept.len(), count));
         }
         Some(kept)
     }
+}
+
+/// `SelectivityOptionalFilterState::SelectivityStats`: how many rows a filter let through on one
+/// thread, which pauses it while it lets most of them through, for longer each time.
+#[derive(Debug, Default)]
+struct SelectivityStats {
+    accepted: usize,
+    processed: usize,
+    vectors: u32,
+    paused: bool,
+    pause_multiplier: u32,
+}
+
+impl SelectivityStats {
+    fn is_active(&self) -> bool {
+        !self.paused
+    }
+
+    /// `Update`, after a vector: `processed` rows of which `accepted` passed, both 0 while paused.
+    fn update(&mut self, accepted: usize, processed: usize) {
+        self.vectors += 1;
+        self.accepted += accepted;
+        self.processed += processed;
+        if self.vectors == self.pause_multiplier.max(1) * VECTOR_PAUSE {
+            (self.vectors, self.accepted, self.processed) = (0, 0, 0);
+            self.paused = false;
+        } else if !self.paused && self.vectors >= VECTORS_TO_CHECK {
+            let selectivity = if self.processed == 0 {
+                0.0
+            } else {
+                self.accepted as f64 / self.processed as f64
+            };
+            if selectivity >= SELECTIVITY_THRESHOLD {
+                self.paused = true;
+                self.pause_multiplier += 1;
+            } else {
+                self.pause_multiplier = 0;
+            }
+        }
+    }
+}
+
+thread_local! {
+    /// The selectivity of the Bloom filters this thread ran, by filter: C++ keeps it in the state of
+    /// each thread's scan (`BloomFilterLocalState`)
+    static SELECTIVITY: std::cell::RefCell<Vec<(u64, SelectivityStats)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Calls `f` with this thread's selectivity of filter `id`.
+fn selectivity<T>(id: u64, f: impl FnOnce(&mut SelectivityStats) -> T) -> T {
+    SELECTIVITY.with(|all| {
+        let mut all = all.borrow_mut();
+        let at = match all.iter().position(|(other, _)| *other == id) {
+            Some(at) => at,
+            None => {
+                // the filters of statements that ran before are done with
+                if all.len() >= 64 {
+                    all.remove(0);
+                }
+                all.push((id, SelectivityStats::default()));
+                all.len() - 1
+            }
+        };
+        f(&mut all[at].1)
+    })
 }
 
 thread_local! {
