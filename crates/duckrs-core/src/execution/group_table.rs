@@ -21,6 +21,10 @@ const ID_MASK: u64 = (1 << SALT_SHIFT) - 1;
 /// The entries a table starts with (`GroupedAggregateHashTable::InitialCapacity`).
 const INITIAL_CAPACITY: usize = 4096;
 
+/// How many rows ahead a lookup asks for the entry it will read, so that the reads of a table larger than the
+/// caches overlap rather than wait one by one.
+const PREFETCH_DISTANCE: usize = 32;
+
 /// The groups of an aggregate: their values in rows, their hashes, and a table of entries that finds them.
 #[derive(Debug)]
 pub struct GroupTable {
@@ -103,10 +107,12 @@ impl GroupTable {
             self.resize((self.rows.len() + count) * 2);
         }
         let mask = self.mask();
+        // room for every row to be a new group, so that pushing one never moves the hashes
+        self.hashes.reserve(count);
         let mut ids = vec![0usize; count];
         let mut slots: Vec<usize> = hashes.iter().map(|&hash| hash as usize & mask).collect();
         let mut remaining: Vec<u32> = (0..count as u32).collect();
-        let mut new_rows: Vec<u32> = Vec::new();
+        let mut new_rows: Vec<u32> = Vec::with_capacity(count);
         // the row each row is compared with, by the row of `groups`; those not compared are never read
         let mut candidates: Vec<RowPtr> = Vec::new();
         let mut candidate_ids = vec![0usize; count];
@@ -114,7 +120,10 @@ impl GroupTable {
             let mut compare: Vec<u32> = Vec::new();
             let mut compare_ids: Vec<(u32, usize)> = Vec::new();
             let first_new = new_rows.len();
-            for &row in &remaining {
+            for (i, &row) in remaining.iter().enumerate() {
+                if let Some(&ahead) = remaining.get(i + PREFETCH_DISTANCE) {
+                    super::prefetch(&self.entries[slots[ahead as usize]]);
+                }
                 let r = row as usize;
                 let salt = Self::salt(hashes[r]);
                 let mut slot = slots[r];
@@ -187,7 +196,10 @@ impl GroupTable {
         while !remaining.is_empty() && !self.rows.is_empty() {
             let mut compare = Vec::new();
             let mut compare_ids = Vec::new();
-            for &row in &remaining {
+            for (i, &row) in remaining.iter().enumerate() {
+                if let Some(&ahead) = remaining.get(i + PREFETCH_DISTANCE) {
+                    super::prefetch(&self.entries[slots[ahead as usize]]);
+                }
                 let r = row as usize;
                 let salt = Self::salt(hashes[r]);
                 let mut slot = slots[r];
