@@ -262,6 +262,9 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] the scalar aggregate merger (`scalar_aggregate_merge_threshold`), over tables, `read_parquet`, `read_csv`
     and `read_json`; predicate factoring of ORs in filters
   - [ ] secure views (7 files), `json_serialize_plan`, gamma's errors without IEEE
+  - [x] statistics and zone maps of `%` (`PropagateModuloStats`: signed and unsigned, DECIMAL, FLOAT/DOUBLE, a
+    column divisor, and bounds with a NULL where `error_on_division_by_zero` is off), of `//` on UHUGEINT past the
+    range of an i128, and of `power` (`PropagatePowStats`)
   - [x] string statistics in `stats()`: bounds, unicode, lengths and totals of tables and constants; `approx_unique`
   - [x] string statistics through functions (contains, suffix, upper/lower, length)
   - [x] list lengths through `length` / `array_length` (a `constant_or_null` where all lists are as long),

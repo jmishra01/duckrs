@@ -636,21 +636,40 @@ impl Group<'_> {
             {
                 self.range(input)
             }
-            // `x % c` of what is from 0 up to below `c` is itself, and otherwise from 0 up to below `c`
-            ("%", [input, divisor]) if constant(divisor).as_ref().and_then(Value::as_i128).is_some_and(|c| c > 0) => {
-                let c = constant(divisor).as_ref().and_then(Value::as_i128).expect("checked");
-                let Range::Bounds(min, max) = self.range(input) else {
-                    return self.range(input);
+            // `PropagatePowStats`
+            ("pow" | "power" | "**" | "^", [base, exponent]) => {
+                let float = |value: &Value| value.try_to_string().ok()?.parse::<f64>().ok();
+                let Range::Bounds(exponent_min, exponent_max) = self.range(exponent) else {
+                    return Range::Unknown;
                 };
-                match (min.as_i128(), max.as_i128()) {
-                    (Some(low), Some(high)) if low >= 0 && high < c => Range::Bounds(min, max),
-                    (Some(low), Some(_)) if low >= 0 => {
-                        let bound = |n: i128| crate::execution::parquet::try_cast_value(&Value::hugeint(n), &expr.return_type);
-                        match (bound(0), bound(c - 1)) {
-                            (Some(zero), Some(top)) => Range::Bounds(zero, top),
-                            _ => Range::Unknown,
-                        }
+                let base = match self.range(base) {
+                    Range::Bounds(min, max) => float(&min).zip(float(&max)),
+                    _ => None,
+                };
+                let bounds = float(&exponent_min)
+                    .zip(float(&exponent_max))
+                    .and_then(|exponent| crate::optimizer::statistics::power_bounds(base, exponent));
+                match bounds {
+                    Some((min, max)) => Range::Bounds(Value::double(min), Value::double(max)),
+                    None => Range::Unknown,
+                }
+            }
+            // `PropagateModuloStats` of integers: the bounds of the dividend and the divisor
+            ("%", [input, divisor]) if expr.return_type.is_integral() => {
+                let (Range::Bounds(lmin, lmax), Range::Bounds(rmin, rmax)) = (self.range(input), self.range(divisor))
+                else {
+                    return Range::Unknown;
+                };
+                let null_on_zero = matches!(&expr.kind, BoundExprKind::Function { function, .. } if function.null_on_zero);
+                let bounds = match (lmin.as_i128(), lmax.as_i128(), rmin.as_i128(), rmax.as_i128()) {
+                    (Some(a), Some(b), Some(c), Some(d)) => {
+                        crate::optimizer::statistics::integer_modulo_bounds((a, b), (c, d), &expr.return_type, null_on_zero)
                     }
+                    _ => None,
+                };
+                let bound = |n: i128| crate::execution::parquet::try_cast_value(&Value::hugeint(n), &expr.return_type);
+                match bounds.map(|(min, max)| (bound(min), bound(max))) {
+                    Some((Some(min), Some(max))) => Range::Bounds(min, max),
                     _ => Range::Unknown,
                 }
             }
