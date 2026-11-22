@@ -633,6 +633,7 @@ test/optimizer/pushdown/pushdown_after_statistics.test
 test/optimizer/pushdown/pushdown_in_to_parquet.test
 test/optimizer/pushdown/pushdown_unnest_into_cte.test
 test/optimizer/pushdown/pushdown_window_decreasing_partition.test
+test/optimizer/pushdown/pushdown_window_partition_expression.test
 test/optimizer/pushdown/pushdown_window_partition_filter.test
 test/optimizer/pushdown/scalar_function_pushdown.test
 test/optimizer/pushdown/scalar_function_pushdown_limit.test
@@ -3547,6 +3548,7 @@ test/sql/setops/ambiguous_order_by.test
 test/sql/setops/compression_expression_collation.test
 test/sql/setops/except_intersect_collation.test
 test/sql/setops/except_intersect_filter_equal_values.test
+test/sql/setops/except_intersect_semantics.test
 test/sql/setops/projection_expression_collation.test
 test/sql/setops/setops_pushdown.test
 test/sql/setops/test_except.test

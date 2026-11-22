@@ -223,8 +223,8 @@ Each item gives the number of failing files in `test/` that it should fix, where
     `constant_or_null(false, ...)` (`table_or_pushdown`, `parquet_or_pushdown`)
   - [ ] the rest of C++'s analyzed plan: the `QUERY` / `EXPLAIN_ANALYZE` nodes, `Total Time`, operator timings
   - [x] the order of a join's conditions where an inequality comes before IS DISTINCT FROM (`issue_17042`)
-  - [ ] filters through the row numbers of EXCEPT ALL / INTERSECT ALL on a collation key
-    (`pushdown_window_partition_expression`)
+  - [x] filters through the row numbers of EXCEPT ALL / INTERSECT ALL on a collation key: filters on the
+    partitions of ranking windows pulled up through them (`PullupWindow`; `pushdown_window_partition_expression`)
   - [x] join filters into `read_parquet` scans, through inner blockwise NL joins too, and their
     `Dynamic Filters` (`join_filter_pushdown_any_join` up to its Top-N checks)
   - [x] Top-N dynamic filters pushed into scans of tables and Parquet files, through order-keeping casts
