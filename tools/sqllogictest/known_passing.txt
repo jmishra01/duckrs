@@ -720,6 +720,7 @@ test/optimizer/transitive_filters.test
 test/optimizer/union_exclude.test
 test/optimizer/unnest_rewriter_issue_14542.test
 test/optimizer/unused_columns/cte_unused_columns.test
+test/optimizer/unused_columns/deliver_child_columns.test
 test/optimizer/unused_columns/distinct_on_projection_pushdown.test
 test/optimizer/unused_window_columns.test
 test/optimizer/using_optimizer.test
@@ -4906,6 +4907,7 @@ test/sql/types/variant/variant_object_key_order_json.test
 test/sql/types/variant/variant_shredded_vector_depth_limit.test
 test/sql/types/variant/variant_stats_merge_decimal.test
 test/sql/types/variant/variant_struct_cast_parent_projection.test
+test/sql/types/variant/variant_struct_field_subquery.test
 test/sql/types/variant/variant_struct_field_subquery_cast_parent.test
 test/sql/types/variant/variant_to_array_try_cast.test
 test/sql/types/variant/variant_to_json_null.test
