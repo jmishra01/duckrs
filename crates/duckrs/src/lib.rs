@@ -320,7 +320,7 @@ mod tests {
         assert_eq!(result.value(0, 0), Value::integer(2));
         let result = con.query("SELECT * FROM t WHERE i IN (SELECT i FROM t)").unwrap();
         assert_eq!(result.row_count(), 2);
-        let err = con.query("ATTACH ':memory:' AS x (ENCRYPTION_KEY 'key')").unwrap_err();
+        let err = con.query("SELECT * FROM duckdb_extensions()").unwrap_err();
         assert_eq!(err.kind, ErrorKind::NotImplemented);
     }
 

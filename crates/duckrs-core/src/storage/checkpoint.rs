@@ -5,7 +5,7 @@
 //! A serialized object can't be skipped, so what is not ported (indexes and so on) stops the whole
 //! load with an error instead of going missing silently.
 
-use super::block_manager::{DatabaseHeader, corrupt};
+use super::block_manager::{DatabaseHeader, INVALID_BLOCK, corrupt};
 use super::buffer_manager::BufferManager;
 use super::metadata::{MetaBlockPointer, MetadataChains};
 use super::serialization::convert;
@@ -49,22 +49,36 @@ pub struct RowGroupPointer {
     pub tuple_count: u64,
     pub data_pointers: Vec<MetaBlockPointer>,
     pub deletes_pointers: Vec<MetaBlockPointer>,
+    /// `has_per_column_metadata_blocks`: it says which metadata blocks each column takes, which a checkpoint
+    /// needs to keep the columns of it that stay the same
+    pub per_column: bool,
+    /// `per_column_metadata_blocks`, by column: what a debug build checks against the columns
+    pub column_blocks: Vec<(u64, Vec<u64>)>,
 }
 
 impl Deserialize for RowGroupPointer {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(|d| {
-            let result = Self {
+            let mut result = Self {
                 row_start: d.read_property(100, "row_start")?,
                 tuple_count: d.read_property(101, "tuple_count")?,
                 data_pointers: d.read_property(102, "data_pointers")?,
                 deletes_pointers: d.read_property(103, "delete_pointers")?,
+                per_column: false,
+                column_blocks: Vec::new(),
             };
             d.read_optional_property::<bool>(104, "has_metadata_blocks")?;
             d.read_property_with_default::<Vec<u64>>(105, "extra_metadata_blocks")?;
-            d.read_optional_property::<bool>(106, "has_per_column_metadata_blocks")?;
-            // which metadata blocks a row group owns, packed: only a rewrite needs to know
-            d.read_property_with_default::<Vec<u64>>(107, "per_column_metadata_blocks")?;
+            result.per_column = d.read_optional_property::<bool>(106, "has_per_column_metadata_blocks")? == Some(true);
+            // which metadata blocks each column takes, packed (`PerColumnMetadataBlock`): the top bit marks a column
+            for packed in d.read_property_with_default::<Vec<u64>>(107, "per_column_metadata_blocks")? {
+                let index = packed & !(1 << 63);
+                match result.column_blocks.last_mut() {
+                    _ if packed >> 63 == 1 => result.column_blocks.push((index, Vec::new())),
+                    Some((_, blocks)) => blocks.push(index),
+                    None => return Err(corrupt("per_column_metadata_blocks starts without a column")),
+                }
+            }
             Ok(result)
         })
     }
@@ -85,6 +99,10 @@ pub struct StoredTable {
     pub column_statistics: Vec<Option<BaseStatistics>>,
     /// The id of the next row, past the gaps that a vacuum leaves.
     pub next_row_id: u64,
+    /// Where its statistics and row groups are (`base_table_pointer`), and the metadata sub-blocks they take
+    /// (`read_metadata_pointers`).
+    pub table_pointer: MetaBlockPointer,
+    pub table_blocks: Vec<u64>,
     /// Where the ART of each index is, for what reads one.
     pub indexes: Vec<g::IndexStorageInfo>,
     /// What `COMMENT ON TABLE` and `COMMENT ON COLUMN` said, the columns by name.
@@ -216,7 +234,7 @@ fn read_row_groups(
     chains: &mut MetadataChains,
     pointer: MetaBlockPointer,
     columns: &[StoredColumn],
-) -> Result<(Vec<RowGroupPointer>, Vec<Option<BaseStatistics>>)> {
+) -> Result<(Vec<RowGroupPointer>, Vec<Option<BaseStatistics>>, Vec<u64>)> {
     let mut d = BinaryDeserializer::new(chains.at(buffer, pointer)?);
     let statistics = d.read_object_value(|d| {
         let mut column = columns.iter();
@@ -235,7 +253,8 @@ fn read_row_groups(
     let row_groups = (0..count)
         .map(|_| RowGroupPointer::read_value(&mut d))
         .collect::<Result<_>>()?;
-    Ok((row_groups, statistics))
+    let read = d.position();
+    Ok((row_groups, statistics, chains.sub_blocks(buffer, pointer, read)))
 }
 
 /// `CheckpointReader::LoadCheckpoint`.
@@ -258,8 +277,9 @@ pub fn read_catalog(buffer: &BufferManager) -> Result<StoredCatalog> {
         catalog.entries.push(match entry {
             Pending::Done(entry) => entry,
             Pending::Table(mut table, pointer) => {
-                (table.row_groups, table.column_statistics) =
+                (table.row_groups, table.column_statistics, table.table_blocks) =
                     read_row_groups(buffer, &mut chains, pointer, &table.columns)?;
+                table.table_pointer = pointer;
                 StoredEntry::Table(table)
             }
         });
@@ -378,6 +398,8 @@ pub(super) fn convert_entry(info: g::CreateInfo) -> Result<Converted> {
                 row_groups: Vec::new(),
                 column_statistics: Vec::new(),
                 next_row_id: 0,
+                table_pointer: MetaBlockPointer::new(INVALID_BLOCK, 0),
+                table_blocks: Vec::new(),
                 indexes: Vec::new(),
                 comment: entry_comment,
                 column_comments,

@@ -2,7 +2,7 @@ use super::*;
 use crate::comparison::ComparisonType;
 use crate::types::LogicalType;
 use crate::value::Value;
-use crate::vector::{DataChunk, SelectionVector};
+use crate::vector::{DataChunk, SelectionVector, Vector};
 use proptest::prelude::*;
 
 fn struct_type() -> LogicalType {
@@ -316,5 +316,24 @@ proptest! {
             prop_assert_eq!(back.get_value(0, r), chunk.get_value(0, r));
             prop_assert_eq!(back.get_value(1, r), chunk.get_value(1, r));
         }
+    }
+}
+
+/// A LIST and an ARRAY column of only NULLs read back as NULLs: their store has no value, which a NULL row's
+/// slot would point at.
+#[test]
+fn null_lists_round_trip() {
+    for ty in [LogicalType::list(LogicalType::VARCHAR), LogicalType::array(LogicalType::VARCHAR, 2)] {
+        let mut vector = Vector::new(ty.clone(), 3);
+        vector.prepare_flat(3);
+        for row in 0..3 {
+            vector.set_value(row, &Value::null(ty.clone())).unwrap();
+        }
+        let chunk = DataChunk::from_columns(vec![vector], 3);
+        let mut collection = TupleDataCollection::new(layout_for(&chunk)).unwrap();
+        collection.append(&chunk);
+        let back: Vec<DataChunk> = collection.scan().collect();
+        assert_eq!(back.len(), 1);
+        assert!((0..3).all(|row| back[0].get_value(0, row).is_null()), "{ty}");
     }
 }

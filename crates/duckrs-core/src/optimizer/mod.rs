@@ -10,6 +10,7 @@
 pub mod build_side;
 mod aggregate_rewriter;
 mod common_aggregate;
+mod cse;
 mod common_subplan;
 mod cte_inlining;
 mod eager_aggregate;
@@ -40,7 +41,7 @@ mod remove_redundant_order;
 pub mod rewriter;
 pub mod scan_filters;
 pub mod statistics;
-mod variant_statistics;
+pub(crate) mod variant_statistics;
 pub mod top_n;
 pub mod row_number_rewriter;
 pub mod type_pushdown;
@@ -81,6 +82,7 @@ pub struct OptimizerOptions {
     /// `REORDER_FILTER`
     pub reorder_filter: bool,
     pub common_subplan: bool,
+    pub common_subexpressions: bool,
     pub projection_pullup: bool,
     pub projection_placement: bool,
     pub join_elimination: bool,
@@ -157,6 +159,7 @@ impl Default for OptimizerOptions {
             unnest_rewriter: true,
             reorder_filter: true,
             common_subplan: true,
+            common_subexpressions: true,
             projection_pullup: true,
             projection_placement: true,
             join_elimination: true,
@@ -219,6 +222,7 @@ impl OptimizerOptions {
             unnest_rewriter: false,
             reorder_filter: false,
             common_subplan: false,
+            common_subexpressions: false,
             projection_pullup: false,
             projection_placement: false,
             join_elimination: false,
@@ -280,6 +284,7 @@ impl OptimizerOptions {
             unnest_rewriter: !off("unnest_rewriter"),
             reorder_filter: !off("reorder_filter"),
             common_subplan: !off("common_subplan"),
+            common_subexpressions: !off("common_subexpressions"),
             projection_pullup: !off("projection_pullup"),
             projection_placement: !off("projection_placement"),
             join_elimination: !off("join_elimination"),
@@ -521,6 +526,10 @@ pub fn optimize_timed(
             projection_placement::place(&mut plan, statistics_map);
             plan
         });
+    }
+    // `COMMON_SUBEXPRESSIONS` runs once the unused columns are gone
+    if options.common_subexpressions {
+        plan = run("common_subexpressions", plan, &mut cse::optimize);
     }
     // `TOP_N_WINDOW_ELIMINATION`, and the unused columns removed again after it
     if options.topn_window_elimination {

@@ -1054,6 +1054,23 @@ impl ValueScanner {
         self.machine.finished
     }
 
+    /// The first byte the scanner still needs, between two rows: where the data it scans can start from now.
+    pub fn earliest(&self) -> usize {
+        self.machine.position.min(self.sink.last).min(self.sink.row_start)
+    }
+
+    /// The data it scans now starts `by` bytes later, at most [`Self::earliest`] (`CSVBuffer` after `CSVBuffer`).
+    pub fn rebase(&mut self, by: usize) {
+        self.machine.position -= by;
+        let sink = &mut self.sink;
+        sink.last -= by;
+        sink.row_start -= by;
+        sink.row_end = sink.row_end.saturating_sub(by);
+        sink.quoted_position = sink.quoted_position.saturating_sub(by);
+        sink.position_before_comment = sink.position_before_comment.saturating_sub(by);
+        sink.spans.clear();
+    }
+
     /// The next row, or `None` at the end of the data.
     pub fn next<'a>(&mut self, data: &'a [u8]) -> Option<Scanned<'a>> {
         let sink = &mut self.sink;

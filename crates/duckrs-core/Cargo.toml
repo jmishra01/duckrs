@@ -20,6 +20,7 @@ arrow.workspace = true
 libm.workspace = true
 sha1.workspace = true
 sha2.workspace = true
+ring.workspace = true
 parquet.workspace = true
 regex.workspace = true
 memchr.workspace = true

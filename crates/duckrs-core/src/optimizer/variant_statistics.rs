@@ -190,10 +190,30 @@ pub(super) fn cast_from_variant(stats: &Stats, target: &LogicalType) -> Option<S
     let Some(VariantStatistics::Shredded(ty, shredded)) = stats.variant.as_deref() else {
         return None;
     };
-    if !fully_shredded(ty, shredded) || structured_type(ty) != *target {
+    if !fully_shredded(ty, shredded) {
         return None;
     }
+    let typed_type = structured_type(ty);
     let (_, mut result) = typed(ty, shredded);
+    // `CastStatistics::TryPropagate` of typed values of another integer type: their bounds, cast
+    if typed_type != *target {
+        if !typed_type.is_integral() || !target.is_integral() {
+            return None;
+        }
+        let convert = |value: Option<Value>| {
+            let cast = crate::planner::expression::BoundExpr::constant(value?).cast_to(target, false);
+            let converted = crate::execution::expression_executor::try_evaluate_scalar(&cast)?;
+            (converted.logical_type() == target).then_some(converted)
+        };
+        let (min, max) = (convert(result.min.take())?, convert(result.max.take())?);
+        result = Stats {
+            min: Some(min),
+            max: Some(max),
+            can_be_null: result.can_be_null,
+            can_be_valid: result.can_be_valid,
+            ..Stats::unknown()
+        };
+    }
     if stats.can_be_null {
         result.can_be_null = true;
     }
@@ -244,6 +264,31 @@ pub(super) fn compress_info(stats: &Stats) -> Option<(LogicalType, Stats)> {
     let (_, mut typed_stats) = typed(ty, shredded);
     typed_stats.can_be_null |= stats.can_be_null;
     Some((structured, typed_stats))
+}
+
+/// What the statistics of the VARIANT columns that `column` gives say of `expr`, where it is a path of one
+/// (`variant_extract`s with constant paths) cast to a primitive type: the statistics `ExpressionFilter::
+/// CheckStatistics` takes of a filter's expression. `None` for any other expression, or where nothing is known.
+pub(crate) fn variant_path_statistics(
+    expr: &crate::planner::expression::BoundExpr,
+    column: &dyn Fn(usize) -> Option<Stats>,
+) -> Option<Stats> {
+    use crate::planner::expression::BoundExprKind;
+    match &expr.kind {
+        BoundExprKind::Reference(at) if expr.return_type.id() == LogicalTypeId::Variant => column(*at),
+        BoundExprKind::Function { function, children, .. }
+            if function.name == "variant_extract" && children.len() == 2 =>
+        {
+            let BoundExprKind::Constant(key) = &children[1].kind else {
+                return None;
+            };
+            extract(&variant_path_statistics(&children[0], column)?, key)
+        }
+        BoundExprKind::Cast { child, try_cast: false } if child.return_type.id() == LogicalTypeId::Variant => {
+            cast_from_variant(&variant_path_statistics(child, column)?, &expr.return_type)
+        }
+        _ => None,
+    }
 }
 
 /// `VariantExtractPropagateStats`: the statistics of a field (`key`) or an element (`index`) of a VARIANT.

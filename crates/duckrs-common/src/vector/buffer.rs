@@ -64,9 +64,19 @@ pub struct StringBuffer {
 }
 
 impl StringBuffer {
+    /// Bytes its strings took so far, for memory accounting.
+    pub fn allocated(&self) -> usize {
+        self.heap.allocated()
+    }
+
     /// Copies `bytes` into this buffer. The result stays readable while the buffer is alive.
     pub fn add(&self, bytes: &[u8]) -> StringT {
         self.heap.add(bytes)
+    }
+
+    /// Takes `bytes` into this buffer without copying them ([`StringHeap::adopt`]).
+    pub fn adopt(&self, bytes: Vec<u8>) -> *const u8 {
+        self.heap.adopt(bytes)
     }
 
     /// Keeps `other` alive as long as this buffer, so strings pointing into it stay valid.

@@ -30,19 +30,16 @@ pub struct BaseStatistics {
     pub geometry: Option<duckrs_common::geometry::GeometryStats>,
     /// of a VARCHAR, the bounds the file has
     pub strings: Option<StringBounds>,
-    /// of a LIST or ARRAY its element's, of a STRUCT its fields'
+    /// of a VARIANT, its `VariantStatsShreddingState`
+    pub variant_state: Option<u8>,
+    /// of a shredded VARIANT, the type of its shredded part and the statistics of that
+    pub variant_shredded: Option<Box<(LogicalType, BaseStatistics)>>,
+    /// of a LIST or ARRAY its element's, of a STRUCT each field's
     pub children: Vec<BaseStatistics>,
-    /// of a VARIANT, `VariantStats`
-    pub variant: Option<Box<StoredVariantStats>>,
-    /// of a LIST, the lengths of its lists the file has (`ListStatsData`, from v2.1.0)
+    /// of a LIST, the lengths of its lists, as files from v2.1.0 have them
     pub lists: Option<crate::catalog::ListLengths>,
-}
-
-/// `VariantStatsData`: the shredding state, and if shredded the type of the typed part and its statistics.
-#[derive(Debug, Clone)]
-pub struct StoredVariantStats {
-    pub state: u8,
-    pub shredded: Option<(LogicalType, BaseStatistics)>,
+    /// of a table's column, its `DistinctStatistics`, if the file has them in a form that is read
+    pub distinct: Option<crate::optimizer::distinct_statistics::DistinctState>,
 }
 
 fn numeric_value(d: &mut BinaryDeserializer<'_>, physical: PhysicalType) -> Result<Option<[u8; 16]>> {
@@ -90,12 +87,12 @@ fn numeric_value(d: &mut BinaryDeserializer<'_>, physical: PhysicalType) -> Resu
 /// The bounds of a VARCHAR column's values: prefixes of them where `exact` is false (`StringStatsData`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StringBounds {
+    /// whether `min` and `max` are bounds: without them only the rest is known
+    pub has_bounds: bool,
     pub min: Vec<u8>,
     pub min_exact: bool,
     pub max: Vec<u8>,
     pub max_exact: bool,
-    /// whether there are bounds: there are none of no strings, whose lengths are still known
-    pub bounds_known: bool,
     pub has_unicode: bool,
     pub min_length: Option<u64>,
     pub max_length: Option<u64>,
@@ -117,17 +114,18 @@ fn string_stats(d: &mut BinaryDeserializer<'_>) -> Result<Option<StringBounds>> 
         let has_max_length = d.read_property::<bool>(203, "has_max_string_length")?;
         let max_length = d.read_property::<u32>(204, "max_string_length")? as usize;
         let (min, max) = (min.0, max.0);
-        if min.len() != LEGACY_MINMAX_SIZE || max.len() != LEGACY_MINMAX_SIZE {
-            return Ok(None);
-        }
-        // `LegacyGetMinMaxType`: no bounds, as of no strings, whose lengths are known all the same
-        if min[0] > max[0] || (min.iter().all(|b| *b == 0) && max.iter().all(|b| *b == 0xFF)) {
+        // `LegacyGetMinMaxType`: EMPTY_STATS or NO_STATS have no bounds, but the rest
+        if min.len() != LEGACY_MINMAX_SIZE
+            || max.len() != LEGACY_MINMAX_SIZE
+            || min[0] > max[0]
+            || (min.iter().all(|b| *b == 0) && max.iter().all(|b| *b == 0xFF))
+        {
             return Ok(Some(StringBounds {
+                has_bounds: false,
                 min: Vec::new(),
                 min_exact: false,
                 max: Vec::new(),
                 max_exact: false,
-                bounds_known: false,
                 has_unicode,
                 min_length: None,
                 max_length: has_max_length.then_some(max_length as u64),
@@ -143,11 +141,11 @@ fn string_stats(d: &mut BinaryDeserializer<'_>) -> Result<Option<StringBounds>> 
             bytes[..end].to_vec()
         };
         return Ok(Some(StringBounds {
+            has_bounds: true,
             min: trimmed(min),
             min_exact: exact,
             max: trimmed(max),
             max_exact: exact,
-            bounds_known: true,
             has_unicode,
             min_length: None,
             max_length: has_max_length.then_some(max_length as u64),
@@ -158,40 +156,38 @@ fn string_stats(d: &mut BinaryDeserializer<'_>) -> Result<Option<StringBounds>> 
     let min_max = d.read_optional_property::<RawBytes>(205, "min_max")?;
     let packed = d.read_property::<u32>(206, "packed_field")?;
     let total_length = d.read_optional_property::<u64>(207, "total_string_length")?;
-    // `StringStatsField::GetMinStringLength`: 0 for not set, the length plus one, or the most it can hold,
-    // which is no length either (`StringStatsData::HasMinStringLength`)
+    // `StringStatsField::GetMinStringLength`: 0 for not set, the length plus one, or the most it can hold
     let min_length = match (packed >> 11) & ((1 << 21) - 1) {
-        0 | MAXIMUM_MIN_STRING_LENGTH => None,
+        0 => None,
+        MAXIMUM_MIN_STRING_LENGTH => Some(u64::from(u32::MAX)),
         length => Some(u64::from(length - 1)),
     };
     let has_unicode = packed & 1 == 0;
     let max_length = max_length.filter(|length| *length != u32::MAX).map(u64::from);
     // `StringStatsField`
-    let Some(min_max) = min_max.filter(|m| m.0.len() == 2 * CURRENT_MINMAX_SIZE) else {
-        // no bounds, as of no strings, but what is known of their lengths
-        return Ok(max_length.is_some().then(|| StringBounds {
+    let min_size = ((packed >> 3) & 0xF) as usize;
+    let max_size = ((packed >> 7) & 0xF) as usize;
+    let Some(min_max) = min_max.filter(|m| {
+        m.0.len() == 2 * CURRENT_MINMAX_SIZE && min_size <= CURRENT_MINMAX_SIZE && max_size <= CURRENT_MINMAX_SIZE
+    }) else {
+        return Ok(Some(StringBounds {
+            has_bounds: false,
             min: Vec::new(),
             min_exact: false,
             max: Vec::new(),
             max_exact: false,
-            bounds_known: false,
             has_unicode,
             min_length,
             max_length,
             total_length,
         }));
     };
-    let min_size = ((packed >> 3) & 0xF) as usize;
-    let max_size = ((packed >> 7) & 0xF) as usize;
-    if min_size > CURRENT_MINMAX_SIZE || max_size > CURRENT_MINMAX_SIZE {
-        return Ok(None);
-    }
     Ok(Some(StringBounds {
+        has_bounds: true,
         min: min_max.0[..min_size].to_vec(),
         min_exact: packed & (1 << 1) != 0,
         max: min_max.0[CURRENT_MINMAX_SIZE..CURRENT_MINMAX_SIZE + max_size].to_vec(),
         max_exact: packed & (1 << 2) != 0,
-        bounds_known: true,
         has_unicode,
         min_length,
         max_length,
@@ -218,23 +214,26 @@ pub fn read_statistics(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalType>)
             max: bounds.and_then(|(_, max)| max),
             geometry,
             strings,
+            variant_state: nested.variant_state,
+            variant_shredded: nested.variant_shredded,
             children: nested.children,
-            variant: nested.variant,
             lists: nested.lists,
+            distinct: None,
         })
     })
 }
 
-/// The bounds of the values, of the types that have numeric statistics.
-type Bounds = Option<([u8; 16], Option<[u8; 16]>)>;
-
-/// The statistics in those of a nested type or a VARIANT.
+/// What statistics of a VARIANT or a nested type have besides their own.
 #[derive(Default)]
 struct Nested {
+    variant_state: Option<u8>,
+    variant_shredded: Option<Box<(LogicalType, BaseStatistics)>>,
     children: Vec<BaseStatistics>,
-    variant: Option<Box<StoredVariantStats>>,
     lists: Option<crate::catalog::ListLengths>,
 }
+
+/// The bounds of the values, of the types that have numeric statistics.
+type Bounds = Option<([u8; 16], Option<[u8; 16]>)>;
 
 fn read_type_stats(
     d: &mut BinaryDeserializer<'_>,
@@ -247,21 +246,17 @@ fn read_type_stats(
         return Ok(None);
     };
     if ty.id() == LogicalTypeId::Variant {
-        // `VariantStats::Deserialize`: the statistics of the unshredded values and, if shredded, of the typed part
+        // `VariantStats::Deserialize`: the statistics of the unshredded part, and of a shredded one
         const SHREDDED: u8 = 2;
         let state: u8 = d.read_property(200, "shredding_state")?;
+        nested.variant_state = Some(state);
         let unshredded = duckrs_common::variant::unshredded_type();
         d.read_object_field(225, "unshredded_stats", |d| read_statistics(d, Some(&unshredded)))?;
-        let mut shredded_stats = None;
         if state == SHREDDED {
             let shredded: LogicalType = d.read_property(230, "shredded_type")?;
             let stats = d.read_object_field(235, "shredded_stats", |d| read_statistics(d, Some(&shredded)))?;
-            shredded_stats = Some((shredded, stats));
+            nested.variant_shredded = Some(Box::new((shredded, stats)));
         }
-        nested.variant = Some(Box::new(StoredVariantStats {
-            state,
-            shredded: shredded_stats,
-        }));
         return Ok(None);
     }
     // `GeometryStats::Deserialize`: the string stats of files of the spatial extension, or the extent,
@@ -315,13 +310,14 @@ fn read_type_stats(
         PhysicalType::List | PhysicalType::Array => {
             let child = d.read_object_field(200, "child_stats", |d| read_statistics(d, ty.child_type()))?;
             nested.children = vec![child];
-            // `ListStats::Deserialize`: each length that is there is known
-            if physical == PhysicalType::List {
+            // `ListStats::Deserialize`: what is not there is not known
+            if ty.physical_type() == PhysicalType::List {
                 nested.lists = Some(crate::catalog::ListLengths {
                     min: d.read_optional_property::<u64>(201, "min_list_length")?,
                     max: d.read_optional_property::<u64>(202, "max_list_length")?,
                     total: d.read_optional_property::<u64>(203, "total_list_length")?,
-                });
+                })
+                .filter(|lists| lists.min.is_some() || lists.max.is_some() || lists.total.is_some());
             }
             Ok(None)
         }
@@ -332,34 +328,51 @@ fn read_type_stats(
             }
             let min = d.read_object(200, "min", |d| numeric_value(d, physical))?;
             let max = d.read_object(201, "max", |d| numeric_value(d, physical))?;
+            // `NumericStats::HasMinMax`: a minimum above the maximum, of no values, is no bounds
+            if let (Some(min), Some(max)) = (&min, &max)
+                && super::writer::compare(physical, min, max) == std::cmp::Ordering::Greater
+            {
+                return Ok(None);
+            }
             Ok(min.map(|min| (min, max)))
         }
     }
 }
 
 /// `HyperLogLog::Deserialize`, whose registers nothing uses yet.
-struct HyperLogLog;
+/// `HyperLogLog::Deserialize`: the registers, as they are of `HLL_V2`, and of `HLL_V1` as `HLLV1::ToNew` makes
+/// them; `None` of what is neither.
+struct HyperLogLog(Option<Vec<u8>>);
+
+use crate::optimizer::distinct_statistics::{HLL_V1, HLL_V2, registers_of_v1};
 
 impl Deserialize for HyperLogLog {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(|d| {
-            d.read_property::<u8>(100, "type")?;
-            d.read_property::<RawBytes>(101, "data")?;
-            Ok(Self)
+            let storage = d.read_property::<u8>(100, "type")?;
+            let data = d.read_property::<RawBytes>(101, "data")?;
+            Ok(Self(match storage {
+                HLL_V2 => Some(data.0),
+                HLL_V1 => registers_of_v1(&data.0),
+                _ => None,
+            }))
         })
     }
 }
 
 /// `DistinctStatistics::Deserialize`.
-struct DistinctStatistics;
+struct DistinctStatistics(Option<crate::optimizer::distinct_statistics::DistinctState>);
 
 impl Deserialize for DistinctStatistics {
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
         d.read_object_value(|d| {
-            d.read_property_with_default::<u64>(100, "sample_count")?;
-            d.read_property_with_default::<u64>(101, "total_count")?;
-            d.read_optional_property::<Option<HyperLogLog>>(102, "log")?;
-            Ok(Self)
+            let sample_count = d.read_property_with_default::<u64>(100, "sample_count")?;
+            let total_count = d.read_property_with_default::<u64>(101, "total_count")?;
+            let log = d.read_optional_property::<Option<HyperLogLog>>(102, "log")?.flatten();
+            let state = log.and_then(|log| log.0).and_then(|registers| {
+                crate::optimizer::distinct_statistics::DistinctState::stored(&registers, sample_count, total_count)
+            });
+            Ok(Self(state))
         })
     }
 }
@@ -370,8 +383,11 @@ pub fn read_column_statistics(d: &mut BinaryDeserializer<'_>, ty: &LogicalType) 
         return Ok(None);
     }
     d.read_object_value(|d| {
-        let statistics = d.read_object_field(100, "statistics", |d| read_statistics(d, Some(ty)))?;
-        d.read_optional_property::<Option<DistinctStatistics>>(101, "distinct")?;
+        let mut statistics = d.read_object_field(100, "statistics", |d| read_statistics(d, Some(ty)))?;
+        statistics.distinct = d
+            .read_optional_property::<Option<DistinctStatistics>>(101, "distinct")?
+            .flatten()
+            .and_then(|distinct| distinct.0);
         Ok(Some(statistics))
     })
 }
@@ -493,4 +509,29 @@ fn skip_data_chunk(d: &mut BinaryDeserializer<'_>) -> Result<()> {
         d.read_object_value(|d| skip_vector(d, ty))
     })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use duckrs_common::serializer::{BinarySerializer, SerializationOptions};
+
+    #[test]
+    fn distinct_statistics_read_back_as_written() {
+        use crate::optimizer::distinct_statistics::DistinctState;
+        let mut state = DistinctState::default();
+        let mut vector = duckrs_common::vector::Vector::new(LogicalType::BIGINT, 2048);
+        vector.prepare_flat(2048);
+        for (row, value) in vector.data_mut::<i64>().iter_mut().enumerate() {
+            *value = (row % 300) as i64;
+        }
+        assert!(state.update(&LogicalType::BIGINT, &vector, 2048));
+        let mut s = BinarySerializer::new(SerializationOptions::default());
+        s.write_object_value(|s| state.write(s));
+        let bytes = s.into_bytes();
+        let mut d = BinaryDeserializer::new(&bytes);
+        let read = DistinctStatistics::read_value(&mut d).unwrap().0.unwrap();
+        assert_eq!(read.count(), state.count());
+        assert!(read.count() > 0);
+    }
 }

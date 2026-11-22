@@ -121,9 +121,12 @@ A statement goes `parse_ast` → `Binder` (bound expressions, `LogicalOperator` 
 - **Aggregates** bind like `BaseSelectBinder`: groups naming a select list entry swap places with
   it, expressions matching a group or an aggregate become column references of the aggregate
   operator, equal aggregates are computed once, and a column outside of them is DuckDB's "must
-  appear in the GROUP BY clause" error. `PhysicalAggregate` finds groups by sort key and keeps a
-  state per group and aggregate (`function::aggregates`); min, max and DISTINCT compare sort
-  keys. This is simple rather than fast: DuckDB's vectorized hash table comes with Phase 8.
+  appear in the GROUP BY clause" error. `PhysicalAggregate` keeps a state per group and aggregate
+  (`function::aggregates`). With one grouping set and no DISTINCT or ORDER BY aggregate it finds
+  groups in a `GroupTable` (`execution::group_table`, C++'s `GroupedAggregateHashTable`): the hash of
+  their columns, then a comparison with the rows of the row format that hold them; threads' tables
+  merge by partition of that hash, and past the memory limit rows spill by it. Otherwise groups are
+  found by sort key; min, max and DISTINCT compare sort keys.
 - **Settings** are generated from DuckDB's `settings.json` (`tools/generate_settings.py`) with
   their aliases, types, scopes and defaults, and kept per database and per connection.
   Settings that only tune performance, storage, extensions or logging are stored; the
@@ -384,8 +387,7 @@ Floating point sums over large tables can differ in their last digits between ru
 in another order, which SQL allows, and so do the matches of a key in the build side of a join, as threads add their
 rows in the order they finish. The piecewise merge, IE and nested loop joins are that join with another lookup, so they
 probe on threads too, with the build side sorted once instead of the sorted runs of both sides that C++ merges. Not
-ported: cross products, AsOf and the other special joins on threads, sort and window on threads, parallel CSV and
-`InterruptState`.
+ported: cross products, AsOf and the other special joins on threads, sort and window on threads, and `InterruptState`.
 
 ### Spilling
 
@@ -483,8 +485,7 @@ passes `checkpoint_threshold` and when the database goes away.
 These fail with an error that says they are not ported, because going on would give wrong answers
 or lose data:
 
-- ZSTD, Chimp and Patas;
-- VARIANT and GEOMETRY columns;
+- shredded VARIANT columns, and GEOMETRY columns;
 - triggers;
 - `CREATE TABLE ... AS` queries, partition and sort keys, table options, and schemas with options;
 - in a stored query: INSERT, UPDATE, DELETE, MERGE, COPY, SHOW and MATCH_RECOGNIZE;
@@ -497,8 +498,7 @@ These stop writes, or fail when they are made, as a file can't hold them yet:
 - VARIANT and GEOMETRY columns, and in a stored query what can't be read from one either. These fail
   at the commit, which leaves the database in memory as it is, until what can't be stored is dropped.
 
-Next: VARIANT and writing older `STORAGE_VERSION`s are the largest of the rest. ZSTD takes a new dependency, and Chimp and
-Patas are only in old files.
+Next: shredded VARIANT and writing older `STORAGE_VERSION`s are the largest of the rest.
 
 **Indexes**: the ART of each index in a file is parsed past and not read, whichever way the file
 points to it (`index_storage_infos`, or `index_pointers` and `root_block_pointer` in old files). C++
@@ -580,6 +580,13 @@ leave them as they are, and new values are added by reading only rows that are n
 (`TableStatistics::covered`, `updated`). Whoever calls `write_storage` says what became of the rows
 (`rows_removed`, `rows_appended`, `rows_updated_in_place`), and what nobody reports counts as all of
 them. Zones stay for the row groups before the first row that changed.
+
+**Distinct values** of a column (`optimizer::distinct_statistics::DistinctState`) are C++'s `DistinctStatistics`: a
+HyperLogLog of a sample of each appended chunk, with how many rows it saw. A file keeps them per column, which
+`TableSource::distinct_states` reads (`HLL_V2`, or `HLL_V1` converted as `HLLV1::ToNew` does); a row group
+written ahead counts its own as it is encoded, rows in memory are counted from their chunks, and the parts of a
+table merge. A checkpoint writes them for files from v1.2.0 on. Where a part does not have them (a file without
+them, or row groups replayed from a log), they are counted from all the rows, as before.
 
 **Temporary objects** are a connection's: each has a schema of its own, which `Catalog::get_schema`
 finds through a thread local for as long as a statement of that connection runs (`SessionTemp`).
@@ -678,9 +685,14 @@ file with `fsync`, but it can't lose what the operating system holds, as a power
 
 **Tables in place** (`DiskTable`, `TableCursor`): rows stay in the file, and `TableSource` is how the
 engine reaches them without knowing about files. A scan decodes the row group it is at, only the
-columns that its projection and filter refer to, through the buffer manager, which keeps 256 MiB of
-blocks whatever `memory_limit` says for now. Metadata is read at open, as are deletes, as the number
-of rows has to be known. Decoding is what fails on damage or ZSTD, so those errors come from the
+columns that its projection and filter refer to, through the buffer manager, which keeps blocks up to
+`memory_limit` (80% of the machine's memory by default), as each query sets it, and reads them with
+`pread` on threads at once. The metadata of a column of a row group is read once and kept. A filter
+of comparisons of an integer column with constants is a range of its values, which a loop over them
+keeps (C++'s `ConstantFilter`), and conjuncts of the same columns are one pass. Of the rows a filter
+kept, at most a quarter of a group's are fetched one by one from bitpacked integers, and at most half
+from DICT_FSST strings, each decoded from its entry. Metadata is read at open, as are deletes, as the
+number of rows has to be known. Decoding is what fails on damage or ZSTD, so those errors come from the
 query that reads the rows and not from opening the file; bad metadata still fails the open.
 
 `storage` of a table is private, so what wants all rows goes through `rows` and `write_storage`,
@@ -748,9 +760,9 @@ bytes of a block and fixes its checksum, to get past that to the decoders. Layou
 exactly and not just bounds: an FSST symbol table in the wrong place is corruption even if it is in
 bounds, as otherwise strings decode to garbage without an error.
 
-Of the 25 database files under DuckDB's `data` and `test`, 12 open. The rest fail on Patas and Chimp
-(3) and encryption (2), and 8 are refused as DuckDB refuses them: damaged, of another vector size, or
-too old.
+Of the 25 database files under DuckDB's `data` and `test`, 15 open, the Patas and Chimp ones (`float_codecs`)
+among them. The rest fail on encryption (2), and 8 are refused as DuckDB refuses them: damaged, of another
+vector size, or too old.
 
 `stored_queries.txt` is one query per line, stored as a view in files for v1.0.0, v1.5.0 and v2.0.0.
 Every view gives the rows that DuckDB gives, and on the v1.5.0 file `duckdb_views()` renders each
@@ -791,7 +803,8 @@ tests read; `test_vector_types`; COLLATE; and VARIANT columns in database files.
 
 ## Phase 11
 
-CSV is in, on one thread: C++'s state machine and sniffer are ported, its buffers and parallel scan are not.
+CSV is in: C++'s state machine and sniffer are ported, and a file is read a buffer at a time and scanned on threads
+in parts that start where its rows do.
 Parquet is in as the plan's v1, through the `parquet` crate. JSON has a first slice. EXPORT and IMPORT have not started.
 
 - **Files** (`execution::file_system`): globbing with `*`, `?`, `[...]` and `**`, and reading a whole
@@ -800,7 +813,9 @@ Parquet is in as the plan's v1, through the `parquet` crate. JSON has a first sl
 - **The state machine** (`execution::csv_state_machine`) is C++'s transition table, byte by byte: quotes,
   escapes, comments, multi-byte delimiters, strict mode and all three newlines. `Machine::process` is
   `BaseScanner::Process` over a `Sink`, so `ColumnCountScanner`, `SkipScanner` and `ValueScanner` get the same
-  events in the same order as in C++. A file is in memory whole, so there are no boundaries between buffers.
+  events in the same order as in C++. A file larger than a buffer (32MB) is read a buffer at a time; a
+  part for a thread starts after a `\n` that ends a row, which the state machine finds once a quote or escape is
+  in the file.
 - **The sniffer** (`execution::csv_sniffer`) follows `CSVSniffer` step by step: the search space of dialects and
   `AnalyzeDialectCandidate`, refinement over `sample_size` rows, date and timestamp formats, type candidates and
   how they fall back, header detection, `normalize_names`. Its error messages are C++'s.
@@ -921,10 +936,12 @@ cargo run --release -p benchmark --features reference -- --engine=both --threads
 cargo bench -p duckrs --bench kernels
 ```
 
-Larger scale factors go through `--sf N`. duckrs cannot load TPC-H SF10 itself (an append keeps the rows of
-its table in memory), so SF10 is measured on the file C++ writes: run the reference engine once
-(`--engine=reference --sf 10`), copy `duckdb_benchmark_data/reference/tpch_sf10.duckdb` to
-`duckdb_benchmark_data/duckrs/`, then `--engine=both --sf 10`. There are no SF10 answers to check.
+Larger scale factors go through `--sf N`. The benchmark measures SF10 on the file C++ writes: run the reference
+engine once (`--engine=reference --sf 10`), copy `duckdb_benchmark_data/reference/tpch_sf10.duckdb` to
+`duckdb_benchmark_data/duckrs/`, then `--engine=both --sf 10`. duckrs can load SF10 into a file of its own too
+(CREATE TABLE and `COPY ... FROM` the `.tbl` files, about 35 seconds, under 800MB at the most, as appends write
+their full row groups to blocks as they fill), and `TPCH_DATABASE=<file> cargo run --release -p duckrs --example
+tpch -- - ../duckdb/extension/tpch/dbgen 10` checks the 22 queries on it against `answers/sf10`.
 
 ## Testing
 

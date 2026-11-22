@@ -1104,7 +1104,30 @@ fn row_groups_to_scan(
         .row_groups()
         .iter()
         .enumerate()
-        .filter(|(_, group)| {
+        .filter(|(index, group)| {
+            // `ColumnReader::Stats` of a VARIANT column in the row group, which the paths of it filtered on have
+            // bounds by; each worked out once
+            let variant_stats = std::cell::RefCell::new(HashMap::new());
+            let variant = |column: usize| -> Option<crate::catalog::ColumnStatistics> {
+                let is_variant = scan
+                    .types
+                    .get(column)
+                    .is_some_and(|ty| ty.id() == LogicalTypeId::Variant)
+                    && column < scan.names.len()
+                    && scan.schema.is_none()
+                    && !scan
+                        .hive_overrides
+                        .iter()
+                        .any(|(_, key)| key.eq_ignore_ascii_case(&scan.names[column]));
+                if !is_variant {
+                    return None;
+                }
+                variant_stats
+                    .borrow_mut()
+                    .entry(column)
+                    .or_insert_with(|| variant_stats::variant_statistics(metadata, &scan.names[column], Some(*index)))
+                    .clone()
+            };
             let zone = |at: usize| -> Option<crate::catalog::ColumnZone> {
                 if let Some((leaf, element)) = element_leaves.get(at).and_then(Option::as_ref) {
                     // `TransformColumnStatistics` of a LIST or MAP: unknown validity, the elements' statistics
@@ -1128,8 +1151,17 @@ fn row_groups_to_scan(
                     ..Default::default()
                 })
             };
-            !crate::execution::zone_map::never_true(&zone, filter)
-                && !bloom_rules_out(scan, &leaves, &element_leaves, group, filter, &mut file, path, normalized)
+            !crate::execution::zone_map::never_true_with_variants(&zone, &variant, filter)
+                && !bloom_rules_out(
+                    scan,
+                    &leaves,
+                    &element_leaves,
+                    group,
+                    filter,
+                    &mut file,
+                    path,
+                    normalized,
+                )
         })
         .map(|(at, _)| at)
         .collect();
@@ -2665,6 +2697,10 @@ pub fn scan_statistics(scan: &ParquetScanData) -> Vec<Option<crate::catalog::Col
         }
         let mut file_stats = Vec::with_capacity(scan.names.len());
         for column in 0..scan.names.len() {
+            if scan.types[column].id() == LogicalTypeId::Variant {
+                file_stats.push(variant_stats::variant_statistics(&metadata, &scan.names[column], None));
+                continue;
+            }
             let Some(leaf) = statistics_leaf(scan, &metadata, column, path) else {
                 file_stats.push(None);
                 continue;
@@ -2725,9 +2761,51 @@ pub fn scan_statistics(scan: &ParquetScanData) -> Vec<Option<crate::catalog::Col
                 stats.min = None;
                 stats.max = None;
             }
-            if string_column {
-                stats.strings = Some(strings.unwrap_or_else(unknown_strings));
-                string_bounds_only(&mut stats);
+            // `TransformParquetStatistics` of strings: the bounds as the file has them, nothing of their lengths or
+            // characters
+            let ty = scan.types.get(column).map(LogicalType::id);
+            if matches!(ty, Some(LogicalTypeId::Varchar | LogicalTypeId::Blob)) {
+                let varchar = ty == Some(LogicalTypeId::Varchar);
+                let mut bounds: Option<(Vec<u8>, Vec<u8>)> = None;
+                let mut known = true;
+                for group in metadata.row_groups() {
+                    let Some(statistics) = group.column(leaf).statistics() else {
+                        known = false;
+                        break;
+                    };
+                    if statistics
+                        .null_count_opt()
+                        .is_some_and(|nulls| nulls >= group.num_rows() as u64)
+                    {
+                        continue;
+                    }
+                    // `StringStatsAreValid`: exact bounds of a VARCHAR that are not UTF-8 are bogus; cut ones may be
+                    let valid = |bytes: &[u8], exact: bool| !(varchar && exact && std::str::from_utf8(bytes).is_err());
+                    match (statistics.min_bytes_opt(), statistics.max_bytes_opt()) {
+                        (Some(min), Some(max))
+                            if valid(min, statistics.min_is_exact()) && valid(max, statistics.max_is_exact()) =>
+                        {
+                            let (low, high) = bounds.get_or_insert_with(|| (min.to_vec(), max.to_vec()));
+                            if min < low.as_slice() {
+                                *low = min.to_vec();
+                            }
+                            if max > high.as_slice() {
+                                *high = max.to_vec();
+                            }
+                        }
+                        _ => {
+                            known = false;
+                            break;
+                        }
+                    }
+                }
+                stats.strings = Some(crate::catalog::StringStatistics {
+                    bounds: bounds.filter(|_| known),
+                    has_unicode: true,
+                    min_length: None,
+                    max_length: None,
+                    total_length: None,
+                });
             }
             file_stats.push(usable.then_some(stats));
         }
@@ -2742,6 +2820,8 @@ pub fn scan_statistics(scan: &ParquetScanData) -> Vec<Option<crate::catalog::Col
                 (Some(mut a), Some(b)) => {
                     a.can_be_null |= b.can_be_null;
                     a.can_be_valid |= b.can_be_valid;
+                    // `VariantStats::Merge`
+                    a.variant = variant_stats::merge_catalog(a.variant.take(), b.variant.clone());
                     let less = |x: &Value, y: &Value| {
                         crate::optimizer::statistics::compare_values(duckrs_parser::ast::ComparisonOp::LessThan, x, y)
                             == Some(true)
@@ -2758,10 +2838,22 @@ pub fn scan_statistics(scan: &ParquetScanData) -> Vec<Option<crate::catalog::Col
                         (None, y) if !a.can_be_valid => y,
                         _ => None,
                     };
-                    if let (Some(x), Some(y)) = (&a.strings, &b.strings) {
-                        a.strings = Some(x.merge(y, false));
-                        string_bounds_only(&mut a);
-                    }
+                    // `StringStats::Merge`: the bounds of both, of files that have any values
+                    a.strings = match (a.strings.take(), b.strings) {
+                        (Some(mut x), Some(y)) => {
+                            x.bounds = match (x.bounds, y.bounds) {
+                                (Some((low, high)), Some((other_low, other_high))) => {
+                                    Some((low.min(other_low), high.max(other_high)))
+                                }
+                                (bounds, None) if !b.can_be_valid => bounds,
+                                (None, bounds) if !a.can_be_valid => bounds,
+                                _ => None,
+                            };
+                            x.has_unicode |= y.has_unicode;
+                            Some(x)
+                        }
+                        _ => None,
+                    };
                     Some(a)
                 }
                 _ => None,
@@ -4020,4 +4112,516 @@ pub fn reads_byte_length(scan: &ParquetScanData, column: usize) -> bool {
             .encodings()
             .all(|encoding| encoding != parquet::basic::Encoding::DELTA_LENGTH_BYTE_ARRAY)
     })
+}
+
+/// The statistics of a VARIANT column of a Parquet file (Stage 4's port of `TransformColumnStatistics`), worked out
+/// in the form of `VariantStatsShreddingState`, merged by `MergeShredding` and given to the catalog as its
+/// [`crate::catalog::VariantStatistics`].
+mod variant_stats {
+    use super::*;
+    use crate::optimizer::statistics::union;
+
+    type Stats = crate::catalog::ColumnStatistics;
+
+    fn unknown() -> Stats {
+        Stats::unknown()
+    }
+
+    const VARIANT_INCONSISTENT: u8 = 3;
+
+    /// `VariantStatsShreddingState` as the catalog keeps it.
+    pub(super) fn to_catalog(state: Option<u8>, shredded: Shredding) -> Option<Box<crate::catalog::VariantStatistics>> {
+        use crate::catalog::VariantStatistics as V;
+        Some(Box::new(match (state?, shredded) {
+            (0, _) => V::Uninitialized,
+            (1, _) => V::NotShredded,
+            (VARIANT_SHREDDED, Some(shredded)) => V::Shredded(shredded.0, shredded.1),
+            _ => V::Inconsistent,
+        }))
+    }
+
+    /// What [`to_catalog`] made of it, back as a state and a shredding.
+    fn from_catalog(variant: Option<Box<crate::catalog::VariantStatistics>>) -> (Option<u8>, Shredding) {
+        use crate::catalog::VariantStatistics as V;
+        match variant.map(|variant| *variant) {
+            None => (None, None),
+            Some(V::Uninitialized) => (Some(0), None),
+            Some(V::NotShredded) => (Some(1), None),
+            Some(V::Shredded(ty, stats)) => (Some(VARIANT_SHREDDED), Some(Box::new((ty, stats)))),
+            Some(V::Inconsistent) => (Some(VARIANT_INCONSISTENT), None),
+        }
+    }
+
+    /// `VariantStats::Merge` of the statistics of two files.
+    pub(super) fn merge_catalog(
+        a: Option<Box<crate::catalog::VariantStatistics>>,
+        b: Option<Box<crate::catalog::VariantStatistics>>,
+    ) -> Option<Box<crate::catalog::VariantStatistics>> {
+        let (a_state, a_shredded) = from_catalog(a);
+        let (b_state, b_shredded) = from_catalog(b);
+        let (state, shredded) = merge_variant_state(a_state, a_shredded, b_state, b_shredded);
+        to_catalog(state, shredded)
+    }
+
+    /// A shredding: the type of a VARIANT's shredded part and its statistics.
+    type Shredding = Option<Box<(LogicalType, Stats)>>;
+
+    /// `VariantStats::Merge` of the shredding states and the shredded parts: UNINITIALIZED takes the other,
+    /// two shredded alike are merged, and any others that differ are INCONSISTENT.
+    fn merge_variant_state(
+        a: Option<u8>,
+        a_shredded: Shredding,
+        b: Option<u8>,
+        b_shredded: Shredding,
+    ) -> (Option<u8>, Shredding) {
+        const UNINITIALIZED: u8 = 0;
+        const NOT_SHREDDED: u8 = 1;
+        const SHREDDED: u8 = 2;
+        const INCONSISTENT: u8 = 3;
+        let (Some(a), Some(b)) = (a, b) else {
+            return (None, None);
+        };
+        match (a, b) {
+            (_, UNINITIALIZED) => (Some(a), a_shredded),
+            (INCONSISTENT, _) => (Some(INCONSISTENT), None),
+            (UNINITIALIZED, _) => (Some(b), b_shredded),
+            (NOT_SHREDDED, NOT_SHREDDED) => (Some(NOT_SHREDDED), None),
+            (SHREDDED, SHREDDED) => match (a_shredded, b_shredded) {
+                (Some(x), Some(y)) => match merge_shredding(&x.0, &x.1, &y.0, &y.1) {
+                    Some(merged) => (Some(SHREDDED), Some(Box::new(merged))),
+                    None => (Some(INCONSISTENT), None),
+                },
+                _ => (Some(INCONSISTENT), None),
+            },
+            _ => (Some(INCONSISTENT), None),
+        }
+    }
+
+    /// `VariantStats::GetTypedStats`: of `STRUCT(typed_value, ...)` its `typed_value`, else itself.
+    fn typed_stats<'a>(ty: &'a LogicalType, stats: &'a Stats) -> Option<(&'a LogicalType, &'a Stats)> {
+        if ty.id() != LogicalTypeId::Struct {
+            return Some((ty, stats));
+        }
+        Some((&ty.struct_children().first()?.1, stats.children.first()?))
+    }
+
+    /// `VariantStats::GetUntypedStats`
+    fn untyped_stats(ty: &LogicalType, stats: &Stats) -> Option<Stats> {
+        (ty.id() == LogicalTypeId::Struct && ty.struct_children().len() == 2)
+            .then(|| stats.children.get(1).cloned().unwrap_or_else(unknown))
+    }
+
+    /// `WrapTypedValue`: the shredding of these typed value statistics, with an `untyped_value_index`.
+    fn wrap_typed_value(typed_type: LogicalType, typed: Stats, untyped: Option<Stats>) -> (LogicalType, Stats) {
+        let nested = matches!(
+            typed_type.id(),
+            LogicalTypeId::Struct | LogicalTypeId::List | LogicalTypeId::Array
+        );
+        if untyped.is_none() && !nested {
+            return (typed_type, typed);
+        }
+        let mut fields = vec![("typed_value".to_string(), typed_type)];
+        let mut children = vec![typed];
+        if let Some(untyped) = untyped {
+            fields.push(("untyped_value_index".to_string(), LogicalType::UINTEGER));
+            children.push(untyped);
+        }
+        // `BaseStatistics::CreateEmpty`
+        let stats = Stats {
+            can_be_null: false,
+            can_be_valid: false,
+            children,
+            ..unknown()
+        };
+        (LogicalType::struct_type(fields), stats)
+    }
+
+    /// `VariantStats::MergeShredding`: of two shreddings the fields they share as alike, `None` if nothing is.
+    fn merge_shredding(a_ty: &LogicalType, a: &Stats, b_ty: &LogicalType, b: &Stats) -> Option<(LogicalType, Stats)> {
+        let (a_type, a_typed) = typed_stats(a_ty, a)?;
+        let (b_type, b_typed) = typed_stats(b_ty, b)?;
+        let untyped = match (untyped_stats(a_ty, a), untyped_stats(b_ty, b)) {
+            (Some(x), Some(y)) => Some(union(x, y)),
+            (x, y) => x.or(y),
+        };
+        // `CombineValidity`
+        let validity = |children: Vec<Stats>| Stats {
+            can_be_null: a_typed.can_be_null || b_typed.can_be_null,
+            can_be_valid: a_typed.can_be_valid || b_typed.can_be_valid,
+            children,
+            ..unknown()
+        };
+        match a_type.id() {
+            LogicalTypeId::Struct => {
+                if b_type.id() != LogicalTypeId::Struct {
+                    return None;
+                }
+                let b_fields = b_type.struct_children();
+                let mut fields = Vec::new();
+                let mut children = Vec::new();
+                for (at, (name, field)) in a_type.struct_children().iter().enumerate() {
+                    let Some(other_at) = b_fields.iter().position(|(other, _)| other == name) else {
+                        continue;
+                    };
+                    let other = &b_fields[other_at].1;
+                    if other.id() != field.id() {
+                        continue;
+                    }
+                    let (Some(x), Some(y)) = (a_typed.children.get(at), b_typed.children.get(other_at)) else {
+                        continue;
+                    };
+                    if let Some((ty, stats)) = merge_shredding(field, x, other, y) {
+                        fields.push((name.clone(), ty));
+                        children.push(stats);
+                    }
+                }
+                if fields.is_empty() {
+                    return None;
+                }
+                Some(wrap_typed_value(
+                    LogicalType::struct_type(fields),
+                    validity(children),
+                    untyped,
+                ))
+            }
+            LogicalTypeId::List => {
+                if b_type.id() != LogicalTypeId::List {
+                    return None;
+                }
+                let (x, y) = (a_typed.children.first()?, b_typed.children.first()?);
+                let (child_type, child) = merge_shredding(a_type.child_type()?, x, b_type.child_type()?, y)?;
+                Some(wrap_typed_value(
+                    LogicalType::list(child_type),
+                    validity(vec![child]),
+                    untyped,
+                ))
+            }
+            _ => {
+                if a_type != b_type {
+                    return None;
+                }
+                Some(wrap_typed_value(
+                    a_type.clone(),
+                    union(a_typed.clone(), b_typed.clone()),
+                    untyped,
+                ))
+            }
+        }
+    }
+
+    /// `VariantShreddedStats::IsFullyShredded`: whether every value of a shredding is in its typed part.
+    fn is_fully_shredded(ty: &LogicalType, stats: &Stats) -> bool {
+        if ty.id() != LogicalTypeId::Struct || ty.struct_children().len() == 1 {
+            return true;
+        }
+        let unknown_child = unknown();
+        let typed = stats.children.first().unwrap_or(&unknown_child);
+        let untyped = stats.children.get(1).unwrap_or(&unknown_child);
+        if !typed.can_be_null || !untyped.can_be_valid {
+            return true;
+        }
+        match (&untyped.min, &untyped.max) {
+            (Some(min), Some(max)) => min == max && min.try_to_string().is_ok_and(|min| min == "0"),
+            _ => false,
+        }
+    }
+
+    const VARIANT_SHREDDED: u8 = 2;
+
+    /// `TransformColumnStatistics` of a VARIANT group (`metadata`, `value`, `typed_value`): per row group, the shredding
+    /// of its `typed_value` with the statistics of its parts, merged across the row groups (`MergeShredding`). Parts
+    /// whose statistics can't be told are left unknown, which makes them not fully shredded, rather than the whole
+    /// column's statistics going. With `only`, those of that row group alone (`ColumnReader::Stats`).
+    pub(super) fn variant_statistics(
+        metadata: &ParquetMetaData,
+        name: &str,
+        only: Option<usize>,
+    ) -> Option<crate::catalog::ColumnStatistics> {
+        let descriptor = metadata.file_metadata().schema_descr();
+        let field = descriptor
+            .root_schema()
+            .get_fields()
+            .iter()
+            .find(|field| field.name().eq_ignore_ascii_case(name))?;
+        let path = vec![field.name().to_string()];
+        let fields = (!field.is_primitive()).then(|| field.get_fields())?;
+        if fields.len() != 3
+            || fields[0].name() != "metadata"
+            || fields[1].name() != "value"
+            || fields[2].name() != "typed_value"
+        {
+            return None;
+        }
+        // the types the leaves read as
+        let arrow = parquet::arrow::parquet_to_arrow_schema(descriptor, None).ok()?;
+        let arrow_field = arrow.fields().iter().find(|f| f.name() == field.name())?;
+        let DataType::Struct(arrow_parts) = arrow_field.data_type() else {
+            return None;
+        };
+        let arrow_typed = arrow_parts.iter().find(|f| f.name() == "typed_value")?;
+        let leaves: Vec<Vec<String>> = (0..descriptor.num_columns())
+            .map(|i| descriptor.column(i).path().parts().to_vec())
+            .collect();
+        let mut merged: Option<(Option<u8>, Shredding)> = None;
+        for (at, group) in metadata.row_groups().iter().enumerate() {
+            if only.is_some_and(|only| only != at) {
+                continue;
+            }
+            let leaf_stats = |path: &[String], ty: &LogicalType| -> Option<crate::catalog::ColumnStatistics> {
+                let leaf = leaves.iter().position(|leaf| leaf == path)?;
+                let zone = leaf_zone(metadata, group, leaf, ty, true)?;
+                let statistics = group.column(leaf).statistics()?;
+                let all_null = statistics.null_count_opt()? >= group.column(leaf).num_values() as u64;
+                // `TransformParquetStatistics` of strings: their bounds as the file has them
+                let strings = matches!(ty.id(), LogicalTypeId::Varchar | LogicalTypeId::Blob).then(|| {
+                    let exact = statistics.min_is_exact() && statistics.max_is_exact();
+                    let bounds = statistics
+                        .min_bytes_opt()
+                        .zip(statistics.max_bytes_opt())
+                        .filter(|_| exact && !all_null)
+                        .filter(|(min, max)| {
+                            ty.id() == LogicalTypeId::Blob
+                                || (std::str::from_utf8(min).is_ok() && std::str::from_utf8(max).is_ok())
+                        })
+                        .map(|(min, max)| (min.to_vec(), max.to_vec()));
+                    crate::catalog::StringStatistics {
+                        bounds,
+                        has_unicode: true,
+                        min_length: None,
+                        max_length: None,
+                        total_length: None,
+                    }
+                });
+                Some(crate::catalog::ColumnStatistics {
+                    can_be_null: zone.has_null,
+                    can_be_valid: !all_null,
+                    min: zone.min.filter(|_| !zone.unknown),
+                    max: zone.max.filter(|_| !zone.unknown),
+                    strings,
+                    ..unknown()
+                })
+            };
+            let value_leaf = |path: &[String]| -> Option<(bool, bool, Option<(Vec<u8>, Vec<u8>)>)> {
+                let leaf = leaves.iter().position(|leaf| leaf == path)?;
+                let statistics = group.column(leaf).statistics()?;
+                let nulls = statistics.null_count_opt()?;
+                let bounds = statistics
+                    .min_bytes_opt()
+                    .zip(statistics.max_bytes_opt())
+                    .map(|(min, max)| (min.to_vec(), max.to_vec()));
+                Some((nulls > 0, nulls < group.column(leaf).num_values() as u64, bounds))
+            };
+            let shredding = variant_node_stats(&path, &fields[1], &fields[2], arrow_typed, &leaf_stats, &value_leaf)?;
+            let state = (Some(VARIANT_SHREDDED), Some(Box::new(shredding)));
+            merged = Some(match merged {
+                None => state,
+                Some((state_a, shredded_a)) => merge_variant_state(state_a, shredded_a, state.0, state.1),
+            });
+        }
+        let (variant_state, variant_shredded) = merged?;
+        Some(crate::catalog::ColumnStatistics {
+            variant: to_catalog(variant_state, variant_shredded),
+            // `SetHasNoNull` and `SetHasNull`: the validity of the column is not known
+            can_be_null: true,
+            can_be_valid: true,
+            ..unknown()
+        })
+    }
+
+    /// `ConvertShreddedStatsItem`: the shredding of a part of a VARIANT, `STRUCT(typed_value, untyped_value_index)`,
+    /// and its statistics, of its `value` and `typed_value` at `path`.
+    fn variant_node_stats(
+        path: &[String],
+        value: &parquet::schema::types::Type,
+        typed_value: &parquet::schema::types::Type,
+        arrow: &Field,
+        leaf_stats: &dyn Fn(&[String], &LogicalType) -> Option<crate::catalog::ColumnStatistics>,
+        value_leaf: &dyn Fn(&[String]) -> Option<(bool, bool, Option<(Vec<u8>, Vec<u8>)>)>,
+    ) -> Option<(LogicalType, crate::catalog::ColumnStatistics)> {
+        let child = |name: &str| {
+            let mut path = path.to_vec();
+            path.push(name.to_string());
+            path
+        };
+        // `ConvertUnshreddedStats`: of the values that are not shredded, NULLs or VARIANT NULLs (a lone 0 byte) alone
+        // leave the part fully shredded
+        let untyped = match value_leaf(&child(value.name())) {
+            None => unknown(),
+            Some((has_null, has_value, bounds)) => {
+                let mut stats = crate::catalog::ColumnStatistics {
+                    can_be_null: has_null,
+                    can_be_valid: has_value,
+                    ..unknown()
+                };
+                if has_value {
+                    match bounds {
+                        Some((min, max)) if min == [0] && max == [0] => {
+                            stats.min = Some(Value::uinteger(0));
+                            stats.max = Some(Value::uinteger(0));
+                        }
+                        Some(_) => {}
+                        None => stats = unknown(),
+                    }
+                }
+                stats
+            }
+        };
+        let (typed_type, typed) =
+            variant_typed_stats(&child(typed_value.name()), typed_value, arrow, leaf_stats, value_leaf)?;
+        let ty = LogicalType::struct_type(vec![
+            ("typed_value".to_string(), typed_type),
+            ("untyped_value_index".to_string(), LogicalType::UINTEGER),
+        ]);
+        // `BaseStatistics::CreateEmpty` of the part itself
+        let stats = crate::catalog::ColumnStatistics {
+            can_be_null: false,
+            can_be_valid: false,
+            children: vec![typed, untyped],
+            ..unknown()
+        };
+        Some((ty, stats))
+    }
+
+    /// `ConvertShreddedStats` of a `typed_value` at `path`: of a leaf its statistics, of a LIST those of its elements,
+    /// of a group those of its fields (`VariantColumnReader::TypedValueLayoutToType` for the type).
+    fn variant_typed_stats(
+        path: &[String],
+        typed_value: &parquet::schema::types::Type,
+        arrow: &Field,
+        leaf_stats: &dyn Fn(&[String], &LogicalType) -> Option<crate::catalog::ColumnStatistics>,
+        value_leaf: &dyn Fn(&[String]) -> Option<(bool, bool, Option<(Vec<u8>, Vec<u8>)>)>,
+    ) -> Option<(LogicalType, crate::catalog::ColumnStatistics)> {
+        let child = |name: &str| {
+            let mut path = path.to_vec();
+            path.push(name.to_string());
+            path
+        };
+        // the `typed_value` and `value` of a part, as the file and as Arrow have them
+        let parts = |group: &parquet::schema::types::Type, arrow: &Field| -> Option<(_, _, Field)> {
+            let parts = group.get_fields();
+            let value = parts.iter().find(|part| part.name() == "value")?.clone();
+            let typed = parts.iter().find(|part| part.name() == "typed_value")?.clone();
+            let DataType::Struct(arrow_parts) = arrow.data_type() else {
+                return None;
+            };
+            let arrow_typed = arrow_parts.iter().find(|f| f.name() == "typed_value")?.as_ref().clone();
+            Some((value, typed, arrow_typed))
+        };
+        if typed_value.is_primitive() {
+            let ty = field_type(arrow).ok()?;
+            let stats = leaf_stats(path, &ty).unwrap_or_else(unknown);
+            return Some((ty, stats));
+        }
+        let fields = typed_value.get_fields();
+        let is_list = matches!(
+            typed_value.get_basic_info().logical_type_ref(),
+            Some(parquet::basic::LogicalType::List)
+        ) || typed_value.get_basic_info().converted_type() == parquet::basic::ConvertedType::LIST;
+        if is_list {
+            // three levels: the LIST, its repeated group, and the element with its `value` and `typed_value`
+            let repeated = fields.first()?;
+            let element = repeated.get_fields().first()?;
+            let element_path = {
+                let mut path = child(repeated.name());
+                path.push(element.name().to_string());
+                path
+            };
+            let (DataType::List(arrow_element) | DataType::LargeList(arrow_element)) = arrow.data_type() else {
+                return None;
+            };
+            let (value, typed, arrow_typed) = parts(element, arrow_element)?;
+            let (element_type, element_stats) =
+                variant_node_stats(&element_path, &value, &typed, &arrow_typed, leaf_stats, value_leaf)?;
+            let stats = crate::catalog::ColumnStatistics {
+                children: vec![element_stats],
+                ..unknown()
+            };
+            return Some((LogicalType::list(element_type), stats));
+        }
+        // an object: a group of fields, each with its `value` and `typed_value`
+        let mut types = Vec::with_capacity(fields.len());
+        let mut children = Vec::with_capacity(fields.len());
+        let DataType::Struct(arrow_fields) = arrow.data_type() else {
+            return None;
+        };
+        for field in fields {
+            let arrow_field = arrow_fields.iter().find(|f| f.name() == field.name())?;
+            let (value, typed, arrow_typed) = parts(field, arrow_field)?;
+            let (field_type, field_stats) = variant_node_stats(
+                &child(field.name()),
+                &value,
+                &typed,
+                &arrow_typed,
+                leaf_stats,
+                value_leaf,
+            )?;
+            types.push((field.name().to_string(), field_type));
+            children.push(field_stats);
+        }
+        let stats = crate::catalog::ColumnStatistics { children, ..unknown() };
+        Some((LogicalType::struct_type(types), stats))
+    }
+
+    /// What the statistics of row group `group` say of the leaf `leaf`, read as a `ty`. With `float_bounds`, the bounds
+    /// of floats are taken as `TransformParquetStatistics` takes them: as they are, but for a maximum of NaN where the
+    /// file says there are NaNs (`CreateFloatingPointStats`).
+    fn leaf_zone(
+        metadata: &ParquetMetaData,
+        group: &parquet::file::metadata::RowGroupMetaData,
+        leaf: usize,
+        ty: &LogicalType,
+        float_bounds: bool,
+    ) -> Option<crate::catalog::ColumnZone> {
+        use parquet::basic::Type as Physical;
+        let descriptor = metadata.file_metadata().schema_descr().column(leaf);
+        let statistics = group.column(leaf).statistics()?;
+        // (of a leaf in a list, its values rather than the rows)
+        let rows = group.column(leaf).num_values() as u64;
+        let nulls = statistics.null_count_opt()?;
+        let mut zone = crate::catalog::ColumnZone {
+            has_null: nulls > 0,
+            ..crate::catalog::ColumnZone::default()
+        };
+        if nulls >= rows {
+            return Some(zone);
+        }
+        // NaNs are left out of float bounds, but are the largest values to DuckDB; INT96 bounds compare bytes
+        let float = matches!(descriptor.physical_type(), Physical::FLOAT | Physical::DOUBLE)
+            || matches!(ty.id(), LogicalTypeId::Float | LogicalTypeId::Double);
+        let bounded = descriptor.physical_type() != Physical::INT96 && (!float || float_bounds);
+        // byte arrays with only the deprecated bounds may be ordered as signed bytes
+        let deprecated = statistics.is_min_max_deprecated()
+            && matches!(
+                descriptor.physical_type(),
+                Physical::BYTE_ARRAY | Physical::FIXED_LEN_BYTE_ARRAY
+            );
+        let bound = |bytes: Option<&[u8]>, exact: bool| -> Option<Value> {
+            let bytes = bytes?;
+            // `StringStatsAreValid`: exact bounds of a VARCHAR that are not UTF-8 are bogus
+            if ty.id() == LogicalTypeId::Varchar && std::str::from_utf8(bytes).is_err() {
+                return None;
+            }
+            let text = statistic_text(&descriptor, bytes)?;
+            if !exact || deprecated {
+                return None;
+            }
+            try_cast_value(&Value::varchar(text), ty)
+        };
+        let min = bound(statistics.min_bytes_opt(), statistics.min_is_exact());
+        let max = bound(statistics.max_bytes_opt(), statistics.max_is_exact());
+        let max = match max {
+            Some(_) if float && statistics.nan_count_opt().is_some_and(|nans| nans > 0) => {
+                try_cast_value(&Value::varchar("nan"), ty)
+            }
+            max => max,
+        };
+        match (min, max) {
+            (Some(min), Some(max)) if bounded => {
+                zone.min = Some(min);
+                zone.max = Some(max);
+            }
+            _ => zone.unknown = true,
+        }
+        Some(zone)
+    }
 }

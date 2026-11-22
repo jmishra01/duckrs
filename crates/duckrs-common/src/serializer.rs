@@ -480,6 +480,14 @@ impl BinarySerializer {
         self.end_property();
     }
 
+    /// `WriteProperty` of a `unique_ptr` that is there: the presence flag, then the object.
+    pub fn write_nullable_object(&mut self, field_id: u16, tag: &str, body: impl FnOnce(&mut Self)) {
+        self.begin_property(field_id, tag, false);
+        self.begin_nullable(true);
+        self.write_object_value(body);
+        self.end_property();
+    }
+
     /// `WriteList`: a property holding `count` elements written by `element`.
     pub fn write_list(&mut self, field_id: u16, tag: &str, count: usize, mut element: impl FnMut(&mut Self, usize)) {
         self.begin_property(field_id, tag, false);
@@ -1574,6 +1582,10 @@ impl Serialize for LogicalType {
     /// `LogicalType::Serialize`: the id, then the type info object if the type has parameters
     /// or an alias.
     fn write_value(&self, s: &mut BinarySerializer) {
+        // before v1.5.0, a GEOMETRY is the spatial extension's (`GetSpatialGeometryType`), without its CRS
+        if self.id() == LogicalTypeId::Geometry && !s.should_serialize(StorageVersion::V1_5_0) {
+            return LogicalType::BLOB.with_alias("GEOMETRY").write_value(s);
+        }
         s.write_object_value(|s| {
             let id = if self.id() == LogicalTypeId::Tuple && !s.should_serialize(StorageVersion::V2_0_0) {
                 LogicalTypeId::Struct
@@ -1656,7 +1668,18 @@ impl Serialize for LogicalType {
 }
 
 impl Deserialize for LogicalType {
+    /// `LogicalType::Deserialize`; the spatial extension's GEOMETRY (`IsSpatialGeometryType`) is a GEOMETRY.
     fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let ty = read_logical_type(d)?;
+        if ty.id() == LogicalTypeId::Blob && ty.alias() == Some("GEOMETRY") {
+            return Ok(LogicalType::new(LogicalTypeId::Geometry));
+        }
+        Ok(ty)
+    }
+}
+
+fn read_logical_type(d: &mut BinaryDeserializer<'_>) -> Result<LogicalType> {
+    {
         d.read_object_value(|d| {
             let mut id: LogicalTypeId = d.read_property(100, "id")?;
             if id == LogicalTypeId::Pointer {

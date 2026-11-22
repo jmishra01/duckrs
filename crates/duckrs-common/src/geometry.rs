@@ -1192,3 +1192,294 @@ pub fn point_coordinate(wkb: &[u8], index: usize) -> Option<f64> {
     let value = f64::from_le_bytes(wkb.get(at..at + 8)?.try_into().ok()?);
     (!value.is_nan()).then_some(value)
 }
+
+// The spatial extension's format of GEOMETRYs (`Geometry::ToSpatialGeometry` / `FromSpatialGeometry`), which
+// database files before v1.5.0 hold: an 8-byte header (the 0-based type of the root, flags for Z, M and a bounding
+// box, padding), the box as floats for all but a point, then each part as a 0-based type and a count, with the
+// vertices of points, line strings and the rings of polygons after it.
+
+const SPATIAL_HAS_Z: u8 = 0x01;
+const SPATIAL_HAS_M: u8 = 0x02;
+const SPATIAL_HAS_BBOX: u8 = 0x04;
+
+/// `GeometryExtent::ExtendAxis`: a NaN makes the axis unknown.
+fn extend_axis(min: &mut f64, max: &mut f64, value: f64) {
+    if value.is_nan() {
+        *min = f64::NEG_INFINITY;
+        *max = f64::INFINITY;
+        return;
+    }
+    *min = min_value(*min, value);
+    *max = max_value(*max, value);
+}
+
+/// `DoubleToFloatDown`: the greatest float not above it.
+fn double_to_float_down(d: f64) -> f32 {
+    if d > f64::from(f32::MAX) {
+        return f32::MAX;
+    }
+    if d <= f64::from(f32::MIN) {
+        return f32::MIN;
+    }
+    let f = d as f32;
+    if f64::from(f) <= d { f } else { f.next_down() }
+}
+
+/// `DoubleToFloatUp`: the least float not below it.
+fn double_to_float_up(d: f64) -> f32 {
+    if d >= f64::from(f32::MAX) {
+        return f32::MAX;
+    }
+    if d < f64::from(f32::MIN) {
+        return f32::MIN;
+    }
+    let f = d as f32;
+    if f64::from(f) >= d { f } else { f.next_up() }
+}
+
+struct Cursor<'a> {
+    data: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+        let bytes = self
+            .data
+            .get(self.at..self.at + n)
+            .ok_or_else(|| invalid("Unsupported geometry type in legacy geometry!"))?;
+        self.at += n;
+        Ok(bytes)
+    }
+    fn u8(&mut self) -> Result<u8> {
+        Ok(self.take(1)?[0])
+    }
+    fn u32(&mut self) -> Result<u32> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().expect("4 bytes")))
+    }
+    fn at_end(&self) -> bool {
+        self.at >= self.data.len()
+    }
+}
+
+/// `Geometry::ToSpatialGeometry`: a GEOMETRY (little-endian ISO WKB) in the spatial extension's format.
+pub fn to_spatial(wkb: &[u8]) -> Result<Vec<u8>> {
+    // `ToSpatialGeometryAnalyze`: the root's type and dimensions, and the extent of the vertices
+    let mut reader = Cursor { data: wkb, at: 0 };
+    let mut root: Option<(u32, bool, bool)> = None;
+    let mut extent = Extent::empty();
+    while !reader.at_end() {
+        if reader.u8()? != 1 {
+            return Err(invalid(
+                "Only little-endian legacy geometries are supported for conversion to spatial format!",
+            ));
+        }
+        let type_id = reader.u32()?;
+        let (flag, kind) = (type_id / 1000, type_id % 1000);
+        let (has_z, has_m) = (flag & 1 != 0, flag & 2 != 0);
+        match root {
+            None => root = Some((kind, has_z, has_m)),
+            Some((_, z, m)) => {
+                if z != has_z {
+                    return Err(invalid(
+                        "All geometries in a spatial blob must have the same Z presence",
+                    ));
+                }
+                if m != has_m {
+                    return Err(invalid(
+                        "All geometries in a spatial blob must have the same M presence",
+                    ));
+                }
+            }
+        }
+        let dims = 2 + usize::from(has_z) + usize::from(has_m);
+        let vertex = |reader: &mut Cursor<'_>, extent: &mut Extent, point: bool| -> Result<()> {
+            let bytes = reader.take(dims * 8)?;
+            let value = |i: usize| f64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().expect("8 bytes"));
+            if point && (0..dims).all(|i| value(i).is_nan()) {
+                return Ok(());
+            }
+            extend_axis(&mut extent.x_min, &mut extent.x_max, value(0));
+            extend_axis(&mut extent.y_min, &mut extent.y_max, value(1));
+            if has_z {
+                extend_axis(&mut extent.z_min, &mut extent.z_max, value(2));
+            }
+            if has_m {
+                let at = if has_z { 3 } else { 2 };
+                extend_axis(&mut extent.m_min, &mut extent.m_max, value(at));
+            }
+            Ok(())
+        };
+        match kind {
+            1 => vertex(&mut reader, &mut extent, true)?,
+            2 => {
+                for _ in 0..reader.u32()? {
+                    vertex(&mut reader, &mut extent, false)?;
+                }
+            }
+            3 => {
+                for _ in 0..reader.u32()? {
+                    for _ in 0..reader.u32()? {
+                        vertex(&mut reader, &mut extent, false)?;
+                    }
+                }
+            }
+            4..=7 => {
+                reader.u32()?;
+            }
+            _ => return Err(invalid("Unsupported geometry type in legacy geometry!")),
+        }
+    }
+    let Some((root_type, has_z, has_m)) = root else {
+        return Err(invalid("Unsupported geometry type in legacy geometry!"));
+    };
+    let bbox = root_type != 1;
+    // `ToSpatialGeometryConvert`
+    let mut out = Vec::with_capacity(wkb.len() + 32);
+    let mut flags = 0u8;
+    if has_z {
+        flags |= SPATIAL_HAS_Z;
+    }
+    if has_m {
+        flags |= SPATIAL_HAS_M;
+    }
+    if bbox {
+        flags |= SPATIAL_HAS_BBOX;
+    }
+    out.push((root_type - 1) as u8);
+    out.push(flags);
+    out.extend_from_slice(&[0; 6]);
+    if bbox {
+        let mut bounds = vec![
+            double_to_float_down(extent.x_min),
+            double_to_float_down(extent.y_min),
+            double_to_float_up(extent.x_max),
+            double_to_float_up(extent.y_max),
+        ];
+        if has_z {
+            bounds.extend([double_to_float_down(extent.z_min), double_to_float_up(extent.z_max)]);
+        }
+        if has_m {
+            bounds.extend([double_to_float_down(extent.m_min), double_to_float_up(extent.m_max)]);
+        }
+        for bound in bounds {
+            out.extend_from_slice(&bound.to_le_bytes());
+        }
+    }
+    let width = (2 + usize::from(has_z) + usize::from(has_m)) * 8;
+    let mut reader = Cursor { data: wkb, at: 0 };
+    while !reader.at_end() {
+        reader.u8()?;
+        let kind = reader.u32()? % 1000;
+        out.extend_from_slice(&(kind - 1).to_le_bytes());
+        match kind {
+            1 => {
+                let vertex = reader.take(width)?;
+                if vertex
+                    .chunks_exact(8)
+                    .all(|v| f64::from_le_bytes(v.try_into().expect("8 bytes")).is_nan())
+                {
+                    out.extend_from_slice(&0u32.to_le_bytes());
+                } else {
+                    out.extend_from_slice(&1u32.to_le_bytes());
+                    out.extend_from_slice(vertex);
+                }
+            }
+            2 => {
+                let count = reader.u32()?;
+                out.extend_from_slice(&count.to_le_bytes());
+                out.extend_from_slice(reader.take(width * count as usize)?);
+            }
+            3 => {
+                let rings = reader.u32()?;
+                out.extend_from_slice(&rings.to_le_bytes());
+                // the sizes of the rings, padded to 8 bytes, then their vertices
+                let sizes_at = out.len();
+                out.resize(sizes_at + 4 * (rings as usize + rings as usize % 2), 0);
+                for ring in 0..rings as usize {
+                    let size = reader.u32()?;
+                    out[sizes_at + ring * 4..sizes_at + ring * 4 + 4].copy_from_slice(&size.to_le_bytes());
+                    out.extend_from_slice(reader.take(width * size as usize)?);
+                }
+            }
+            _ => out.extend_from_slice(&reader.u32()?.to_le_bytes()),
+        }
+    }
+    Ok(out)
+}
+
+/// `Geometry::FromSpatialGeometry` (`FromLegacyGeometryConversion`): a GEOMETRY of one in the spatial extension's
+/// format.
+pub fn from_spatial(blob: &[u8]) -> Result<Vec<u8>> {
+    let mut reader = Cursor { data: blob, at: 0 };
+    reader.take(1)?;
+    let flags = reader.u8()?;
+    reader.take(6)?;
+    let (has_z, has_m) = (flags & SPATIAL_HAS_Z != 0, flags & SPATIAL_HAS_M != 0);
+    if flags & 0xC0 != 0 {
+        return Err(invalid(
+            "Cannot import an unknown version of the spatial geometry format!",
+        ));
+    }
+    let dims = 2 + usize::from(has_z) + usize::from(has_m);
+    if flags & SPATIAL_HAS_BBOX != 0 {
+        reader.take(4 * 2 * dims)?;
+    }
+    let width = dims * 8;
+    let mut out = Vec::with_capacity(blob.len());
+    while !reader.at_end() {
+        let kind = reader.u32()? + 1;
+        let size = reader.u32()?;
+        let meta = kind + if has_z { 1000 } else { 0 } + if has_m { 2000 } else { 0 };
+        out.push(1);
+        out.extend_from_slice(&meta.to_le_bytes());
+        match kind {
+            1 => {
+                if size == 0 {
+                    for _ in 0..dims {
+                        out.extend_from_slice(&f64::NAN.to_le_bytes());
+                    }
+                } else {
+                    out.extend_from_slice(reader.take(width)?);
+                }
+            }
+            2 => {
+                out.extend_from_slice(&size.to_le_bytes());
+                out.extend_from_slice(reader.take(width * size as usize)?);
+            }
+            3 => {
+                out.extend_from_slice(&size.to_le_bytes());
+                let sizes = reader.take(4 * (size as usize + size as usize % 2))?;
+                for ring in 0..size as usize {
+                    let ring_size = u32::from_le_bytes(sizes[ring * 4..ring * 4 + 4].try_into().expect("4 bytes"));
+                    out.extend_from_slice(&ring_size.to_le_bytes());
+                    out.extend_from_slice(reader.take(width * ring_size as usize)?);
+                }
+            }
+            4..=7 => out.extend_from_slice(&size.to_le_bytes()),
+            _ => return Err(invalid("Unsupported geometry type in legacy geometry!")),
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod spatial_tests {
+    use super::*;
+
+    #[test]
+    fn spatial_format_round_trips() {
+        for text in [
+            "POINT (1 2)",
+            "POINT EMPTY",
+            "LINESTRING (0 0, 1 1, 2 0)",
+            "POLYGON ((0 0, 4 0, 4 4, 0 0), (1 1, 2 1, 1 2, 1 1), (3 3, 3.5 3, 3 3.5, 3 3))",
+            "MULTIPOINT Z ((1 2 3), (4 5 6))",
+            "GEOMETRYCOLLECTION (POINT (1 1), LINESTRING (0 0, 1 2))",
+        ] {
+            let wkb = from_wkt(text).unwrap();
+            let spatial = to_spatial(&wkb).unwrap();
+            assert_eq!(from_spatial(&spatial).unwrap(), wkb, "{text}");
+        }
+    }
+}

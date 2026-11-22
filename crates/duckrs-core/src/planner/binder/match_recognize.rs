@@ -1340,6 +1340,7 @@ impl Binder<'_> {
         self.bind_context.add_binding(Binding {
             alias,
             schema: None,
+            catalog: None,
             table_index,
             names,
             types: output_types,
@@ -1523,6 +1524,7 @@ impl Binder<'_> {
         residual_binder.bind_context.add_binding(Binding {
             alias: context.alias.to_string(),
             schema: None,
+            catalog: None,
             table_index: context.input_index,
             names: context.names.to_vec(),
             types: context.input_types.to_vec(),
@@ -1533,6 +1535,7 @@ impl Binder<'_> {
         residual_binder.bind_context.add_binding(Binding {
             alias: SLOTS.to_string(),
             schema: None,
+            catalog: None,
             table_index: context.slots_index,
             names: (0..slots.len()).map(slot_name).collect(),
             types: slots.iter().map(|s| s.ty.clone()).collect(),

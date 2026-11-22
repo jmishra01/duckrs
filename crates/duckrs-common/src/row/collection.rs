@@ -128,6 +128,13 @@ impl TupleDataCollection {
         self.count == 0
     }
 
+    /// The bytes of its blocks and of its strings (`SizeInBytes`), for memory accounting: the values of its LIST
+    /// and ARRAY columns are not counted.
+    pub fn size_in_bytes(&self) -> usize {
+        let blocks: usize = self.blocks.iter().map(|block| block.len() * 8).sum();
+        blocks + self.strings.allocated()
+    }
+
     /// Reserves space for one row and returns its address; the row's bytes are zeroed.
     fn allocate_row(&mut self) -> RowPtr {
         if self.blocks.is_empty() || self.rows_in_last == self.rows_per_block {
@@ -408,7 +415,8 @@ unsafe fn gather(
             .iter()
             .map(|r| !layout.can_have_null() || unsafe { row_is_valid(r.as_ptr(), column) })
             .collect();
-        if let Some(store) = nested.lists.get(&column) {
+        // with no valid row there may be no value in the store for a NULL row's 0 to read
+        if let Some(store) = nested.lists.get(&column).filter(|_| valid.iter().any(|&v| v)) {
             let sel: Vec<u32> = rows
                 .iter()
                 .zip(&valid)

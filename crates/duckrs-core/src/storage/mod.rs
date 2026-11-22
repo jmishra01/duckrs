@@ -1,6 +1,7 @@
 //! The storage engine: DuckDB's `src/storage`, in step with its file format (see Phase 9 in
 //! `docs/ARCHITECTURE.md`). For now it reads database files, into memory.
 
+pub mod appended;
 pub mod bitpacking;
 pub mod block_manager;
 pub mod buffer_manager;
@@ -8,9 +9,14 @@ pub mod checkpoint;
 pub mod checksum;
 pub mod compression;
 mod dict_fsst_analyze;
+mod dict_fsst_compress;
+mod float_codecs;
 pub mod encode;
+pub mod encryption;
 mod fsst;
 mod index_data;
+mod old_string_analyze;
+pub mod layered;
 pub mod log_writer;
 pub mod metadata;
 pub mod roaring;
@@ -27,9 +33,6 @@ use duckrs_common::{Error, ErrorKind, Result};
 use std::path::Path;
 use std::sync::Arc;
 
-/// The blocks of a file that stay in memory. Rows stay in the file, and a scan decodes one row group
-/// at a time, so this is what bounds the memory that a large file takes.
-const BUFFER_MEMORY: usize = 256 << 20;
 
 /// Whether there is a database in the file: a new database starts as a missing or empty file.
 /// `DBPathAndType::CheckMagicBytes`: a file that is not a DuckDB (or SQLite) database but that one of
@@ -63,9 +66,19 @@ pub fn is_database_file(path: &Path) -> bool {
 
 /// Puts what the last checkpoint of the file at `path` left into `catalog`, with what its write-ahead
 /// log committed since. The tables stay in the file, which is what the result reads them through.
-pub fn load_database(path: &Path, catalog: &Catalog, read_only: bool) -> Result<Arc<BufferManager>> {
-    let blocks = Arc::new(SingleFileBlockManager::open(path, read_only)?);
-    let buffer = Arc::new(BufferManager::new(blocks, BUFFER_MEMORY));
+/// `encryption` is what `ATTACH` gave to open an encrypted file with.
+pub fn load_database(
+    path: &Path,
+    catalog: &Catalog,
+    read_only: bool,
+    encryption: Option<&encryption::EncryptionRequest>,
+) -> Result<Arc<BufferManager>> {
+    let blocks = Arc::new(SingleFileBlockManager::open(path, read_only, encryption)?);
+    // until a query sets it from `memory_limit`, its default (`DBConfig::SetDefaultMaxMemory`)
+    let buffer = Arc::new(BufferManager::new(
+        blocks,
+        crate::execution::temporary::default_memory_limit(),
+    ));
     use crate::execution::profiler::{add_counter, time_metric};
     metadata::load_free_list(&buffer)?;
     let records = time_metric("storage.attach_replay_wal_latency", || wal::read_records(path, &buffer))?;
@@ -83,6 +96,11 @@ pub fn load_database(path: &Path, catalog: &Catalog, read_only: bool) -> Result<
     Ok(buffer)
 }
 
+/// [`wal::replayed_end`]: where the replayed log of the file at `path` goes on, and its entries' version.
+pub fn replayed_log_end(path: &Path, buffer: &BufferManager) -> Result<wal::ReplayedLog> {
+    wal::replayed_end(path, buffer)
+}
+
 /// Whether a write-ahead log is next to the file at `path`.
 pub fn has_log(path: &Path) -> bool {
     let mut log = path.as_os_str().to_owned();
@@ -90,17 +108,18 @@ pub fn has_log(path: &Path) -> bool {
     std::fs::metadata(log).is_ok()
 }
 
-/// A new database file in `version`, for `load_database`.
+/// A new database file in `version`, encrypted as `encryption` asks, for `load_database`.
 pub fn create_database(
     path: &Path,
     block_size: Option<u64>,
     version: duckrs_common::serializer::StorageVersion,
+    encryption: Option<&encryption::EncryptionRequest>,
 ) -> Result<()> {
     if std::fs::metadata(path).is_ok() {
         std::fs::remove_file(path).map_err(|e| Error::new(ErrorKind::Io, format!("{}: {e}", path.display())))?;
     }
     let block_size = block_size.unwrap_or(block_manager::DEFAULT_BLOCK_ALLOC_SIZE);
-    SingleFileBlockManager::create(path, block_size, version).map(drop)
+    SingleFileBlockManager::create(path, block_size, version, encryption).map(drop)
 }
 
 /// Whether checkpoints can go into this file: in the version of the file, from v0.10.2 on.
@@ -140,7 +159,7 @@ mod tests {
             .join("../duckrs/tests/fixtures")
             .join(file);
         let catalog = Catalog::new("test");
-        load_database(&path, &catalog, true).unwrap();
+        load_database(&path, &catalog, true, None).unwrap();
         catalog
     }
 
@@ -151,7 +170,7 @@ mod tests {
         use crate::execution::art::allocator::{FixedSizeAllocator, PREFIX_METADATA_SIZE, segment_sizes};
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../duckrs/tests/fixtures/parsed_v200.db");
         let catalog = Catalog::new("test");
-        let buffer = load_database(&path, &catalog, true).unwrap();
+        let buffer = load_database(&path, &catalog, true, None).unwrap();
         let block_size = buffer.block_manager().block_size();
         assert_eq!(block_size, 16_376);
         let mut buffers = 0;
@@ -192,7 +211,7 @@ mod tests {
         let files = std::env::var("DUCKRS_ART_FILES").expect("the files to read");
         for file in files.split(':') {
             let catalog = Catalog::new("test");
-            let buffer = load_database(Path::new(file), &catalog, true).unwrap();
+            let buffer = load_database(Path::new(file), &catalog, true, None).unwrap();
             let block_size = buffer.block_manager().block_size();
             let tables = checkpoint::read_catalog(&buffer).unwrap().entries.into_iter();
             let table = tables
@@ -364,7 +383,7 @@ mod tests {
     fn a_group_is_read_a_column_at_a_time() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../duckrs/tests/fixtures/scan_v122880.db");
         let catalog = Catalog::new("test");
-        load_database(&path, &catalog, true).unwrap();
+        load_database(&path, &catalog, true, None).unwrap();
         let table = catalog.get_table(None, "big").unwrap();
         let source = table.source().unwrap();
         let chunk = source.read_group(1, &[0]).unwrap();

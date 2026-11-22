@@ -739,20 +739,40 @@ impl Binder<'_> {
     }
 
     /// What sniffing says of a file, with what the user decided put over it.
-    fn csv_sniff(arguments: &CsvArguments, path: &str) -> Result<(Sniffed, Vec<u8>)> {
-        let data = read_csv_file(path, &arguments.options)?;
+    /// The file at `path` sniffed, and what of it was read for that: `None` of a file larger than a buffer that the
+    /// first buffer was enough for (`CSVBufferManager` reads the buffers a sniffer gets to), which the scan reads
+    /// a buffer at a time.
+    fn csv_sniff(arguments: &CsvArguments, path: &str) -> Result<(Sniffed, Option<Vec<u8>>)> {
         let fixed: Option<(Vec<String>, Vec<LogicalType>)> = arguments
             .columns
             .as_ref()
             .map(|columns| columns.iter().cloned().unzip());
-        let mut sniffed = sniff(
-            &data,
-            path,
-            &arguments.options,
-            fixed
-                .as_ref()
-                .map(|(names, types)| (names.as_slice(), types.as_slice())),
-        )?;
+        let sniff_of = |data: &[u8]| {
+            sniff(
+                data,
+                path,
+                &arguments.options,
+                fixed
+                    .as_ref()
+                    .map(|(names, types)| (names.as_slice(), types.as_slice())),
+            )
+        };
+        let start = match crate::execution::csv::streamed_size(path, &arguments.options) {
+            Some(_) => {
+                let size = crate::execution::csv::buffer_size(&arguments.options);
+                let first = file_system::read_range(path, 0, size)?;
+                // what sniffing all of the file finds, unless a scan of it got to the end of the buffer
+                sniff_of(&first).ok().filter(|sniffed| !sniffed.reached_end)
+            }
+            None => None,
+        };
+        let (mut sniffed, data) = match start {
+            Some(sniffed) => (sniffed, None),
+            None => {
+                let data = read_csv_file(path, &arguments.options)?;
+                (sniff_of(&data)?, Some(data))
+            }
+        };
         if let Some(names) = &arguments.names {
             if names.len() > sniffed.names.len() {
                 return Err(binder_error(
@@ -812,7 +832,7 @@ impl Binder<'_> {
             let (file, data) = Self::csv_sniff(arguments, path)?;
             total += file.lines_sniffed;
             let rows = rows_read(&file);
-            if data.is_empty() || rows == 0 {
+            if data.as_ref().is_some_and(Vec::is_empty) || rows == 0 {
                 continue;
             }
             if best_rows == 0 {
@@ -922,6 +942,7 @@ impl Binder<'_> {
         self.bind_context.add_binding(Binding {
             alias,
             schema: None,
+            catalog: None,
             table_index,
             names: output_names,
             types: output_types,
@@ -977,7 +998,7 @@ impl Binder<'_> {
             names,
             types,
             filename: arguments.filename.is_some(),
-            first_data: std::sync::Mutex::new(Some(first_data)),
+            first_data: std::sync::Mutex::new(first_data.map(std::sync::Arc::new)),
             projection: None,
             column_order: self.column_order(table_index),
             file_filters: String::new(),
@@ -1009,6 +1030,7 @@ impl Binder<'_> {
         self.bind_context.add_binding(Binding {
             alias,
             schema: None,
+            catalog: None,
             table_index,
             names: output_names,
             types: types.clone(),
@@ -1726,6 +1748,7 @@ impl Binder<'_> {
         binder.bind_context.add_binding(Binding {
             alias: "__copy_input".to_string(),
             schema: None,
+            catalog: None,
             table_index,
             names: names.to_vec(),
             types: types.to_vec(),
@@ -2285,6 +2308,7 @@ impl Binder<'_> {
         binder.bind_context.add_binding(Binding {
             alias: String::new(),
             schema: None,
+            catalog: None,
             table_index,
             names: columns.iter().map(|&c| names[c].clone()).collect(),
             types: columns.iter().map(|&c| types[c].clone()).collect(),

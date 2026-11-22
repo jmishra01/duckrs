@@ -89,6 +89,24 @@ impl MetadataChains {
         Ok(&self.data[self.starts[&pointer.block_pointer] + offset..])
     }
 
+    /// The sub-blocks (as disk pointers) that `length` bytes of the chain from `pointer` on are in.
+    pub fn sub_blocks(&self, buffer: &BufferManager, pointer: MetaBlockPointer, length: usize) -> Vec<u64> {
+        let payload = metadata_block_size(buffer.block_manager().block_size()) - NEXT_POINTER_SIZE;
+        let Some(&first) = self.starts.get(&pointer.block_pointer) else {
+            return Vec::new();
+        };
+        let start = first + (pointer.offset as usize).max(NEXT_POINTER_SIZE) - NEXT_POINTER_SIZE;
+        let end = start + length.max(1);
+        let mut result: Vec<(usize, u64)> = self
+            .starts
+            .iter()
+            .filter(|(_, at)| **at < end && **at + payload > start)
+            .map(|(block, at)| (*at, *block))
+            .collect();
+        result.sort_unstable();
+        result.into_iter().map(|(_, block)| block).collect()
+    }
+
     fn read_chain(&mut self, buffer: &BufferManager, first: u64) -> Result<()> {
         let size = metadata_block_size(buffer.block_manager().block_size());
         let mut next = first;
@@ -123,7 +141,8 @@ pub(super) fn take<const N: usize>(data: &mut &[u8]) -> Result<[u8; N]> {
     Ok(*head)
 }
 
-/// `LoadFreeList`, without the free sub-blocks at its end, which only writing needs.
+/// `LoadFreeList`: the free blocks, those that several segments share, and the metadata blocks with their free
+/// sub-blocks (`MetadataManager::Read`).
 pub fn load_free_list(buffer: &BufferManager) -> Result<()> {
     let blocks = buffer.block_manager();
     let pointer = MetaBlockPointer::new(blocks.header().free_list, 0);
@@ -143,6 +162,15 @@ pub fn load_free_list(buffer: &BufferManager) -> Result<()> {
         let block = u64::from_le_bytes(take(&mut data)?);
         multi_use_blocks.insert(block, u32::from_le_bytes(take(&mut data)?));
     }
+    // a file of DuckDB before v0.9 has no list of metadata blocks
+    let mut metadata_blocks = std::collections::BTreeMap::new();
+    if let Ok(count) = take::<8>(&mut data) {
+        for _ in 0..u64::from_le_bytes(count) {
+            let block = u64::from_le_bytes(take(&mut data)?);
+            metadata_blocks.insert(block, u64::from_le_bytes(take(&mut data)?));
+        }
+    }
     blocks.set_free_list(free_list, multi_use_blocks);
+    blocks.set_metadata_blocks(metadata_blocks);
     Ok(())
 }

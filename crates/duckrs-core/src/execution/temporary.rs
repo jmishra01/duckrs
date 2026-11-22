@@ -41,6 +41,8 @@ pub struct QueryMemory {
     threads: AtomicUsize,
     /// `MetaTransaction::start_timestamp` of the query's transaction, `i64::MIN` until it is known
     transaction_start: std::sync::atomic::AtomicI64,
+    /// `temp_file_encryption`: what goes to temporary files is encrypted
+    encrypt_files: std::sync::atomic::AtomicBool,
 }
 
 impl QueryMemory {
@@ -55,7 +57,13 @@ impl QueryMemory {
             next_file: AtomicUsize::new(0),
             threads: AtomicUsize::new(1),
             transaction_start: std::sync::atomic::AtomicI64::new(i64::MIN),
+            encrypt_files: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// `temp_file_encryption`.
+    pub fn set_encrypt_files(&self, encrypt: bool) {
+        self.encrypt_files.store(encrypt, Ordering::Relaxed);
     }
 
     pub fn set_transaction_start(&self, micros: i64) {
@@ -132,12 +140,18 @@ impl QueryMemory {
                 format!("Failed to create the temporary file \"{}\": {e}", path.display()),
             )
         })?;
+        let encryption = if self.encrypt_files.load(Ordering::Relaxed) {
+            Some(crate::storage::encryption::temp_key()?)
+        } else {
+            None
+        };
         Ok(SpillFile {
             memory: Arc::clone(self),
             path,
             writer: Some(BufWriter::new(file)),
             chunks: 0,
             bytes: 0,
+            encryption,
         })
     }
 
@@ -208,6 +222,8 @@ pub struct SpillFile {
     writer: Option<BufWriter<File>>,
     chunks: usize,
     bytes: u64,
+    /// of `temp_file_encryption`: each chunk is encrypted, with its nonce and tag (`EncryptTemporaryBuffer`)
+    encryption: Option<&'static crate::storage::encryption::FileEncryption>,
 }
 
 impl SpillFile {
@@ -222,7 +238,10 @@ impl SpillFile {
         if chunk.is_empty() {
             return Ok(());
         }
-        let bytes = serialize_chunk(chunk)?;
+        let mut bytes = serialize_chunk(chunk)?;
+        if let Some(encryption) = self.encryption {
+            bytes = encryption.encrypt_log_entry(crate::storage::checksum::checksum(&bytes), &bytes)?;
+        }
         self.memory.add_temp_bytes(bytes.len() as u64 + 8)?;
         let writer = self
             .writer
@@ -301,6 +320,19 @@ impl SpillReader {
             )
         })?;
         self.left -= 1;
+        let bytes = match self.file.encryption {
+            Some(encryption) => {
+                let (stored, bytes) = encryption.decrypt_log_entry(&bytes)?;
+                if stored != crate::storage::checksum::checksum(&bytes) {
+                    return Err(Error::new(
+                        ErrorKind::DataCorruption,
+                        format!("Corrupt temporary file \"{}\"", self.file.path.display()),
+                    ));
+                }
+                bytes
+            }
+            None => bytes,
+        };
         deserialize_chunk(&bytes).map(Some)
     }
 }
@@ -546,6 +578,35 @@ mod tests {
         assert_eq!(format_bytes(300 << 20), "300.0 MiB");
         assert_eq!(format_bytes(1_000_000_000), "953.6 MiB");
         assert_eq!(format_bytes(1), "1 byte");
+    }
+
+    #[test]
+    fn encrypted_spill_files_hold_no_plaintext_and_give_back_their_chunks() {
+        let directory = std::env::temp_dir().join(format!("duckrs_spill_encrypted_{}", std::process::id()));
+        let memory = QueryMemory::new(1000, directory.clone(), None);
+        memory.set_encrypt_files(true);
+        let mut file = memory.spill_file().unwrap();
+        let types = [LogicalType::VARCHAR];
+        let mut chunk = DataChunk::new(&types);
+        for i in 0..50 {
+            chunk
+                .append_row(&[Value::varchar(format!("a secret that is not inlined {i}"))])
+                .unwrap();
+        }
+        file.write(&chunk).unwrap();
+        file.writer.as_mut().unwrap().flush().unwrap();
+        let written = std::fs::read(&file.path).unwrap();
+        assert!(!written.windows(6).any(|w| w == b"secret"));
+        let mut reader = file.into_reader().unwrap();
+        let back = reader.next_chunk().unwrap().unwrap();
+        assert_eq!(back.len(), 50);
+        assert_eq!(
+            back.column(0).get_value(49),
+            Value::varchar("a secret that is not inlined 49")
+        );
+        assert!(reader.next_chunk().unwrap().is_none());
+        drop(reader);
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]

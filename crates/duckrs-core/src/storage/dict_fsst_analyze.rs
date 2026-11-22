@@ -10,7 +10,7 @@
 //! the same; a dictionary that FSST encodes can be estimated a little differently from C++.
 
 use super::fsst::SymbolTable;
-use std::collections::HashSet;
+use hashbrown::HashSet;
 
 /// `DictFSSTCompression::STRING_SIZE_LIMIT`.
 const STRING_SIZE_LIMIT: usize = 16384;
@@ -45,14 +45,14 @@ fn align(value: usize) -> usize {
 }
 
 /// `BitpackingPrimitives::MinimumBitWidth` of an unsigned 64-bit value.
-fn bit_width(value: usize) -> usize {
+pub(super) fn bit_width(value: usize) -> usize {
     let width = (usize::BITS - value.leading_zeros()) as usize;
     // `GetEffectiveWidth`
     if width + 8 > 64 { 64 } else { width }
 }
 
 /// `BitpackingPrimitives::GetRequiredSize`.
-fn packed_size(count: usize, width: usize) -> usize {
+pub(super) fn packed_size(count: usize, width: usize) -> usize {
     count.next_multiple_of(32) * width / 8
 }
 
@@ -407,6 +407,11 @@ impl State {
         }
         estimate
     }
+}
+
+/// The length from which a string leaves FSST out of the column's DICT_FSST (`disable_fsst`).
+pub fn fsst_string_limit(block_size: usize) -> usize {
+    string_size_limit(block_size, true)
 }
 
 /// `DictFSSTCompressionStorage::StringFinalAnalyze` of the strings of a column (`strings[i]` is empty

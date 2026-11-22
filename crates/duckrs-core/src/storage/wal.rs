@@ -18,7 +18,7 @@ use super::serialization::generated::enums::{vector_type, wal_type};
 use super::serialization::generated::{self as g};
 use super::serialization::not_ported;
 use super::table_data::{self, DiskTable, PersistentRowGroup, fill_vector, fixed_width};
-use crate::catalog::{Catalog, OnCreateConflict, RowIds, SequenceData};
+use crate::catalog::{Catalog, OnCreateConflict, RowIds, SequenceData, TableCatalogEntry};
 use crate::planner::binder::Binder;
 use crate::planner::logical::LogicalOperatorKind;
 use duckrs_common::column_data::ColumnDataCollection;
@@ -77,6 +77,8 @@ pub(super) enum Record {
         validity: bool,
         chunk: DataChunk,
     },
+    /// `ReplayAlter`: an ALTER TABLE, run again
+    Alter(duckrs_parser::ast::AlterInfo),
 }
 
 /// What reading an entry leaves besides a `Record`.
@@ -98,6 +100,21 @@ struct FileState {
     db_identifier: [u8; DB_IDENTIFIER_LEN],
     iteration: u64,
     before_v2: bool,
+    /// of an encrypted file, whose log is encrypted as well
+    encryption: Option<super::encryption::FileEncryption>,
+}
+
+impl FileState {
+    fn of(buffer: &BufferManager) -> Self {
+        let blocks = buffer.block_manager();
+        let header = blocks.header();
+        Self {
+            db_identifier: blocks.main_header().db_identifier,
+            iteration: header.iteration,
+            before_v2: checkpoint::is_before_v2(&header),
+            encryption: blocks.encryption().cloned(),
+        }
+    }
 }
 
 /// `ThrowVersionError`.
@@ -282,8 +299,32 @@ fn read_flat_vector(d: &mut BinaryDeserializer<'_>, ty: &LogicalType, count: usi
     // `Vector::Deserialize` of a GEOMETRY: WKB, or the spatial extension's format before v1.5.0
     if ty.id() == duckrs_common::types::LogicalTypeId::Geometry {
         const WKB: u8 = 1;
-        if d.read_optional_property::<u8>(99, "geometry_format")? != Some(WKB) {
-            return Err(not_ported("GEOMETRY of the spatial extension in a write-ahead log"));
+        const SPATIAL: u8 = 0;
+        match d
+            .read_optional_property::<u8>(99, "geometry_format")?
+            .unwrap_or(SPATIAL)
+        {
+            WKB => {}
+            SPATIAL => {
+                // `Geometry::FromSpatialGeometry` of each blob
+                let blobs = read_flat_vector(d, &LogicalType::BLOB, count)?;
+                let mut result = Vector::new(ty.clone(), count.max(1));
+                for row in 0..count {
+                    let value = blobs.get_value(row);
+                    match value.data() {
+                        duckrs_common::value::ValueData::Bytes(blob) if !value.is_null() => {
+                            let wkb = duckrs_common::geometry::from_spatial(blob)?;
+                            result.set_value(
+                                row,
+                                &Value::new(ty.clone(), duckrs_common::value::ValueData::Bytes(wkb))?,
+                            )?;
+                        }
+                        _ => result.set_null(row, true),
+                    }
+                }
+                return Ok(result);
+            }
+            _ => return Err(not_ported("a shredded GEOMETRY in a write-ahead log")),
         }
     } else if d.has_property(99)? {
         return Err(not_ported("extra vector data in a write-ahead log"));
@@ -398,8 +439,11 @@ impl Reader<'_> {
     /// `ReplayVersion`.
     fn read_version(&mut self, d: &mut BinaryDeserializer<'_>) -> Result<()> {
         self.version = d.read_property(101, "version")?;
-        if self.version == ENCRYPTED_VERSION {
-            return Err(not_ported("an encrypted write-ahead log"));
+        if self.version == ENCRYPTED_VERSION && self.file.encryption.is_none() {
+            return Err(Error::new(
+                ErrorKind::Io,
+                "Failed to read WAL: the WAL is marked as encrypted, but the database is not",
+            ));
         }
         if self.version > ENCRYPTED_VERSION {
             let version = self.version;
@@ -537,7 +581,21 @@ impl Reader<'_> {
                     chunk,
                 }
             }
-            ALTER_INFO => return Err(not_ported("ALTER in a write-ahead log")),
+            ALTER_INFO => {
+                let info = d.read_property::<Option<Box<g::ParseInfo>>>(101, "info")?;
+                let Some(g::ParseInfoKind::AlterInfo(alter)) = info.map(|info| info.kind) else {
+                    return Err(corrupt("an ALTER of a log is not an ALTER"));
+                };
+                // ADD of a UNIQUE constraint comes with the index it makes (`index_storage_info`)
+                if let g::AlterInfoKind::AlterTableInfo(g::AlterTableInfo {
+                    kind: g::AlterTableInfoKind::AddConstraintInfo(_),
+                    ..
+                }) = &alter.kind
+                {
+                    return Err(not_ported("ADD CONSTRAINT in a write-ahead log"));
+                }
+                Record::Alter(super::serialization::convert::alter_info(alter)?)
+            }
             other => return Err(corrupt(format!("unknown write-ahead log entry {other}"))),
         };
         Ok(Entry::Record(record))
@@ -553,6 +611,42 @@ impl Reader<'_> {
             let mut d = self.deserializer(&data[position..]);
             let entry = self.read_entry(&mut d)?;
             return Ok((entry, position + d.position()));
+        }
+        // the size of the entry stays plain, then come the nonce, the encrypted checksum and entry, and GCM's tag
+        if self.version == ENCRYPTED_VERSION
+            && let Some(encryption) = &self.file.encryption
+        {
+            let size = data
+                .get(position..position + 8)
+                .map(|bytes| u64::from_le_bytes(bytes.try_into().expect("8 bytes")))
+                .ok_or_else(|| torn("a log ends inside the header of an entry"))?;
+            let start = position + 8;
+            let end = usize::try_from(size)
+                .ok()
+                .and_then(|size| size.checked_add(encryption.log_entry_overhead()))
+                .and_then(|framed| start.checked_add(framed))
+                .filter(|&end| end <= data.len() && size != 0)
+                .ok_or_else(|| {
+                    torn(&format!(
+                        "Corrupt Encrypted WAL file: entry size exceeded remaining data in file at byte position \
+                         {start} (found entry with size {size} bytes, file size {} bytes)",
+                        data.len()
+                    ))
+                })?;
+            let (stored, entry) = encryption.decrypt_log_entry(&data[start..end])?;
+            let computed = checksum(&entry);
+            if stored != computed {
+                return Err(Error::new(
+                    ErrorKind::DataCorruption,
+                    format!(
+                        "Corrupt WAL file: entry at byte position {start} computed checksum {computed} does not \
+                         match stored checksum {stored}"
+                    ),
+                ));
+            }
+            let mut d = self.deserializer(&entry);
+            let entry = self.read_entry(&mut d)?;
+            return Ok((entry, end));
         }
         let header = data
             .get(position..position + FRAME_HEADER_SIZE)
@@ -594,6 +688,11 @@ struct Scan {
     checkpoint: Option<(MetaBlockPointer, usize)>,
     /// Where the last entry started, or would have.
     last_position: usize,
+    /// Where what was committed ends, before a checkpoint marker: where the log goes on
+    /// (`WriteAheadLog::Initialize` with the size that replay left)
+    committed_end: usize,
+    /// the version of its entries
+    version: u64,
     expected_iteration: Option<u64>,
 }
 
@@ -609,6 +708,8 @@ fn scan(data: &[u8], file: &FileState, kind: LogKind) -> Result<Scan> {
     let mut position = 0;
     let mut last_position;
     let mut checkpoint = None;
+    let mut committed_end = 0;
+    let mut marker_start = None;
     loop {
         last_position = position;
         match reader.next(data, position) {
@@ -616,13 +717,17 @@ fn scan(data: &[u8], file: &FileState, kind: LogKind) -> Result<Scan> {
                 position = next;
                 match entry {
                     Entry::Record(record) => records.push(record),
-                    Entry::Version => {}
+                    Entry::Version => committed_end = next,
                     Entry::Checkpoint(_) if checkpoint.is_some() => {
                         return Err(corrupt("a log has more than one checkpoint marker"));
                     }
-                    Entry::Checkpoint(pointer) => checkpoint = Some((pointer, next)),
+                    Entry::Checkpoint(pointer) => {
+                        marker_start = Some(last_position);
+                        checkpoint = Some((pointer, next));
+                    }
                     Entry::Flush => {
                         committed = records.len();
+                        committed_end = next;
                         if next == data.len() {
                             break;
                         }
@@ -639,6 +744,8 @@ fn scan(data: &[u8], file: &FileState, kind: LogKind) -> Result<Scan> {
         records,
         checkpoint,
         last_position,
+        committed_end: marker_start.map_or(committed_end, |start| start.min(committed_end)),
+        version: reader.version,
         expected_iteration: reader.expected_iteration,
     })
 }
@@ -699,13 +806,38 @@ pub(super) fn read_records(path: &Path, buffer: &BufferManager) -> Result<Vec<Re
     let Some(data) = read_log(&with_suffix(path, ".wal"))? else {
         return Ok(Vec::new());
     };
-    let header = buffer.block_manager().header();
-    let file = FileState {
-        db_identifier: buffer.block_manager().main_header().db_identifier,
-        iteration: header.iteration,
-        before_v2: checkpoint::is_before_v2(&header),
-    };
+    let file = FileState::of(buffer);
     replay_log(&data, path, buffer, &file, LogKind::Main)
+}
+
+/// What became of the log of a file that was replayed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayedLog {
+    /// none, or one that doesn't belong to the file
+    None,
+    /// `IsCheckpointClean`: all of it is in the file already, as its marker says
+    Checkpointed,
+    /// it goes on at the end of what it committed, before a checkpoint marker, with entries of this version
+    Ends(u64, u64),
+}
+
+/// [`ReplayedLog`] of the log of the file at `path`.
+pub(super) fn replayed_end(path: &Path, buffer: &BufferManager) -> Result<ReplayedLog> {
+    let Some(data) = read_log(&with_suffix(path, ".wal"))? else {
+        return Ok(ReplayedLog::None);
+    };
+    let header = buffer.block_manager().header();
+    let file = FileState::of(buffer);
+    let Ok(scanned) = scan(&data, &file, LogKind::Main) else {
+        return Ok(ReplayedLog::None);
+    };
+    let clean = scanned
+        .checkpoint
+        .is_some_and(|(marker, _)| marker.block_pointer == header.meta_block);
+    if clean && read_log(&with_suffix(path, ".wal.checkpoint"))?.is_none() {
+        return Ok(ReplayedLog::Checkpointed);
+    }
+    Ok(ReplayedLog::Ends(scanned.committed_end as u64, scanned.version))
 }
 
 /// A table while a log is replayed. Row ids are what records name rows by, and deleting rows in
@@ -755,6 +887,8 @@ pub(super) struct Replay<'a> {
     tables: HashMap<EntryName, LiveTable>,
     sequence_usage: HashMap<EntryName, u64>,
     current: Option<EntryName>,
+    /// The `storage_version` of each index whose ART the file has, by schema and name.
+    index_versions: HashMap<EntryName, Option<u64>>,
 }
 
 impl<'a> Replay<'a> {
@@ -768,12 +902,24 @@ impl<'a> Replay<'a> {
             tables: HashMap::new(),
             sequence_usage: HashMap::new(),
             current: None,
+            index_versions: HashMap::new(),
         }
     }
 
     /// Binds the definition of a table as `CREATE TABLE` does, for its defaults, generated columns
     /// and constraints. Its rows stay in the file.
     fn load_table(&mut self, table: StoredTable) -> Result<()> {
+        // `ART::ART` of an index with storage: the version it has, if it says
+        for index in &table.indexes {
+            let version = index
+                .options
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("storage_version"))
+                .and_then(|(_, value)| value.as_i128())
+                .map(|version| version as u64);
+            self.index_versions
+                .insert(key(&(table.schema.clone(), index.name.clone())), version);
+        }
         let plan = Binder::new(self.catalog).bind_stored_table(&table.definition, &table.schema)?;
         let LogicalOperatorKind::CreateTable {
             schema,
@@ -820,14 +966,14 @@ impl<'a> Replay<'a> {
                 .disk
                 .get(&table_key)
                 .ok_or_else(|| corrupt("a log names a table that does not exist"))?;
-            let mut row_ids = Vec::new();
-            let rows = disk.read_rows(Some(&mut row_ids))?;
+            // the rows stay in the file until what the log does needs them: an INSERT or an UPDATE reads them, a
+            // DELETE doesn't
+            let ids = crate::catalog::TableSource::row_ids(&**disk);
             let live = LiveTable {
-                row_ids,
+                row_ids: (0..ids.len()).map(|position| ids.id(position)).collect(),
                 next_row_id: disk.next_row_id(),
                 ..LiveTable::default()
             };
-            self.catalog.get_table(Some(&name.0), &name.1)?.set_rows(rows);
             self.tables.insert(table_key.clone(), live);
         }
         Ok(self.tables.get_mut(&table_key).expect("just ensured"))
@@ -925,6 +1071,8 @@ impl<'a> Replay<'a> {
                 };
                 // the file has these rows under the index already, so they aren't checked again
                 if let Some((table, mut index)) = Binder::new(self.catalog).bind_create_index(&info)? {
+                    let name = key(&(table.schema.clone(), index.name.clone()));
+                    index.storage_version = self.index_versions.get(&name).copied();
                     index.index_type = index_type;
                     index.comment = comment;
                     table.indexes.write().push(Arc::new(index));
@@ -999,7 +1147,71 @@ impl<'a> Replay<'a> {
         if chunk.types() != table.types() {
             return Err(corrupt("a log inserts rows of other types"));
         }
-        table.write_storage()?.append(chunk);
+        table.append_storage()?.append(chunk);
+        Ok(())
+    }
+
+    /// `ReplayRowGroupData`: row groups an append wrote to blocks ahead of a checkpoint stay there
+    /// (`RowGroupCollection::MergeStorage`, `MarkBlockAsUsed`), after the rows of the table, where those are in its
+    /// file or there are none in memory; others are read into memory, as rows.
+    fn row_groups(&mut self, row_groups: Vec<table_data::PersistentRowGroup>) -> Result<()> {
+        use super::appended::{AppendedPart, AppendedTable};
+        self.current_table()?;
+        let (schema, name) = self.current.clone().expect("the table above");
+        let table = self.catalog.get_table(Some(&schema), &name)?;
+        let version = self.buffer.block_manager().storage_version()?;
+        let keep = table.rows_in_memory() == 0 && table.appends_after_source();
+        let mut kept = Vec::new();
+        let mut rest = Vec::new();
+        for row_group in row_groups {
+            let rows = row_group.count as usize;
+            let group = if keep && rest.is_empty() && row_group.types == table.types() {
+                let row_start = self.current_table()?.next_row_id;
+                super::writer::WrittenGroup::from_persistent(
+                    row_start,
+                    rows,
+                    &row_group.columns,
+                    row_group.types.clone(),
+                    version,
+                    self.buffer.clone(),
+                )?
+            } else {
+                None
+            };
+            match group {
+                Some(group) => {
+                    let mut blocks = Vec::new();
+                    for column in &row_group.columns {
+                        table_data::column_blocks(column, &mut blocks);
+                    }
+                    for block in blocks {
+                        self.buffer.block_manager().mark_used(block);
+                    }
+                    self.current_table()?.add_rows(rows);
+                    kept.push(Arc::new(group));
+                }
+                None => rest.push(row_group),
+            }
+        }
+        if !kept.is_empty() {
+            let mut parts = match table.source() {
+                Some(source) => AppendedTable::parts_of(&source),
+                None => Vec::new(),
+            };
+            parts.extend(kept.into_iter().map(AppendedPart::Written));
+            let live = self.current_table()?;
+            let ids = crate::catalog::RowIds::of_list(&live.row_ids, live.next_row_id);
+            table.set_appended(Arc::new(AppendedTable::new(
+                parts,
+                ids,
+                table.types(),
+                table.row_group_size(),
+            )));
+        }
+        for row_group in &rest {
+            let chunk = table_data::scan_row_group(&self.buffer, row_group)?;
+            self.append(&chunk)?;
+        }
         Ok(())
     }
 
@@ -1032,13 +1244,7 @@ impl<'a> Replay<'a> {
                 Ok(())
             }
             Record::Insert(chunk) => self.append(&chunk),
-            Record::RowGroups(row_groups) => {
-                for row_group in &row_groups {
-                    let chunk = table_data::scan_row_group(&self.buffer, row_group)?;
-                    self.append(&chunk)?;
-                }
-                Ok(())
-            }
+            Record::RowGroups(row_groups) => self.row_groups(row_groups),
             Record::Delete(chunk) => {
                 let table = self.current_table()?;
                 for row in 0..chunk.len() {
@@ -1047,6 +1253,7 @@ impl<'a> Replay<'a> {
                 }
                 Ok(())
             }
+            Record::Alter(info) => self.alter(&info),
             Record::Update {
                 column,
                 validity,
@@ -1072,43 +1279,59 @@ impl<'a> Replay<'a> {
     fn finish(self) -> Result<()> {
         for ((schema, name), live) in self.tables {
             let table = self.catalog.get_table(Some(&schema), &name)?;
-            let ids: Vec<u64> = (0..live.row_ids.len())
+            settle(&table, &live)?;
+        }
+        Ok(())
+    }
+
+    /// `ReplayAlter`: the ALTER as the statement did it, on the rows as the log has them so far, whose columns it
+    /// may move. A table renamed is the same table under its new name.
+    fn alter(&mut self, info: &duckrs_parser::ast::AlterInfo) -> Result<()> {
+        let name = &info.name;
+        let schema = match name.qualification.last() {
+            Some(schema) => schema.clone(),
+            None => self.catalog.schema_for(None)?.name.clone(),
+        };
+        let entry_name = (schema.clone(), name.name.clone());
+        let table_key = key(&entry_name);
+        if self.disk.contains_key(&table_key) || self.tables.contains_key(&table_key) {
+            self.live_table(&entry_name)?;
+            let table = self.catalog.get_table(Some(&schema), &name.name)?;
+            let live = self.tables.get_mut(&table_key).expect("just made live");
+            settle(&table, live)?;
+            let kept: Vec<u64> = (0..live.row_ids.len())
                 .filter(|position| !live.deleted.contains(position))
                 .map(|position| live.row_ids[position])
                 .collect();
-            table.set_row_ids(RowIds::of_list(&ids, live.next_row_id));
-            if live.deleted.is_empty() && live.updates.is_empty() {
-                table.reset_log();
-                continue;
+            live.row_ids = kept;
+            live.deleted.clear();
+            live.updates.clear();
+        }
+        // the database is this one, whatever it was called
+        let mut info = info.clone();
+        info.name.qualification = vec![schema.clone()];
+        let bound = Binder::new(self.catalog).bind_alter(&info)?;
+        crate::execution::alter::execute_alter(bound)?;
+        // the rows keep the ids the log has them under, which C++ doesn't change (`RowGroup::AlterType`)
+        if !self.tables.contains_key(&table_key) {
+            return Ok(());
+        }
+        let new_name = match &info.kind {
+            duckrs_parser::ast::AlterKind::RenameTable(new_name) => new_name.clone(),
+            _ => name.name.clone(),
+        };
+        let table = self.catalog.get_table(Some(&schema), &new_name)?;
+        if new_name != name.name {
+            let new_key = key(&(schema.clone(), new_name));
+            if let Some(live) = self.tables.remove(&table_key) {
+                self.tables.insert(new_key.clone(), live);
             }
-            let mut storage = table.write_storage()?;
-            let types = storage.types().to_vec();
-            let mut result = ColumnDataCollection::new(types.clone());
-            let mut chunk = DataChunk::new(&types);
-            for position in (0..storage.len()).filter(|position| !live.deleted.contains(position)) {
-                let mut row = storage.row(position);
-                for (&column, cell) in live.updates.get(&position).into_iter().flatten() {
-                    let target = row
-                        .get_mut(column)
-                        .ok_or_else(|| corrupt("a log updates a column that does not exist"))?;
-                    if cell.null == Some(true) {
-                        *target = Value::null(types[column].clone());
-                    } else if let Some(value) = &cell.value {
-                        *target = value.clone();
-                    }
-                }
-                chunk.append_row(&row)?;
-                if chunk.len() == STANDARD_VECTOR_SIZE {
-                    result.append(&chunk);
-                    chunk.reset();
-                }
+            if let Some(disk) = self.disk.remove(&table_key) {
+                self.disk.insert(new_key, disk);
             }
-            if !chunk.is_empty() {
-                result.append(&chunk);
+            if self.current.as_ref().is_some_and(|current| key(current) == table_key) {
+                self.current = Some((schema, table.name.clone()));
             }
-            *storage = result;
-            drop(storage);
-            table.reset_log();
         }
         Ok(())
     }
@@ -1123,4 +1346,65 @@ impl<'a> Replay<'a> {
         }
         self.finish()
     }
+}
+
+/// What a log deleted and updated of a table, put into its rows, which it numbers as the log does.
+fn settle(table: &TableCatalogEntry, live: &LiveTable) -> Result<()> {
+    let ids: Vec<u64> = (0..live.row_ids.len())
+        .filter(|position| !live.deleted.contains(position))
+        .map(|position| live.row_ids[position])
+        .collect();
+    // the row groups of the file and those in blocks of their own stay row groups of their own
+    let stored = table.stored_groups();
+    let left = RowIds::of_list(&ids, live.next_row_id).with_stored_groups(stored.clone());
+    if live.deleted.is_empty() && live.updates.is_empty() {
+        table.set_row_ids(left);
+        table.reset_log();
+        return Ok(());
+    }
+    // the ids of all the rows, deleted ones too, as long as the table has them
+    table.set_row_ids(RowIds::of_list(&live.row_ids, live.next_row_id).with_stored_groups(stored));
+    // deletes of rows still in the file only say which are left, as a DELETE does
+    if let (true, Some(source)) = (live.updates.is_empty(), table.source())
+        && crate::execution::physical::delete_leaves_in_file(table)
+        && source.row_count() == live.row_ids.len()
+    {
+        let mut removed: Vec<usize> = live.deleted.iter().copied().collect();
+        removed.sort_unstable();
+        let mut layered = super::layered::LayeredTable::of(&source, table.types());
+        layered.delete(&removed);
+        table.keep_in_file(Arc::new(layered));
+        table.reset_log();
+        return Ok(());
+    }
+    let mut storage = table.write_storage()?;
+    let types = storage.types().to_vec();
+    let mut result = ColumnDataCollection::new(types.clone());
+    let mut chunk = DataChunk::new(&types);
+    for position in (0..storage.len()).filter(|position| !live.deleted.contains(position)) {
+        let mut row = storage.row(position);
+        for (&column, cell) in live.updates.get(&position).into_iter().flatten() {
+            let target = row
+                .get_mut(column)
+                .ok_or_else(|| corrupt("a log updates a column that does not exist"))?;
+            if cell.null == Some(true) {
+                *target = Value::null(types[column].clone());
+            } else if let Some(value) = &cell.value {
+                *target = value.clone();
+            }
+        }
+        chunk.append_row(&row)?;
+        if chunk.len() == STANDARD_VECTOR_SIZE {
+            result.append(&chunk);
+            chunk.reset();
+        }
+    }
+    if !chunk.is_empty() {
+        result.append(&chunk);
+    }
+    *storage = result;
+    drop(storage);
+    table.set_row_ids(left);
+    table.reset_log();
+    Ok(())
 }

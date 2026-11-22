@@ -182,8 +182,8 @@ fn is_scan_not_in(expr: &BoundExpr, scan: &[ColumnBinding]) -> bool {
         && !expr.is_volatile()
         && !super::rewriter::can_throw(expr)
 }
-
-/// `col IN (c1, ...)` of non-NULL constants on a column of the scan that a key of one column indexes.
+/// `col IN (c1, ...)` of non-NULL constants on a column of the scan that a key or an index of just that column
+/// indexes.
 fn is_indexed_column_in(expr: &BoundExpr, scan: &LogicalOperator) -> bool {
     let (
         BoundExprKind::Operator {
@@ -204,10 +204,13 @@ fn is_indexed_column_in(expr: &BoundExpr, scan: &LogicalOperator) -> bool {
     children[1..]
         .iter()
         .all(|c| matches!(&c.kind, BoundExprKind::Constant(v) if !v.is_null()))
-        && table
-            .scan_keys()
-            .iter()
-            .any(|key| key.columns.as_slice() == [column] && key.expressions.is_none())
+        && table.scan_keys().iter().any(|key| {
+            // a constraint's key is its columns, an index's its expressions: a plain one is the column itself
+            let plain = key.expressions.as_ref().is_none_or(|expressions| {
+                matches!(expressions.as_slice(), [expression] if matches!(expression.kind, BoundExprKind::Reference(_)))
+            });
+            plain && key.columns.as_slice() == [column]
+        })
 }
 
 /// An IN that becomes a join: of enough values, all constants.

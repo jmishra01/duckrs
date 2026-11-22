@@ -458,9 +458,25 @@ pub(super) fn table_statistics(table: &Arc<TableCatalogEntry>) -> Option<Arc<Vec
 /// The distinct values of each column of `table`, as C++'s statistics count them
 /// ([`super::distinct_statistics`]).
 fn compute_distinct_counts(table: &Arc<TableCatalogEntry>) -> Option<TableDistinctCounts> {
-    let columns = (0..table.columns.len())
-        .map(|column| super::distinct_statistics::table_column_distinct(table, column))
-        .collect();
+    // a file keeps them, as C++ does, and counting them again would read all of the table
+    let stored = table.distinct_states();
+    let columns = match stored {
+        // a column without one (a change put it in memory) is counted from its rows alone
+        Some(states) => states
+            .iter()
+            .enumerate()
+            .map(|(column, state)| match state {
+                Some(state) => Some(state.count()),
+                None if super::distinct_statistics::type_is_supported(&table.columns[column].ty) => {
+                    super::distinct_statistics::table_column_distinct(table, column)
+                }
+                None => None,
+            })
+            .collect(),
+        None => (0..table.columns.len())
+            .map(|column| super::distinct_statistics::table_column_distinct(table, column))
+            .collect(),
+    };
     Some(TableDistinctCounts {
         rows: table.row_count() as u64,
         columns,
@@ -660,7 +676,7 @@ fn larger(a: Option<Value>, b: Option<Value>) -> Option<Value> {
 }
 
 /// `BaseStatistics::Merge`: of values that are one or the other.
-fn union(a: Stats, b: Stats) -> Stats {
+pub(crate) fn union(a: Stats, b: Stats) -> Stats {
     let (a_valid, b_valid) = (a.can_be_valid, b.can_be_valid);
     let (min, max) = match (a_valid, b_valid) {
         (true, false) => (a.min, a.max),
@@ -3495,7 +3511,11 @@ pub(super) fn stats_fields(stats: &Stats, ty: &LogicalType) -> Option<Value> {
         }
         fields.push(("has_unicode".to_string(), Value::boolean(strings.has_unicode)));
         for (name, value) in [
-            ("min_string_length", strings.min_length),
+            // `StringStatsData::HasMinStringLength`: the most it holds says only that it is at least that
+            (
+                "min_string_length",
+                strings.min_length.filter(|length| *length != u64::from(u32::MAX)),
+            ),
             ("max_string_length", strings.max_length),
             ("total_string_length", strings.total_length),
         ] {

@@ -282,7 +282,55 @@ impl Binder<'_> {
             rest.qualification[0] = DEFAULT_CATALOG.to_string();
             return schema_of(&rest);
         }
+        // `db.t`: the database's default schema, unless it has a schema of that name
+        if let [first] = name.qualification.as_slice()
+            && first.eq_ignore_ascii_case(database)
+            && self.session.is_some()
+            && self.catalog.get_schema(first).is_none()
+        {
+            return Ok(None);
+        }
         schema_of(name)
+    }
+
+    /// A table or view of the connection's default database, when this binder binds in another one.
+    fn default_database_entry(&self, name: &str) -> Option<crate::catalog::TableOrView> {
+        let session = self.session.as_ref()?;
+        if session.default_database.eq_ignore_ascii_case(&session.database) {
+            return None;
+        }
+        let catalog = (session.attached_catalog)(&session.default_database)?;
+        if std::ptr::eq(Arc::as_ptr(&catalog), self.catalog) {
+            return None;
+        }
+        catalog.get_entry(None, None, name).ok()
+    }
+
+    /// The catalog of an attached database other than this binder's that `name` is qualified by, and
+    /// the schema in it (`None` for its default one). The first part of `a.b` is a schema if this
+    /// catalog has one, as in C++.
+    pub(super) fn other_database_of(&self, name: &QualifiedName) -> Option<(Arc<crate::catalog::Catalog>, Option<String>)> {
+        let first = name.qualification.first()?;
+        let session = self.session.as_ref()?;
+        if first.eq_ignore_ascii_case(&session.database)
+            || first.eq_ignore_ascii_case(TEMP_SCHEMA)
+            || first.eq_ignore_ascii_case("system")
+        {
+            return None;
+        }
+        if name.qualification.len() == 1 && self.catalog.get_schema(first).is_some() {
+            return None;
+        }
+        let catalog = (session.attached_catalog)(first)?;
+        if std::ptr::eq(Arc::as_ptr(&catalog), self.catalog) {
+            return None;
+        }
+        let schema = match &name.qualification[1..] {
+            [] => None,
+            [schema] => Some(schema.clone()),
+            path => Some(crate::catalog::schema_key(path)),
+        };
+        Some((catalog, schema))
     }
 
     /// `Binder::Bind(SelectStatement)`.
@@ -2141,11 +2189,10 @@ impl Binder<'_> {
         let in_scope = |qualification: &[String], binding: &Binding| match qualification.split_last() {
             Some((table, schema)) => {
                 table.eq_ignore_ascii_case(&binding.alias)
-                    && (schema.is_empty()
-                        || binding.schema.as_ref().is_some_and(|s| {
-                            let path = schema.join(&crate::catalog::SCHEMA_PATH_SEPARATOR.to_string());
-                            super::BindContext::schema_matches(s, &path)
-                        }))
+                    && (schema.is_empty() || {
+                        let path = schema.join(&crate::catalog::SCHEMA_PATH_SEPARATOR.to_string());
+                        super::BindContext::schema_matches(binding, &path)
+                    })
             }
             None => true,
         };
@@ -2458,6 +2505,7 @@ impl Binder<'_> {
                     self.bind_context.add_binding(Binding {
                         alias,
                         schema: None,
+                        catalog: None,
                         table_index,
                         names,
                         types: working.types.clone(),
@@ -2486,18 +2534,83 @@ impl Binder<'_> {
                         .find(|f| f.name.eq_ignore_ascii_case(first))
                         .cloned()
                 });
-                let entry = match &foreign {
-                    Some(foreign) => {
+                // `Catalog::GetEntry` of another attached database: a statement that writes one database
+                // reads the others by their names
+                let other = match &foreign {
+                    Some(_) => None,
+                    None => self.other_database_of(name),
+                };
+                let entry = match (&foreign, &other) {
+                    (Some(foreign), _) => {
                         foreign
                             .catalog
                             .get_entry(name.qualification.get(1).map(String::as_str), None, &name.name)
                     }
-                    None => self.catalog.get_entry(
+                    (None, Some((catalog, schema))) => catalog.get_entry(schema.as_deref(), None, &name.name),
+                    (None, None) => self.catalog.get_entry(
                         self.schema_of(name)?.as_deref(),
                         self.search_schema.as_deref(),
                         &name.name,
                     ),
                 };
+                // `CatalogEntryRetriever::GetEntry`: past the search path of the statement's (or view's)
+                // database comes that of the connection, in its default database
+                let mut entry_catalog = self.catalog.name.clone();
+                let entry = match entry {
+                    Err(error) if foreign.is_none() && other.is_none() && name.qualification.is_empty() => {
+                        match self.default_database_entry(&name.name) {
+                            Some(found) => {
+                                if let Some(session) = &self.session {
+                                    entry_catalog.clone_from(&session.default_database);
+                                }
+                                Ok(found)
+                            }
+                            None => Err(error),
+                        }
+                    }
+                    entry => entry,
+                };
+                // `Catalog::TryLookupDefaultTable`: the bare name of a database that has a default table stands for
+                // that table, once it is there; an entry of that name as well makes the name ambiguous
+                if name.qualification.is_empty()
+                    && foreign.is_none()
+                    && let Some(session) = &self.session
+                    && let Some(database) = (session.attached_catalog)(&name.name)
+                    && let Some((schema, table)) = database.default_table()
+                    && database.get_entry(Some(&schema), None, &table).is_ok()
+                {
+                    // (the catalog of an attached file goes by the name it was attached under, which only the
+                    // database knows)
+                    let default_name = [name.name.as_str(), &schema, &table].map(ast::sql_identifier).join(".");
+                    if let Ok(found) = &entry {
+                        let (kind, found_schema, found_name) = match found {
+                            TableOrView::Table(table) => ("Table", &table.schema, &table.name),
+                            TableOrView::View(view) => ("View", &view.schema, &view.name),
+                        };
+                        let found_qualified = [entry_catalog.as_str(), found_schema, found_name]
+                            .map(ast::sql_identifier)
+                            .join(".");
+                        let n = &name.name;
+                        return Err(Error::new(
+                            ErrorKind::Catalog,
+                            format!(
+                                "Ambiguity detected for '{n}': this could either refer to the '{kind}' '{n}', or the \
+                                 attached catalog '{n}' which has a default table. To avoid this error, either detach \
+                                 the catalog and reattach under a different name, or use a fully qualified name for \
+                                 the '{kind}': '{found_qualified}' or for the Catalog Default Table: '{default_name}'."
+                            ),
+                        ));
+                    }
+                    let mut rewritten = table_ref.clone();
+                    rewritten.kind = TableRefKind::BaseTable {
+                        name: ast::QualifiedName {
+                            qualification: vec![name.name.clone(), schema],
+                            name: table,
+                        },
+                        at_clause: None,
+                    };
+                    return self.bind_unsampled_table_ref(&rewritten);
+                }
                 if entry.is_err()
                     && name.qualification.is_empty()
                     && self
@@ -2587,6 +2700,12 @@ impl Binder<'_> {
                 let table_index = self.generate_table_index();
                 let mut binding = table_binding(&table, alias, table_index, names);
                 binding.schema = table_ref.alias.is_empty().then(|| table.schema.clone());
+                if table_ref.alias.is_empty() && foreign.is_none() {
+                    binding.catalog = match &other {
+                        Some(_) => name.qualification.first().cloned(),
+                        None => self.session.as_ref().map(|session| session.database.clone()),
+                    };
+                }
                 self.bind_context.add_binding(binding);
                 // the scan also outputs the rowid, past the columns
                 let column_ids = (0..table.columns.len()).chain([COLUMN_IDENTIFIER_ROW_ID]).collect();
@@ -2619,6 +2738,7 @@ impl Binder<'_> {
                 self.bind_context.add_binding(Binding {
                     alias,
                     schema: None,
+                    catalog: None,
                     table_index,
                     names,
                     types: types.clone(),
@@ -2804,6 +2924,7 @@ impl Binder<'_> {
         self.bind_context.add_binding(Binding {
             alias,
             schema: None,
+            catalog: None,
             table_index,
             names,
             types: bound.types,
@@ -2956,6 +3077,7 @@ impl Binder<'_> {
         self.bind_context.add_binding(Binding {
             alias,
             schema: None,
+            catalog: None,
             table_index,
             names,
             types: vec![LogicalType::BIGINT],
@@ -3089,6 +3211,7 @@ impl Binder<'_> {
                 alias,
                 // `schema.table.column` reads it too
                 schema: Some(table.schema.clone()),
+                catalog: None,
                 table_index,
                 names: table.columns.iter().map(|c| c.name.clone()).collect(),
                 types: table.types(),
@@ -3142,6 +3265,7 @@ impl Binder<'_> {
             self.bind_context.add_binding(Binding {
                 alias: "\u{1}merge".to_string(),
                 schema: None,
+                catalog: None,
                 table_index,
                 names: hidden,
                 types,
@@ -3673,12 +3797,19 @@ impl Binder<'_> {
                 ));
             }
             if column.generated.is_some() {
+                if column.compression.is_some() {
+                    return Err(binder_error(format!(
+                        "Can't set a compression type on generated column {}, generated columns are not stored",
+                        sql_quoted_identifier(&column.name)
+                    )));
+                }
                 continue;
             }
             let Some(ty) = &column.column_type else {
                 return Err(not_implemented("columns without a type"));
             };
             let mut definition = ColumnDefinition::new(column.name.clone(), self.bind_type(ty)?);
+            definition.compression = self.column_compression(column, &definition.ty)?;
             if let Some(default) = &column.default_value {
                 // `Binder::BindCreateTableInfo`: a stored DEFAULT can't refer to parameters
                 // (unnamed `?` parameters are found missing before binding, as in C++)
@@ -3692,6 +3823,8 @@ impl Binder<'_> {
                 let mut binder = Binder::new(self.catalog);
                 binder.aggregate_error = "DEFAULT value cannot contain aggregates!";
                 binder.search_schema = self.search_schema.clone();
+                // the sequences of `nextval` are those of the statement's databases
+                binder.session = self.session.clone();
                 definition.default_value = Some(checked_cast(binder.bind_expression(default)?, &definition.ty)?);
                 definition.default_text = Some(default.to_string());
             }
@@ -4064,3 +4197,34 @@ const CPP_TABLE_FUNCTIONS: &[&str] = &[
     "unnest",
     "which_secret",
 ];
+
+impl Binder<'_> {
+    /// `VerifyCompressionType`: the method `USING COMPRESSION` names for a column of a new table, if one, which the
+    /// database's storage version has and which can store the column's type.
+    pub(super) fn column_compression(&self, column: &ast::ColumnDefinition, ty: &LogicalType) -> Result<Option<u8>> {
+        use crate::storage::compression::{compression_availability, compression_of_name, compression_supports};
+        let Some(name) = column.compression else {
+            return Ok(None);
+        };
+        let compression = compression_of_name(name).expect("the parser names a compression type");
+        if let Err(deprecated) = compression_availability(compression, self.catalog.storage_version()) {
+            return Err(binder_error(if deprecated {
+                format!(
+                    "Can't compress using user-provided compression type '{name}', that type is deprecated and only \
+                     has decompress support"
+                )
+            } else {
+                format!("Can't compress using user-provided compression type '{name}', that type is not available yet")
+            }));
+        }
+        let physical = ty.physical_type();
+        if !compression_supports(compression, physical) {
+            return Err(binder_error(format!(
+                "Can't compress column {} with type '{ty}' (physical: {}) using compression type '{name}'",
+                sql_quoted_identifier(&column.name),
+                physical.name()
+            )));
+        }
+        Ok(Some(compression))
+    }
+}

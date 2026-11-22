@@ -470,7 +470,15 @@ fn chr(args: &DataChunk, result: &mut Vector) -> Result<()> {
 }
 
 pub(super) fn contains(args: &DataChunk, result: &mut Vector) -> Result<()> {
-    let found = |text: &[u8], needle: &[u8]| memchr::memmem::find(text, needle).is_some();
+    // the needle is nearly always a constant: its search is set up once
+    let finder: std::cell::RefCell<Option<memchr::memmem::Finder<'static>>> = std::cell::RefCell::new(None);
+    let found = |text: &[u8], needle: &[u8]| {
+        let mut finder = finder.borrow_mut();
+        if finder.as_ref().is_none_or(|finder| finder.needle() != needle) {
+            *finder = Some(memchr::memmem::Finder::new(needle).into_owned());
+        }
+        finder.as_ref().expect("set above").find(text).is_some()
+    };
     if super::strings::string_predicate(args, result, found) {
         return Ok(());
     }
@@ -1425,6 +1433,8 @@ struct LikePattern {
     segments: Vec<LikeSegment>,
     /// per segment, its bytes if it has no `_` (a literal matches only itself)
     literals: Vec<Option<Vec<u8>>>,
+    /// per segment, a substring search for its literal, set up once for every text
+    finders: Vec<Option<memchr::memmem::Finder<'static>>>,
 }
 
 fn is_continuation(byte: u8) -> bool {
@@ -1435,8 +1445,20 @@ impl LikePattern {
     fn new(pattern: &[u8]) -> Self {
         let segment = |part: &[u8]| part.iter().map(|&b| (b != b'_').then_some(b)).collect();
         let segments: Vec<LikeSegment> = pattern.split(|&b| b == b'%').map(segment).collect();
-        let literals = segments.iter().map(|s| s.iter().copied().collect()).collect();
-        Self { segments, literals }
+        let literals: Vec<Option<Vec<u8>>> = segments.iter().map(|s| s.iter().copied().collect()).collect();
+        let finders = literals
+            .iter()
+            .map(|literal| {
+                literal
+                    .as_deref()
+                    .map(|literal| memchr::memmem::Finder::new(literal).into_owned())
+            })
+            .collect();
+        Self {
+            segments,
+            literals,
+            finders,
+        }
     }
 
     /// Where `segment` ends if it matches at the start of `text`.
@@ -1467,7 +1489,7 @@ impl LikePattern {
             return at == text.len();
         };
         for (index, segment) in middle.iter().enumerate() {
-            match Self::find(segment, self.literals[index + 1].as_deref(), &text[at..]) {
+            match Self::find(segment, self.finders[index + 1].as_ref(), &text[at..]) {
                 Some(end) => at += end,
                 None => return false,
             }
@@ -1481,14 +1503,14 @@ impl LikePattern {
             .any(|start| Self::match_at(last, &text[start..]) == Some(text.len() - start))
     }
 
-    /// Where the first match of `segment` (`literal` if it has no `_`) in `text` ends.
-    fn find(segment: &[Option<u8>], literal: Option<&[u8]>, text: &[u8]) -> Option<usize> {
+    /// Where the first match of `segment` (found by `literal` if it has no `_`) in `text` ends.
+    fn find(segment: &[Option<u8>], literal: Option<&memchr::memmem::Finder<'_>>, text: &[u8]) -> Option<usize> {
         if segment.is_empty() {
             return Some(0);
         }
         // a literal is found with a substring search; it starts on a character, as it is valid text
         if let Some(literal) = literal {
-            return memchr::memmem::find(text, literal).map(|start| start + literal.len());
+            return literal.find(text).map(|start| start + literal.needle().len());
         }
         (0..text.len())
             .filter(|&start| !is_continuation(text[start]))

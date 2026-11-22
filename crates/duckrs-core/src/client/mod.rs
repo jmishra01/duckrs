@@ -78,15 +78,22 @@ pub struct DatabaseInstance {
     log_sync_failed: AtomicBool,
     /// How `USE` and qualified names call this database.
     name: String,
-    /// What `ATTACH` added to this database, which connections go to with `USE` or by name. A
-    /// query runs in one database, so one that reads two isn't ported.
+    /// What `ATTACH` added to this database, which connections go to with `USE` or by name.
     attached: RwLock<BTreeMap<String, Arc<DatabaseInstance>>>,
+    /// `DETACH` of the database the connections were made to (`DatabaseManager::DetachDatabase` of the
+    /// default one): it is gone by name, and only keeps what is attached
+    detached: AtomicBool,
     /// `DatabaseInstance::GetLogManager`
     log_manager: crate::logging::SharedLogManager,
     /// `DatabaseManager::GetNewQueryNumber`: the queries so far
     query_number: AtomicU64,
     /// `global_transaction_id`: the transactions so far, an auto-commit statement being one
     transaction_number: AtomicU64,
+    /// `AttachVisibility::HIDDEN`: the listings of databases and of what is in them leave it out, while names still
+    /// reach it
+    hidden: bool,
+    /// the options of its ATTACH that went to its storage, by name, as given
+    attach_options: Vec<(String, String)>,
 }
 
 /// What `ATTACH` can say of a file.
@@ -99,8 +106,152 @@ pub struct AttachOptions {
     pub storage_version: Option<(String, duckrs_common::serializer::StorageVersion)>,
     /// `RecoveryMode::NO_WAL_WRITES`: commits don't go into the log, so only checkpoints keep them.
     pub no_wal_writes: bool,
+    /// `vacuum_rebuild_indexes`: what this database has rather than the setting
+    pub vacuum_rebuild_indexes: Option<u64>,
     /// Those of the database that it is attached to, as a log is replayed with them.
     settings: Option<Arc<RwLock<SettingValues>>>,
+    /// Whoever opens it sets what writes appends ahead, once it is done changing it.
+    no_write_ahead: bool,
+    /// `DEFAULT_TABLE`, by its schema (if given) and name
+    pub default_table: Option<(Option<String>, String)>,
+    /// `HIDDEN`
+    pub hidden: bool,
+    /// `StorageOptions`: the options that go to the storage, by name, as given (`AttachOptions::options`)
+    pub listed: Vec<(String, String)>,
+    /// `ENCRYPTION_KEY` and what goes with it
+    pub encryption: Option<storage::encryption::EncryptionRequest>,
+}
+
+/// `StorageOptions::SetEncryptionVersion`: the encryption version a new file gets. Version 1 needs v1.5.0, so an
+/// explicit older storage version takes version 0, unless version 1 was asked for; encryption needs v1.4.0.
+fn encryption_version_for(
+    storage_version: Option<&(String, StorageVersion)>,
+    asked: Option<storage::encryption::Version>,
+) -> Result<storage::encryption::Version> {
+    use storage::encryption::Version;
+    if let Some((given, version)) = storage_version {
+        if *version < StorageVersion::V1_4_0 {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "Explicit provided STORAGE_VERSION (\"{given}\") and ENCRYPTION_KEY (storage >= v1.4.0) are not \
+                     compatible"
+                ),
+            ));
+        }
+        if *version < StorageVersion::V1_5_0 && asked != Some(Version::V0) {
+            if asked == Some(Version::V1) {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "Explicit provided STORAGE_VERSION (\"{given}\") is not compatible with \
+                         'debug_encryption_version = v1' (storage >= v1.5.0)"
+                    ),
+                ));
+            }
+            return Ok(Version::V0);
+        }
+    }
+    Ok(asked.unwrap_or(Version::V1))
+}
+
+/// `BooleanValue::Get(DefaultCastAs(BOOLEAN))` of an ATTACH option: one without a value is true.
+fn attach_bool(value: &duckrs_parser::ast::Literal) -> Result<bool> {
+    if value.text.is_empty() {
+        return Ok(true);
+    }
+    crate::function::cast::try_cast_string_to_bool(value.text.as_bytes()).ok_or_else(|| {
+        Error::new(
+            ErrorKind::Conversion,
+            format!("Could not convert string '{}' to BOOL", value.text),
+        )
+    })
+}
+
+/// `OptimisticDataWriter` of a database in a file: row groups of appends go to blocks of their own, as the settings say.
+#[derive(Debug)]
+struct FileAheadWriter {
+    db: std::sync::Weak<DatabaseInstance>,
+}
+
+impl crate::catalog::AheadWriter for FileAheadWriter {
+    fn write(
+        &self,
+        table: &crate::catalog::TableCatalogEntry,
+        rows: &duckrs_common::column_data::ColumnDataCollection,
+        first: usize,
+        first_id: u64,
+        final_flush: bool,
+    ) -> Result<Vec<storage::writer::WrittenGroup>> {
+        let Some(db) = self.db.upgrade() else {
+            return Ok(Vec::new());
+        };
+        db.write_ahead(table, rows, first, first_id, final_flush)
+    }
+
+    fn encode(
+        &self,
+        table: &crate::catalog::TableCatalogEntry,
+        rows: &duckrs_common::column_data::ColumnDataCollection,
+    ) -> Result<Option<storage::writer::EncodedAhead>> {
+        let Some(db) = self.db.upgrade() else {
+            return Ok(None);
+        };
+        db.encode_ahead(table, rows)
+    }
+
+    fn place(
+        &self,
+        table: &crate::catalog::TableCatalogEntry,
+        encoded: storage::writer::EncodedAhead,
+        first_id: u64,
+    ) -> Result<Vec<storage::writer::WrittenGroup>> {
+        let Some(db) = self.db.upgrade() else {
+            return Ok(Vec::new());
+        };
+        db.place_ahead(table, encoded, first_id)
+    }
+}
+
+/// What a checkpoint writes a file with, from the settings: `CheckpointOptions` borrow from it.
+struct CheckpointSettings {
+    vacuum_rebuild_indexes: u64,
+    metadata_reuse: bool,
+    force_column_metadata_reuse: bool,
+    /// `enable_optimistic_write`
+    optimistic_write: bool,
+    variant_minimum_shredding_size: i64,
+    force_variant_shredding: Option<LogicalType>,
+    zstd_min_string_length: usize,
+    storage_version: duckrs_common::serializer::StorageVersion,
+    keep_free_blocks: bool,
+    force: String,
+    /// `disabled_compression_methods`, in lower case
+    disabled_compression: Vec<String>,
+    bitpacking_mode: String,
+    row_group_size: u64,
+    vacuum_tasks: usize,
+}
+
+impl CheckpointSettings {
+    fn options<'a>(&'a self, abort: &'a str) -> storage::writer::CheckpointOptions<'a> {
+        storage::writer::CheckpointOptions {
+            vacuum_rebuild_indexes: self.vacuum_rebuild_indexes,
+            metadata_reuse: self.metadata_reuse,
+            force_column_metadata_reuse: self.force_column_metadata_reuse,
+            variant_minimum_shredding_size: self.variant_minimum_shredding_size,
+            force_variant_shredding: self.force_variant_shredding.as_ref(),
+            zstd_min_string_length: self.zstd_min_string_length,
+            storage_version: self.storage_version,
+            keep_free_blocks: self.keep_free_blocks,
+            force_compression: &self.force,
+            disabled_compression: &self.disabled_compression,
+            bitpacking_mode: &self.bitpacking_mode,
+            row_group_size: self.row_group_size,
+            vacuum_tasks: self.vacuum_tasks,
+            abort,
+        }
+    }
 }
 
 /// Where a checkpoint goes, and the log of what happened since the last one.
@@ -116,6 +267,8 @@ struct DatabaseFile {
     storage_version: duckrs_common::serializer::StorageVersion,
     /// `RecoveryMode::NO_WAL_WRITES`
     no_wal_writes: bool,
+    /// `AttachedDatabase::vacuum_rebuild_threshold`
+    vacuum_rebuild_indexes: Option<u64>,
 }
 
 /// Why a database that came from a file takes no writes.
@@ -149,9 +302,12 @@ impl DatabaseInstance {
             log_sync_failed: AtomicBool::new(false),
             name: DEFAULT_CATALOG.to_string(),
             attached: RwLock::default(),
+            detached: AtomicBool::new(false),
             log_manager: Arc::default(),
             query_number: AtomicU64::new(0),
             transaction_number: AtomicU64::new(0),
+            hidden: false,
+            attach_options: Vec::new(),
         }
     }
 
@@ -169,7 +325,10 @@ impl DatabaseInstance {
             row_group_size: None,
             storage_version: None,
             no_wal_writes: false,
+            vacuum_rebuild_indexes: None,
             settings: None,
+            no_write_ahead: false,
+            ..AttachOptions::default()
         };
         Self::open_with(path, &options)
     }
@@ -192,7 +351,10 @@ impl DatabaseInstance {
             row_group_size: None,
             storage_version: Some((version.to_string(), known)),
             no_wal_writes: false,
+            vacuum_rebuild_indexes: None,
             settings: None,
+            no_write_ahead: false,
+            ..AttachOptions::default()
         };
         Self::open_with(path, &options)
     }
@@ -238,9 +400,18 @@ impl DatabaseInstance {
         }
         let requested = options.storage_version.as_ref().map(|(_, version)| *version);
         if !storage::is_database_file(path) {
-            let version = requested.unwrap_or_else(|| default_storage_version(options.settings.as_ref()));
+            let mut version = requested.unwrap_or_else(|| default_storage_version(options.settings.as_ref()));
+            // `SingleFileStorageManager::LoadDatabase`: the default encryption format needs at least v1.5.0
+            if requested.is_none() && options.encryption.is_some() {
+                version = version.max(StorageVersion::V1_5_0);
+            }
             // checkpoints write v2.1.0 at the newest
-            storage::create_database(path, options.block_size, version.min(StorageVersion::V2_1_0))?;
+            storage::create_database(
+                path,
+                options.block_size,
+                version.min(StorageVersion::V2_1_0),
+                options.encryption.as_ref(),
+            )?;
         }
         let name = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
         let mut db = Self::with_file_access(None);
@@ -248,7 +419,7 @@ impl DatabaseInstance {
         if let Some(settings) = &options.settings {
             db.settings = settings.clone();
         }
-        let buffer = storage::load_database(path, &db.catalog, read_only)?;
+        let buffer = storage::load_database(path, &db.catalog, read_only, options.encryption.as_ref())?;
         // `SingleFileBlockManager::Initialize`: an explicit version can go up, not down
         let file_version = buffer.block_manager().storage_version()?;
         let storage_version = match requested {
@@ -308,7 +479,11 @@ impl DatabaseInstance {
                 }
             }
         }
-        let log = Mutex::new(WriteAheadLog::new(&db.catalog).with_version(storage_version));
+        let log = Mutex::new(
+            WriteAheadLog::new(&db.catalog)
+                .with_version(storage_version)
+                .with_encryption(buffer.block_manager().encryption().cloned()),
+        );
         db.catalog.set_storage_version(storage_version);
         db.file = Some(DatabaseFile {
             path: path.to_path_buf(),
@@ -320,7 +495,27 @@ impl DatabaseInstance {
                 .unwrap_or(crate::execution::zone_map::ROW_GROUP_SIZE as u64),
             storage_version,
             no_wal_writes: options.no_wal_writes,
+            vacuum_rebuild_indexes: options.vacuum_rebuild_indexes,
         });
+        // `WriteAheadLog::ReplayInternal` of a log that is in the file already: done with it. Another one is marked
+        // where what it committed ends by the checkpoint below.
+        if db.file_access.is_none()
+            && let Some(file) = &db.file
+        {
+            match storage::replayed_log_end(path, &file.buffer)? {
+                storage::wal::ReplayedLog::Checkpointed => {
+                    let mut log = path.as_os_str().to_owned();
+                    log.push(".wal");
+                    std::fs::remove_file(&log)
+                        .map_err(|error| Error::new(ErrorKind::Io, format!("{}: {error}", Path::new(&log).display())))?;
+                }
+                storage::wal::ReplayedLog::Ends(end, version) => {
+                    let mut log = file.log.lock();
+                    *log = std::mem::take(&mut *log).with_replayed(Some((end, version)));
+                }
+                storage::wal::ReplayedLog::None => {}
+            }
+        }
         // a log that was replayed can end in anything a crash leaves, so it isn't added to: its
         // records go to the file, and the next commit starts a new one
         if db.file_access.is_none() && storage::has_log(path) {
@@ -330,7 +525,20 @@ impl DatabaseInstance {
                 db.file_access = Some(FileAccess::WritesNotPorted);
             }
         }
-        Ok(Arc::new(db))
+        let db = Arc::new(db);
+        // what holds on to it, once whoever opened it is done with it (`ATTACH` names it first)
+        if !options.no_write_ahead {
+            Self::write_ahead_with(&db);
+        }
+        Ok(db)
+    }
+
+    /// Appends of a database in a file go to blocks of their own ahead of a checkpoint (`OptimisticDataWriter`).
+    fn write_ahead_with(db: &Arc<DatabaseInstance>) {
+        if db.file.is_some() && db.file_access.is_none() {
+            db.catalog
+                .set_ahead_writer(Arc::new(FileAheadWriter { db: Arc::downgrade(db) }));
+        }
     }
 
     /// Makes a commit durable, in the log of the file, and checkpoints if the log has grown past
@@ -351,6 +559,13 @@ impl DatabaseInstance {
             self.changed.store(true, AtomicOrdering::SeqCst);
             return Ok(());
         }
+        // `OptimisticDataWriter`: large appends go to blocks of their own ahead of a checkpoint
+        let write_ahead =
+            |table: &crate::catalog::TableCatalogEntry,
+             rows: &duckrs_common::column_data::ColumnDataCollection,
+             first: usize,
+             first_id: u64| self.write_ahead(table, rows, first, first_id, true);
+        let ahead: Option<storage::log_writer::WriteAhead> = Some(&write_ahead);
         if !log.commit(
             &file.path,
             &self.catalog,
@@ -358,6 +573,7 @@ impl DatabaseInstance {
             &identifier,
             blocks.header().iteration,
             blocks.block_size(),
+            ahead,
         )? {
             return Ok(());
         }
@@ -383,6 +599,8 @@ impl DatabaseInstance {
             free_blocks: 0,
             wal_size: 0,
             storage_version: None,
+            options: self.attach_options.clone(),
+            cipher: None,
         };
         if let Some(file) = &self.file {
             listing.storage_version = Some(file.storage_version.display_name(true));
@@ -392,6 +610,7 @@ impl DatabaseInstance {
             listing.total_blocks = blocks.header().block_count;
             listing.free_blocks = blocks.free_list().len() as u64;
             listing.wal_size = storage::log_writer::log_size(&file.path);
+            listing.cipher = blocks.encryption().map(|encryption| encryption.cipher.name().to_string());
         }
         listing
     }
@@ -423,27 +642,103 @@ impl DatabaseInstance {
         }
     }
 
-    /// `abort` is `debug_checkpoint_abort`, which belongs to the session that asked.
-    fn write_checkpoint_with(&self, abort: &str) -> Result<()> {
-        crate::execution::profiler::time_metric("storage.checkpoint_latency", || self.write_checkpoint_timed(abort))
+    /// `OptimisticDataWriter::FlushToDisk`: rows of `table` from position `first` on, whose first has id `first_id`, to
+    /// blocks of their own; nothing where `enable_optimistic_write` is off or the database can't be written.
+    fn write_ahead(
+        &self,
+        table: &crate::catalog::TableCatalogEntry,
+        rows: &duckrs_common::column_data::ColumnDataCollection,
+        first: usize,
+        first_id: u64,
+        final_flush: bool,
+    ) -> Result<Vec<storage::writer::WrittenGroup>> {
+        let Some(file) = self
+            .file
+            .as_ref()
+            .filter(|file| self.file_access.is_none() && !file.no_wal_writes)
+        else {
+            return Ok(Vec::new());
+        };
+        let settings = self.checkpoint_settings(file)?;
+        let mut blocks = table.append_blocks.lock();
+        if !settings.optimistic_write && blocks.is_empty() {
+            return Ok(Vec::new());
+        }
+        storage::writer::write_ahead(
+            &file.buffer,
+            &self.catalog,
+            table,
+            rows,
+            first,
+            first_id,
+            settings.options(""),
+            &mut blocks,
+            final_flush,
+        )
     }
 
-    fn write_checkpoint_timed(&self, abort: &str) -> Result<()> {
-        let Some(file) = self.file.as_ref().filter(|_| self.file_access.is_none()) else {
-            return Ok(());
+    /// The encoding of [`Self::write_ahead`] of all of `rows`, with no lock held: `None` where nothing is written.
+    fn encode_ahead(
+        &self,
+        table: &crate::catalog::TableCatalogEntry,
+        rows: &duckrs_common::column_data::ColumnDataCollection,
+    ) -> Result<Option<storage::writer::EncodedAhead>> {
+        let Some(file) = self
+            .file
+            .as_ref()
+            .filter(|file| self.file_access.is_none() && !file.no_wal_writes)
+        else {
+            return Ok(None);
         };
-        if !self.changed.swap(false, AtomicOrdering::SeqCst) {
-            return Ok(());
+        let settings = self.checkpoint_settings(file)?;
+        if !settings.optimistic_write && table.append_blocks.lock().is_empty() {
+            return Ok(None);
         }
-        let mut log = file.log.lock();
-        let mut marked = None;
-        let log_ref = &mut *log;
-        let mut mark = |root: storage::metadata::MetaBlockPointer| {
-            marked = Some(log_ref.mark_checkpoint(&file.path, root)?);
-            Ok(())
+        let options = settings.options("");
+        let encoded = storage::writer::encode_ahead(&file.buffer, &self.catalog, table, rows, 0, options);
+        Ok(Some(encoded))
+    }
+
+    /// The placing of [`Self::write_ahead`], of what [`Self::encode_ahead`] encoded.
+    fn place_ahead(
+        &self,
+        table: &crate::catalog::TableCatalogEntry,
+        encoded: storage::writer::EncodedAhead,
+        first_id: u64,
+    ) -> Result<Vec<storage::writer::WrittenGroup>> {
+        let Some(file) = self.file.as_ref() else {
+            return Ok(Vec::new());
         };
+        let settings = self.checkpoint_settings(file)?;
+        let mut blocks = table.append_blocks.lock();
+        storage::writer::place_ahead(
+            &file.buffer,
+            &self.catalog,
+            table,
+            encoded,
+            first_id,
+            settings.options(""),
+            &mut blocks,
+            false,
+        )
+    }
+
+    /// The settings a checkpoint writes the file with, which a commit writing rows ahead of it uses too.
+    fn checkpoint_settings(&self, file: &DatabaseFile) -> Result<CheckpointSettings> {
         let force = settings::current_value("force_compression", &self.settings.read(), &SettingValues::default());
         let force = force.and_then(|value| value.try_to_string().ok()).unwrap_or_default();
+        let disabled_compression = settings::current_value(
+            "disabled_compression_methods",
+            &self.settings.read(),
+            &SettingValues::default(),
+        );
+        let disabled_compression: Vec<String> = disabled_compression
+            .and_then(|value| value.try_to_string().ok())
+            .unwrap_or_default()
+            .split(',')
+            .map(|name| name.trim().to_lowercase())
+            .filter(|name| !name.is_empty())
+            .collect();
         let vacuum_tasks =
             settings::current_value("max_vacuum_tasks", &self.settings.read(), &SettingValues::default());
         let vacuum_tasks = vacuum_tasks
@@ -477,27 +772,77 @@ impl DatabaseInstance {
             &self.settings.read(),
             &SettingValues::default(),
         )
+        .filter(|value| !value.is_null())
         .and_then(|value| value.try_to_string().ok())
-        .filter(|name| !name.is_empty());
+        .filter(|text| !text.is_empty());
         let force_variant_shredding = match force_variant_shredding {
-            Some(name) => {
-                let ty = crate::planner::binder::Binder::new(&self.catalog).type_from_name(&name)?;
-                Some(duckrs_common::variant_shredding::forced_shredding_type(&ty))
+            Some(text) => {
+                let ty = crate::planner::binder::Binder::new(&self.catalog).type_from_name(&text)?;
+                Some(duckrs_common::variant::shredding::forced_shredded_type(&ty))
             }
             None => None,
         };
-        let options = storage::writer::CheckpointOptions {
+        // `AttachedDatabase::GetVacuumRebuildIndexThreshold`
+        let vacuum_rebuild_indexes = file.vacuum_rebuild_indexes.unwrap_or_else(|| {
+            settings::current_value("vacuum_rebuild_indexes", &self.settings.read(), &SettingValues::default())
+                .and_then(|value| value.as_i128())
+                .map_or(0, |rows| rows as u64)
+        });
+        let setting = |name: &str| {
+            settings::current_value(name, &self.settings.read(), &SettingValues::default()).is_some_and(|value| {
+                value
+                    .try_to_string()
+                    .is_ok_and(|text| text.eq_ignore_ascii_case("true"))
+            })
+        };
+        Ok(CheckpointSettings {
+            vacuum_rebuild_indexes,
+            metadata_reuse: setting("experimental_metadata_reuse"),
+            force_column_metadata_reuse: setting("force_column_metadata_reuse"),
+            optimistic_write: settings::current_value(
+                "enable_optimistic_write",
+                &self.settings.read(),
+                &SettingValues::default(),
+            )
+            .is_none_or(|value| {
+                !value
+                    .try_to_string()
+                    .is_ok_and(|text| text.eq_ignore_ascii_case("false"))
+            }),
             variant_minimum_shredding_size,
-            force_variant_shredding: force_variant_shredding.as_ref(),
+            force_variant_shredding,
             zstd_min_string_length,
             storage_version: file.storage_version,
             keep_free_blocks: self.catalog.has_forks(),
-            force_compression: &force,
-            bitpacking_mode: &bitpacking_mode,
+            force,
+            disabled_compression,
+            bitpacking_mode,
             row_group_size: file.row_group_size,
             vacuum_tasks: if self.catalog.has_forks() { 0 } else { vacuum_tasks },
-            abort,
+        })
+    }
+
+    /// `abort` is `debug_checkpoint_abort`, which belongs to the session that asked.
+    fn write_checkpoint_with(&self, abort: &str) -> Result<()> {
+        crate::execution::profiler::time_metric("storage.checkpoint_latency", || self.write_checkpoint_timed(abort))
+    }
+
+    fn write_checkpoint_timed(&self, abort: &str) -> Result<()> {
+        let Some(file) = self.file.as_ref().filter(|_| self.file_access.is_none()) else {
+            return Ok(());
         };
+        if !self.changed.swap(false, AtomicOrdering::SeqCst) {
+            return Ok(());
+        }
+        let mut log = file.log.lock();
+        let mut marked = None;
+        let log_ref = &mut *log;
+        let mut mark = |root: storage::metadata::MetaBlockPointer| {
+            marked = Some(log_ref.mark_checkpoint(&file.path, root)?);
+            Ok(())
+        };
+        let settings = self.checkpoint_settings(file)?;
+        let options = settings.options(abort);
         let result =
             storage::writer::write_checkpoint(&file.path, &file.buffer, &self.catalog, &file.name, options, &mut mark);
         match result {
@@ -815,9 +1160,7 @@ fn strip_database(statement: &mut Statement, database: &str) {
                 ty.name.qualification.remove(0);
             }
         }
-        ExprKind::ColumnRef(parts) if parts.len() > 2 && parts[0].eq_ignore_ascii_case(database) => {
-            parts.remove(0);
-        }
+        // (a column qualified by the database finds its table by the catalog of the binding)
         // `db.f()` calls `f` of the database
         ExprKind::Function(function)
             if function
@@ -882,6 +1225,13 @@ pub struct ClientContext {
     db: Arc<DatabaseInstance>,
     /// What the connection was made to, which holds what is attached.
     home: Arc<DatabaseInstance>,
+    /// the default database of a statement running now that was routed to `db`: the names of other
+    /// databases left in it are bound there by name, not routed again
+    routed_from: Option<String>,
+    /// the database the statement being run writes, if it writes one that is not temporary
+    statement_writes: Option<String>,
+    /// the database the sequences of the statement being run write (`SessionValues::sequence_writes`)
+    sequence_writes: Arc<std::sync::Mutex<Option<String>>>,
     /// identifies the connection among the database's connections
     id: u64,
     /// the statement ran side-effecting CTEs before what is planned now, which its statistics don't see
@@ -1002,6 +1352,79 @@ fn is_write(statement: &Statement) -> bool {
     }
 }
 
+/// The name of the table (or other entry) a statement that `is_write` writes, as written.
+fn written_name(statement: &Statement) -> Option<&QualifiedName> {
+    fn in_table(table: &duckrs_parser::ast::TableRef) -> Option<&QualifiedName> {
+        match &table.kind {
+            duckrs_parser::ast::TableRefKind::BaseTable { name, .. } => Some(name),
+            _ => None,
+        }
+    }
+    match statement {
+        Statement::Insert(insert) => Some(&insert.table),
+        Statement::Update(update) => in_table(&update.table),
+        Statement::Delete(delete) => in_table(&delete.table),
+        Statement::CreateTable(info) if !info.temporary => Some(&info.name),
+        Statement::Copy(info) if info.is_from => Some(&info.table),
+        _ => None,
+    }
+}
+
+/// The names of the CTEs anywhere in a statement, which unqualified table names may refer to.
+fn cte_names(statement: &Statement) -> Vec<String> {
+    use duckrs_parser::ast::{QueryNode, QueryNodeKind, TableRef, TableRefKind};
+    fn in_table(table: &mut TableRef, names: &mut Vec<String>) {
+        match &mut table.kind {
+            TableRefKind::Join(join) => {
+                in_table(&mut join.left, names);
+                in_table(&mut join.right, names);
+            }
+            TableRefKind::Subquery(query) => in_query(&mut query.node, names),
+            _ => {}
+        }
+    }
+    fn in_query(node: &mut QueryNode, names: &mut Vec<String>) {
+        for (name, cte) in &mut node.cte_map.0 {
+            names.push(name.clone());
+            in_query(&mut cte.query, names);
+        }
+        match &mut node.kind {
+            QueryNodeKind::Select(select) => in_table(&mut select.from_table, names),
+            QueryNodeKind::SetOperation(set) => set.children.iter_mut().for_each(|child| in_query(child, names)),
+            _ => {}
+        }
+        duckrs_parser::transformer::visit_query_node_exprs_mut(node, &mut |e: &mut Expr| {
+            if let ExprKind::Subquery { subquery, .. } = &mut e.kind {
+                in_query(&mut subquery.node, names);
+            }
+        });
+    }
+    let mut names = Vec::new();
+    let mut statement = statement.clone();
+    match &mut statement {
+        Statement::Select(select) => in_query(&mut select.node, &mut names),
+        Statement::Insert(insert) => {
+            if let duckrs_parser::ast::InsertValues::Select(query) = &mut insert.values {
+                in_query(&mut query.node, &mut names);
+            }
+        }
+        Statement::CreateTable(info) => {
+            if let Some(query) = &mut info.query {
+                in_query(&mut query.node, &mut names);
+            }
+        }
+        Statement::Update(update) => in_table(&mut update.table, &mut names),
+        Statement::Delete(delete) => in_table(&mut delete.table, &mut names),
+        Statement::Copy(info) => {
+            if let Some(query) = &mut info.select {
+                in_query(query, &mut names);
+            }
+        }
+        _ => {}
+    }
+    names
+}
+
 /// `StatementTypeToString`, of a statement that `is_write`.
 fn statement_type_name(statement: &Statement) -> &'static str {
     match statement {
@@ -1035,6 +1458,9 @@ impl ClientContext {
         let log_target_id = crate::logging::register_target(&log_target);
         let context = Self {
             home: db.clone(),
+            routed_from: None,
+            statement_writes: None,
+            sequence_writes: Arc::default(),
             db,
             id,
             after_dml_ctes: false,
@@ -1091,7 +1517,9 @@ impl ClientContext {
             Some(size) => parse_setting_bytes(&size)?,
             None => None,
         };
-        Ok(QueryMemory::new(limit, directory, max_temp_size))
+        let memory = QueryMemory::new(limit, directory, max_temp_size);
+        memory.set_encrypt_files(text("temp_file_encryption").is_some_and(|value| value == "true"));
+        Ok(memory)
     }
 
     /// The `threads` setting: all the machine has, unless someone said otherwise.
@@ -1116,6 +1544,14 @@ impl ClientContext {
         let attached_db = self.home.clone();
         Arc::new(SessionValues {
             database: self.db.name.clone(),
+            default_database: self.routed_from.clone().unwrap_or_else(|| self.db.name.clone()),
+            written_database: self
+                .transaction
+                .as_ref()
+                .and_then(|transaction| transaction.modified.as_ref())
+                .map(|database| database.name.clone())
+                .or_else(|| self.statement_writes.clone()),
+            sequence_writes: self.sequence_writes.clone(),
             log_manager: self.home.log_manager.clone(),
             log_target: self.log_target_id,
             connection_id: self.id,
@@ -1178,7 +1614,7 @@ impl ClientContext {
                     .collect()
             }),
             attached_catalog: Box::new(move |name: &str| {
-                if name.eq_ignore_ascii_case(&attached_db.name) {
+                if name.eq_ignore_ascii_case(&attached_db.name) && !attached_db.is_detached() {
                     return Some(attached_db.catalog.clone());
                 }
                 attached_db
@@ -1755,10 +2191,14 @@ impl ClientContext {
         }
         let db = self.db.clone();
         if let Some(transaction) = &mut self.transaction {
-            let fork = {
+            let mut fork = {
                 let _reading = db.statements.read();
                 db.catalog.fork()
             };
+            // the temporary objects the transaction made so far are those of its first database's fork
+            if let Some((_, first)) = transaction.forks.first() {
+                fork.share_temp(first);
+            }
             db.transactions.lock().open.insert(self.id);
             transaction.forks.push((db, fork));
         }
@@ -1795,13 +2235,15 @@ impl ClientContext {
         }
         if let Some((database, routed)) = self.route_to_database(statement)? {
             let previous = std::mem::replace(&mut self.db, database);
+            let was_routed = self.routed_from.replace(previous.name.clone());
             let result = self.run_statement(&routed);
+            self.routed_from = was_routed;
             self.db = previous;
             return result;
         }
         let _search_path = crate::catalog::SearchPathGuard::set(self.search_path_for(&self.db.name.clone()));
         // the default database can be gone, as when its ATTACH was rolled back
-        if !Arc::ptr_eq(&self.db, &self.home)
+        if (!Arc::ptr_eq(&self.db, &self.home) || self.home.is_detached())
             && !self
                 .home
                 .attached
@@ -1960,6 +2402,12 @@ impl ClientContext {
                 statement,
                 Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) | Statement::Merge(_)
             );
+        // what a sequence of another database it uses is refused for (`NextValModifiedDatabases`)
+        let previous_writes = std::mem::replace(
+            &mut self.statement_writes,
+            (write && !writes_temporary_table).then(|| self.db.name.clone()),
+        );
+        let previous_sequence_writes = self.sequence_writes.lock().expect("not poisoned").take();
         let db = self.db.clone();
         let result = if self.transaction.is_some() {
             // on a fork of its own, which nobody else writes to
@@ -2010,6 +2458,20 @@ impl ClientContext {
                 (result, _) => result,
             }
         };
+        self.statement_writes = previous_writes;
+        // `MetaTransaction::ModifyDatabase` of the database whose sequence the statement advanced
+        let sequence_writes = std::mem::replace(
+            &mut *self.sequence_writes.lock().expect("not poisoned"),
+            previous_sequence_writes,
+        );
+        if result.is_ok()
+            && let Some(name) = sequence_writes
+            && let Some(database) = self.find_database(&name)
+            && let Some(transaction) = &mut self.transaction
+            && transaction.modified.is_none()
+        {
+            transaction.modified = Some(database);
+        }
         if let Err(error) = &result {
             if let Some(transaction) = &mut self.transaction {
                 transaction.apply_invalidation_policy(error.kind);
@@ -2041,7 +2503,7 @@ impl ClientContext {
 
     /// The database of this name, among those this connection can reach.
     fn find_database(&self, name: &str) -> Option<Arc<DatabaseInstance>> {
-        if name.eq_ignore_ascii_case(&self.home.name) {
+        if name.eq_ignore_ascii_case(&self.home.name) && !self.home.is_detached() {
             return Some(self.home.clone());
         }
         if name.eq_ignore_ascii_case(&self.db.name) {
@@ -2053,6 +2515,9 @@ impl ClientContext {
     /// A statement that names another database runs there, without that name. The first part of
     /// `a.b` is a schema if this database has one, as in C++.
     fn route_to_database(&self, statement: &Statement) -> Result<Option<(Arc<DatabaseInstance>, Statement)>> {
+        if self.routed_from.is_some() {
+            return Ok(None);
+        }
         let mut names = Vec::new();
         let mut routed = statement.clone();
         for_each_table_name(&mut routed, &mut |name| names.push(name.clone()));
@@ -2074,33 +2539,48 @@ impl ClientContext {
                 })
             });
         }
-        let named: Vec<Arc<DatabaseInstance>> = names
-            .iter()
-            .filter_map(|name| {
-                let first = name.qualification.first()?;
-                let is_schema = name.qualification.len() == 1
-                    && (self.catalog().get_schema(first).is_some() || first.eq_ignore_ascii_case(TEMP_SCHEMA));
-                if is_schema {
-                    return None;
-                }
-                self.find_database(first)
-            })
-            .collect();
-        let Some(database) = named.first().cloned() else {
+        let database_of = |name: &QualifiedName| {
+            let first = name.qualification.first()?;
+            let is_schema = name.qualification.len() == 1
+                && (self.catalog().get_schema(first).is_some() || first.eq_ignore_ascii_case(TEMP_SCHEMA));
+            if is_schema {
+                return None;
+            }
+            self.find_database(first)
+        };
+        let named: Vec<Arc<DatabaseInstance>> = names.iter().filter_map(database_of).collect();
+        let Some(first) = named.first().cloned() else {
             return Ok(None);
         };
-        // a statement runs in one database here: reading another works, but a write to another would quietly go to
-        // the first in its place
-        let reads_only = matches!(
-            statement,
-            Statement::Select(_) | Statement::Explain { .. } | Statement::Pragma { .. }
-        );
-        if !reads_only && named.iter().any(|other| !Arc::ptr_eq(other, &database)) {
-            return Err(crate::unported(
-                "statements that write to one database and read another",
-            ));
-        }
+        // a statement that writes runs in the database it writes, and binds the tables of the others it reads
+        // by their names (`Binder::other_database_of`)
+        let database = match written_name(statement) {
+            Some(written) => match database_of(written) {
+                Some(database) => database,
+                None => return Ok(None),
+            },
+            None => first,
+        };
         let prefix = database.name.clone();
+        // a name the default database resolves stays there: it is qualified by that database
+        if !Arc::ptr_eq(&database, &self.db) {
+            let ctes = cte_names(statement);
+            let here = self.db.name.clone();
+            for_each_table_name(&mut routed, &mut |name| {
+                // (the temporary tables are the connection's: any catalog finds them)
+                let temporary = self
+                    .catalog()
+                    .get_schema(TEMP_SCHEMA)
+                    .is_some_and(|temp| temp.get_entry(&name.name).is_some());
+                if name.qualification.is_empty()
+                    && !temporary
+                    && !ctes.iter().any(|cte| cte.eq_ignore_ascii_case(&name.name))
+                    && self.catalog().get_entry(None, None, &name.name).is_ok()
+                {
+                    name.qualification.push(here.clone());
+                }
+            });
+        }
         for_each_table_name(&mut routed, &mut |name| {
             if name
                 .qualification
@@ -2261,6 +2741,10 @@ impl ClientContext {
         let path = crate::execution::file_system::expand_path(&path);
         let mut options = AttachOptions::default();
         let mut mode_given = false;
+        let mut compress_given = false;
+        let mut encryption_key: Option<Vec<u8>> = None;
+        let mut encryption_cipher = None;
+        let mut encryption_version = None;
         // the options given as expressions, such as `TYPE getvariable('t')`, by their values
         let mut given: Vec<(String, duckrs_parser::ast::Literal)> = info.options.clone();
         for (name, expression) in &info.parsed_options {
@@ -2278,7 +2762,14 @@ impl ClientContext {
         }
         for (name, value) in &given {
             let text = value.text.to_lowercase();
-            match name.to_lowercase().as_str() {
+            let lower = name.to_lowercase();
+            if matches!(
+                lower.as_str(),
+                "block_size" | "row_group_size" | "storage_version" | "compress" | "io_mode" | "mmap_reserve_size"
+            ) {
+                options.listed.push((lower.clone(), value.text.clone()));
+            }
+            match lower.as_str() {
                 "readonly" | "read_only" => {
                     options.read_only = text != "false";
                     mode_given = true;
@@ -2339,22 +2830,77 @@ impl ClientContext {
                     }
                     options.row_group_size = Some(size);
                 }
+                // `AttachOptions::AttachOptions`: a UBIGINT
+                "vacuum_rebuild_indexes" => {
+                    let threshold: u64 = value.text.trim().parse().map_err(|_| {
+                        Error::new(
+                            ErrorKind::Conversion,
+                            format!("Could not convert string '{}' to UINT64", value.text),
+                        )
+                    })?;
+                    options.vacuum_rebuild_indexes = Some(threshold);
+                }
                 "recovery_mode" => {
                     // `RecoveryMode`
                     let modes = [(false, "DEFAULT"), (true, "NO_WAL_WRITES")];
                     options.no_wal_writes = crate::logging::enum_from(&modes, "RecoveryMode", &value.text)?;
                 }
-                // `AttachOptions` and `StorageOptions::Initialize` have these
-                other @ ("default_table"
-                | "hidden"
-                | "vacuum_rebuild_indexes"
-                | "access_mode"
-                | "encryption_key"
-                | "encryption_cipher"
-                | "compress"
-                | "debug_encryption_version"
-                | "io_mode"
-                | "mmap_reserve_size") => return Err(crate::unported(format!("ATTACH with {other}"))),
+                // `QualifiedName::Parse`
+                "default_table" => {
+                    // `QualifiedName::FromPath`: the last part is the name and the one before the schema
+                    let parts = crate::catalog::parse_qualified_name(&value.text)?;
+                    options.default_table = match parts.as_slice() {
+                        [] => None,
+                        [name] => Some((None, name.clone())),
+                        [.., schema, name] => Some((Some(schema.clone()), name.clone())),
+                    };
+                }
+                "hidden" => options.hidden = attach_bool(value)?,
+                // `CompressInMemory`: what a database in memory does with its blocks; duckrs keeps those of a
+                // database in memory as rows either way, so it only checks the value
+                "compress" => {
+                    attach_bool(value)?;
+                    compress_given = true;
+                }
+                // `FileIOMode`: the file is read the same way whichever it is
+                "io_mode" => {
+                    if !["BUFFERED_IO", "MMAP", "DIRECT_IO"].contains(&value.text.to_uppercase().as_str()) {
+                        return Err(Error::new(
+                            ErrorKind::Binder,
+                            format!(
+                                "Unrecognized IO_MODE \"{}\". Valid values are 'BUFFERED_IO', 'MMAP', or 'DIRECT_IO'.",
+                                value.text
+                            ),
+                        ));
+                    }
+                }
+                // `DBConfig::ParseMemoryLimitOrMaximum`
+                "mmap_reserve_size" => {
+                    let size = crate::execution::temporary::parse_memory_limit(&value.text)?;
+                    if size.is_none_or(|size| size > i64::MAX as u64) {
+                        return Err(Error::new(
+                            ErrorKind::Binder,
+                            format!("MMAP_RESERVE_SIZE \"{}\" is out of range", value.text),
+                        ));
+                    }
+                }
+                // `StorageOptions::Initialize`
+                "encryption_key" => {
+                    if value.kind != duckrs_parser::ast::LiteralKind::String {
+                        return Err(Error::new(
+                            ErrorKind::Binder,
+                            format!("\"{}\" is not a valid key. A key must be of type VARCHAR", value.text),
+                        ));
+                    }
+                    if value.text.is_empty() {
+                        return Err(Error::new(ErrorKind::Binder, "Not a valid key. A key cannot be empty"));
+                    }
+                    encryption_key = Some(value.text.clone().into_bytes());
+                }
+                "encryption_cipher" => encryption_cipher = Some(storage::encryption::Cipher::parse(&value.text)?),
+                "debug_encryption_version" => {
+                    encryption_version = Some(storage::encryption::Version::parse(&value.text)?);
+                }
                 other => {
                     return Err(Error::new(
                         ErrorKind::Binder,
@@ -2363,7 +2909,23 @@ impl ClientContext {
                 }
             }
         }
+        if let Some(key) = encryption_key {
+            let version = encryption_version_for(options.storage_version.as_ref(), encryption_version)?;
+            options.encryption = Some(storage::encryption::EncryptionRequest {
+                key,
+                cipher: encryption_cipher,
+                version,
+                writable: self.setting_text("debug_force_mbedtls_unsafe") == "true",
+            });
+        }
         let in_memory = path.is_empty() || path == ":memory:";
+        // `StorageManager::Initialize`
+        if compress_given && !in_memory {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "COMPRESS can only be set for in-memory databases",
+            ));
+        }
         // the storage extension opens the file through the opener file system
         if !in_memory && let Some(access) = self.file_access() {
             access.check(&path, false)?;
@@ -2407,6 +2969,12 @@ impl ClientContext {
                         mode(options.read_only)
                     ),
                 ));
+            }
+            // `DatabaseManager::AttachDatabase`: the attachment that stays takes the default table given
+            if let Some((schema, table)) = options.default_table.clone()
+                && info.on_conflict != Conflict::Error
+            {
+                existing.catalog.set_default_table(schema, table);
             }
             if info.on_conflict == Conflict::Ignore {
                 return Ok(());
@@ -2472,6 +3040,8 @@ impl ClientContext {
         }
         let database = if in_memory {
             let mut database = DatabaseInstance::with_file_access(None);
+            database.hidden = options.hidden;
+            database.attach_options.clone_from(&options.listed);
             database.name.clone_from(&name);
             database.settings = self.home.settings.clone();
             if let Some(rows) = options.row_group_size {
@@ -2480,14 +3050,21 @@ impl ClientContext {
             Arc::new(database)
         } else {
             options.settings = Some(self.home.settings.clone());
+            options.no_write_ahead = true;
             let mut opened = DatabaseInstance::open_with(Path::new(&path), &options)?;
             let Some(database) = Arc::get_mut(&mut opened) else {
                 return Err(Error::new(ErrorKind::Internal, "a new database is in use"));
             };
+            database.hidden = options.hidden;
+            database.attach_options.clone_from(&options.listed);
             database.name.clone_from(&name);
+            DatabaseInstance::write_ahead_with(&opened);
             opened
         };
         database.catalog.set_database_list(self.database_list());
+        if let Some((schema, table)) = options.default_table.clone() {
+            database.catalog.set_default_table(schema, table);
+        }
         // `checkpoint_on_shutdown` is an option of the instance, which the attached databases share.
         let on_shutdown = self.home.checkpoint_on_shutdown.load(AtomicOrdering::SeqCst);
         database
@@ -2498,6 +3075,19 @@ impl ClientContext {
         }
         self.home.attached.write().insert(name.to_lowercase(), database);
         Ok(())
+    }
+
+    /// Whether an encrypted database is attached that takes writes.
+    fn writable_encrypted_database(&self) -> bool {
+        let mut databases = vec![self.home.clone()];
+        databases.extend(self.home.attached.read().values().cloned());
+        databases.iter().any(|database| {
+            database.file_access.is_none()
+                && database
+                    .file
+                    .as_ref()
+                    .is_some_and(|file| file.buffer.block_manager().encryption().is_some())
+        })
     }
 
     fn database_list(&self) -> std::sync::Weak<dyn DatabaseList> {
@@ -2514,6 +3104,13 @@ impl ClientContext {
                     "Cannot detach database \"{name}\" because it is the default database. Select a different database using `USE` to allow detaching."
                 ),
             ));
+        }
+        // the database the connection was made to keeps what is attached: it is only gone by name
+        if name.eq_ignore_ascii_case(&self.home.name)
+            && !self.home.attached.read().contains_key(&name.to_lowercase())
+            && !self.home.detached.swap(true, AtomicOrdering::SeqCst)
+        {
+            return Ok(());
         }
         if self.home.attached.write().remove(&name.to_lowercase()).is_none() && !if_exists {
             return Err(Error::new(
@@ -3119,7 +3716,12 @@ impl ClientContext {
             {
                 // `CatalogSearchPath::Reset`
                 self.search_path.clear();
-                self.db = self.home.clone();
+                // the default database, or with it detached one that remains
+                let remaining = self.home.attached.read().values().next().cloned();
+                self.db = match remaining {
+                    Some(remaining) if self.home.is_detached() => remaining,
+                    _ => self.home.clone(),
+                };
                 return Ok(Self::success());
             }
             Statement::Attach(info) => {
@@ -3151,6 +3753,33 @@ impl ClientContext {
                     && let Some(transaction) = &mut self.transaction
                 {
                     transaction.invalidation_policy = value.try_to_string()?.to_uppercase();
+                }
+                // `ForceMbedtlsUnsafeSetting::SetGlobal`: without httpfs, nothing else writes an encrypted database
+                if (name.eq_ignore_ascii_case("force_mbedtls_unsafe")
+                    || name.eq_ignore_ascii_case("debug_force_mbedtls_unsafe"))
+                    && !value.is_null()
+                    && value.try_to_string()? == "false"
+                    && self.writable_encrypted_database()
+                {
+                    return Err(Error::new(
+                        ErrorKind::InvalidConfiguration,
+                        "Failed to autoload HTTPFS. Cannot disable MbedTLS, HTTPFS extension is required to write \
+                         encrypted databases.",
+                    ));
+                }
+                // `ForceVariantShredding::SetGlobal` (`UnboundType::TryParseAndDefaultBind`): a type it can parse
+                if (name.eq_ignore_ascii_case("force_variant_shredding")
+                    || name.eq_ignore_ascii_case("debug_force_variant_shredding"))
+                    && let Some(text) = (!value.is_null()).then(|| value.try_to_string()).transpose()?
+                    && !text.is_empty()
+                    && crate::planner::binder::Binder::new(&self.catalog())
+                        .type_from_name(&text)
+                        .is_err()
+                {
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        format!("Could not parse type string '{text}'"),
+                    ));
                 }
                 let mut global = self.home.settings.write();
                 if let Some(setting) = logging::is_logging_setting(name) {
@@ -3626,6 +4255,8 @@ impl ClientContext {
         }
         let memory = self.query_memory()?;
         memory.set_threads(threads);
+        // the blocks of the files in memory take what `memory_limit` gives, as C++'s buffer pool does
+        self.db.set_block_memory(memory.limit());
         // an auto-commit statement is a transaction of its own, which starts now
         memory.set_transaction_start(
             self.transaction
@@ -3801,9 +4432,30 @@ fn on_create_conflict(conflict: AstConflict) -> OnCreateConflict {
     }
 }
 
+impl DatabaseInstance {
+    /// The limit of the blocks in memory of its file and of the files attached to it.
+    fn set_block_memory(&self, bytes: usize) {
+        if let Some(file) = &self.file {
+            file.buffer.set_memory_limit(bytes);
+        }
+        for attached in self.attached.read().values() {
+            if let Some(file) = &attached.file {
+                file.buffer.set_memory_limit(bytes);
+            }
+        }
+    }
+}
+
+impl DatabaseInstance {
+    /// Whether `DETACH` took this database away by name (only the one connections were made to).
+    fn is_detached(&self) -> bool {
+        self.detached.load(AtomicOrdering::SeqCst)
+    }
+}
+
 impl DatabaseList for DatabaseInstance {
     fn with_catalog(&self, name: &str, use_it: &mut dyn FnMut(&crate::catalog::Catalog)) {
-        if name.eq_ignore_ascii_case(&self.name) {
+        if name.eq_ignore_ascii_case(&self.name) && !self.is_detached() {
             use_it(&self.catalog);
         } else if let Some(database) = self.attached.read().get(&name.to_lowercase()) {
             use_it(&database.catalog);
@@ -3813,7 +4465,9 @@ impl DatabaseList for DatabaseInstance {
     fn databases(&self) -> Vec<DatabaseListing> {
         let attached = self.attached.read();
         std::iter::once(self)
+            .filter(|home| !home.is_detached())
             .chain(attached.values().map(Arc::as_ref))
+            .filter(|database| !database.hidden)
             .map(DatabaseInstance::listing)
             .collect()
     }

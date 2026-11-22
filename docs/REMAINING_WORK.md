@@ -149,15 +149,47 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] compression chosen as `DetectBestCompressionMethod` does, by the `final_analyze` score of each method in
     C++'s order (UNCOMPRESSED, RLE, BITPACKING, ROARING for validity and booleans), logged as C++ logs it;
     bitpacking with all of C++'s modes (CONSTANT_DELTA, DELTA_FOR) and types (BOOL, HUGEINT, UHUGEINT)
-  - [x] strings from v1.3.0 on: UNCOMPRESSED, ZSTD and DICT_FSST by their scores (a port of DictFSSTAnalyzeState,
-    with the FSST of `fsst.rs`), and EMPTY validity where DICT_FSST covers the NULLs
-  - [ ] before v1.3.0, DICTIONARY and FSST by score (their analyze samples at random; the smaller encoding is
-    taken), the analyze of ALP and ALPRD (scored by their encoded size), DICT_FSST and FSST segment layouts
-    as C++ writes them (`dict_fsst_count_bound`, `dict_fsst_boolean_selection`, `string/blob`)
+  - [x] strings from v1.3.0 on: UNCOMPRESSED, ZSTD and DICT_FSST by their scores (a port of DictFSSTAnalyzeState),
+    and EMPTY validity where DICT_FSST covers the NULLs
+  - [x] DICT_FSST segments as C++ fills them (`DictFSSTCompressionState`: a plain dictionary until the block is
+    full, then FSST encoded if that saves enough, without indices where all strings are unique), with libfsst
+    ported exactly (the sample, `buildSymbolTable` with its counters, `finalize`, `compressBulk`): segments are
+    those of C++ byte for byte, but for a padding byte C++ leaves as it was
+  - [x] before v1.3.0, UNCOMPRESSED, DICTIONARY, FSST and (from v1.2.0) ZSTD by their `final_analyze` scores:
+    DICTIONARY's as C++ simulates its segments, FSST's as its random sampling of a quarter of the vectors gives
+    it on average (C++ itself differs from run to run there)
+  - [ ] the analyze of ALP and ALPRD (scored by their encoded size)
+  - [x] blocks as C++ hands them out at a checkpoint: metadata sub-blocks the lowest free first, in the file's
+    metadata blocks before new ones (`MetadataManager::AllocateHandle`), those the last checkpoint took freed
+    unless kept (`MarkBlocksAsModified`, `ClearModifiedBlocks`), the free list's room taken as
+    `GetFreeListBlocks` does; an unchanged table keeps its metadata whole (`WriteUnchangedTable`); deletes in
+    a writer of their own and kept when they didn't change, as `ValidityMask::Write` packs them; segments into
+    the fullest partly filled block they fit (`PartialBlockManager`)
+  - [x] large appends written ahead of a checkpoint (`OptimisticDataWriter`): an INSERT, COPY or CREATE TABLE AS
+    writes its row groups to blocks as they fill, five at a time a column at a time, into blocks that get their
+    ids as they fill and stay open between those writes until the commit (`APPEND_TO_TABLE`), and keeps only
+    the rest in memory; the commit writes the rest of a bulk append the same way and logs where its row groups
+    are (`ROW_GROUP_DATA`). A table is then its rows in the file, those row groups and rows in memory, one after
+    another (`AppendedTable`), read where they are; an append to a table in a file doesn't read its rows. A
+    checkpoint keeps the row groups' blocks, under a DELETE too, and a replay keeps those of a log of C++ in
+    theirs (`MarkBlockAsUsed`). An append of 80M rows takes 90MB rather than refusing to keep more than 2 GiB.
+    `enable_optimistic_write` turns it off. Not for tables with a key or an index, nor in an explicit
+    transaction, whose appends go in at the commit
+  - [x] a one-row VARCHAR column is UNCOMPRESSED, as the baseline scores it (DICT_FSST's analyze charges a segment
+    as the partial block manager stores it, 48 bytes against 9 for one 5-byte string). The 2.0.0 release
+    (`d54cbbe3df`) stores it as DICT_FSST: its analyze predates that change (`1ed7c0e2b03`, `9cd38959030`)
   - [x] the ART layouts of files before v2.0.0, in checkpoints and the WAL: from v1.2.0 the current nodes with
     the 264-byte `Node256Leaf` (`GetNode256LeafSegmentSize`), before it `ART::TransformToDeprecated` (chains of
     `Leaf` of 4 row ids, 15-byte prefixes, 6 allocators); the `storage_version` option is the file's
-  - [ ] dense row id rewriting of files before v2.0.0 (`rowid_gaps/old_storage_*`): row groups stay as they are
+  - [x] dense row id rewriting of files before v2.0.0: row groups without rows go and the ids after them move
+    up, unless indexes keep the ids (`KEEP_ROW_IDS`: then only the trailing ones go)
+  - [x] GEOMETRY in files and logs before v1.5.0: the spatial extension's BLOB format and type, the keys of
+    an index of one (`ART::ConvertKeyInput`), the `storage_version` each index keeps, and no vacuum remap of an
+    index with such keys (`KEEP_ROW_IDS`)
+  - [x] ATTACH's and the setting `vacuum_rebuild_indexes`: indexes of tables up to that many rows are built
+    again after a vacuum that moves their rows (`VacuumIndexStrategy::REBUILD`)
+  - [x] `storage.total_vacuum_time` of the checkpoint profiling; under `KEEP_ROW_IDS` row groups without deletes
+    whose ids follow each other still come together
   - [x] unshredded VARIANT columns, in the file and the WAL
   - [x] shredded VARIANT columns: read from files C++ writes, and written at a checkpoint by
     `variant_minimum_shredding_size` and `force_variant_shredding`, with the type inferred as C++ does (object fields
@@ -174,11 +206,94 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] the statistics of the unshredded part, a row group the checkpoint does not shred as `UNINITIALIZED`
     (which merges into what the others are), and the row groups a delete emptied dropped in files before
     v2.0.0, the rows after them taking new ids where no index keeps them
-  - [ ] shredded GEOMETRY columns, Patas and Chimp segments (8), `read_duckdb` (8)
+  - [x] Patas and Chimp segments of the files before v0.9, with C++'s checks of damaged ones
+  - [ ] shredded GEOMETRY columns, `read_duckdb` (8)
   - [x] list-length statistics: the shortest, longest and total length of a table's lists, kept through appends,
     checkpoints (v2.1.0, with the lists' `ListPersistentColumnData`) and WAL replay; checkpoints write v2.1.0 when
     asked; a table's statistics keep those of what is in its nested columns
   - [ ] string statistics for `stats()` from database files, per-column `USING COMPRESSION`
+  - [x] shredded VARIANT columns in the file: read and written as C++ does (`variant_minimum_shredding_size`,
+    `force_variant_shredding`, the type the values suggest), with their statistics
+  - [x] GEOMETRY in a VARIANT; `vector_type` of a shredded scan (SHREDDED_VECTOR); `stats()` of a VARIANT column:
+    its validity and `shredding_state`
+  - [x] the statistics of the shredded part in `stats()` (`fully_shredded`, `partially_shredded`), merged across
+    row groups as `MergeShredding` does, also of casts to VARIANT, of casts of a VARIANT, and through extracts;
+    nested (STRUCT, LIST, ARRAY) child statistics in the file; the empty bounds of an all-NULL numeric segment,
+    which C++ scans a constant segment with
+  - [ ] of shredded VARIANTs: pushdown of extracts into the shredded part; C++'s order of the fields of a shredded
+    object (that of an `unordered_map`); shredded GEOMETRY
+  - [x] of shredded VARIANTs: pushdown of extracts into the shredded part; shredded GEOMETRY (typed, with its
+    extent; written to Parquet it errors, as in C++)
+  - [ ] the key order of VARIANT objects (`parquet/variant/variant_object_key_order`): a C++ VARIANT row keeps one
+    key slot per field of an object, in the order the objects are opened (`json_to_variant.hpp`: an object
+    reserves its slots, its keys in document order, when it is converted; `{"z":[{"c":..,"b":..}],"a":{"y":..,
+    "x":..},"empty":{}}` has `z, a, empty, c, b, y, x`). `variant_to_parquet_variant` writes those slots as the
+    dictionary and sorts only the field ids of each object by name (`parquet_variant_encoding.cpp`). duckrs sorts
+    the keys of an object as it builds it (`VariantNode::Object`) and stores them sorted and once each, so the
+    order is gone: a format change, where each object keeps the order of its keys, set by the conversions from
+    JSON and STRUCT and by the readers of database files and Parquet, and used by their writers
+  - [x] extracts of fields (`struct_extract`) and VARIANT keys (`variant_extract`), cast or not, pushed into table
+    and Parquet scans (`ColumnIndex::IsPushdownExtract`), through the projections that pass a column on; EXPLAIN
+    shows `s.a`. Not under TRY for a CAST, nor below a window
+  - [x] a pushed down path of keys of a shredded VARIANT in a database file is read from its shredded part alone,
+    where every value of a row group is there or the key is missing (otherwise the column, then the extracts)
+  - [x] filters on a path of a VARIANT in a scan read the path's column (`PushdownExtract` of table filters), and
+    row groups are left out by the statistics of a path that is fully shredded all the way, cast to the filter's
+    type (`VariantStats::PushdownExtract`)
+  - [x] a path whose values are partly in the unshredded part (`VariantStats::PushdownExtract` in the scan); late
+    materialization (`LateMaterialization`: a TopN, LIMIT or SAMPLE over a table scan becomes a SEMI join on the
+    row ID, with optional filters on the copy); pushed paths of a Parquet scan in SQL export
+  - [ ] late materialization of a scan whose paths are pushed (`pushdown_extract_reapplied`): main runs the
+    pushdown extract after `LATE_MATERIALIZATION`, where C++ runs it before, so a scan that only needs a path of a
+    column looks to need all of it. Running it first needs main's late materialization to take the pushed paths
+    (their types, and those of the copy of the scan)
+  - [x] Parquet's shredded paths: a pushed down path that a file has all of in its `typed_value`, of the type it is
+    cast to, is read from there alone (`CreateVariantTypedValuePushdown`); row groups are left out by the
+    statistics of a path of a VARIANT, by key or by index, cast to the filter's type (`ExpressionFilter::
+    CheckStatistics` through `VariantExtractPropagateStats`)
+  - [x] late materialization of Parquet scans, on `file_index` and `file_row_number` (`ParquetGetRowIdColumns`)
+  - [x] a crash between the end of a checkpoint and the removal of its log: a log that its marker says is in the
+    file goes on open (`IsCheckpointClean`), and the checkpoint of a replayed log marks it where what it committed
+    ends, before the new header goes in
+  - [x] a checkpoint keeps the row groups whose rows are as the last one left them
+    (`REUSE_EXISTING_ROW_GROUP_METADATA`): their column metadata, blocks and statistics stay, and only the row group
+    and its deletes are written again. Whether rows changed is found by comparing them with the file's.
+  - [x] columns load when something reads them (`RowGroup::is_loaded`, `LoadColumn`), and `pragma_storage_info`'s
+    `loaded_segments_only` lists only those; a checkpoint leaves loaded what it wrote and what a kept row group had
+  - [x] `PARTIALLY_REUSE_COLUMN_METADATA` (from v2.0.0, or v1.4.0 with `force_column_metadata_reuse`): a row group
+    says which metadata blocks each column takes (`PerColumnMetadataBlocks`), and a checkpoint writes again only
+    the columns whose values changed; an ALTER keeps the columns it leaves as they were (ADD, DROP, ALTER TYPE).
+    Before v2.0.0 a row group lists the blocks of all its columns together (`extra_metadata_blocks`).
+  - [x] ALTER TABLE in the WAL (`ALTER_INFO`, `WriteAlter` and `ReplayAlter`): ADD, DROP and RENAME COLUMN, ALTER
+    TYPE, SET and DROP DEFAULT and NOT NULL, RENAME TO are read, and an ALTER of a column is logged as such unless
+    the transaction changed the rows first, the table has indexes, or an ALTER TYPE gives the rows new ids; a replay
+    keeps the ids the log has the rows under. SET DEFAULT keeps the text of the default too.
+  - [x] columns that stay in the file through UPDATE and ALTER (`LayeredTable`): an UPDATE in place of a table in a
+    file reads and changes only its columns in the row groups it updates, and ADD, DROP and ALTER TYPE COLUMN only
+    compute the column they make; a commit takes the table's columns as they are, the log reads only the updated
+    columns, and a checkpoint writes the columns in memory and keeps the others unread. An UPDATE with RETURNING,
+    of a table with a CHECK or that a foreign key references, and an ALTER that checks the rows read the table.
+  - [x] DELETE of a table in a file (`DataTable::Delete`): the rows go from which rows of each row group are left,
+    and nothing but the columns of the WHERE is read; a later UPDATE or ALTER keeps that, a commit and the log
+    take the ids, a replay of deletes leaves the rows in the file too, and a checkpoint keeps the columns and
+    writes the deletes. A DELETE with RETURNING, of a table with a key or an index, or that a foreign key
+    references reads the table.
+    columns, `read_duckdb` (8)
+  - [x] string statistics for `stats()`: a minimum length too long to keep is left out, a checkpoint leaves a table the
+    statistics it computed until the file is opened again (a file before v2.0.0 keeps 8 bytes of a string bound),
+    and Parquet strings have the bounds of the file
+  - [x] list-length statistics (`ListStatsData`): the shortest, longest and total of a column's lists, in a row
+    group's column (`ListPersistentColumnData`) and the table's statistics from v2.1.0, which checkpoints now write;
+    `length` of lists all as long is a `constant_or_null`, `list_concat`, `flatten`, list constants and ARRAY to
+    LIST casts give their lengths, and joins, cross products and UNNEST drop the totals of strings and lists
+    (`ResetAdditiveStatistics`)
+  - [x] per-column `USING COMPRESSION`: CREATE TABLE refuses methods the file's storage version has no more or not
+    yet and those that can't store the column's type (`VerifyCompressionType`), ADD COLUMN keeps one unchecked,
+    the catalog, the log and `sql` keep it, and a checkpoint stores the column, its validity and children with
+    only that method and UNCOMPRESSED in place of `force_compression` (`ColumnCheckpointInfo::GetCompressionType`)
+  - [x] `disabled_compression_methods`: a checkpoint leaves the methods out of what it chooses from, for every type,
+    before `force_compression` is looked up (`CompressionFunctionSet::GetCompressionFunctions`); the setting reads
+    back in the order of `CompressionType` (`RLE,Dictionary`)
   - [x] `read_duckdb` and the replacement scan of `.db` files; `enable_view_dependencies` (DROP ... CASCADE,
     refused DROP and ALTER, CREATE OR REPLACE of a view that reads itself)
   - [ ] `vector_type` (~20 files) and `duckdb_memory` (~17) report engine internals duckrs does not model
@@ -188,12 +303,22 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] COPY, casts to a database's types and `PRAGMA table_info('db.t')` run in the database they name
   - [x] ATTACH options as expressions, unknown options and TYPEs refused, `OR REPLACE`, access-mode conflicts,
     a rollback detaches what the transaction attached; one database written per transaction
-  - [ ] statements that read one database and write another (`CREATE TABLE db2.t AS SELECT ... FROM db1.t`; refused
-    for now, as running them in one of the databases wrote to the wrong one),
-    temp tables and sequences of the default database in a statement routed to another, views binding across
-    databases, DETACH of the default database
+  - [x] statements that read one database and write another (`CREATE TABLE db2.t AS SELECT ... FROM db1.t`): they
+    run in the database they write, and bind the tables of the others by name; unqualified names that database
+    lacks are looked up in the default one, as are those of the views of an attached database
+  - [x] the catalog in table bindings (`BindingAlias`): `db1.t.c`, `db1.s1.t.c`, `EXCLUDE (db1.s1.t.c)`, the struct
+    pack `db1.s1.t`, and `MinimumUniqueAlias` in the errors of ambiguous tables and columns
+  - [x] temp tables created in the transaction in a statement routed to another database: the forks of a
+    transaction share the temporary schema of its first one, which alone commits it
+  - [x] sequences of other databases: `nextval('db.seq')`, unqualified ones of the default database in a statement
+    routed to another, and `nextval`/`setval` writing the database of the sequence (`NextValModifiedDatabases`), so
+    that a DEFAULT or a statement that advances a sequence of another database than it writes is refused
+  - [x] DETACH of the default database: it is gone by name and keeps what is attached; RESET of the search path
+    then goes to a database that remains; SHOW DATABASES lists them all (`PragmaShowDatabases`)
   - [x] `RECOVERY_MODE` (`NO_WAL_WRITES` keeps commits out of the log until a checkpoint)
-  - [ ] `ENCRYPTION_KEY`, `COMPRESS`, `IO_MODE` and the other ATTACH options
+  - [x] `ENCRYPTION_KEY`, `COMPRESS`, `IO_MODE` and the other ATTACH options: `DEFAULT_TABLE`, `HIDDEN`, `COMPRESS`,
+    `IO_MODE` and `MMAP_RESERVE_SIZE` (part 74); encrypted files, GCM and CTR, readable and writable both ways with
+    DuckDB 1.4 and 2.0, their logs and temporary files (part 75)
 - [x] 11. Files that C++ DuckDB v69 can read and write (`sql/storage_version`: all pass)
 - [ ] 12. `VACUUM` (`sql/vacuum`: 1 failing)
 - [ ] 13. Crash-recovery fuzzing: kill the process during writes, then reopen and verify
@@ -485,7 +610,7 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] CRS type parameters (AUTH:CODE, PROJJSON, WKT2:2019, the OGC:CRS84/CRS83 defaults), `ST_CRS`, `ST_SetCRS`
   - [ ] `CREATE COORDINATE SYSTEM`, `duckdb_coordinate_systems()`, `ignore_unknown_crs`
   - [x] GEOMETRY columns in database files (v1.5.0 and later, as WKB) and the WAL
-  - [ ] shredded GEOMETRY columns, and the spatial extension's format of files before v1.5.0
+  - [ ] shredded GEOMETRY columns
   - [x] `GeometryStats`: in `stats()`, in database files (extent, types, flags), and `vertex_extract`'s bounds
   - [ ] `ST_GeomFromWKB`'s types from BLOB min/max (duckrs keeps no string statistics), GeoParquet, the spatial extension's blob format
 - [ ] 34. Remaining type and cast failures (`sql/types`: 39 failing, 92.6%; `sql/cast`: 2 failing)
@@ -582,9 +707,73 @@ Each item gives the number of failing files in `test/` that it should fix, where
 - [ ] 48. v1 gate: TPC-H SF10 geometric mean ≤ 1.5× C++ DuckDB, and no query slower than 3×. The runner
   prints the gate after `--engine=both`. On TPC-H SF1 (8 threads, all 22 answers correct) duckrs is at
   1.53× (none above 3×: Q21 2.7×; Q02 0.5×, Q08 0.95×), from 12.7× at the start of item 47.
-  SF10, both engines on the file C++ wrote: about 1.3× (1.27× and 1.37× in two runs under heavy load from other work, in which Q18 and Q14 read above 3×; Q09 is down to 1.2–1.9× from 2.5×; Q11 0.5×, Q15 0.7×, Q22 0.7×), which passes the gate on a machine that was busy with other work; measure again on a quiet one before ticking this. duckrs
-  cannot load SF10 itself: an append keeps the rows of its table in memory (more than 2 GiB fails), where
-  C++ writes full row groups to blocks as they fill (optimistic writes)
+  SF10, both engines on the file C++ wrote: 0.58× on 2026-11-22 after part 71, all 22 answers correct (none above
+  3×: Q18 1.10×, Q13 0.97×, Q16 0.84×, Q09 0.81×; Q06 0.32×, Q15 0.21×), with the load average 5 at the start and 18
+  at the end; Q18 took 1.28s against C++'s 1.16s, while timed on its own it is the same before and after part 71
+  (about 1.1s). Before that, 0.60× after part 69 (Q09 0.96×, Q13 0.93×, Q18 0.86×) with the load average 4 at the
+  start and 16 at the end; 0.60× after part 67 (Q18 0.93×, Q16 0.91×) with the load average 10 at the
+  start and 13 at the end; 0.65× after part 65 (Q13 and Q21 0.94×) with the load
+  average 19 at the start and 27 at the end; 0.64× after part 63 (Q10 0.96×, Q09, Q13, Q18 and Q21
+  0.93×) with the load average 4 at the start and 14 at the end, the quietest run yet; 0.63× after part 60 (Q22 1.44×, Q16 1.07×,
+  Q10 1.06×) with the load average rising from 10 to 32, which slowed C++'s Q01 to 0.85s from its usual 0.5s;
+  0.68× after part 52, the GROUP BY rewrite done (none above 3×: Q01 1.49×, Q09 1.10×; Q10 0.97×, Q18 0.73×,
+  Q15 0.17×), with the machine's load average rising from 18 to 58 during the run. Earlier that day: 0.71× after part
+  49 (Q18 1.14×) under a load of 20 to 53, which slowed C++ well past its usual times. On 2026-11-20: 0.67× after part 44 (Q10 1.31×) under a load rising from 45 to 157,
+  which says least of all, 0.89× after part 42 (Q10 1.97×)
+  with the load falling from 43 to 14, 1.09× after parts 39 and 40, 1.20×, and before that 1.27× and 1.37×
+  under heavier load, with Q18 and Q14 above 3× in them. The gate passes; measure once more on a quiet machine
+  before ticking this. Q10 then took 18% less: a GROUP BY writes the keys of a
+  chunk's rows into one buffer and makes a key only for a new group, and threads read blocks of the file at once
+  (`pread`), where they took turns. The distinct values of each column, which the join order starts from, are
+  kept in the file as C++ keeps them (`DistinctStatistics`, as `HLL_V2`, and read of older files as `HLL_V1`):
+  the first query of a file at SF10 took 16–27s counting them from all the rows, and takes under a second. Q06
+  then took 0.35s warm against C++'s 0.09s: the blocks of a file stay in memory up to `memory_limit` (C++'s
+  buffer pool) where 256 MiB of them did, a scan keeps the metadata of the columns it read, and comparisons of
+  an integer column with constants are a range of its values; warm Q06 takes 0.06s against C++'s 0.05s. Q10
+  then took 3.3s of CPU warm where C++ takes 1.0s: the keys of a GROUP BY are written a column at a time, a join
+  filter loops over a flat column, and the strings of the few rows of a group a filtered scan wants are decoded
+  each from its entry, where all of the group's were; that takes 20% of the CPU off (2.6s). A join's build side
+  keeps the strings of its input where they are rather than copying them under its lock, and a Top-N compares a
+  row's key with its boundary in one buffer: warm Q10 takes 0.49s from 0.57s, against C++'s 0.23s, with 2.5s of
+  CPU against 1.1s. A plain GROUP BY now finds its groups in a hash table over the row format, by the hash of
+  their columns and a comparison with their rows (docs/GROUP_BY_REWRITE.md), and merges threads' tables by
+  partition: Q18 1.07s from 1.49s, Q10 0.37s from 0.40s. Q01 took 4.4s of CPU warm where C++ takes 1.2s: a
+  sum over few groups adds a chunk into four banks of sums per group, so that an addition doesn't wait for the
+  one of the row before, and a binary operation over dictionaries without NULLs loops by the kind of selection
+  of each side: 3.5s. A range of a dictionary is a window on its selection rather than a copy of its indices,
+  and sums take the banks too where a column has a validity mask without NULLs: 3.4s. Bit-packed values unpack
+  32 at a time by code for their width, DICT_FSST indices straight into `u32`s, and a filter's rows of a
+  dictionary are a gather: 3.15s. An expression that an aggregate or a projection computes twice is computed once
+  below it (`CommonSubExpressionOptimizer`): 2.8s. The loops of arithmetic inline their operation, with overflow
+  errors made apart, and `count_star` counts each group's rows apart: 2.7s. A range filter on a flat column keeps
+  its rows without a branch, a group's selection is no longer gathered through while it is all the group's rows,
+  and fixed-width columns decode into their vectors' memory: 2.5s, and a filtered count over lineitem takes 0.22s
+  of CPU from 0.54s. Q22's scan of customer read all its columns, below the column select that hides the marker
+  of an IN list's MARK join; the unused columns pass narrows that select and goes on below it, and a hash join
+  prefetches the keys of 32 probe rows' candidates before it compares them: Q22 0.58s of CPU from 0.93s, Q03 1.02s
+  from 1.18s. Q10's GROUP BY hashes strings of customer rows that the join reads in the order of the orders, so
+  hashing prefetches the string entries of 32 rows and then the bytes of those not inlined before it hashes them,
+  and the join filter's Bloom check prefetches its blocks: Q10 1.8s of CPU from 2.0s. A scan checks a join filter
+  over a whole row group's values at once rather than through chunks of 2048 for the expression executor, selected
+  rows of a bitpacked column are fetched in u64 with a store of their width each, and RIGHT SEMI and RIGHT ANTI
+  joins pair no probe rows with build rows that matched already: Q21 about 12% fewer cycles. A group table lookup
+  asks for the entry of the row 32 rows ahead, so that the reads of a table larger than the caches overlap: Q18,
+  whose subquery groups 60M rows into 15M groups, about 14% fewer cycles (5.0s of CPU from 6.0s). Threads handing
+  a hash join their build chunks only record them while they hold the build, which copies them into its columns
+  when it finishes or spills, a column per thread (in Q09 threads waited for the lock about a third of their time),
+  and a probe asks for the build rows of the probe rows ahead: Q09 0.44s from 0.51s. duckrs
+  had no way to load SF10 itself, as an append kept its rows in memory (more than 2 GiB failed); appends now write
+  their full row groups to blocks as they fill (an INSERT of 80M rows takes 90MB). duckrs now loads SF10 into its
+  own file (COPY of the `.tbl` files: lineitem 24s against C++'s 22s, the rest under 5s each; at most 710MB
+  resident, where C++ takes 2.2GB; 2.78GB of file against C++'s 2.79GB), and all 22 queries on that file match
+  `answers/sf10`. A CSV file larger than a buffer (32MB) is sniffed on its first buffer, unless a scan of the
+  sniffer gets to its end, and read a buffer at a time. It is scanned on threads at once, in parts of 8MB that
+  start after a `\n` that ends a row, each read of the file: any `\n` until the first quote or escape, then the
+  state machine runs on to the row ends (C++ guesses where a part starts, which a quoted newline can fool, and
+  stops when its guess was wrong). An 8M-row file with quoted values loads in 2.4s on 8 threads, from 10.1s on
+  one, where C++ takes 3.5s. An INSERT appends the parts in
+  order; threads claim the row groups they fill, encode them with no lock held, and place them in the order of
+  their rows, so the file is the one a single thread writes. An error is the one a scan of the whole file finds
 
 ## Phase 14: Extensions (not started)
 

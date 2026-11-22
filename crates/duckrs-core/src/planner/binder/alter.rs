@@ -53,6 +53,11 @@ pub struct BoundTableAlter {
     pub rejected: Option<Error>,
     /// What `COMMENT ON TABLE` says of the new entry.
     pub comment: Option<String>,
+    /// The column whose type changes, which is written again even to the type it had (`RowGroup::AlterType`).
+    pub retyped: Option<usize>,
+    /// What a write-ahead log says of it (`WriteAlter`), for the ALTERs of a column that it logs as such rather
+    /// than as the table made again.
+    pub logged: Option<AlterKind>,
 }
 
 /// The columns of `table` and then `column`, as CREATE TABLE would list them.
@@ -356,6 +361,10 @@ impl Binder<'_> {
         let mut definition = ColumnDefinition::new(column.name.clone(), type_binder.bind_type(ty)?);
         // `CheckTypeIsSupported`
         self.catalog.check_column_type(&definition.ty)?;
+        // `AddColumnInfo` keeps the compression, unchecked
+        definition.compression = column
+            .compression
+            .and_then(crate::storage::compression::compression_of_name);
         if let Some(default) = &column.default_value {
             definition.default_value = Some(self.bind_default(default, &definition.ty)?);
             definition.default_text = Some(default.to_string());
@@ -424,6 +433,7 @@ impl Binder<'_> {
         binder.bind_context.add_binding(Binding {
             alias: table.name.clone(),
             schema: None,
+            catalog: None,
             table_index,
             names: table.columns.iter().map(|c| c.name.clone()).collect(),
             types: table.types(),
@@ -454,6 +464,23 @@ impl Binder<'_> {
             verify: false,
             rejected: None,
             comment: table.comment.lock().clone(),
+            retyped: None,
+            logged: match kind {
+                AlterKind::AddColumn { column, unique, .. } if column.generated.is_none() && !*unique => {
+                    Some(kind.clone())
+                }
+                AlterKind::RemoveColumn { path, .. }
+                | AlterKind::ChangeColumnType { path, .. }
+                | AlterKind::SetDefault { path, .. }
+                | AlterKind::SetNotNull(path)
+                | AlterKind::DropNotNull(path)
+                | AlterKind::RenameColumn { path, .. }
+                    if path.len() == 1 =>
+                {
+                    Some(kind.clone())
+                }
+                _ => None,
+            },
             schema,
             table: table.clone(),
         };
@@ -609,6 +636,7 @@ impl Binder<'_> {
                 }
                 let index = column_index(&table, &path[0])?;
                 self.change_type(&mut alter, index, target.as_ref(), using.as_deref())?;
+                alter.retyped = Some(index);
             }
             AlterKind::SetDefault { path, expression } => {
                 if path.len() > 1 {
@@ -628,6 +656,8 @@ impl Binder<'_> {
                     None => None,
                 };
                 alter.columns[index].default_value = default;
+                // what a checkpoint writes and `information_schema` shows
+                alter.columns[index].default_text = expression.as_ref().map(ToString::to_string);
             }
             AlterKind::SetNotNull(path) => {
                 if path.len() > 1 {

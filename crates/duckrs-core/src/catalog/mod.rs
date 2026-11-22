@@ -34,6 +34,59 @@ pub const DEFAULT_CATALOG: &str = "memory";
 /// The schema used when a name is not qualified (`DEFAULT_SCHEMA`).
 pub const DEFAULT_SCHEMA: &str = "main";
 
+/// `QualifiedName::ParseComponents`: the parts of a dotted name, of which a part with a `.` is in double quotes (a
+/// doubled one standing for itself); anything else is taken as it is, keywords and spaces included.
+pub fn parse_qualified_name(input: &str) -> Result<Vec<String>> {
+    let fail = |what: &str| Err(Error::new(ErrorKind::Parser, format!("{what} (input: {input})")));
+    let chars: Vec<char> = input.chars().collect();
+    let mut result = Vec::new();
+    let mut index = 0;
+    while index < chars.len() {
+        let mut entry = String::new();
+        if chars[index] == '"' {
+            // `StringUtil::TryParseQuotedString`
+            index += 1;
+            let mut closed = false;
+            while index < chars.len() {
+                if chars[index] == '"' {
+                    if chars.get(index + 1) == Some(&'"') {
+                        entry.push('"');
+                        index += 2;
+                        continue;
+                    }
+                    index += 1;
+                    closed = true;
+                    break;
+                }
+                entry.push(chars[index]);
+                index += 1;
+            }
+            if !closed {
+                return fail("Unterminated quote in qualified name!");
+            }
+            if entry.is_empty() {
+                return fail("Zero-length delimited identifier in qualified name!");
+            }
+            if index < chars.len() && chars[index] != '.' {
+                return fail("Unexpected character after a quoted identifier in a qualified name!");
+            }
+        } else {
+            while index < chars.len() && chars[index] != '.' {
+                if chars[index] == '"' {
+                    return fail("Unexpected quote in the middle of a qualified name component!");
+                }
+                entry.push(chars[index]);
+                index += 1;
+            }
+        }
+        result.push(entry);
+        if index < chars.len() {
+            index += 1;
+        }
+    }
+    Ok(result)
+}
+
 /// The part of a connection's `CatalogSearchPath` that is about the catalog a statement runs in: the schema
 /// what is created without a schema goes into (`GetDefaultSchema`), and the schemas a name without one is looked
 /// up in, after the temporary one (`GetSchemasForCatalog`). The client sets it while it runs a statement.
@@ -101,6 +154,9 @@ pub struct ColumnDefinition {
     pub default_text: Option<String>,
     /// What `COMMENT ON COLUMN` said.
     pub comment: Option<String>,
+    /// The `CompressionType` of `USING COMPRESSION`, if it says one: a checkpoint stores the column with only
+    /// that method, or UNCOMPRESSED where it can't.
+    pub compression: Option<u8>,
 }
 
 /// A generated column: not stored, only an expression over the other columns.
@@ -133,6 +189,7 @@ impl ColumnDefinition {
             not_null: false,
             default_text: None,
             comment: None,
+            compression: None,
         }
     }
 }
@@ -140,6 +197,8 @@ impl ColumnDefinition {
 /// The rows of a table that stay in a database file: row groups that can be read one at a time,
 /// and only the columns that are needed.
 pub trait TableSource: std::fmt::Debug + Send + Sync {
+    /// The source as what it is, for the checkpoint that wrote it.
+    fn as_any(&self) -> &dyn std::any::Any;
     /// Its rows that aren't deleted.
     fn row_count(&self) -> usize;
     /// Their ids.
@@ -166,11 +225,13 @@ pub trait TableSource: std::fmt::Debug + Send + Sync {
     fn read_all(&self) -> Result<ColumnDataCollection>;
     /// What the file says about the values of the table's columns, without reading them.
     fn column_statistics(&self) -> Option<Vec<ColumnStatistics>>;
+    /// The `DistinctStatistics` of each column that the file has, without reading the rows: `None` if there is
+    /// a column of a type that has them and they are not known.
+    fn distinct_states(&self) -> Option<Vec<Option<crate::optimizer::distinct_statistics::DistinctState>>> {
+        None
+    }
     /// What the file says about a column per group, without reading its values.
     fn zones(&self, column: usize) -> Result<Vec<ColumnZone>>;
-    /// `pragma_storage_info`: the segments, in the order that C++ lists them. Reading what fills
-    /// `segment_info` takes their blocks, so that is only done on request.
-    fn segments(&self, include_info: bool) -> Result<Vec<SegmentInfo>>;
     /// Of the row group from `row_start` with `rows` rows as it is stored, how a VARIANT column of it is shredded:
     /// the type of its typed part, or `None` when it is not; `None` when there is no such row group.
     fn variant_shredding(&self, _row_start: u64, _rows: usize, _column: usize) -> Option<Option<LogicalType>> {
@@ -189,7 +250,58 @@ pub trait TableSource: std::fmt::Debug + Send + Sync {
     fn all_variant_shredding(&self, _columns: &[usize]) -> HashMap<(u64, usize, usize), Option<LogicalType>> {
         HashMap::new()
     }
+    /// `pragma_storage_info`: the segments, in the order that C++ lists them. Reading what fills
+    /// `segment_info` takes their blocks, so that is only done on request. Listing a column loads it, unless
+    /// `loaded_only` leaves out the columns that aren't (`loaded_segments_only`).
+    fn segments(&self, include_info: bool, loaded_only: bool) -> Result<Vec<SegmentInfo>>;
 }
+
+/// What writes the row groups of an append to blocks of their own ahead of a checkpoint (`OptimisticDataWriter`): of
+/// a table, rows, the position among them of the first to write and its id. Nothing where the database doesn't.
+pub trait AheadWriter: Send + Sync + std::fmt::Debug {
+    fn write(
+        &self,
+        table: &TableCatalogEntry,
+        rows: &ColumnDataCollection,
+        first: usize,
+        first_id: u64,
+        final_flush: bool,
+    ) -> Result<Vec<crate::storage::writer::WrittenGroup>>;
+    /// [`Self::write`] in two: the encoding, which threads do at once, and the placing, in order after; `None` where
+    /// nothing is written ahead.
+    fn encode(
+        &self,
+        table: &TableCatalogEntry,
+        rows: &ColumnDataCollection,
+    ) -> Result<Option<crate::storage::writer::EncodedAhead>>;
+    fn place(
+        &self,
+        table: &TableCatalogEntry,
+        encoded: crate::storage::writer::EncodedAhead,
+        first_id: u64,
+    ) -> Result<Vec<crate::storage::writer::WrittenGroup>>;
+}
+
+/// `OptimisticDataWriter` of each thread of an append: the row groups that threads claimed to write ahead, up to
+/// where, and the turns that place them in the order of their rows, each after the one before it.
+#[derive(Debug, Default)]
+struct AheadClaims {
+    state: Mutex<ClaimState>,
+    placed: parking_lot::Condvar,
+}
+
+#[derive(Debug, Default)]
+struct ClaimState {
+    /// the rows up to here are claimed
+    claimed: usize,
+    next_turn: u64,
+    /// the turn that places now
+    placing: u64,
+}
+
+/// Where the [`AheadWriter`] of a database is, which its schemas and tables share; empty in memory and in the copies
+/// of a transaction.
+pub type AheadSlot = Arc<RwLock<Option<Arc<dyn AheadWriter>>>>;
 
 /// A row of `pragma_storage_info`.
 #[derive(Debug, Clone)]
@@ -220,6 +332,10 @@ pub struct DatabaseListing {
     pub wal_size: u64,
     /// `tags['storage_version']`, of a database in a file
     pub storage_version: Option<String>,
+    /// `AttachedDatabase::GetAttachOptions`: the options of its ATTACH that went to its storage, by name, as given
+    pub options: Vec<(String, String)>,
+    /// `Catalog::GetEncryptionCipher`, of an encrypted file
+    pub cipher: Option<String>,
 }
 
 /// `TypeVisitor`: `visit` for a type and all types in it.
@@ -339,6 +455,13 @@ pub struct TableLog {
     pub updated_columns: BTreeSet<usize>,
 }
 
+/// An ALTER of a table, as the log says it, and the entry it was made of.
+#[derive(Debug, Clone)]
+pub struct LoggedAlter {
+    pub from: std::sync::Weak<TableCatalogEntry>,
+    pub info: crate::storage::serialization::generated::AlterInfo,
+}
+
 /// A table (`TableCatalogEntry`) and its rows.
 #[derive(Debug)]
 pub struct TableCatalogEntry {
@@ -359,6 +482,12 @@ pub struct TableCatalogEntry {
     /// How the last checkpoint shredded the VARIANT columns of the row groups it wrote, by the row group's first
     /// row id, its rows and the column: the type of the typed part, or `None` when not shredded.
     pub variant_shredding: Mutex<HashMap<(u64, usize, usize), Option<LogicalType>>>,
+    /// What the file has of the table as of its last checkpoint, whatever happened to the rows since: a
+    /// checkpoint keeps the row groups of it whose rows are still the same (`REUSE_EXISTING_ROW_GROUP_METADATA`).
+    checkpointed: RwLock<Option<Arc<dyn TableSource>>>,
+    /// Of each column, which of `checkpointed` it is the same as, if any: an ALTER keeps the columns it doesn't
+    /// change (`RowGroup::AddColumn`, `RemoveColumn`, `AlterType`). `None` while they are those of the file.
+    checkpointed_columns: RwLock<Option<Vec<Option<usize>>>>,
     /// Beyond the NOT NULLs, which are in `columns`.
     pub constraints: Vec<TableConstraint>,
     /// What the write-ahead log knows of the rows.
@@ -387,6 +516,15 @@ pub struct TableCatalogEntry {
     versions: Arc<Mutex<RowVersions>>,
     /// What `COMMENT ON TABLE` said.
     pub comment: Mutex<Option<String>>,
+    /// The ALTERs that made this entry of one the log knows, oldest first, which the log says as such
+    /// (`WriteAlter`): empty when it has to make the table again.
+    pub alters: Mutex<Vec<LoggedAlter>>,
+    /// that of its database, set where the schema it is in has one
+    ahead: RwLock<Option<AheadSlot>>,
+    /// the blocks an append is filling, open until its commit (`PartialBlockManager` of `APPEND_TO_TABLE`)
+    pub append_blocks: Mutex<crate::storage::writer::AppendBlocks>,
+    /// the row groups that threads of an append write ahead at once
+    ahead_claims: AheadClaims,
     /// made by CREATE TABLE AS, whose columns depend on no type (`BindCreateTableInfo` registers
     /// the types of the columns only when there is no query)
     pub from_query: std::sync::atomic::AtomicBool,
@@ -492,6 +630,8 @@ pub struct ColumnStatistics {
     pub geometry: Option<duckrs_common::geometry::GeometryStats>,
     /// of a VARCHAR or BLOB, its `StringStats`, if known
     pub strings: Option<StringStatistics>,
+    /// of a LIST, the lengths of its lists (`ListStatsData`), if known
+    pub lists: Option<ListLengths>,
     /// `distinct_count`: the approximate number of distinct values of a table's column, if known
     pub distinct: Option<u64>,
     /// of a LIST or ARRAY its element's (`ListStats` / `ArrayStats`), of a STRUCT each field's
@@ -499,8 +639,6 @@ pub struct ColumnStatistics {
     pub children: Vec<ColumnStatistics>,
     /// of a VARIANT, how it is shredded (`VariantStats`); `None` when not known (`INCONSISTENT`)
     pub variant: Option<Box<VariantStatistics>>,
-    /// of a LIST (or MAP), the lengths of its lists (`ListStatsData`); `None` when none is known
-    pub lists: Option<ListLengths>,
 }
 
 /// `ListStatsData`: the shortest, longest and total length of the lists that are not NULL, each `None` when not
@@ -565,6 +703,47 @@ pub enum VariantStatistics {
     NotShredded,
     Shredded(LogicalType, ColumnStatistics),
     Inconsistent,
+}
+
+impl ColumnStatistics {
+    /// `BaseStatistics::CreateUnknown`: nothing is known.
+    pub fn unknown() -> Self {
+        Self {
+            min: None,
+            max: None,
+            can_be_null: true,
+            can_be_valid: true,
+            geometry: None,
+            strings: None,
+            distinct: None,
+            children: Vec::new(),
+            variant: None,
+            lists: None,
+        }
+    }
+}
+
+impl ListLengths {
+
+    /// Of one list of `length` elements.
+    pub fn of(length: u64) -> Self {
+        Self {
+            min: Some(length),
+            max: Some(length),
+            total: Some(length),
+        }
+    }
+
+
+    /// `StatsMergeType::EXPAND_BOUNDS` and `ResetTotalListLength`: lists that may be counted twice have no total.
+    pub fn without_total(self) -> Self {
+        Self { total: None, ..self }
+    }
+
+    /// `ListStats::MinListLength`: the shortest, if there is one.
+    pub fn min_length(&self) -> Option<u64> {
+        self.min.filter(|min| *min != u64::MAX)
+    }
 }
 
 /// `StringStatsData`: what is known of the strings of a column besides their bounds.
@@ -636,6 +815,9 @@ pub struct IndexCatalogEntry {
     pub sql: String,
     /// `COMMENT ON INDEX`, which makes a new entry, for a transaction that rolls back to lose it.
     pub comment: Option<String>,
+    /// `ART::storage_version` of an index a file had: `Some(None)` where the file says none
+    /// (`StorageVersion::INVALID`, of before v1.5.0). `None` for a new index, which has the version of its file.
+    pub storage_version: Option<Option<u64>>,
 }
 
 /// The tree of a key, for scans.
@@ -756,6 +938,8 @@ impl TableCatalogEntry {
             source: RwLock::default(),
             read_from: RwLock::default(),
             variant_shredding: Mutex::default(),
+            checkpointed: RwLock::default(),
+            checkpointed_columns: RwLock::default(),
             log: Mutex::default(),
             constraints,
             referenced_by: Mutex::default(),
@@ -772,6 +956,10 @@ impl TableCatalogEntry {
             from_query: std::sync::atomic::AtomicBool::new(false),
             unloaded_deletes: std::sync::atomic::AtomicBool::new(false),
             comment: Mutex::new(None),
+            alters: Mutex::default(),
+            ahead: RwLock::default(),
+            append_blocks: Mutex::default(),
+            ahead_claims: AheadClaims::default(),
         }
     }
 
@@ -780,14 +968,65 @@ impl TableCatalogEntry {
     /// How many rows there are, which takes no reading.
     pub fn row_count(&self) -> usize {
         match &*self.source.read() {
-            Some(source) => source.row_count(),
+            Some(source) => source.row_count() + self.storage.read().len(),
             None => self.storage.read().len(),
         }
     }
 
-    /// Where the rows are, if they are still in a file.
+    /// Where the rows are, if they are still in a file: then `storage` holds those appended after them, if any,
+    /// which are the last part of the source this gives.
     pub fn source(&self) -> Option<Arc<dyn TableSource>> {
-        self.source.read().clone()
+        let source = self.source.read().clone()?;
+        let storage = self.storage.read();
+        if storage.is_empty() {
+            return Some(source);
+        }
+        let mut parts = crate::storage::appended::AppendedTable::parts_of(&source);
+        parts.push(crate::storage::appended::AppendedPart::Memory(Arc::new(
+            storage.clone(),
+        )));
+        let ids = self.row_ids(source.row_count() + storage.len());
+        let ids = (*ids).clone();
+        let appended = crate::storage::appended::AppendedTable::new(parts, ids, self.types(), self.row_group_size());
+        Some(Arc::new(appended))
+    }
+
+    /// The `DistinctStatistics` of each column, as C++ keeps them while rows are appended: those of the file and
+    /// of the row groups written ahead, merged with those of the rows in memory. `None` if those of a part are not
+    /// known (a file that does not have them), and then they come from the rows.
+    pub fn distinct_states(&self) -> Option<Vec<Option<crate::optimizer::distinct_statistics::DistinctState>>> {
+        use crate::optimizer::distinct_statistics::rows_distinct;
+        if let Some(source) = self.source() {
+            return source.distinct_states();
+        }
+        let storage = self.storage.read();
+        Some(
+            self.columns
+                .iter()
+                .enumerate()
+                .map(|(column, definition)| rows_distinct(&storage, column, &definition.ty))
+                .collect(),
+        )
+    }
+
+    /// How many of its rows are in memory.
+    pub fn rows_in_memory(&self) -> usize {
+        self.storage.read().len()
+    }
+
+    /// The rows of the table in its source, without those appended after them in memory.
+    pub fn source_rows(&self) -> usize {
+        self.source.read().as_ref().map_or(0, |source| source.row_count())
+    }
+
+    /// Whether rows can be appended to a table in a file without reading those: nothing that checks the rows
+    /// appended against the others (a key or an index) needs them in memory.
+    pub(crate) fn appends_after_source(&self) -> bool {
+        self.indexes.read().is_empty()
+            && !self
+                .constraints
+                .iter()
+                .any(|c| matches!(c, TableConstraint::Unique { .. } | TableConstraint::ForeignKey(_)))
     }
 
     /// Leaves the rows in a file until something needs them all.
@@ -804,7 +1043,44 @@ impl TableCatalogEntry {
         if !variants.is_empty() {
             *self.variant_shredding.lock() = source.all_variant_shredding(&variants);
         }
+        *self.checkpointed.write() = Some(source.clone());
+        *self.checkpointed_columns.write() = None;
         *self.source.write() = Some(source);
+    }
+
+    /// Of each column, the column of [`Self::checkpointed`] it has the values of, if it is one.
+    pub fn checkpointed_columns(&self) -> Vec<Option<usize>> {
+        match &*self.checkpointed_columns.read() {
+            Some(columns) => columns.clone(),
+            None => (0..self.columns.len()).map(Some).collect(),
+        }
+    }
+
+    /// For a table an ALTER made of one with the rows of `source`: which of its columns each of this one's is.
+    pub fn set_checkpointed_columns(&self, source: Option<Arc<dyn TableSource>>, columns: Vec<Option<usize>>) {
+        let identity = columns.iter().enumerate().all(|(at, column)| *column == Some(at));
+        *self.checkpointed.write() = source;
+        *self.checkpointed_columns.write() = (!identity).then_some(columns);
+    }
+
+    /// Of a table an UPDATE or an ALTER made of one in a file: its rows are still there, but for the columns that
+    /// `source` has in memory. What the last checkpoint wrote stays what it was.
+    pub fn keep_in_file(&self, source: Arc<dyn TableSource>) {
+        self.set_row_ids(source.row_ids());
+        *self.write_loaded_storage() = ColumnDataCollection::new(self.types());
+        *self.read_from.write() = None;
+        *self.source.write() = Some(source);
+        self.statistics.lock().forget();
+    }
+
+    /// [`Self::checkpointed`]: what the last checkpoint left of the table in its file.
+    pub fn checkpointed(&self) -> Option<Arc<dyn TableSource>> {
+        self.checkpointed.read().clone()
+    }
+
+    /// For a copy of the table: what the file had of it.
+    pub fn set_checkpointed(&self, source: Option<Arc<dyn TableSource>>) {
+        *self.checkpointed.write() = source;
     }
 
     /// One column of each chunk in turn, of rows in memory or in a file, which stay there.
@@ -836,6 +1112,8 @@ impl TableCatalogEntry {
         }
         self.set_row_ids(ids);
         *self.write_loaded_storage() = ColumnDataCollection::new(types);
+        *self.checkpointed.write() = Some(source.clone());
+        *self.checkpointed_columns.write() = None;
         *self.source.write() = Some(source);
         self.statistics.lock().forget();
     }
@@ -847,7 +1125,11 @@ impl TableCatalogEntry {
         }
         let mut source = self.source.write();
         if let Some(rows) = source.as_ref() {
-            *self.storage.write() = rows.read_all()?;
+            let mut loaded = rows.read_all()?;
+            let mut storage = self.storage.write();
+            // the rows appended after those in the file
+            loaded.append_collection(&storage);
+            *storage = loaded;
             *self.read_from.write() = source.take();
         }
         Ok(())
@@ -866,6 +1148,11 @@ impl TableCatalogEntry {
             Arc::make_mut(&mut ids).fill(count);
         }
         ids.clone()
+    }
+
+    /// The row groups its rows are in that a checkpoint keeps as such, without giving rows ids.
+    pub fn stored_groups(&self) -> Vec<(u64, usize)> {
+        self.row_ids.lock().stored_groups().to_vec()
     }
 
     pub fn set_row_ids(&self, ids: RowIds) {
@@ -941,11 +1228,194 @@ impl TableCatalogEntry {
         Ok(self.write_loaded_storage())
     }
 
-    /// `write_storage` for what only adds rows at the end.
+    /// `write_storage` for what only adds rows at the end. Rows in a file stay there and the new ones come after
+    /// them in memory, unless something checks those against all the others.
     pub fn append_storage(&self) -> Result<parking_lot::RwLockWriteGuard<'_, ColumnDataCollection>> {
-        let storage = self.write_storage()?;
-        self.rows_appended(storage.len());
+        if !self.appends_after_source() {
+            self.load_rows()?;
+        }
+        let first_new = self.row_count();
+        let storage = self.write_loaded_storage();
+        self.rows_appended(first_new);
         Ok(storage)
+    }
+
+    /// The rows of the table are now `source`, which a commit made of them, writing those it appended to blocks.
+    pub fn set_appended(&self, source: Arc<dyn TableSource>) {
+        self.set_row_ids(source.row_ids());
+        *self.storage.write() = ColumnDataCollection::new(self.types());
+        *self.source.write() = Some(source);
+    }
+
+    /// [`Self::write_full_row_groups`] of `WRITE_BUFFER_ROW_GROUP_COUNT` row groups, with the writer of the table's database.
+    pub fn write_ahead_when_full(&self) -> Result<()> {
+        let slot = self.ahead.read().clone();
+        let Some(writer) = slot.and_then(|slot| slot.read().clone()) else {
+            return Ok(());
+        };
+        self.write_full_row_groups(
+            crate::storage::writer::WRITE_BUFFER_ROW_GROUP_COUNT,
+            &|table, rows, first, id| writer.write(table, rows, first, id, false),
+        )
+    }
+
+    /// `OptimisticDataWriter::WriteNewRowGroup` during an append: once the rows appended to the table in memory have
+    /// `count` row groups full and more rows after them, those row groups go to blocks and out of memory.
+    /// `write` writes them, given the rows, the position of the first and its id.
+    pub fn write_full_row_groups(
+        &self,
+        count: usize,
+        write: &dyn Fn(
+            &TableCatalogEntry,
+            &ColumnDataCollection,
+            usize,
+            u64,
+        ) -> Result<Vec<crate::storage::writer::WrittenGroup>>,
+    ) -> Result<()> {
+        use crate::storage::appended::{AppendedPart, AppendedTable, collection_between};
+        if !self.appends_after_source() {
+            return Ok(());
+        }
+        let group_rows = self.row_group_size();
+        let total = self.row_count();
+        let in_source = self.source_rows();
+        // rows the log has, which a commit has to write as rows, stay
+        let logged = self.log.lock().logged.len();
+        let first = in_source.max(logged);
+        if total <= first + count * group_rows || (self.source.read().is_none() && logged > 0) {
+            return Ok(());
+        }
+        let ids = self.row_ids(total);
+        let first_id = ids.id(first);
+        if ids.id(first + count * group_rows - 1) - first_id != (count * group_rows - 1) as u64 {
+            return Ok(());
+        }
+        // the source before the rows in memory, as everything that takes both does
+        let mut current = self.source.write();
+        let mut storage = self.storage.write();
+        // another thread of the append wrote them meanwhile
+        if current.as_ref().map_or(0, |source| source.row_count()) != in_source || in_source + storage.len() < total {
+            return Ok(());
+        }
+        let offset = first - in_source;
+        let flushed = collection_between(&storage, offset, offset + count * group_rows);
+        let groups = write(self, &flushed, 0, first_id)?;
+        if groups.is_empty() {
+            return Ok(());
+        }
+        let mut parts = match current.clone() {
+            Some(source) => AppendedTable::parts_of(&source),
+            None => Vec::new(),
+        };
+        if offset > 0 {
+            parts.push(AppendedPart::Memory(Arc::new(collection_between(&storage, 0, offset))));
+        }
+        parts.extend(groups.into_iter().map(|group| AppendedPart::Written(Arc::new(group))));
+        let rest = collection_between(&storage, offset + count * group_rows, storage.len());
+        let mut kept_ids = (*ids).clone();
+        kept_ids.truncate(first + count * group_rows);
+        let source = AppendedTable::new(parts, kept_ids, self.types(), group_rows);
+        *storage = rest;
+        *current = Some(Arc::new(source));
+        Ok(())
+    }
+
+    /// [`Self::write_full_row_groups`] of `count` row groups, for threads that append at once: the rows are claimed,
+    /// encoded with no lock held, and placed in the order of their rows, so that the blocks are those one thread
+    /// writes. Whether there were rows to claim.
+    pub fn write_claimed_row_groups(&self, count: usize) -> Result<bool> {
+        use crate::storage::appended::{AppendedPart, AppendedTable, collection_between};
+        let slot = self.ahead.read().clone();
+        let Some(writer) = slot.and_then(|slot| slot.read().clone()) else {
+            return Ok(false);
+        };
+        if !self.appends_after_source() {
+            return Ok(false);
+        }
+        let flushed = count * self.row_group_size();
+        let (turn, first, rows) = {
+            let mut claims = self.ahead_claims.state.lock();
+            let total = self.row_count();
+            let logged = self.log.lock().logged.len();
+            // a statement that failed may have left its claims past the rows that stayed
+            if claims.claimed > total {
+                claims.claimed = 0;
+            }
+            let first = self.source_rows().max(logged).max(claims.claimed);
+            if total <= first + flushed || (self.source.read().is_none() && logged > 0) {
+                return Ok(false);
+            }
+            let ids = self.row_ids(total);
+            if ids.id(first + flushed - 1) - ids.id(first) != (flushed - 1) as u64 {
+                return Ok(false);
+            }
+            let current = self.source.read();
+            let storage = self.storage.read();
+            let in_source = current.as_ref().map_or(0, |source| source.row_count());
+            if first < in_source || in_source + storage.len() < first + flushed {
+                return Ok(false);
+            }
+            let rows = collection_between(&storage, first - in_source, first - in_source + flushed);
+            claims.claimed = first + flushed;
+            claims.next_turn += 1;
+            (claims.next_turn - 1, first, rows)
+        };
+        let encoded = writer.encode(self, &rows);
+        drop(rows);
+        // the turns of the claims before this one first, and the next after this one even where it fails
+        {
+            let mut claims = self.ahead_claims.state.lock();
+            while claims.placing != turn {
+                self.ahead_claims.placed.wait(&mut claims);
+            }
+        }
+        let placed = (|| -> Result<()> {
+            let Some(encoded) = encoded? else {
+                return Ok(());
+            };
+            let ids = self.row_ids(self.row_count());
+            let first_id = ids.id(first);
+            let mut current = self.source.write();
+            let mut storage = self.storage.write();
+            let in_source = current.as_ref().map_or(0, |source| source.row_count());
+            // rows before these, that a claim left in memory, stay there
+            if first < in_source || in_source + storage.len() < first + flushed {
+                return Ok(());
+            }
+            let offset = first - in_source;
+            let groups = writer.place(self, encoded, first_id)?;
+            if groups.is_empty() {
+                return Ok(());
+            }
+            let mut parts = match current.clone() {
+                Some(source) => AppendedTable::parts_of(&source),
+                None => Vec::new(),
+            };
+            if offset > 0 {
+                parts.push(AppendedPart::Memory(Arc::new(collection_between(&storage, 0, offset))));
+            }
+            parts.extend(groups.into_iter().map(|group| AppendedPart::Written(Arc::new(group))));
+            let rest = collection_between(&storage, offset + flushed, storage.len());
+            let mut kept_ids = (*ids).clone();
+            kept_ids.truncate(first + flushed);
+            let source = AppendedTable::new(parts, kept_ids, self.types(), self.row_group_size());
+            *storage = rest;
+            *current = Some(Arc::new(source));
+            Ok(())
+        })();
+        let mut claims = self.ahead_claims.state.lock();
+        claims.placing += 1;
+        self.ahead_claims.placed.notify_all();
+        placed.map(|()| true)
+    }
+
+    /// The end of an append whose threads claimed row groups: all are placed, and the next starts over.
+    pub fn end_claims(&self) {
+        let mut claims = self.ahead_claims.state.lock();
+        while claims.placing != claims.next_turn {
+            self.ahead_claims.placed.wait(&mut claims);
+        }
+        claims.claimed = 0;
     }
 
     /// All rows are durable as they are, in a file or in a log that was replayed.
@@ -1103,8 +1573,48 @@ impl TableCatalogEntry {
 
     /// Drops the rows from `rows` on, which a statement that failed added.
     pub fn truncate(&self, rows: usize) {
-        // rows that are still in a file weren't added to
-        if self.source.read().is_some() {
+        // rows in a file stay; what the statement wrote to blocks of its own goes, and its rows in memory
+        let source = self.source.read().clone();
+        if let Some(source) = source {
+            if let Some(buffer) = crate::storage::appended::AppendedTable::parts_of(&source)
+                .iter()
+                .find_map(|part| match part {
+                    crate::storage::appended::AppendedPart::Written(group) => Some(group.buffer()),
+                    _ => None,
+                })
+            {
+                self.append_blocks.lock().clear(&buffer);
+            }
+            let in_source = source.row_count();
+            if rows < in_source {
+                use crate::storage::appended::{AppendedPart, AppendedTable};
+                let mut kept = Vec::new();
+                let mut end = 0;
+                for part in AppendedTable::parts_of(&source) {
+                    let part_rows = match &part {
+                        AppendedPart::Source(source) => source.row_count(),
+                        AppendedPart::Written(written) => written.rows,
+                        AppendedPart::Memory(memory) => memory.len(),
+                    };
+                    if end + part_rows > rows {
+                        break;
+                    }
+                    end += part_rows;
+                    kept.push(part);
+                }
+                let mut ids = (*self.row_ids(self.row_count())).clone();
+                ids.truncate(end);
+                let source: Arc<dyn TableSource> = match kept.as_slice() {
+                    [AppendedPart::Source(source)] => source.clone(),
+                    _ => Arc::new(AppendedTable::new(kept, ids, self.types(), self.row_group_size())),
+                };
+                *self.source.write() = Some(source);
+                *self.storage.write() = ColumnDataCollection::new(self.types());
+            } else {
+                self.storage.write().truncate(rows - in_source);
+            }
+            Arc::make_mut(&mut self.row_ids.lock()).truncate(rows);
+            self.statistics.lock().forget();
             return;
         }
         self.rows_rewritten();
@@ -1383,6 +1893,7 @@ pub struct SchemaCatalogEntry {
     triggers: RwLock<BTreeMap<String, Arc<TriggerCatalogEntry>>>,
     /// the rows of a row group of the tables of its database (`ROW_GROUP_SIZE`), shared with the catalog
     row_group_rows: Arc<std::sync::atomic::AtomicUsize>,
+    ahead: AheadSlot,
 }
 
 /// A type of CREATE TYPE, and its comment.
@@ -1426,12 +1937,23 @@ impl SchemaCatalogEntry {
 
     /// The schema at `path`, nested in the one before it if there is one.
     fn at_path(path: Vec<String>) -> Self {
-        Self::at_path_in(path, Arc::new(std::sync::atomic::AtomicUsize::new(ROW_GROUP_ROWS)), TEMP_SCHEMA)
+        Self::at_path_in(
+            path,
+            Arc::new(std::sync::atomic::AtomicUsize::new(ROW_GROUP_ROWS)),
+            AheadSlot::default(),
+            TEMP_SCHEMA,
+        )
     }
 
-    fn at_path_in(path: Vec<String>, row_group_rows: Arc<std::sync::atomic::AtomicUsize>, catalog: &str) -> Self {
+    fn at_path_in(
+        path: Vec<String>,
+        row_group_rows: Arc<std::sync::atomic::AtomicUsize>,
+        ahead: AheadSlot,
+        catalog: &str,
+    ) -> Self {
         Self {
             row_group_rows,
+            ahead,
             catalog: catalog.to_string(),
             name: path.last().cloned().unwrap_or_default(),
             path,
@@ -1463,9 +1985,24 @@ impl SchemaCatalogEntry {
         (self.path.len() > 1).then(|| schema_key(&self.path[..self.path.len() - 1]))
     }
 
+    /// What writes the appends of its database ahead of a checkpoint, if it does.
+    pub(crate) fn ahead_writer(&self) -> Option<Arc<dyn AheadWriter>> {
+        self.ahead.read().clone()
+    }
+
+    /// The rows of a row group of its tables.
+    pub(crate) fn row_group_size(&self) -> usize {
+        self.row_group_rows.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// An empty schema at the same place.
     pub(crate) fn empty_like(&self) -> Self {
-        Self::at_path_in(self.path.clone(), self.row_group_rows.clone(), &self.catalog)
+        Self::at_path_in(
+            self.path.clone(),
+            self.row_group_rows.clone(),
+            AheadSlot::default(),
+            &self.catalog,
+        )
     }
 
     /// `DuckSchemaEntry::CreateType`.
@@ -1751,6 +2288,7 @@ impl SchemaCatalogEntry {
             self.row_group_rows.load(std::sync::atomic::Ordering::Relaxed),
             std::sync::atomic::Ordering::Relaxed,
         );
+        *table.ahead.write() = Some(self.ahead.clone());
         let table = Arc::new(table);
         Self::register_foreign_keys(&tables, &table);
         tables.insert(key(name), TableOrView::Table(table.clone()));
@@ -2242,6 +2780,11 @@ pub struct Catalog {
     storage_version: RwLock<Option<duckrs_common::serializer::StorageVersion>>,
     /// `ROW_GROUP_SIZE`: the rows of a row group of its tables, which its schemas share
     pub(crate) row_group_rows: Arc<std::sync::atomic::AtomicUsize>,
+    /// what writes appends ahead of a checkpoint, of a database in a file
+    ahead: AheadSlot,
+    /// `DEFAULT_TABLE`: the table, by its schema (if given) and name, that the name of the database stands for in a
+    /// query (`Catalog::SetDefaultTable`)
+    default_table: RwLock<Option<(Option<String>, String)>>,
 }
 
 thread_local! {
@@ -2381,6 +2924,19 @@ impl Catalog {
         *self.database_list.write() = Some(list);
     }
 
+    /// `Catalog::SetDefaultTable`.
+    pub fn set_default_table(&self, schema: Option<String>, name: String) {
+        *self.default_table.write() = Some((schema, name));
+    }
+
+    /// `Catalog::HasDefaultTable`: the schema (`main` unless given) and name of the default table, if there is one.
+    pub fn default_table(&self) -> Option<(String, String)> {
+        let default = self.default_table.read();
+        let (schema, name) = default.as_ref()?;
+        let schema = schema.clone().unwrap_or_else(|| DEFAULT_SCHEMA.to_string());
+        Some((schema, name.clone()))
+    }
+
     /// All databases, or none if this one is on its own.
     pub fn databases(&self) -> Vec<DatabaseListing> {
         let list = self.database_list.read().as_ref().and_then(std::sync::Weak::upgrade);
@@ -2405,8 +2961,9 @@ impl Catalog {
             for entry in tables.values() {
                 if let TableOrView::Table(table) = entry {
                     // a table that is still in a file comes back as it is, without reading it
+                    // the source as it is, and the rows appended after it in memory
                     let rows = table.storage.read().clone();
-                    let source = table.source();
+                    let source = table.source.read().clone();
                     let indexes = table.indexes.read().clone();
                     table_rows.push(TableRows {
                         table: table.clone(),
@@ -2478,16 +3035,33 @@ impl Catalog {
             forked: false,
             storage_version: RwLock::new(None),
             row_group_rows: Arc::new(std::sync::atomic::AtomicUsize::new(ROW_GROUP_ROWS)),
+            ahead: AheadSlot::default(),
+            default_table: RwLock::new(None),
         };
         for name in [DEFAULT_SCHEMA, TEMP_SCHEMA] {
-            let schema =
-                SchemaCatalogEntry::at_path_in(vec![name.to_string()], catalog.row_group_rows.clone(), &catalog.name);
+            // temporary tables aren't in the file
+            let ahead = if name == TEMP_SCHEMA {
+                AheadSlot::default()
+            } else {
+                catalog.ahead.clone()
+            };
+            let schema = SchemaCatalogEntry::at_path_in(
+                vec![name.to_string()],
+                catalog.row_group_rows.clone(),
+                ahead,
+                &catalog.name,
+            );
             catalog.schemas.write().insert(key(name), Arc::new(schema));
         }
         catalog
     }
 
     /// `ROW_GROUP_SIZE` of the database: the tables created from now on have row groups of this many rows.
+    /// What writes the appends of the database ahead of a checkpoint.
+    pub fn set_ahead_writer(&self, writer: Arc<dyn AheadWriter>) {
+        *self.ahead.write() = Some(writer);
+    }
+
     pub fn set_row_group_rows(&self, rows: usize) {
         self.row_group_rows.store(rows, std::sync::atomic::Ordering::Relaxed);
     }
@@ -2533,6 +3107,7 @@ impl Catalog {
             Arc::new(SchemaCatalogEntry::at_path_in(
                 path.to_vec(),
                 self.row_group_rows.clone(),
+                self.ahead.clone(),
                 &self.name,
             )),
         );

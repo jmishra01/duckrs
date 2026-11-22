@@ -22,10 +22,27 @@ pub mod string_util;
 pub mod types;
 pub mod value;
 pub mod variant;
-pub mod variant_shredding;
 pub mod vector;
 
 pub use error::{Error, ErrorKind, Result};
 
 /// The number of rows in a vector (`STANDARD_VECTOR_SIZE`).
 pub const STANDARD_VECTOR_SIZE: usize = 2048;
+
+/// Asks for the memory of `value` to be brought into the cache, without waiting for it (a prefetch never faults).
+#[inline(always)]
+pub fn prefetch<T: ?Sized>(value: &T) {
+    let address = std::ptr::from_ref(value).cast::<u8>();
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: `prfm` only hints at a read of a valid address; it reads no register and writes no memory
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) address, options(nostack, readonly, preserves_flags));
+    }
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: a prefetch only hints at a read; it never faults
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(address.cast::<i8>(), std::arch::x86_64::_MM_HINT_T0);
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    let _ = address;
+}

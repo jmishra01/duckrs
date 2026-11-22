@@ -26,24 +26,17 @@ fn for_each_valid<E>(
     count: usize,
     mut op: impl FnMut(usize) -> Result<(), E>,
 ) -> Result<(), E> {
-    let Some(entries) = validity.entries() else {
-        for i in 0..count {
-            op(i)?;
+    // one call of `op`, so that it inlines; whether an entry is all valid doesn't change along its rows
+    let entries = validity.entries();
+    for start in (0..count).step_by(ENTRY) {
+        let entry = entries.map_or(u64::MAX, |entries| entries.get(start / ENTRY).copied().unwrap_or(0));
+        if entry == 0 {
+            continue;
         }
-        return Ok(());
-    };
-    for (entry_idx, &entry) in entries.iter().enumerate().take(count.div_ceil(ENTRY)) {
-        let start = entry_idx * ENTRY;
         let end = (start + ENTRY).min(count);
-        if entry == u64::MAX {
-            for i in start..end {
+        for i in start..end {
+            if entry == u64::MAX || entry & (1 << (i - start)) != 0 {
                 op(i)?;
-            }
-        } else if entry != 0 {
-            for i in start..end {
-                if entry & (1 << (i - start)) != 0 {
-                    op(i)?;
-                }
             }
         }
     }
@@ -241,6 +234,30 @@ where
         let (lu, ru) = (left.to_unified(count), right.to_unified(count));
         let (a, b) = (lu.data::<A>(), ru.data::<B>());
         let out = result.data_mut::<R>();
+        // no NULL on either side: a loop for the kind of selection of each, with no check of a row's validity
+        if lu.validity.all_valid() && ru.validity.all_valid() {
+            use crate::vector::SelectionVector::{Identity, Zero};
+            macro_rules! each {
+                ($left:expr, $right:expr) => {{
+                    for (i, slot) in out.iter_mut().enumerate().take(count) {
+                        match f(a[$left(i)], b[$right(i)])? {
+                            Some(r) => *slot = r,
+                            None => nulls.push(i),
+                        }
+                    }
+                }};
+            }
+            match ((&lu.sel, lu.sel.indices()), (&ru.sel, ru.sel.indices())) {
+                ((_, Some(x)), (_, Some(y))) => each!(|i: usize| x[i] as usize, |i: usize| y[i] as usize),
+                ((_, Some(x)), (Identity, _)) => each!(|i: usize| x[i] as usize, |i: usize| i),
+                ((Identity, _), (_, Some(y))) => each!(|i: usize| i, |i: usize| y[i] as usize),
+                ((_, Some(x)), (Zero, _)) => each!(|i: usize| x[i] as usize, |_| 0),
+                ((Zero, _), (_, Some(y))) => each!(|_| 0, |i: usize| y[i] as usize),
+                ((left, _), (right, _)) => each!(|i: usize| left.get(i), |i: usize| right.get(i)),
+            }
+            nulls.into_iter().for_each(|i| result.set_null(i, true));
+            return Ok(());
+        }
         for (i, slot) in out.iter_mut().enumerate().take(count) {
             let (li, ri) = (lu.sel.get(i), ru.sel.get(i));
             if !lu.validity.is_valid(li) || !ru.validity.is_valid(ri) {

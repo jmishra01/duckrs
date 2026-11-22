@@ -27,6 +27,119 @@ pub mod enums {
             ];
         }
     }
+    pub mod alter_database_type {
+        pub const RENAME_DATABASE: u64 = 0;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "AlterDatabaseType";
+            const NAMES: &'static [(&'static str, u64)] = &[("RENAME_DATABASE", 0)];
+        }
+    }
+    pub mod alter_foreign_key_type {
+        pub const AFT_ADD: u64 = 0;
+        pub const AFT_DELETE: u64 = 1;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "AlterForeignKeyType";
+            const NAMES: &'static [(&'static str, u64)] = &[("AFT_ADD", 0), ("AFT_DELETE", 1)];
+        }
+    }
+    pub mod alter_schema_type {
+        pub const INVALID: u64 = 0;
+        pub const SET_SCHEMA_OPTIONS: u64 = 1;
+        pub const RESET_SCHEMA_OPTIONS: u64 = 2;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "AlterSchemaType";
+            const NAMES: &'static [(&'static str, u64)] =
+                &[("INVALID", 0), ("SET_SCHEMA_OPTIONS", 1), ("RESET_SCHEMA_OPTIONS", 2)];
+        }
+    }
+    pub mod alter_table_type {
+        pub const INVALID: u64 = 0;
+        pub const RENAME_COLUMN: u64 = 1;
+        pub const RENAME_TABLE: u64 = 2;
+        pub const ADD_COLUMN: u64 = 3;
+        pub const REMOVE_COLUMN: u64 = 4;
+        pub const ALTER_COLUMN_TYPE: u64 = 5;
+        pub const SET_DEFAULT: u64 = 6;
+        pub const FOREIGN_KEY_CONSTRAINT: u64 = 7;
+        pub const SET_NOT_NULL: u64 = 8;
+        pub const DROP_NOT_NULL: u64 = 9;
+        pub const SET_COLUMN_COMMENT: u64 = 10;
+        pub const ADD_CONSTRAINT: u64 = 11;
+        pub const SET_PARTITIONED_BY: u64 = 12;
+        pub const SET_SORTED_BY: u64 = 13;
+        pub const ADD_FIELD: u64 = 14;
+        pub const REMOVE_FIELD: u64 = 15;
+        pub const RENAME_FIELD: u64 = 16;
+        pub const SET_TABLE_OPTIONS: u64 = 17;
+        pub const RESET_TABLE_OPTIONS: u64 = 18;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "AlterTableType";
+            const NAMES: &'static [(&'static str, u64)] = &[
+                ("INVALID", 0),
+                ("RENAME_COLUMN", 1),
+                ("RENAME_TABLE", 2),
+                ("ADD_COLUMN", 3),
+                ("REMOVE_COLUMN", 4),
+                ("ALTER_COLUMN_TYPE", 5),
+                ("SET_DEFAULT", 6),
+                ("FOREIGN_KEY_CONSTRAINT", 7),
+                ("SET_NOT_NULL", 8),
+                ("DROP_NOT_NULL", 9),
+                ("SET_COLUMN_COMMENT", 10),
+                ("ADD_CONSTRAINT", 11),
+                ("SET_PARTITIONED_BY", 12),
+                ("SET_SORTED_BY", 13),
+                ("ADD_FIELD", 14),
+                ("REMOVE_FIELD", 15),
+                ("RENAME_FIELD", 16),
+                ("SET_TABLE_OPTIONS", 17),
+                ("RESET_TABLE_OPTIONS", 18),
+            ];
+        }
+    }
+    pub mod alter_type {
+        pub const INVALID: u64 = 0;
+        pub const ALTER_TABLE: u64 = 1;
+        pub const ALTER_VIEW: u64 = 2;
+        pub const ALTER_SEQUENCE: u64 = 3;
+        pub const CHANGE_OWNERSHIP: u64 = 4;
+        pub const ALTER_SCALAR_FUNCTION: u64 = 5;
+        pub const ALTER_TABLE_FUNCTION: u64 = 6;
+        pub const SET_COMMENT: u64 = 7;
+        pub const SET_COLUMN_COMMENT: u64 = 8;
+        pub const ALTER_DATABASE: u64 = 9;
+        pub const ALTER_SCHEMA: u64 = 10;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "AlterType";
+            const NAMES: &'static [(&'static str, u64)] = &[
+                ("INVALID", 0),
+                ("ALTER_TABLE", 1),
+                ("ALTER_VIEW", 2),
+                ("ALTER_SEQUENCE", 3),
+                ("CHANGE_OWNERSHIP", 4),
+                ("ALTER_SCALAR_FUNCTION", 5),
+                ("ALTER_TABLE_FUNCTION", 6),
+                ("SET_COMMENT", 7),
+                ("SET_COLUMN_COMMENT", 8),
+                ("ALTER_DATABASE", 9),
+                ("ALTER_SCHEMA", 10),
+            ];
+        }
+    }
+    pub mod alter_view_type {
+        pub const INVALID: u64 = 0;
+        pub const RENAME_VIEW: u64 = 1;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "AlterViewType";
+            const NAMES: &'static [(&'static str, u64)] = &[("INVALID", 0), ("RENAME_VIEW", 1)];
+        }
+    }
     pub mod cte_materialize {
         pub const CTE_MATERIALIZE_DEFAULT: u64 = 1;
         pub const CTE_MATERIALIZE_ALWAYS: u64 = 2;
@@ -573,6 +686,26 @@ pub mod enums {
             ];
         }
     }
+    pub mod load_type {
+        pub const LOAD: u64 = 0;
+        pub const INSTALL: u64 = 1;
+        pub const FORCE_INSTALL: u64 = 2;
+        pub const LOAD_AS: u64 = 3;
+        pub const CREATE_REPOSITORY: u64 = 4;
+        pub const DROP_REPOSITORY: u64 = 5;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "LoadType";
+            const NAMES: &'static [(&'static str, u64)] = &[
+                ("LOAD", 0),
+                ("INSTALL", 1),
+                ("FORCE_INSTALL", 2),
+                ("LOAD_AS", 3),
+                ("CREATE_REPOSITORY", 4),
+                ("DROP_REPOSITORY", 5),
+            ];
+        }
+    }
     pub mod macro_type {
         pub const VOID_MACRO: u64 = 0;
         pub const TABLE_MACRO: u64 = 1;
@@ -609,6 +742,15 @@ pub mod enums {
                 ("REPLACE_ON_CONFLICT", 2),
                 ("ALTER_ON_CONFLICT", 3),
             ];
+        }
+    }
+    pub mod on_entry_not_found {
+        pub const THROW_EXCEPTION: u64 = 0;
+        pub const RETURN_NULL: u64 = 1;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "OnEntryNotFound";
+            const NAMES: &'static [(&'static str, u64)] = &[("THROW_EXCEPTION", 0), ("RETURN_NULL", 1)];
         }
     }
     pub mod order_by_null_type {
@@ -656,6 +798,52 @@ pub mod enums {
         impl duckrs_common::serializer::EnumNames for Names {
             const NAME: &'static str = "OrdinalityType";
             const NAMES: &'static [(&'static str, u64)] = &[("WITHOUT_ORDINALITY", 0), ("WITH_ORDINALITY", 1)];
+        }
+    }
+    pub mod parse_info_type {
+        pub const ALTER_INFO: u64 = 0;
+        pub const ATTACH_INFO: u64 = 1;
+        pub const COPY_INFO: u64 = 2;
+        pub const CREATE_INFO: u64 = 3;
+        pub const CREATE_SECRET_INFO: u64 = 4;
+        pub const DETACH_INFO: u64 = 5;
+        pub const DROP_INFO: u64 = 6;
+        pub const BOUND_EXPORT_DATA: u64 = 7;
+        pub const LOAD_INFO: u64 = 8;
+        pub const PRAGMA_INFO: u64 = 9;
+        pub const SHOW_SELECT_INFO: u64 = 10;
+        pub const TRANSACTION_INFO: u64 = 11;
+        pub const VACUUM_INFO: u64 = 12;
+        pub const COMMENT_ON_INFO: u64 = 13;
+        pub const COMMENT_ON_COLUMN_INFO: u64 = 14;
+        pub const COPY_DATABASE_INFO: u64 = 15;
+        pub const UPDATE_EXTENSIONS_INFO: u64 = 16;
+        pub const CONNECT_INFO: u64 = 17;
+        pub const DISCONNECT_INFO: u64 = 18;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "ParseInfoType";
+            const NAMES: &'static [(&'static str, u64)] = &[
+                ("ALTER_INFO", 0),
+                ("ATTACH_INFO", 1),
+                ("COPY_INFO", 2),
+                ("CREATE_INFO", 3),
+                ("CREATE_SECRET_INFO", 4),
+                ("DETACH_INFO", 5),
+                ("DROP_INFO", 6),
+                ("BOUND_EXPORT_DATA", 7),
+                ("LOAD_INFO", 8),
+                ("PRAGMA_INFO", 9),
+                ("SHOW_SELECT_INFO", 10),
+                ("TRANSACTION_INFO", 11),
+                ("VACUUM_INFO", 12),
+                ("COMMENT_ON_INFO", 13),
+                ("COMMENT_ON_COLUMN_INFO", 14),
+                ("COPY_DATABASE_INFO", 15),
+                ("UPDATE_EXTENSIONS_INFO", 16),
+                ("CONNECT_INFO", 17),
+                ("DISCONNECT_INFO", 18),
+            ];
         }
     }
     pub mod query_node_type {
@@ -795,6 +983,46 @@ pub mod enums {
                 ("BOUND_TABLE_REF", 13),
                 ("MATCH_RECOGNIZE", 14),
             ];
+        }
+    }
+    pub mod transaction_invalidation_policy {
+        pub const STANDARD_POLICY: u64 = 0;
+        pub const SYNTACTIC_ERRORS_DO_NOT_INVALIDATE: u64 = 1;
+        pub const ALL_ERRORS_INVALIDATE_TRANSACTION: u64 = 2;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "TransactionInvalidationPolicy";
+            const NAMES: &'static [(&'static str, u64)] = &[
+                ("STANDARD_POLICY", 0),
+                ("SYNTACTIC_ERRORS_DO_NOT_INVALIDATE", 1),
+                ("ALL_ERRORS_INVALIDATE_TRANSACTION", 2),
+            ];
+        }
+    }
+    pub mod transaction_modifier_type {
+        pub const TRANSACTION_DEFAULT_MODIFIER: u64 = 0;
+        pub const TRANSACTION_READ_ONLY: u64 = 1;
+        pub const TRANSACTION_READ_WRITE: u64 = 2;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "TransactionModifierType";
+            const NAMES: &'static [(&'static str, u64)] = &[
+                ("TRANSACTION_DEFAULT_MODIFIER", 0),
+                ("TRANSACTION_READ_ONLY", 1),
+                ("TRANSACTION_READ_WRITE", 2),
+            ];
+        }
+    }
+    pub mod transaction_type {
+        pub const INVALID: u64 = 0;
+        pub const BEGIN_TRANSACTION: u64 = 1;
+        pub const COMMIT: u64 = 2;
+        pub const ROLLBACK: u64 = 3;
+        pub struct Names;
+        impl duckrs_common::serializer::EnumNames for Names {
+            const NAME: &'static str = "TransactionType";
+            const NAMES: &'static [(&'static str, u64)] =
+                &[("INVALID", 0), ("BEGIN_TRANSACTION", 1), ("COMMIT", 2), ("ROLLBACK", 3)];
         }
     }
     pub mod trigger_event_type {
@@ -1195,6 +1423,100 @@ impl Deserialize for BlockPointer {
 }
 
 impl Serialize for BlockPointer {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ParseInfo {
+    pub info_type: u64,
+    pub kind: ParseInfoKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum ParseInfoKind {
+    AlterInfo(AlterInfo),
+    AttachInfo(AttachInfo),
+    CopyDatabaseInfo(CopyDatabaseInfo),
+    CopyInfo(CopyInfo),
+    DetachInfo(DetachInfo),
+    ConnectInfo(ConnectInfo),
+    DisconnectInfo(DisconnectInfo),
+    DropInfo(DropInfo),
+    LoadInfo(LoadInfo),
+    UpdateExtensionsInfo(UpdateExtensionsInfo),
+    PragmaInfo(PragmaInfo),
+    TransactionInfo(TransactionInfo),
+    VacuumInfo(VacuumInfo),
+    BoundExportData(BoundExportData),
+}
+
+impl ParseInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let info_type = d
+            .read_property::<Enum<enums::parse_info_type::Names>>(100, "info_type")?
+            .0;
+        let kind = match u64::from(info_type) {
+            enums::parse_info_type::ALTER_INFO => ParseInfoKind::AlterInfo(AlterInfo::read_members(d)?),
+            enums::parse_info_type::ATTACH_INFO => ParseInfoKind::AttachInfo(AttachInfo::read_members(d)?),
+            enums::parse_info_type::COPY_DATABASE_INFO => {
+                ParseInfoKind::CopyDatabaseInfo(CopyDatabaseInfo::read_members(d)?)
+            }
+            enums::parse_info_type::COPY_INFO => ParseInfoKind::CopyInfo(CopyInfo::read_members(d)?),
+            enums::parse_info_type::DETACH_INFO => ParseInfoKind::DetachInfo(DetachInfo::read_members(d)?),
+            enums::parse_info_type::CONNECT_INFO => ParseInfoKind::ConnectInfo(ConnectInfo::read_members(d)?),
+            enums::parse_info_type::DISCONNECT_INFO => ParseInfoKind::DisconnectInfo(DisconnectInfo::read_members(d)?),
+            enums::parse_info_type::DROP_INFO => ParseInfoKind::DropInfo(DropInfo::read_members(d)?),
+            enums::parse_info_type::LOAD_INFO => ParseInfoKind::LoadInfo(LoadInfo::read_members(d)?),
+            enums::parse_info_type::UPDATE_EXTENSIONS_INFO => {
+                ParseInfoKind::UpdateExtensionsInfo(UpdateExtensionsInfo::read_members(d)?)
+            }
+            enums::parse_info_type::PRAGMA_INFO => ParseInfoKind::PragmaInfo(PragmaInfo::read_members(d)?),
+            enums::parse_info_type::TRANSACTION_INFO => {
+                ParseInfoKind::TransactionInfo(TransactionInfo::read_members(d)?)
+            }
+            enums::parse_info_type::VACUUM_INFO => ParseInfoKind::VacuumInfo(VacuumInfo::read_members(d)?),
+            enums::parse_info_type::BOUND_EXPORT_DATA => {
+                ParseInfoKind::BoundExportData(BoundExportData::read_members(d)?)
+            }
+            other => return Err(unknown("ParseInfo", other)),
+        };
+        Ok(Self { info_type, kind })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property(
+            100,
+            "info_type",
+            &Enum::<enums::parse_info_type::Names>::new(self.info_type),
+        );
+        match &self.kind {
+            ParseInfoKind::AlterInfo(value) => value.write_members(s),
+            ParseInfoKind::AttachInfo(value) => value.write_members(s),
+            ParseInfoKind::CopyDatabaseInfo(value) => value.write_members(s),
+            ParseInfoKind::CopyInfo(value) => value.write_members(s),
+            ParseInfoKind::DetachInfo(value) => value.write_members(s),
+            ParseInfoKind::ConnectInfo(value) => value.write_members(s),
+            ParseInfoKind::DisconnectInfo(value) => value.write_members(s),
+            ParseInfoKind::DropInfo(value) => value.write_members(s),
+            ParseInfoKind::LoadInfo(value) => value.write_members(s),
+            ParseInfoKind::UpdateExtensionsInfo(value) => value.write_members(s),
+            ParseInfoKind::PragmaInfo(value) => value.write_members(s),
+            ParseInfoKind::TransactionInfo(value) => value.write_members(s),
+            ParseInfoKind::VacuumInfo(value) => value.write_members(s),
+            ParseInfoKind::BoundExportData(value) => value.write_members(s),
+        }
+    }
+}
+
+impl Deserialize for ParseInfo {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for ParseInfo {
     fn write_value(&self, s: &mut BinarySerializer) {
         s.write_object_value(|s| self.write_members(s));
     }
@@ -2525,6 +2847,569 @@ impl Serialize for FixedSizeAllocatorInfo {
 }
 
 #[derive(Debug, Clone)]
+pub struct AlterInfo {
+    pub type_: u64,
+    pub catalog: String,
+    pub schema: String,
+    pub name: String,
+    pub if_not_found: u64,
+    pub allow_internal: bool,
+    pub qualified_name: Option<QualifiedName>,
+    pub kind: AlterInfoKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum AlterInfoKind {
+    AlterTableInfo(AlterTableInfo),
+    SetCommentInfo(SetCommentInfo),
+    ChangeOwnershipInfo(ChangeOwnershipInfo),
+    SetColumnCommentInfo(SetColumnCommentInfo),
+    AlterViewInfo(AlterViewInfo),
+    AlterDatabaseInfo(AlterDatabaseInfo),
+    AlterSchemaInfo(AlterSchemaInfo),
+}
+
+impl AlterInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let type_ = d.read_property::<Enum<enums::alter_type::Names>>(200, "type")?.0;
+        let catalog = d.read_property_with_default::<String>(201, "catalog")?;
+        let schema = d.read_property_with_default::<String>(202, "schema")?;
+        let name = d.read_property_with_default::<String>(203, "name")?;
+        let if_not_found = d
+            .read_property::<Enum<enums::on_entry_not_found::Names>>(204, "if_not_found")?
+            .0;
+        let allow_internal = d.read_property_with_default::<bool>(205, "allow_internal")?;
+        let qualified_name = d.read_optional_property::<QualifiedName>(206, "qualified_name")?;
+        let kind = match u64::from(type_) {
+            enums::alter_type::ALTER_TABLE => AlterInfoKind::AlterTableInfo(AlterTableInfo::read_members(d)?),
+            enums::alter_type::SET_COMMENT => AlterInfoKind::SetCommentInfo(SetCommentInfo::read_members(d)?),
+            enums::alter_type::CHANGE_OWNERSHIP => {
+                AlterInfoKind::ChangeOwnershipInfo(ChangeOwnershipInfo::read_members(d)?)
+            }
+            enums::alter_type::SET_COLUMN_COMMENT => {
+                AlterInfoKind::SetColumnCommentInfo(SetColumnCommentInfo::read_members(d)?)
+            }
+            enums::alter_type::ALTER_VIEW => AlterInfoKind::AlterViewInfo(AlterViewInfo::read_members(d)?),
+            enums::alter_type::ALTER_DATABASE => AlterInfoKind::AlterDatabaseInfo(AlterDatabaseInfo::read_members(d)?),
+            enums::alter_type::ALTER_SCHEMA => AlterInfoKind::AlterSchemaInfo(AlterSchemaInfo::read_members(d)?),
+            other => return Err(unknown("AlterInfo", other)),
+        };
+        Ok(Self {
+            type_,
+            catalog,
+            schema,
+            name,
+            if_not_found,
+            allow_internal,
+            qualified_name,
+            kind,
+        })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property(200, "type", &Enum::<enums::alter_type::Names>::new(self.type_));
+        s.write_property_with_default(201, "catalog", &self.catalog);
+        s.write_property_with_default(202, "schema", &self.schema);
+        s.write_property_with_default(203, "name", &self.name);
+        s.write_property(
+            204,
+            "if_not_found",
+            &Enum::<enums::on_entry_not_found::Names>::new(self.if_not_found),
+        );
+        s.write_property_with_default(205, "allow_internal", &self.allow_internal);
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_optional_property(206, "qualified_name", self.qualified_name.as_ref());
+        }
+        match &self.kind {
+            AlterInfoKind::AlterTableInfo(value) => value.write_members(s),
+            AlterInfoKind::SetCommentInfo(value) => value.write_members(s),
+            AlterInfoKind::ChangeOwnershipInfo(value) => value.write_members(s),
+            AlterInfoKind::SetColumnCommentInfo(value) => value.write_members(s),
+            AlterInfoKind::AlterViewInfo(value) => value.write_members(s),
+            AlterInfoKind::AlterDatabaseInfo(value) => value.write_members(s),
+            AlterInfoKind::AlterSchemaInfo(value) => value.write_members(s),
+        }
+    }
+}
+
+impl Deserialize for AlterInfo {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for AlterInfo {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AttachInfo {
+    pub name: String,
+    pub path: String,
+    pub options: u64,
+    pub on_conflict: Option<u64>,
+    pub external_resource: Option<Box<u64>>,
+}
+
+impl AttachInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let name = d.read_property_with_default::<String>(200, "name")?;
+        let path = d.read_property_with_default::<String>(201, "path")?;
+        let options = d.read_property_with_default::<u64>(202, "options")?;
+        let on_conflict = d
+            .read_optional_property::<Enum<enums::on_create_conflict::Names>>(203, "on_conflict")?
+            .map(|e| e.0);
+        let external_resource = d.read_property_with_default::<Option<Box<u64>>>(204, "external_resource")?;
+        Ok(Self {
+            name,
+            path,
+            options,
+            on_conflict,
+            external_resource,
+        })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "name", &self.name);
+        s.write_property_with_default(201, "path", &self.path);
+        s.write_property_with_default(202, "options", &self.options);
+        s.write_optional_property(
+            203,
+            "on_conflict",
+            self.on_conflict
+                .map(Enum::<enums::on_create_conflict::Names>::new)
+                .as_ref(),
+        );
+        s.write_property_with_default(204, "external_resource", &self.external_resource);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CopyDatabaseInfo {
+    pub target_database: String,
+    pub entries: Vec<Option<Box<CreateInfo>>>,
+}
+
+impl CopyDatabaseInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let target_database = d.read_property_with_default::<String>(200, "target_database")?;
+        let entries = d.read_property_with_default::<Vec<Option<Box<CreateInfo>>>>(201, "entries")?;
+        Ok(Self {
+            target_database,
+            entries,
+        })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "target_database", &self.target_database);
+        s.write_property_with_default(201, "entries", &self.entries);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CopyInfo {
+    pub catalog: String,
+    pub schema: String,
+    pub table: String,
+    pub select_list: Vec<String>,
+    pub is_from: bool,
+    pub format: String,
+    pub file_path: String,
+    pub options: Vec<(String, Vec<Value>)>,
+    pub select_statement: Option<Box<QueryNode>>,
+    pub is_format_auto_detected: bool,
+    pub file_path_expression: Option<Box<ParsedExpression>>,
+    pub parsed_options: Vec<(String, Option<Box<ParsedExpression>>)>,
+    pub qualified_name: Option<QualifiedName>,
+}
+
+impl CopyInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let catalog = d.read_property_with_default::<String>(200, "catalog")?;
+        let schema = d.read_property_with_default::<String>(201, "schema")?;
+        let table = d.read_property_with_default::<String>(202, "table")?;
+        let select_list = d.read_property_with_default::<Vec<String>>(203, "select_list")?;
+        let is_from = d.read_property_with_default::<bool>(204, "is_from")?;
+        let format = d.read_property_with_default::<String>(205, "format")?;
+        let file_path = d.read_property_with_default::<String>(206, "file_path")?;
+        let options = d
+            .read_property_with_default::<Map<String, Vec<Value>>>(207, "options")?
+            .0;
+        let select_statement = d.read_property_with_default::<Option<Box<QueryNode>>>(208, "select_statement")?;
+        let is_format_auto_detected = d.read_property_with_default::<bool>(209, "is_format_auto_detected")?;
+        let file_path_expression =
+            d.read_property_with_default::<Option<Box<ParsedExpression>>>(210, "file_path_expression")?;
+        let parsed_options = d
+            .read_property_with_default::<Map<String, Option<Box<ParsedExpression>>>>(211, "parsed_options")?
+            .0;
+        let qualified_name = d.read_optional_property::<QualifiedName>(212, "qualified_name")?;
+        Ok(Self {
+            catalog,
+            schema,
+            table,
+            select_list,
+            is_from,
+            format,
+            file_path,
+            options,
+            select_statement,
+            is_format_auto_detected,
+            file_path_expression,
+            parsed_options,
+            qualified_name,
+        })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "catalog", &self.catalog);
+        s.write_property_with_default(201, "schema", &self.schema);
+        s.write_property_with_default(202, "table", &self.table);
+        s.write_property_with_default(203, "select_list", &self.select_list);
+        s.write_property_with_default(204, "is_from", &self.is_from);
+        s.write_property_with_default(205, "format", &self.format);
+        s.write_property_with_default(206, "file_path", &self.file_path);
+        s.write_property_with_default(207, "options", &MapRef(&self.options));
+        s.write_property_with_default(208, "select_statement", &self.select_statement);
+        s.write_property_with_default(209, "is_format_auto_detected", &self.is_format_auto_detected);
+        s.write_property_with_default(210, "file_path_expression", &self.file_path_expression);
+        s.write_property_with_default(211, "parsed_options", &MapRef(&self.parsed_options));
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_optional_property(212, "qualified_name", self.qualified_name.as_ref());
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DetachInfo {
+    pub name: String,
+    pub if_not_found: u64,
+}
+
+impl DetachInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let name = d.read_property_with_default::<String>(200, "name")?;
+        let if_not_found = d
+            .read_property::<Enum<enums::on_entry_not_found::Names>>(201, "if_not_found")?
+            .0;
+        Ok(Self { name, if_not_found })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "name", &self.name);
+        s.write_property(
+            201,
+            "if_not_found",
+            &Enum::<enums::on_entry_not_found::Names>::new(self.if_not_found),
+        );
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ConnectInfo {
+    pub name: String,
+    pub name_is_string_literal: bool,
+    pub target_is_local: bool,
+    pub options: u64,
+    pub external_resource: Option<Box<u64>>,
+}
+
+impl ConnectInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let name = d.read_property_with_default::<String>(200, "name")?;
+        let name_is_string_literal = d.read_property_with_default::<bool>(201, "name_is_string_literal")?;
+        let target_is_local = d.read_property_with_default::<bool>(202, "target_is_local")?;
+        let options = d.read_property_with_default::<u64>(203, "options")?;
+        let external_resource = d.read_property_with_default::<Option<Box<u64>>>(204, "external_resource")?;
+        Ok(Self {
+            name,
+            name_is_string_literal,
+            target_is_local,
+            options,
+            external_resource,
+        })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "name", &self.name);
+        s.write_property_with_default(201, "name_is_string_literal", &self.name_is_string_literal);
+        s.write_property_with_default(202, "target_is_local", &self.target_is_local);
+        s.write_property_with_default(203, "options", &self.options);
+        s.write_property_with_default(204, "external_resource", &self.external_resource);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DisconnectInfo {}
+
+impl DisconnectInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        Ok(Self {})
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {}
+}
+
+#[derive(Debug, Clone)]
+pub struct DropInfo {
+    pub type_: u64,
+    pub catalog: String,
+    pub schema: String,
+    pub name: String,
+    pub if_not_found: u64,
+    pub cascade: bool,
+    pub allow_drop_internal: bool,
+    pub extra_drop_info: Option<Box<u64>>,
+    pub qualified_name: Option<QualifiedName>,
+}
+
+impl DropInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let type_ = d.read_property::<Enum<enums::catalog_type::Names>>(200, "type")?.0;
+        let catalog = d.read_property_with_default::<String>(201, "catalog")?;
+        let schema = d.read_property_with_default::<String>(202, "schema")?;
+        let name = d.read_property_with_default::<String>(203, "name")?;
+        let if_not_found = d
+            .read_property::<Enum<enums::on_entry_not_found::Names>>(204, "if_not_found")?
+            .0;
+        let cascade = d.read_property_with_default::<bool>(205, "cascade")?;
+        let allow_drop_internal = d.read_property_with_default::<bool>(206, "allow_drop_internal")?;
+        let extra_drop_info = d.read_property_with_default::<Option<Box<u64>>>(207, "extra_drop_info")?;
+        let qualified_name = d.read_optional_property::<QualifiedName>(208, "qualified_name")?;
+        Ok(Self {
+            type_,
+            catalog,
+            schema,
+            name,
+            if_not_found,
+            cascade,
+            allow_drop_internal,
+            extra_drop_info,
+            qualified_name,
+        })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property(200, "type", &Enum::<enums::catalog_type::Names>::new(self.type_));
+        s.write_property_with_default(201, "catalog", &self.catalog);
+        s.write_property_with_default(202, "schema", &self.schema);
+        s.write_property_with_default(203, "name", &self.name);
+        s.write_property(
+            204,
+            "if_not_found",
+            &Enum::<enums::on_entry_not_found::Names>::new(self.if_not_found),
+        );
+        s.write_property_with_default(205, "cascade", &self.cascade);
+        s.write_property_with_default(206, "allow_drop_internal", &self.allow_drop_internal);
+        s.write_property_with_default(207, "extra_drop_info", &self.extra_drop_info);
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_optional_property(208, "qualified_name", self.qualified_name.as_ref());
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LoadInfo {
+    pub filename: String,
+    pub load_type: u64,
+    pub repository: String,
+    pub version: String,
+    pub repo_is_alias: bool,
+    pub alias: String,
+    pub repository_url: String,
+    pub public_keys: Vec<String>,
+    pub on_conflict: Option<u64>,
+    pub missing_ok: Option<bool>,
+    pub load_after_install: Option<bool>,
+}
+
+impl LoadInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let filename = d.read_property_with_default::<String>(200, "filename")?;
+        let load_type = d.read_property::<Enum<enums::load_type::Names>>(201, "load_type")?.0;
+        let repository = d.read_property_with_default::<String>(202, "repository")?;
+        let version = d.read_property_with_default::<String>(203, "version")?;
+        let repo_is_alias = d.read_property_with_default::<bool>(204, "repo_is_alias")?;
+        let alias = d.read_property_with_default::<String>(205, "alias")?;
+        let repository_url = d.read_property_with_default::<String>(206, "repository_url")?;
+        let public_keys = d.read_property_with_default::<Vec<String>>(207, "public_keys")?;
+        let on_conflict = d
+            .read_optional_property::<Enum<enums::on_create_conflict::Names>>(208, "on_conflict")?
+            .map(|e| e.0);
+        let missing_ok = d.read_optional_property::<bool>(209, "missing_ok")?;
+        let load_after_install = d.read_optional_property::<bool>(210, "load_after_install")?;
+        Ok(Self {
+            filename,
+            load_type,
+            repository,
+            version,
+            repo_is_alias,
+            alias,
+            repository_url,
+            public_keys,
+            on_conflict,
+            missing_ok,
+            load_after_install,
+        })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "filename", &self.filename);
+        s.write_property(201, "load_type", &Enum::<enums::load_type::Names>::new(self.load_type));
+        s.write_property_with_default(202, "repository", &self.repository);
+        s.write_property_with_default(203, "version", &self.version);
+        s.write_property_with_default(204, "repo_is_alias", &self.repo_is_alias);
+        s.write_property_with_default(205, "alias", &self.alias);
+        s.write_property_with_default(206, "repository_url", &self.repository_url);
+        s.write_property_with_default(207, "public_keys", &self.public_keys);
+        s.write_optional_property(
+            208,
+            "on_conflict",
+            self.on_conflict
+                .map(Enum::<enums::on_create_conflict::Names>::new)
+                .as_ref(),
+        );
+        s.write_optional_property(209, "missing_ok", self.missing_ok.as_ref());
+        s.write_optional_property(210, "load_after_install", self.load_after_install.as_ref());
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateExtensionsInfo {
+    pub extensions_to_update: Vec<String>,
+}
+
+impl UpdateExtensionsInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let extensions_to_update = d.read_property_with_default::<Vec<String>>(200, "extensions_to_update")?;
+        Ok(Self { extensions_to_update })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "extensions_to_update", &self.extensions_to_update);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PragmaInfo {
+    pub name: String,
+    pub parameters: Vec<Option<Box<ParsedExpression>>>,
+    pub named_parameters: Vec<(String, Option<Box<ParsedExpression>>)>,
+}
+
+impl PragmaInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let name = d.read_property_with_default::<String>(200, "name")?;
+        let parameters = d.read_property_with_default::<Vec<Option<Box<ParsedExpression>>>>(201, "parameters")?;
+        let named_parameters = d
+            .read_property_with_default::<Map<String, Option<Box<ParsedExpression>>>>(202, "named_parameters")?
+            .0;
+        Ok(Self {
+            name,
+            parameters,
+            named_parameters,
+        })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "name", &self.name);
+        s.write_property_with_default(201, "parameters", &self.parameters);
+        s.write_property_with_default(202, "named_parameters", &MapRef(&self.named_parameters));
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TransactionInfo {
+    pub type_: u64,
+    pub modifier: u64,
+    pub invalidation_policy: Option<u64>,
+    pub auto_rollback: bool,
+}
+
+impl TransactionInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let type_ = d.read_property::<Enum<enums::transaction_type::Names>>(200, "type")?.0;
+        let modifier = d
+            .read_property::<Enum<enums::transaction_modifier_type::Names>>(201, "modifier")?
+            .0;
+        let invalidation_policy = d
+            .read_optional_property::<Enum<enums::transaction_invalidation_policy::Names>>(202, "invalidation_policy")?
+            .map(|e| e.0);
+        let auto_rollback = d.read_property_with_default::<bool>(203, "auto_rollback")?;
+        Ok(Self {
+            type_,
+            modifier,
+            invalidation_policy,
+            auto_rollback,
+        })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property(200, "type", &Enum::<enums::transaction_type::Names>::new(self.type_));
+        s.write_property(
+            201,
+            "modifier",
+            &Enum::<enums::transaction_modifier_type::Names>::new(self.modifier),
+        );
+        s.write_optional_property(
+            202,
+            "invalidation_policy",
+            self.invalidation_policy
+                .map(Enum::<enums::transaction_invalidation_policy::Names>::new)
+                .as_ref(),
+        );
+        s.write_property_with_default(203, "auto_rollback", &self.auto_rollback);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct VacuumInfo {
+    pub options: VacuumOptions,
+    pub has_table: bool,
+    pub ref_: Option<Box<TableRef>>,
+    pub columns: Vec<String>,
+}
+
+impl VacuumInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let options = d.read_property::<VacuumOptions>(200, "options")?;
+        let has_table = d.read_property_with_default::<bool>(201, "has_table")?;
+        let ref_ = d.read_property_with_default::<Option<Box<TableRef>>>(202, "ref")?;
+        let columns = d.read_property_with_default::<Vec<String>>(203, "columns")?;
+        Ok(Self {
+            options,
+            has_table,
+            ref_,
+            columns,
+        })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property(200, "options", &self.options);
+        s.write_property_with_default(201, "has_table", &self.has_table);
+        s.write_property_with_default(202, "ref", &self.ref_);
+        s.write_property_with_default(203, "columns", &self.columns);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BoundExportData {
+    pub data: Vec<ExportedTableInfo>,
+}
+
+impl BoundExportData {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let data = d.read_property_with_default::<Vec<ExportedTableInfo>>(200, "data")?;
+        Ok(Self { data })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(200, "data", &self.data);
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct ColumnList {
     pub columns: Vec<ColumnDefinition>,
 }
@@ -3265,6 +4150,438 @@ impl TypeExpression {
         if s.should_serialize(StorageVersion::V2_0_0) {
             s.write_optional_property(204, "qualified_name", self.qualified_name.as_ref());
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AlterTableInfo {
+    pub alter_table_type: u64,
+    pub kind: AlterTableInfoKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum AlterTableInfoKind {
+    RenameColumnInfo(RenameColumnInfo),
+    RenameFieldInfo(RenameFieldInfo),
+    RenameTableInfo(RenameTableInfo),
+    AddColumnInfo(AddColumnInfo),
+    AddFieldInfo(AddFieldInfo),
+    RemoveColumnInfo(RemoveColumnInfo),
+    RemoveFieldInfo(RemoveFieldInfo),
+    ChangeColumnTypeInfo(ChangeColumnTypeInfo),
+    SetDefaultInfo(SetDefaultInfo),
+    AlterForeignKeyInfo(AlterForeignKeyInfo),
+    SetNotNullInfo(SetNotNullInfo),
+    DropNotNullInfo(DropNotNullInfo),
+    AddConstraintInfo(AddConstraintInfo),
+    SetPartitionedByInfo(SetPartitionedByInfo),
+    SetSortedByInfo(SetSortedByInfo),
+    SetTableOptionsInfo(SetTableOptionsInfo),
+    ResetTableOptionsInfo(ResetTableOptionsInfo),
+}
+
+impl AlterTableInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let alter_table_type = d
+            .read_property::<Enum<enums::alter_table_type::Names>>(300, "alter_table_type")?
+            .0;
+        let kind = match u64::from(alter_table_type) {
+            enums::alter_table_type::RENAME_COLUMN => {
+                AlterTableInfoKind::RenameColumnInfo(RenameColumnInfo::read_members(d)?)
+            }
+            enums::alter_table_type::RENAME_FIELD => {
+                AlterTableInfoKind::RenameFieldInfo(RenameFieldInfo::read_members(d)?)
+            }
+            enums::alter_table_type::RENAME_TABLE => {
+                AlterTableInfoKind::RenameTableInfo(RenameTableInfo::read_members(d)?)
+            }
+            enums::alter_table_type::ADD_COLUMN => AlterTableInfoKind::AddColumnInfo(AddColumnInfo::read_members(d)?),
+            enums::alter_table_type::ADD_FIELD => AlterTableInfoKind::AddFieldInfo(AddFieldInfo::read_members(d)?),
+            enums::alter_table_type::REMOVE_COLUMN => {
+                AlterTableInfoKind::RemoveColumnInfo(RemoveColumnInfo::read_members(d)?)
+            }
+            enums::alter_table_type::REMOVE_FIELD => {
+                AlterTableInfoKind::RemoveFieldInfo(RemoveFieldInfo::read_members(d)?)
+            }
+            enums::alter_table_type::ALTER_COLUMN_TYPE => {
+                AlterTableInfoKind::ChangeColumnTypeInfo(ChangeColumnTypeInfo::read_members(d)?)
+            }
+            enums::alter_table_type::SET_DEFAULT => {
+                AlterTableInfoKind::SetDefaultInfo(SetDefaultInfo::read_members(d)?)
+            }
+            enums::alter_table_type::FOREIGN_KEY_CONSTRAINT => {
+                AlterTableInfoKind::AlterForeignKeyInfo(AlterForeignKeyInfo::read_members(d)?)
+            }
+            enums::alter_table_type::SET_NOT_NULL => {
+                AlterTableInfoKind::SetNotNullInfo(SetNotNullInfo::read_members(d)?)
+            }
+            enums::alter_table_type::DROP_NOT_NULL => {
+                AlterTableInfoKind::DropNotNullInfo(DropNotNullInfo::read_members(d)?)
+            }
+            enums::alter_table_type::ADD_CONSTRAINT => {
+                AlterTableInfoKind::AddConstraintInfo(AddConstraintInfo::read_members(d)?)
+            }
+            enums::alter_table_type::SET_PARTITIONED_BY => {
+                AlterTableInfoKind::SetPartitionedByInfo(SetPartitionedByInfo::read_members(d)?)
+            }
+            enums::alter_table_type::SET_SORTED_BY => {
+                AlterTableInfoKind::SetSortedByInfo(SetSortedByInfo::read_members(d)?)
+            }
+            enums::alter_table_type::SET_TABLE_OPTIONS => {
+                AlterTableInfoKind::SetTableOptionsInfo(SetTableOptionsInfo::read_members(d)?)
+            }
+            enums::alter_table_type::RESET_TABLE_OPTIONS => {
+                AlterTableInfoKind::ResetTableOptionsInfo(ResetTableOptionsInfo::read_members(d)?)
+            }
+            other => return Err(unknown("AlterTableInfo", other)),
+        };
+        Ok(Self { alter_table_type, kind })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property(
+            300,
+            "alter_table_type",
+            &Enum::<enums::alter_table_type::Names>::new(self.alter_table_type),
+        );
+        match &self.kind {
+            AlterTableInfoKind::RenameColumnInfo(value) => value.write_members(s),
+            AlterTableInfoKind::RenameFieldInfo(value) => value.write_members(s),
+            AlterTableInfoKind::RenameTableInfo(value) => value.write_members(s),
+            AlterTableInfoKind::AddColumnInfo(value) => value.write_members(s),
+            AlterTableInfoKind::AddFieldInfo(value) => value.write_members(s),
+            AlterTableInfoKind::RemoveColumnInfo(value) => value.write_members(s),
+            AlterTableInfoKind::RemoveFieldInfo(value) => value.write_members(s),
+            AlterTableInfoKind::ChangeColumnTypeInfo(value) => value.write_members(s),
+            AlterTableInfoKind::SetDefaultInfo(value) => value.write_members(s),
+            AlterTableInfoKind::AlterForeignKeyInfo(value) => value.write_members(s),
+            AlterTableInfoKind::SetNotNullInfo(value) => value.write_members(s),
+            AlterTableInfoKind::DropNotNullInfo(value) => value.write_members(s),
+            AlterTableInfoKind::AddConstraintInfo(value) => value.write_members(s),
+            AlterTableInfoKind::SetPartitionedByInfo(value) => value.write_members(s),
+            AlterTableInfoKind::SetSortedByInfo(value) => value.write_members(s),
+            AlterTableInfoKind::SetTableOptionsInfo(value) => value.write_members(s),
+            AlterTableInfoKind::ResetTableOptionsInfo(value) => value.write_members(s),
+        }
+    }
+}
+
+impl Deserialize for AlterTableInfo {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for AlterTableInfo {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SetCommentInfo {
+    pub entry_catalog_type: u64,
+    pub comment_value: Value,
+}
+
+impl SetCommentInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let entry_catalog_type = d
+            .read_property::<Enum<enums::catalog_type::Names>>(300, "entry_catalog_type")?
+            .0;
+        let comment_value = d.read_property::<Value>(301, "comment_value")?;
+        Ok(Self {
+            entry_catalog_type,
+            comment_value,
+        })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property(
+            300,
+            "entry_catalog_type",
+            &Enum::<enums::catalog_type::Names>::new(self.entry_catalog_type),
+        );
+        s.write_property(301, "comment_value", &self.comment_value);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ChangeOwnershipInfo {
+    pub entry_catalog_type: u64,
+    pub owner_schema: String,
+    pub owner_name: String,
+}
+
+impl ChangeOwnershipInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let entry_catalog_type = d
+            .read_property::<Enum<enums::catalog_type::Names>>(300, "entry_catalog_type")?
+            .0;
+        let owner_schema = d.read_property_with_default::<String>(301, "owner_schema")?;
+        let owner_name = d.read_property_with_default::<String>(302, "owner_name")?;
+        Ok(Self {
+            entry_catalog_type,
+            owner_schema,
+            owner_name,
+        })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property(
+            300,
+            "entry_catalog_type",
+            &Enum::<enums::catalog_type::Names>::new(self.entry_catalog_type),
+        );
+        s.write_property_with_default(301, "owner_schema", &self.owner_schema);
+        s.write_property_with_default(302, "owner_name", &self.owner_name);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SetColumnCommentInfo {
+    pub catalog_entry_type: u64,
+    pub comment_value: Value,
+    pub column_name: String,
+}
+
+impl SetColumnCommentInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let catalog_entry_type = d
+            .read_property::<Enum<enums::catalog_type::Names>>(300, "catalog_entry_type")?
+            .0;
+        let comment_value = d.read_property::<Value>(301, "comment_value")?;
+        let column_name = d.read_property_with_default::<String>(302, "column_name")?;
+        Ok(Self {
+            catalog_entry_type,
+            comment_value,
+            column_name,
+        })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property(
+            300,
+            "catalog_entry_type",
+            &Enum::<enums::catalog_type::Names>::new(self.catalog_entry_type),
+        );
+        s.write_property(301, "comment_value", &self.comment_value);
+        s.write_property_with_default(302, "column_name", &self.column_name);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AlterViewInfo {
+    pub alter_view_type: u64,
+    pub kind: AlterViewInfoKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum AlterViewInfoKind {
+    RenameViewInfo(RenameViewInfo),
+}
+
+impl AlterViewInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let alter_view_type = d
+            .read_property::<Enum<enums::alter_view_type::Names>>(300, "alter_view_type")?
+            .0;
+        let kind = match u64::from(alter_view_type) {
+            enums::alter_view_type::RENAME_VIEW => AlterViewInfoKind::RenameViewInfo(RenameViewInfo::read_members(d)?),
+            other => return Err(unknown("AlterViewInfo", other)),
+        };
+        Ok(Self { alter_view_type, kind })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property(
+            300,
+            "alter_view_type",
+            &Enum::<enums::alter_view_type::Names>::new(self.alter_view_type),
+        );
+        match &self.kind {
+            AlterViewInfoKind::RenameViewInfo(value) => value.write_members(s),
+        }
+    }
+}
+
+impl Deserialize for AlterViewInfo {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for AlterViewInfo {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AlterDatabaseInfo {
+    pub alter_database_type: u64,
+    pub kind: AlterDatabaseInfoKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum AlterDatabaseInfoKind {
+    RenameDatabaseInfo(RenameDatabaseInfo),
+}
+
+impl AlterDatabaseInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let alter_database_type = d
+            .read_property::<Enum<enums::alter_database_type::Names>>(300, "alter_database_type")?
+            .0;
+        let kind = match u64::from(alter_database_type) {
+            enums::alter_database_type::RENAME_DATABASE => {
+                AlterDatabaseInfoKind::RenameDatabaseInfo(RenameDatabaseInfo::read_members(d)?)
+            }
+            other => return Err(unknown("AlterDatabaseInfo", other)),
+        };
+        Ok(Self {
+            alter_database_type,
+            kind,
+        })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property(
+            300,
+            "alter_database_type",
+            &Enum::<enums::alter_database_type::Names>::new(self.alter_database_type),
+        );
+        match &self.kind {
+            AlterDatabaseInfoKind::RenameDatabaseInfo(value) => value.write_members(s),
+        }
+    }
+}
+
+impl Deserialize for AlterDatabaseInfo {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for AlterDatabaseInfo {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AlterSchemaInfo {
+    pub alter_schema_type: u64,
+    pub kind: AlterSchemaInfoKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum AlterSchemaInfoKind {
+    SetSchemaOptionsInfo(SetSchemaOptionsInfo),
+    ResetSchemaOptionsInfo(ResetSchemaOptionsInfo),
+}
+
+impl AlterSchemaInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let alter_schema_type = d
+            .read_property::<Enum<enums::alter_schema_type::Names>>(300, "alter_schema_type")?
+            .0;
+        let kind = match u64::from(alter_schema_type) {
+            enums::alter_schema_type::SET_SCHEMA_OPTIONS => {
+                AlterSchemaInfoKind::SetSchemaOptionsInfo(SetSchemaOptionsInfo::read_members(d)?)
+            }
+            enums::alter_schema_type::RESET_SCHEMA_OPTIONS => {
+                AlterSchemaInfoKind::ResetSchemaOptionsInfo(ResetSchemaOptionsInfo::read_members(d)?)
+            }
+            other => return Err(unknown("AlterSchemaInfo", other)),
+        };
+        Ok(Self {
+            alter_schema_type,
+            kind,
+        })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property(
+            300,
+            "alter_schema_type",
+            &Enum::<enums::alter_schema_type::Names>::new(self.alter_schema_type),
+        );
+        match &self.kind {
+            AlterSchemaInfoKind::SetSchemaOptionsInfo(value) => value.write_members(s),
+            AlterSchemaInfoKind::ResetSchemaOptionsInfo(value) => value.write_members(s),
+        }
+    }
+}
+
+impl Deserialize for AlterSchemaInfo {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for AlterSchemaInfo {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct VacuumOptions {
+    pub vacuum: bool,
+    pub analyze: bool,
+}
+
+impl VacuumOptions {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let vacuum = d.read_property_with_default::<bool>(100, "vacuum")?;
+        let analyze = d.read_property_with_default::<bool>(101, "analyze")?;
+        Ok(Self { vacuum, analyze })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(100, "vacuum", &self.vacuum);
+        s.write_property_with_default(101, "analyze", &self.analyze);
+    }
+}
+
+impl Deserialize for VacuumOptions {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for VacuumOptions {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ExportedTableInfo {
+    pub table_data: ExportedTableData,
+}
+
+impl ExportedTableInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let table_data = d.read_property::<ExportedTableData>(1, "table_data")?;
+        Ok(Self { table_data })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property(1, "table_data", &self.table_data);
+    }
+}
+
+impl Deserialize for ExportedTableInfo {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for ExportedTableInfo {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
     }
 }
 
@@ -4398,6 +5715,515 @@ impl Serialize for QualifiedColumnName {
 }
 
 #[derive(Debug, Clone)]
+pub struct RenameColumnInfo {
+    pub old_name: String,
+    pub new_name: String,
+}
+
+impl RenameColumnInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let old_name = d.read_property_with_default::<String>(400, "old_name")?;
+        let new_name = d.read_property_with_default::<String>(401, "new_name")?;
+        Ok(Self { old_name, new_name })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(400, "old_name", &self.old_name);
+        s.write_property_with_default(401, "new_name", &self.new_name);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RenameFieldInfo {
+    pub column_path: Vec<String>,
+    pub new_name: String,
+}
+
+impl RenameFieldInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let column_path = d.read_property_with_default::<Vec<String>>(400, "column_path")?;
+        let new_name = d.read_property_with_default::<String>(401, "new_name")?;
+        Ok(Self { column_path, new_name })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(400, "column_path", &self.column_path);
+        s.write_property_with_default(401, "new_name", &self.new_name);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RenameTableInfo {
+    pub new_table_name: String,
+}
+
+impl RenameTableInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let new_table_name = d.read_property_with_default::<String>(400, "new_table_name")?;
+        Ok(Self { new_table_name })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(400, "new_table_name", &self.new_table_name);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AddColumnInfo {
+    pub new_column: ColumnDefinition,
+    pub if_column_not_exists: bool,
+    pub add_not_null: bool,
+    pub add_unique: bool,
+}
+
+impl AddColumnInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let new_column = d.read_property::<ColumnDefinition>(400, "new_column")?;
+        let if_column_not_exists = d.read_property_with_default::<bool>(401, "if_column_not_exists")?;
+        let add_not_null = d.read_property_with_default::<bool>(402, "add_not_null")?;
+        let add_unique = d.read_property_with_default::<bool>(403, "add_unique")?;
+        Ok(Self {
+            new_column,
+            if_column_not_exists,
+            add_not_null,
+            add_unique,
+        })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property(400, "new_column", &self.new_column);
+        s.write_property_with_default(401, "if_column_not_exists", &self.if_column_not_exists);
+        s.write_property_with_default(402, "add_not_null", &self.add_not_null);
+        s.write_property_with_default(403, "add_unique", &self.add_unique);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AddFieldInfo {
+    pub new_field: ColumnDefinition,
+    pub if_field_not_exists: bool,
+    pub column_path: Vec<String>,
+}
+
+impl AddFieldInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let new_field = d.read_property::<ColumnDefinition>(400, "new_field")?;
+        let if_field_not_exists = d.read_property_with_default::<bool>(401, "if_field_not_exists")?;
+        let column_path = d.read_property_with_default::<Vec<String>>(402, "column_path")?;
+        Ok(Self {
+            new_field,
+            if_field_not_exists,
+            column_path,
+        })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property(400, "new_field", &self.new_field);
+        s.write_property_with_default(401, "if_field_not_exists", &self.if_field_not_exists);
+        s.write_property_with_default(402, "column_path", &self.column_path);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoveColumnInfo {
+    pub removed_column: String,
+    pub if_column_exists: bool,
+    pub cascade: bool,
+}
+
+impl RemoveColumnInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let removed_column = d.read_property_with_default::<String>(400, "removed_column")?;
+        let if_column_exists = d.read_property_with_default::<bool>(401, "if_column_exists")?;
+        let cascade = d.read_property_with_default::<bool>(402, "cascade")?;
+        Ok(Self {
+            removed_column,
+            if_column_exists,
+            cascade,
+        })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(400, "removed_column", &self.removed_column);
+        s.write_property_with_default(401, "if_column_exists", &self.if_column_exists);
+        s.write_property_with_default(402, "cascade", &self.cascade);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoveFieldInfo {
+    pub column_path: Vec<String>,
+    pub if_column_exists: bool,
+    pub cascade: bool,
+}
+
+impl RemoveFieldInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let column_path = d.read_property_with_default::<Vec<String>>(400, "column_path")?;
+        let if_column_exists = d.read_property_with_default::<bool>(401, "if_column_exists")?;
+        let cascade = d.read_property_with_default::<bool>(402, "cascade")?;
+        Ok(Self {
+            column_path,
+            if_column_exists,
+            cascade,
+        })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(400, "column_path", &self.column_path);
+        s.write_property_with_default(401, "if_column_exists", &self.if_column_exists);
+        s.write_property_with_default(402, "cascade", &self.cascade);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ChangeColumnTypeInfo {
+    pub column_name: String,
+    pub target_type: LogicalType,
+    pub expression: Option<Box<ParsedExpression>>,
+    pub column_path: Vec<String>,
+}
+
+impl ChangeColumnTypeInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let column_name = d.read_property_with_default::<String>(400, "column_name")?;
+        let target_type = d.read_property::<LogicalType>(401, "target_type")?;
+        let expression = d.read_property_with_default::<Option<Box<ParsedExpression>>>(402, "expression")?;
+        let column_path = d.read_property_with_default::<Vec<String>>(403, "column_path")?;
+        Ok(Self {
+            column_name,
+            target_type,
+            expression,
+            column_path,
+        })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(400, "column_name", &self.column_name);
+        s.write_property(401, "target_type", &self.target_type);
+        s.write_property_with_default(402, "expression", &self.expression);
+        s.write_property_with_default(403, "column_path", &self.column_path);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SetDefaultInfo {
+    pub column_name: String,
+    pub expression: Option<Box<ParsedExpression>>,
+    pub column_path: Vec<String>,
+}
+
+impl SetDefaultInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let column_name = d.read_property_with_default::<String>(400, "column_name")?;
+        let expression = d.read_property_with_default::<Option<Box<ParsedExpression>>>(401, "expression")?;
+        let column_path = d.read_property_with_default::<Vec<String>>(402, "column_path")?;
+        Ok(Self {
+            column_name,
+            expression,
+            column_path,
+        })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(400, "column_name", &self.column_name);
+        s.write_property_with_default(401, "expression", &self.expression);
+        s.write_property_with_default(402, "column_path", &self.column_path);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AlterForeignKeyInfo {
+    pub fk_table: String,
+    pub pk_columns: Vec<String>,
+    pub fk_columns: Vec<String>,
+    pub pk_keys: Vec<u64>,
+    pub fk_keys: Vec<u64>,
+    pub alter_fk_type: u64,
+}
+
+impl AlterForeignKeyInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let fk_table = d.read_property_with_default::<String>(400, "fk_table")?;
+        let pk_columns = d.read_property_with_default::<Vec<String>>(401, "pk_columns")?;
+        let fk_columns = d.read_property_with_default::<Vec<String>>(402, "fk_columns")?;
+        let pk_keys = d.read_property_with_default::<Vec<u64>>(403, "pk_keys")?;
+        let fk_keys = d.read_property_with_default::<Vec<u64>>(404, "fk_keys")?;
+        let alter_fk_type = d
+            .read_property::<Enum<enums::alter_foreign_key_type::Names>>(405, "alter_fk_type")?
+            .0;
+        Ok(Self {
+            fk_table,
+            pk_columns,
+            fk_columns,
+            pk_keys,
+            fk_keys,
+            alter_fk_type,
+        })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(400, "fk_table", &self.fk_table);
+        s.write_property_with_default(401, "pk_columns", &self.pk_columns);
+        s.write_property_with_default(402, "fk_columns", &self.fk_columns);
+        s.write_property_with_default(403, "pk_keys", &self.pk_keys);
+        s.write_property_with_default(404, "fk_keys", &self.fk_keys);
+        s.write_property(
+            405,
+            "alter_fk_type",
+            &Enum::<enums::alter_foreign_key_type::Names>::new(self.alter_fk_type),
+        );
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SetNotNullInfo {
+    pub column_name: String,
+    pub column_path: Vec<String>,
+}
+
+impl SetNotNullInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let column_name = d.read_property_with_default::<String>(400, "column_name")?;
+        let column_path = d.read_property_with_default::<Vec<String>>(401, "column_path")?;
+        Ok(Self {
+            column_name,
+            column_path,
+        })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(400, "column_name", &self.column_name);
+        s.write_property_with_default(401, "column_path", &self.column_path);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DropNotNullInfo {
+    pub column_name: String,
+    pub column_path: Vec<String>,
+}
+
+impl DropNotNullInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let column_name = d.read_property_with_default::<String>(400, "column_name")?;
+        let column_path = d.read_property_with_default::<Vec<String>>(401, "column_path")?;
+        Ok(Self {
+            column_name,
+            column_path,
+        })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(400, "column_name", &self.column_name);
+        s.write_property_with_default(401, "column_path", &self.column_path);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AddConstraintInfo {
+    pub constraint: Option<Box<Constraint>>,
+}
+
+impl AddConstraintInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let constraint = d.read_property_with_default::<Option<Box<Constraint>>>(400, "constraint")?;
+        Ok(Self { constraint })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(400, "constraint", &self.constraint);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SetPartitionedByInfo {
+    pub partition_keys: Vec<Option<Box<ParsedExpression>>>,
+}
+
+impl SetPartitionedByInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let partition_keys =
+            d.read_property_with_default::<Vec<Option<Box<ParsedExpression>>>>(400, "partition_keys")?;
+        Ok(Self { partition_keys })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(400, "partition_keys", &self.partition_keys);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SetSortedByInfo {
+    pub orders: Vec<OrderByNode>,
+}
+
+impl SetSortedByInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let orders = d.read_property_with_default::<Vec<OrderByNode>>(400, "orders")?;
+        Ok(Self { orders })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(400, "orders", &self.orders);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SetTableOptionsInfo {
+    pub table_options: Vec<(String, Option<Box<ParsedExpression>>)>,
+}
+
+impl SetTableOptionsInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let table_options = d
+            .read_property_with_default::<Map<String, Option<Box<ParsedExpression>>>>(400, "table_options")?
+            .0;
+        Ok(Self { table_options })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(400, "table_options", &MapRef(&self.table_options));
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ResetTableOptionsInfo {
+    pub table_options: Vec<String>,
+}
+
+impl ResetTableOptionsInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let table_options = d.read_property_with_default::<Vec<String>>(400, "table_options")?;
+        Ok(Self { table_options })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        if s.should_serialize(StorageVersion::V2_0_0) {
+            s.write_property_with_default(400, "table_options", &self.table_options);
+        } else {
+            s.write_property(400, "table_options", &self.table_options);
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RenameViewInfo {
+    pub new_view_name: String,
+}
+
+impl RenameViewInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let new_view_name = d.read_property_with_default::<String>(400, "new_view_name")?;
+        Ok(Self { new_view_name })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(400, "new_view_name", &self.new_view_name);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RenameDatabaseInfo {
+    pub new_name: String,
+}
+
+impl RenameDatabaseInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let new_name = d.read_property_with_default::<String>(400, "new_name")?;
+        Ok(Self { new_name })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(400, "new_name", &self.new_name);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SetSchemaOptionsInfo {
+    pub options: Vec<(String, Option<Box<ParsedExpression>>)>,
+}
+
+impl SetSchemaOptionsInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let options = d
+            .read_property_with_default::<Map<String, Option<Box<ParsedExpression>>>>(400, "options")?
+            .0;
+        Ok(Self { options })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(400, "options", &MapRef(&self.options));
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ResetSchemaOptionsInfo {
+    pub options: Vec<String>,
+}
+
+impl ResetSchemaOptionsInfo {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let options = d.read_property_with_default::<Vec<String>>(400, "options")?;
+        Ok(Self { options })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(400, "options", &self.options);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ExportedTableData {
+    pub table_name: String,
+    pub schema_name: String,
+    pub database_name: String,
+    pub file_path: String,
+    pub not_null_columns: Vec<String>,
+    pub qualified_name: Option<QualifiedName>,
+}
+
+impl ExportedTableData {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let table_name = d.read_property_with_default::<String>(1, "table_name")?;
+        let schema_name = d.read_property_with_default::<String>(2, "schema_name")?;
+        let database_name = d.read_property_with_default::<String>(3, "database_name")?;
+        let file_path = d.read_property_with_default::<String>(4, "file_path")?;
+        let not_null_columns = d.read_property_with_default::<Vec<String>>(5, "not_null_columns")?;
+        let qualified_name = d.read_optional_property::<QualifiedName>(6, "qualified_name")?;
+        Ok(Self {
+            table_name,
+            schema_name,
+            database_name,
+            file_path,
+            not_null_columns,
+            qualified_name,
+        })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(1, "table_name", &self.table_name);
+        s.write_property_with_default(2, "schema_name", &self.schema_name);
+        s.write_property_with_default(3, "database_name", &self.database_name);
+        s.write_property_with_default(4, "file_path", &self.file_path);
+        s.write_property_with_default(5, "not_null_columns", &self.not_null_columns);
+        s.write_optional_property(6, "qualified_name", self.qualified_name.as_ref());
+    }
+}
+
+impl Deserialize for ExportedTableData {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for ExportedTableData {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct AtClause {
     pub unit: String,
     pub expr: Option<Box<ParsedExpression>>,
@@ -4705,44 +6531,6 @@ impl Serialize for CommonTableExpressionInfo {
 }
 
 #[derive(Debug, Clone)]
-pub struct PivotColumnEntry {
-    pub values: Vec<Value>,
-    pub star_expr: Option<Box<ParsedExpression>>,
-    pub alias: String,
-}
-
-impl PivotColumnEntry {
-    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        let values = d.read_property_with_default::<Vec<Value>>(100, "values")?;
-        let star_expr = d.read_property_with_default::<Option<Box<ParsedExpression>>>(101, "star_expr")?;
-        let alias = d.read_property_with_default::<String>(102, "alias")?;
-        Ok(Self {
-            values,
-            star_expr,
-            alias,
-        })
-    }
-
-    pub fn write_members(&self, s: &mut BinarySerializer) {
-        s.write_property_with_default(100, "values", &self.values);
-        s.write_property_with_default(101, "star_expr", &self.star_expr);
-        s.write_property_with_default(102, "alias", &self.alias);
-    }
-}
-
-impl Deserialize for PivotColumnEntry {
-    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
-        d.read_object_value(Self::read_members)
-    }
-}
-
-impl Serialize for PivotColumnEntry {
-    fn write_value(&self, s: &mut BinarySerializer) {
-        s.write_object_value(|s| self.write_members(s));
-    }
-}
-
-#[derive(Debug, Clone)]
 pub struct OrderByNode {
     pub type_: u64,
     pub null_order: u64,
@@ -4781,6 +6569,44 @@ impl Deserialize for OrderByNode {
 }
 
 impl Serialize for OrderByNode {
+    fn write_value(&self, s: &mut BinarySerializer) {
+        s.write_object_value(|s| self.write_members(s));
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PivotColumnEntry {
+    pub values: Vec<Value>,
+    pub star_expr: Option<Box<ParsedExpression>>,
+    pub alias: String,
+}
+
+impl PivotColumnEntry {
+    pub fn read_members(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        let values = d.read_property_with_default::<Vec<Value>>(100, "values")?;
+        let star_expr = d.read_property_with_default::<Option<Box<ParsedExpression>>>(101, "star_expr")?;
+        let alias = d.read_property_with_default::<String>(102, "alias")?;
+        Ok(Self {
+            values,
+            star_expr,
+            alias,
+        })
+    }
+
+    pub fn write_members(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(100, "values", &self.values);
+        s.write_property_with_default(101, "star_expr", &self.star_expr);
+        s.write_property_with_default(102, "alias", &self.alias);
+    }
+}
+
+impl Deserialize for PivotColumnEntry {
+    fn read_value(d: &mut BinaryDeserializer<'_>) -> Result<Self> {
+        d.read_object_value(Self::read_members)
+    }
+}
+
+impl Serialize for PivotColumnEntry {
     fn write_value(&self, s: &mut BinarySerializer) {
         s.write_object_value(|s| self.write_members(s));
     }

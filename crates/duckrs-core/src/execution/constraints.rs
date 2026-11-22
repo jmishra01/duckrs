@@ -12,7 +12,7 @@ use super::expression_executor::execute;
 use crate::catalog::{ForeignKey, IndexTree, TableCatalogEntry, TableConstraint, TableKey, UniqueKeys};
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::sort_key::{OrderModifiers, create_sort_keys};
-use duckrs_common::vector::DataChunk;
+use duckrs_common::vector::{DataChunk, Vector};
 use duckrs_common::{Error, ErrorKind, Result, STANDARD_VECTOR_SIZE};
 use duckrs_parser::ast::{sql_identifier, sql_quoted_identifier};
 use parking_lot::MutexGuard;
@@ -64,8 +64,38 @@ fn key_name(
 
 /// The ART key of each row, for a key of the table.
 pub(crate) fn keys_of(key: &TableKey, chunk: &DataChunk) -> Result<Vec<Option<ArtKey>>> {
+    keys_of_converted(key, chunk, false)
+}
+
+/// [`keys_of`], with GEOMETRYs in the spatial extension's format where `legacy_geometry` (`ART::ConvertKeyInput`
+/// of an index whose keys are from before v1.5.0).
+pub(crate) fn keys_of_converted(
+    key: &TableKey,
+    chunk: &DataChunk,
+    legacy_geometry: bool,
+) -> Result<Vec<Option<ArtKey>>> {
     let values = key_values(key, chunk)?;
-    let columns: Vec<_> = values.columns().iter().collect();
+    let mut columns: Vec<Vector> = values.columns().to_vec();
+    if legacy_geometry {
+        for column in &mut columns {
+            if column.logical_type().id() != duckrs_common::types::LogicalTypeId::Geometry {
+                continue;
+            }
+            let mut converted = Vector::new(duckrs_common::types::LogicalType::BLOB, values.len().max(1));
+            for row in 0..values.len() {
+                let value = column.get_value(row);
+                match value.data() {
+                    duckrs_common::value::ValueData::Bytes(wkb) if !value.is_null() => converted.set_value(
+                        row,
+                        &duckrs_common::value::Value::blob(duckrs_common::geometry::to_spatial(&wkb[..])?),
+                    )?,
+                    _ => converted.set_null(row, true),
+                }
+            }
+            *column = converted;
+        }
+    }
+    let columns: Vec<_> = columns.iter().collect();
     chunk_keys(&columns, values.len())
 }
 

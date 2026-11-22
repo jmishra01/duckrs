@@ -348,6 +348,7 @@ impl Binder<'_> {
         self.bind_context.add_binding(super::Binding {
             alias,
             schema: None,
+            catalog: None,
             table_index,
             names,
             types: types.clone(),
@@ -638,15 +639,11 @@ impl Binder<'_> {
             return self.show_all_tables(table_ref);
         };
         match name.name.as_str() {
+            // `PragmaShowDatabases`
             "\"databases\"" => {
-                let name = self.catalog.name.clone();
-                self.bind_rows(
-                    table_ref,
-                    "__show_select",
-                    vec!["database_name".to_string()],
-                    vec![LogicalType::VARCHAR],
-                    vec![vec![Value::varchar(name)]],
-                )
+                let select = "SELECT database_name FROM duckdb_databases() WHERE NOT internal ORDER BY database_name";
+                let select = parse_select(select, "Expected a single SELECT statement")?;
+                self.bind_rewritten(&select, table_ref, "__show_select")
             }
             "\"schemas\"" => {
                 let select = "SELECT schema.database_name, schema.schema_name, ((SELECT current_schema() = \
@@ -1322,23 +1319,28 @@ impl Binder<'_> {
         call: &duckrs_parser::ast::FunctionExpr,
         table_ref: &TableRef,
     ) -> Result<LogicalOperator> {
-        let mut include_info = false;
+        let (mut include_info, mut loaded_only) = (false, false);
         let arguments: Vec<_> = call.args.iter().map(super::table_functions::named_argument).collect();
         for argument in arguments.iter().filter(|argument| !argument.name.is_empty()) {
-            if !argument.name.eq_ignore_ascii_case("include_segment_info") {
-                return Err(binder_error(format!(
-                    "Invalid named parameter \"{}\" for function pragma_storage_info",
-                    argument.name
-                )));
-            }
+            let name = argument.name.to_lowercase();
+            let target = match name.as_str() {
+                "include_segment_info" => &mut include_info,
+                "loaded_segments_only" => &mut loaded_only,
+                _ => {
+                    return Err(binder_error(format!(
+                        "Invalid named parameter \"{}\" for function pragma_storage_info",
+                        argument.name
+                    )));
+                }
+            };
             let value = evaluate_scalar(&self.bind_expression(&argument.expr)?)?;
             if value.is_null() {
                 return Err(duckrs_common::Error::new(
                     duckrs_common::ErrorKind::InvalidInput,
-                    "Cannot use NULL as argument for include_segment_info",
+                    format!("Cannot use NULL as argument for {name}"),
                 ));
             }
-            include_info = value.try_to_string()?.eq_ignore_ascii_case("true");
+            *target = value.try_to_string()?.eq_ignore_ascii_case("true");
         }
         let mut positional = arguments.iter().filter(|argument| argument.name.is_empty());
         let (Some(argument), None) = (positional.next(), positional.next()) else {
@@ -1364,7 +1366,7 @@ impl Binder<'_> {
         let stored = table.stored();
         let persistent = stored.is_some();
         let segments = match stored {
-            Some(source) => source.segments(include_info)?,
+            Some(source) => source.segments(include_info, loaded_only)?,
             None => memory_segments(&table),
         };
         let (bigint, varchar, boolean) = (LogicalType::BIGINT, LogicalType::VARCHAR, LogicalType::BOOLEAN);
@@ -2099,6 +2101,18 @@ impl Binder<'_> {
                     ]);
                     Value::new(tags.clone(), duckrs_common::value::ValueData::List(vec![entry]))
                 };
+                let map_of = |entries: &[(String, String)]| -> Result<Value> {
+                    let entries = entries
+                        .iter()
+                        .map(|(key, value)| {
+                            Value::struct_value(vec![
+                                ("key".to_string(), text(key)),
+                                ("value".to_string(), text(value)),
+                            ])
+                        })
+                        .collect();
+                    Value::new(tags.clone(), duckrs_common::value::ValueData::List(entries))
+                };
                 let database = |name: &str, oid: i64, path: Option<&str>, internal: bool, read_only: bool| {
                     vec![
                         text(name),
@@ -2109,6 +2123,9 @@ impl Binder<'_> {
                         Value::boolean(internal),
                         text("duckdb"),
                         Value::boolean(read_only),
+                        Value::boolean(false),
+                        null_text(),
+                        Value::null(tags.clone()),
                     ]
                 };
                 let mut rows = vec![
@@ -2123,6 +2140,11 @@ impl Binder<'_> {
                     let oid = if index == 0 { 1 } else { index as i64 + 3 };
                     let mut row = database(&listed.name, oid, listed.path.as_deref(), false, listed.read_only);
                     row[4] = tags_of(listed.storage_version.as_deref())?;
+                    row[10] = map_of(&listed.options)?;
+                    if let Some(cipher) = &listed.cipher {
+                        row[8] = Value::boolean(true);
+                        row[9] = text(cipher);
+                    }
                     rows.insert(index.min(rows.len()), row);
                 }
                 (
@@ -2135,6 +2157,9 @@ impl Binder<'_> {
                         ("internal", boolean.clone()),
                         ("type", varchar.clone()),
                         ("readonly", boolean.clone()),
+                        ("encrypted", boolean.clone()),
+                        ("cipher", varchar.clone()),
+                        ("options", tags.clone()),
                     ],
                     rows,
                 )

@@ -112,6 +112,22 @@ impl ColumnDataCollection {
         self.count += chunk.len();
     }
 
+    /// Rows `start..end` as a collection of their own that shares their chunks, where both are where chunks
+    /// start (or `end` the end): `None` elsewhere.
+    pub fn shared_range(&self, start: usize, end: usize) -> Option<Self> {
+        let aligned = |at: usize| at.is_multiple_of(STANDARD_VECTOR_SIZE);
+        if !aligned(start) || !(aligned(end) || end == self.count) || start > end || end > self.count {
+            return None;
+        }
+        // every chunk but the last is full
+        let chunks = self.chunks[start / STANDARD_VECTOR_SIZE..end.div_ceil(STANDARD_VECTOR_SIZE)].to_vec();
+        Some(Self {
+            types: self.types.clone(),
+            chunks,
+            count: end - start,
+        })
+    }
+
     /// Drops the rows after the first `count`, which undoes appends.
     pub fn truncate(&mut self, count: usize) {
         if count >= self.count {

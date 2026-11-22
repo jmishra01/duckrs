@@ -9,8 +9,9 @@ use super::serialization::generated::{self as g};
 use crate::catalog::{IndexCatalogEntry, TableCatalogEntry, TableConstraint, TableKey};
 use crate::execution::art::allocator::{LEGACY_NODE_256_LEAF_SIZE, NODE_256_LEAF_SIZE};
 use crate::execution::art::tree::{AppendMode, Art, Conflict};
-use crate::execution::constraints::{key_prefix_count, keys_of};
+use crate::execution::constraints::{key_prefix_count, keys_of_converted};
 use duckrs_common::storage_version::StorageVersion;
+use duckrs_common::types::LogicalTypeId;
 use duckrs_common::value::Value;
 use duckrs_common::vector::DataChunk;
 use duckrs_common::{Error, ErrorKind, Result};
@@ -32,6 +33,10 @@ pub(super) struct TableIndex {
     key: TableKey,
     art: Art,
     version: StorageVersion,
+    /// `ART::storage_version`: what its keys are made as, `None` for `INVALID` (before v1.5.0)
+    key_version: Option<StorageVersion>,
+    /// [`Self::has_legacy_geometry_keys`]
+    pub legacy_geometry: bool,
     /// Whether the tree is in the `V1_0_0` format already.
     deprecated: bool,
 }
@@ -57,8 +62,27 @@ impl TableIndex {
             key,
             art,
             version,
+            key_version: Some(version),
+            legacy_geometry: false,
             deprecated: false,
         }
+    }
+
+    /// `ART::HasLegacyGeometryKeys` (`KeyInputNeedConversion`): the keys of GEOMETRYs are of the spatial
+    /// extension's format, as before v1.5.0, so the index can't be remapped.
+    pub fn has_legacy_geometry_keys(&self, table: &TableCatalogEntry) -> bool {
+        let old = self.key_version.is_none_or(|version| version < StorageVersion::V1_5_0);
+        let geometry = match &self.key.expressions {
+            None => self
+                .key
+                .columns
+                .iter()
+                .any(|c| table.columns[*c].ty.id() == LogicalTypeId::Geometry),
+            Some(expressions) => expressions
+                .iter()
+                .any(|e| e.return_type.id() == LogicalTypeId::Geometry),
+        };
+        old && geometry
     }
 
     /// `ART::GetSerializationFormat`.
@@ -119,12 +143,20 @@ impl TableIndex {
             primary_key: false,
             deferred: false,
         };
-        Self::new(table, index.name.clone(), key, index.unique, block_size, version)
+        let mut result = Self::new(table, index.name.clone(), key, index.unique, block_size, version);
+        result.key_version = match index.storage_version {
+            None => Some(version),
+            Some(stored) => stored.map(StorageVersion),
+        };
+        result.legacy_geometry = result.has_legacy_geometry_keys(table);
+        result
     }
 
     /// Adds the rows of `chunk`, of which `row_id` says what they are. Not after [`Self::storage_info`].
     pub fn add(&mut self, chunk: &DataChunk, row_id: impl Fn(usize) -> i64) -> Result<()> {
-        for (row, key) in keys_of(&self.key, chunk)?.into_iter().enumerate() {
+        // `ART::ConvertKeyInput`
+        let keys = keys_of_converted(&self.key, chunk, self.legacy_geometry)?;
+        for (row, key) in keys.into_iter().enumerate() {
             let Some(key) = key else { continue };
             if self.art.insert(&key, row_id(row), AppendMode::Default)? != Conflict::None {
                 return Err(Error::new(
@@ -178,7 +210,11 @@ impl TableIndex {
             root: self.art.root_bits(),
             allocator_infos,
             // without it C++ takes the keys to be from before v1.5.0; a new index has the version of its file
-            options: vec![("storage_version".to_string(), Value::ubigint(self.version.0))],
+            options: self
+                .key_version
+                .map(|version| ("storage_version".to_string(), Value::ubigint(version.0)))
+                .into_iter()
+                .collect(),
         })
     }
 

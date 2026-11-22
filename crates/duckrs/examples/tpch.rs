@@ -4,8 +4,9 @@
 //! cargo run --release -p duckrs --example tpch -- <dir with .tbl files> <extension/tpch/dbgen> <sf> [query numbers]
 //! ```
 //!
-//! The `.tbl` files are pipe-delimited rows, as dbgen writes them. duckrs has no COPY yet, so they
-//! go in through INSERT. With `TPCH_EXPLAIN` set it prints the plan of each query first.
+//! The `.tbl` files are pipe-delimited rows, as dbgen writes them, which go in through INSERT. With
+//! `TPCH_DATABASE` set to a database file that has the tables, it reads them there instead. With
+//! `TPCH_EXPLAIN` set it prints the plan of each query first.
 
 use duckrs::{Connection, Database, Result};
 use std::fs;
@@ -86,18 +87,42 @@ fn same_cell(actual: &str, expected: &str) -> bool {
     }
 }
 
+fn same_row(a: &[String], e: &[String]) -> bool {
+    a.len() == e.len() && a.iter().zip(e).all(|(a, e)| same_cell(a, e))
+}
+
+/// Row for row, except that rows tied in the order may come in another order among themselves: each stretch where
+/// the rows differ has to hold the same rows on both sides. (Q11 orders by value alone, and SF10 has ties there.)
 fn same_rows(actual: &[Vec<String>], expected: &[Vec<String>]) -> bool {
-    actual.len() == expected.len()
-        && actual
-            .iter()
-            .zip(expected)
-            .all(|(a, e)| a.len() == e.len() && a.iter().zip(e).all(|(a, e)| same_cell(a, e)))
+    if actual.len() != expected.len() {
+        return false;
+    }
+    let mut pending: Vec<&[String]> = Vec::new();
+    for (a, e) in actual.iter().zip(expected) {
+        if pending.is_empty() && same_row(a, e) {
+            continue;
+        }
+        for row in [a.as_slice(), e.as_slice()] {
+            match pending.iter().position(|p| same_row(p, row)) {
+                Some(at) => {
+                    pending.swap_remove(at);
+                }
+                None => pending.push(row),
+            }
+        }
+    }
+    pending.is_empty()
 }
 
 fn answer(path: &Path) -> Vec<Vec<String>> {
     let text = fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let lines = text.lines().skip(1);
-    lines.map(|l| l.split('|').map(str::to_string).collect()).collect()
+    // the SF10 answers quote some strings (`"Brand#44"`)
+    let unquote = |cell: &str| {
+        let inner = cell.strip_prefix('"').and_then(|c| c.strip_suffix('"'));
+        inner.unwrap_or(cell).to_string()
+    };
+    lines.map(|l| l.split('|').map(unquote).collect()).collect()
 }
 
 fn run(connection: &mut Connection, sql: &str) -> Result<Vec<Vec<String>>> {
@@ -122,9 +147,15 @@ fn main() -> Result<()> {
         panic!("usage: tpch <dir with .tbl files> <extension/tpch/dbgen> <sf> [query numbers]");
     };
     let dbgen = Path::new(dbgen);
-    let database = Database::open_in_memory()?;
+    // `TPCH_DATABASE`: the tables are in that file already, which is read as it is
+    let database = match std::env::var_os("TPCH_DATABASE") {
+        Some(file) => Database::open(Path::new(&file), true)?,
+        None => Database::open_in_memory()?,
+    };
     let mut connection = database.connect()?;
-    load(&mut connection, Path::new(tables))?;
+    if std::env::var_os("TPCH_DATABASE").is_none() {
+        load(&mut connection, Path::new(tables))?;
+    }
     let queries: Vec<usize> = if wanted.is_empty() {
         (1..=22).collect()
     } else {

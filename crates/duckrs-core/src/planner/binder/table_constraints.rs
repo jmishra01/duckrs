@@ -199,6 +199,7 @@ impl Binder<'_> {
         binder.bind_context.add_binding(Binding {
             alias: table.to_string(),
             schema: None,
+            catalog: None,
             table_index,
             names: columns.iter().map(|c| c.name.clone()).collect(),
             types: columns.iter().map(|c| c.ty.clone()).collect(),

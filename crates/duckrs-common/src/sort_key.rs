@@ -315,34 +315,24 @@ pub enum RowKey {
 }
 
 impl RowKey {
-    const EMPTY: Self = Self::Inline {
-        len: 0,
-        bytes: [0; INLINE_KEY_SIZE],
-    };
+    /// The key of these bytes: in here if they fit in [`INLINE_KEY_SIZE`], so that a key has one form.
+    pub fn from_bytes(new: &[u8]) -> Self {
+        if new.len() <= INLINE_KEY_SIZE {
+            let mut bytes = [0; INLINE_KEY_SIZE];
+            bytes[..new.len()].copy_from_slice(new);
+            Self::Inline {
+                len: new.len() as u8,
+                bytes,
+            }
+        } else {
+            Self::Heap(new.to_vec())
+        }
+    }
 
     pub fn as_bytes(&self) -> &[u8] {
         match self {
             Self::Inline { len, bytes } => &bytes[..*len as usize],
             Self::Heap(bytes) => bytes,
-        }
-    }
-
-    fn append(&mut self, new: &[u8]) {
-        match self {
-            Self::Inline { len, bytes } => {
-                let end = *len as usize + new.len();
-                if end <= INLINE_KEY_SIZE {
-                    bytes[*len as usize..end].copy_from_slice(new);
-                    *len = end as u8;
-                } else {
-                    // room for the columns still to come, so that they do not each move the key
-                    let mut heap = Vec::with_capacity((end + end / 2).max(64));
-                    heap.extend_from_slice(&bytes[..*len as usize]);
-                    heap.extend_from_slice(new);
-                    *self = Self::Heap(heap);
-                }
-            }
-            Self::Heap(bytes) => bytes.extend_from_slice(new),
         }
     }
 }
@@ -398,54 +388,205 @@ impl std::hash::Hasher for KeyHasher {
     }
 }
 
-/// A map from row keys.
-pub type RowKeyMap<V> = std::collections::HashMap<RowKey, V, std::hash::BuildHasherDefault<KeyHasher>>;
+/// A map from row keys, which can be looked up by the bytes of a key ([`KeyBytes`]).
+pub type RowKeyMap<V> = hashbrown::HashMap<RowKey, V, std::hash::BuildHasherDefault<KeyHasher>>;
 /// A set of row keys.
-pub type RowKeySet = std::collections::HashSet<RowKey, std::hash::BuildHasherDefault<KeyHasher>>;
+pub type RowKeySet = hashbrown::HashSet<RowKey, std::hash::BuildHasherDefault<KeyHasher>>;
+
+/// The bytes of a row key, which find it in a [`RowKeyMap`] without a [`RowKey`] made of them.
+#[derive(Debug, Clone, Copy)]
+pub struct KeyBytes<'a>(pub &'a [u8]);
+
+impl std::hash::Hash for KeyBytes<'_> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // as `RowKey` hashes
+        state.write(self.0);
+    }
+}
+
+impl hashbrown::Equivalent<RowKey> for KeyBytes<'_> {
+    fn equivalent(&self, key: &RowKey) -> bool {
+        self.0 == key.as_bytes()
+    }
+}
+
+/// The keys of [`create_row_keys`] for the rows of a chunk, one after another in one buffer.
+#[derive(Debug, Default)]
+pub struct RowKeyBuffer {
+    bytes: Vec<u8>,
+    ends: Vec<usize>,
+}
+
+impl RowKeyBuffer {
+    pub fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ends.is_empty()
+    }
+
+    /// The key of row `row`.
+    pub fn get(&self, row: usize) -> KeyBytes<'_> {
+        let start = if row == 0 { 0 } else { self.ends[row - 1] };
+        KeyBytes(&self.bytes[start..self.ends[row]])
+    }
+}
+
+/// [`create_row_keys`] into one buffer, a column at a time: the length of each row's key first, then each column's
+/// bytes at their place in each key. A column of a kind that isn't written so is encoded row by row once.
+pub fn create_row_key_buffer(columns: &[&Vector], count: usize) -> Result<RowKeyBuffer> {
+    let columns = columns
+        .iter()
+        .map(|column| KeyColumn::new(column, count, OrderModifiers::ASC_NULLS_LAST))
+        .collect::<Result<Vec<_>>>()?;
+    let mut lengths = vec![0usize; count];
+    let mut encoded: Vec<Option<RowKeyBuffer>> = Vec::with_capacity(columns.len());
+    for column in &columns {
+        let format = &column.format;
+        if let Some(width) = column.fixed_width() {
+            for (row, length) in lengths.iter_mut().enumerate() {
+                *length += if format.validity.is_valid(format.sel.get(row)) {
+                    1 + width
+                } else {
+                    1
+                };
+            }
+            encoded.push(None);
+        } else if column.plain_string() {
+            for (row, length) in lengths.iter_mut().enumerate() {
+                *length += if format.validity.is_valid(format.sel.get(row)) {
+                    2 + format.str_at(row).len()
+                } else {
+                    1
+                };
+            }
+            encoded.push(None);
+        } else {
+            let mut rows = RowKeyBuffer {
+                bytes: Vec::new(),
+                ends: Vec::with_capacity(count),
+            };
+            for (row, length) in lengths.iter_mut().enumerate() {
+                let start = rows.bytes.len();
+                column.encode(row, false, &mut rows.bytes);
+                rows.ends.push(rows.bytes.len());
+                *length += rows.bytes.len() - start;
+            }
+            encoded.push(Some(rows));
+        }
+    }
+    let mut ends = Vec::with_capacity(count);
+    let mut total = 0;
+    for length in &lengths {
+        total += length;
+        ends.push(total);
+    }
+    let mut bytes = vec![0u8; total];
+    // where each row's key goes on
+    let mut at: Vec<usize> = ends.iter().zip(&lengths).map(|(end, length)| end - length).collect();
+    for (column, encoded) in columns.iter().zip(&encoded) {
+        match encoded {
+            Some(rows) => {
+                for (row, at) in at.iter_mut().enumerate() {
+                    let key = rows.get(row).0;
+                    bytes[*at..*at + key.len()].copy_from_slice(key);
+                    *at += key.len();
+                }
+            }
+            None => column.write_at(&mut bytes, &mut at),
+        }
+    }
+    Ok(RowKeyBuffer { bytes, ends })
+}
 
 impl KeyColumn {
-    /// Appends the key of each row to `keys`: `encode`, but a column at a time.
-    fn append_to(&self, keys: &mut [RowKey]) {
+    /// The bytes of a value of a column of fixed width, which `write_at` writes.
+    fn fixed_width(&self) -> Option<usize> {
+        if !matches!(self.kind, Kind::Value) || self.is_timetz {
+            return None;
+        }
+        Some(match self.physical {
+            PhysicalType::Bool | PhysicalType::Int8 | PhysicalType::UInt8 => 1,
+            PhysicalType::Int16 | PhysicalType::UInt16 => 2,
+            PhysicalType::Int32 | PhysicalType::UInt32 | PhysicalType::Float => 4,
+            PhysicalType::Int64 | PhysicalType::UInt64 | PhysicalType::Double => 8,
+            PhysicalType::Int128 | PhysicalType::UInt128 => 16,
+            _ => return None,
+        })
+    }
+
+    /// A VARCHAR that `encode` writes as its bytes plus one each.
+    fn plain_string(&self) -> bool {
+        matches!(self.kind, Kind::Value)
+            && self.physical == PhysicalType::Varchar
+            && self.is_varchar
+            && !self.is_bit
+            && !self.is_variant
+    }
+
+    /// `encode` of each row at `at[row]` of `bytes`, for a column of fixed width or a plain VARCHAR, moving `at`
+    /// past what it wrote.
+    fn write_at(&self, bytes: &mut [u8], at: &mut [usize]) {
+        let format = &self.format;
         macro_rules! fixed {
             ($t:ty, $encode:expr) => {{
-                let data = self.format.data::<$t>();
+                let data = format.data::<$t>();
                 let encode = $encode;
-                let valid_byte = [self.valid_byte];
-                for (row, key) in keys.iter_mut().enumerate() {
-                    let idx = self.format.sel.get(row);
-                    if self.format.validity.is_valid(idx) {
-                        key.append(&valid_byte);
-                        key.append(&encode(data[idx]));
+                for (row, at) in at.iter_mut().enumerate() {
+                    let index = format.sel.get(row);
+                    if format.validity.is_valid(index) {
+                        let value = encode(data[index]);
+                        bytes[*at] = self.valid_byte;
+                        bytes[*at + 1..*at + 1 + value.len()].copy_from_slice(&value);
+                        *at += 1 + value.len();
                     } else {
-                        key.append(&[self.null_byte]);
+                        bytes[*at] = self.null_byte;
+                        *at += 1;
                     }
                 }
             }};
         }
         match self.physical {
+            PhysicalType::Bool => fixed!(bool, |v: bool| [u8::from(v)]),
+            PhysicalType::Int8 => fixed!(i8, |v: i8| [v as u8 ^ 0x80]),
+            PhysicalType::Int16 => fixed!(i16, |v: i16| (v as u16 ^ (1 << 15)).to_be_bytes()),
             PhysicalType::Int32 => fixed!(i32, |v: i32| (v as u32 ^ (1 << 31)).to_be_bytes()),
             PhysicalType::Int64 => fixed!(i64, |v: i64| (v as u64 ^ (1 << 63)).to_be_bytes()),
+            PhysicalType::Int128 => fixed!(i128, |v: i128| (v as u128 ^ (1 << 127)).to_be_bytes()),
+            PhysicalType::UInt8 => fixed!(u8, |v: u8| [v]),
+            PhysicalType::UInt16 => fixed!(u16, |v: u16| v.to_be_bytes()),
             PhysicalType::UInt32 => fixed!(u32, |v: u32| v.to_be_bytes()),
+            PhysicalType::UInt64 => fixed!(u64, |v: u64| v.to_be_bytes()),
+            PhysicalType::UInt128 => fixed!(u128, |v: u128| v.to_be_bytes()),
+            PhysicalType::Float => fixed!(f32, |v: f32| encode_float(v).to_be_bytes()),
             PhysicalType::Double => fixed!(f64, |v: f64| encode_double(v).to_be_bytes()),
-            _ => {
-                let mut scratch = Vec::new();
-                for (row, key) in keys.iter_mut().enumerate() {
-                    scratch.clear();
-                    self.encode(row, false, &mut scratch);
-                    key.append(&scratch);
+            PhysicalType::Varchar => {
+                for (row, at) in at.iter_mut().enumerate() {
+                    if !format.validity.is_valid(format.sel.get(row)) {
+                        bytes[*at] = self.null_byte;
+                        *at += 1;
+                        continue;
+                    }
+                    let text = format.str_at(row);
+                    bytes[*at] = self.valid_byte;
+                    // every byte + 1, so none is the 0 that ends the string
+                    for (to, from) in bytes[*at + 1..*at + 1 + text.len()].iter_mut().zip(text) {
+                        *to = from.wrapping_add(1);
+                    }
+                    bytes[*at + 1 + text.len()] = STRING_DELIMITER;
+                    *at += 2 + text.len();
                 }
             }
+            other => unreachable!("{other} is not written a column at a time"),
         }
     }
 }
 
 /// A key per row, in the bytes of [`create_sort_keys`] for ascending columns with NULLs last.
 pub fn create_row_keys(columns: &[&Vector], count: usize) -> Result<Vec<RowKey>> {
-    let mut keys = vec![RowKey::EMPTY; count];
-    for column in columns {
-        KeyColumn::new(column, count, OrderModifiers::ASC_NULLS_LAST)?.append_to(&mut keys);
-    }
-    Ok(keys)
+    let buffer = create_row_key_buffer(columns, count)?;
+    Ok((0..count).map(|row| RowKey::from_bytes(buffer.get(row).0)).collect())
 }
 
 /// `Radix::EncodeFloat`: an order-preserving u32 (NaN largest, -0.0 == 0.0).
@@ -514,6 +655,32 @@ fn sort_keys_of(columns: &[(&Vector, OrderModifiers)], count: usize, raw_interva
             key
         })
         .collect())
+}
+
+/// The rows of `columns` whose key of [`create_sort_keys`] sorts before `bound`, each key written into the same
+/// buffer in turn rather than one of its own.
+pub fn rows_sorting_before(columns: &[(&Vector, OrderModifiers)], count: usize, bound: &[u8]) -> Result<Vec<u32>> {
+    let prepared = columns
+        .iter()
+        .map(|(v, m)| {
+            Ok((
+                KeyColumn::new_with(v, count, *m, false)?,
+                m.order == OrderType::Descending,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut key = Vec::new();
+    let mut rows = Vec::new();
+    for row in 0..count {
+        key.clear();
+        for (column, flip) in &prepared {
+            column.encode(row, *flip, &mut key);
+        }
+        if key.as_slice() < bound {
+            rows.push(row as u32);
+        }
+    }
+    Ok(rows)
 }
 
 /// The row order of `chunk` under the given ORDER BY columns, as a selection. Ties keep their

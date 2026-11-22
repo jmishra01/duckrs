@@ -85,6 +85,7 @@ pub(super) fn table_binding(
     };
     Binding {
         schema: None,
+        catalog: None,
         types: columns.iter().map(|c| c.ty.clone()).collect(),
         alias,
         table_index,
@@ -171,6 +172,7 @@ impl Binder<'_> {
             binder.bind_context.add_binding(Binding {
                 alias: table.to_string(),
                 schema: None,
+                catalog: None,
                 table_index,
                 names: names.clone(),
                 types: (0..names.len()).map(usable).collect(),

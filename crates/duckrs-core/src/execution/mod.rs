@@ -13,6 +13,7 @@ pub mod csv_state_machine;
 pub mod expression_executor;
 pub mod external_sort;
 pub mod file_system;
+pub mod group_table;
 pub mod join;
 pub mod join_filter;
 pub mod json_scan;
@@ -369,6 +370,7 @@ fn create_physical(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
                 on_conflict,
                 children,
                 data: Mutex::new(duckrs_common::column_data::ColumnDataCollection::new(types_of_columns)),
+                written: Mutex::default(),
             })
         }
         LogicalOperatorKind::EmptyResult { .. } => Box::new(PhysicalEmptyResult { types }),
@@ -673,6 +675,7 @@ fn create_physical(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
                 pending,
                 output,
                 table,
+                batches: Default::default(),
             })
         }
         LogicalOperatorKind::CreateTable {
@@ -796,6 +799,7 @@ impl Pipeline<'_> {
                     }
                     Ok(())
                 })?;
+                self.sink.batch_done_local(&mut local, index)?;
             }
             self.sink.combine_local_input(self.input, local)
         };
@@ -955,3 +959,5 @@ pub fn execute_plan_with(root: &dyn PhysicalOperator, threads: usize) -> Result<
     }
     Ok(())
 }
+
+pub(crate) use duckrs_common::prefetch;

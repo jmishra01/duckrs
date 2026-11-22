@@ -567,8 +567,7 @@ pub fn try_cast_string_to_double(input: &[u8]) -> Option<f64> {
     if text.contains('_') {
         let bytes = text.as_bytes();
         let separated = bytes.iter().enumerate().all(|(i, b)| {
-            *b != b'_'
-                || (i > 0 && bytes[i - 1].is_ascii_digit() && bytes.get(i + 1).is_some_and(u8::is_ascii_digit))
+            *b != b'_' || (i > 0 && bytes[i - 1].is_ascii_digit() && bytes.get(i + 1).is_some_and(u8::is_ascii_digit))
         });
         if !separated {
             return None;
@@ -676,6 +675,11 @@ fn pow10(exponent: u8) -> i128 {
 /// `TryDecimalStringCast`: the unscaled value a string spells at `scale`, rounding further
 /// digits half away from zero; `None` if it is no number or exceeds the width.
 fn string_to_decimal(input: &[u8], width: u8, scale: u8) -> Option<i128> {
+    plain_decimal(input, width, scale).or_else(|| any_decimal(input, width, scale))
+}
+
+/// [`string_to_decimal`] of any text.
+fn any_decimal(input: &[u8], width: u8, scale: u8) -> Option<i128> {
     let text = std::str::from_utf8(input)
         .ok()?
         .trim_matches(|c: char| c.is_ascii() && is_space(c as u8));
@@ -727,6 +731,46 @@ fn string_to_decimal(input: &[u8], width: u8, scale: u8) -> Option<i128> {
         result += 1;
     }
     (result < pow10(width)).then_some(if negative { -result } else { result })
+}
+
+/// [`string_to_decimal`] of the common text, `[-]digits[.digits]` with no more fraction digits than `scale` and at
+/// most 18 digits in all, in one pass; `None` for anything else, which the general parse then reads.
+fn plain_decimal(input: &[u8], width: u8, scale: u8) -> Option<i128> {
+    let (negative, digits) = match input.split_first() {
+        Some((b'-', rest)) => (true, rest),
+        _ => (false, input),
+    };
+    let mut integer: i64 = 0;
+    let mut integer_digits = 0usize;
+    let mut fraction: i64 = 0;
+    let mut fraction_digits: Option<usize> = None;
+    for &c in digits {
+        match (c, &mut fraction_digits) {
+            (b'0'..=b'9', None) => {
+                integer = integer * 10 + i64::from(c - b'0');
+                integer_digits += 1;
+            }
+            (b'0'..=b'9', Some(count)) => {
+                fraction = fraction * 10 + i64::from(c - b'0');
+                *count += 1;
+            }
+            (b'.', None) => fraction_digits = Some(0),
+            _ => return None,
+        }
+        if integer_digits + fraction_digits.unwrap_or(0) > 18 {
+            return None;
+        }
+    }
+    let fraction_digits = fraction_digits.unwrap_or(0);
+    if integer_digits == 0 || fraction_digits > scale as usize || width > 38 {
+        return None;
+    }
+    let integer = i128::from(integer);
+    if integer >= pow10(width - scale) {
+        return None;
+    }
+    let value = integer * pow10(scale) + i128::from(fraction) * pow10(scale - fraction_digits as u8);
+    Some(if negative { -value } else { value })
 }
 
 /// A cast from or to DECIMAL of one row: its value, or the conversion error.
@@ -882,7 +926,7 @@ fn decimal_at(data: &duckrs_common::vector::UnifiedFormat, physical: PhysicalTyp
 /// larger scale, as integers multiplied by a power of ten. `false` (and nothing written) when a value
 /// does not fit, which the cast by value then reports.
 fn decimal_scale_up(source: &Vector, result: &mut Vector, count: usize) -> Result<bool> {
-    let (Some((_, from_scale)), Some((to_width, to_scale))) = (
+    let (Some((from_width, from_scale)), Some((to_width, to_scale))) = (
         source.logical_type().decimal_properties(),
         result.logical_type().decimal_properties(),
     ) else {
@@ -893,49 +937,66 @@ fn decimal_scale_up(source: &Vector, result: &mut Vector, count: usize) -> Resul
     }
     let factor = 10i128.pow(u32::from(to_scale - from_scale));
     let limit = 10i128.pow(u32::from(to_width));
-    let (source_physical, target_physical) = (source.physical_type(), result.physical_type());
-    if !matches!(
-        source_physical,
-        PhysicalType::Int16 | PhysicalType::Int32 | PhysicalType::Int64 | PhysicalType::Int128
-    ) {
-        return Ok(false);
-    }
+    // `DecimalScaleUp` where no value can outgrow the target, `DecimalScaleUpCheck` otherwise
+    let unchecked = u32::from(from_width) + u32::from(to_scale - from_scale) <= u32::from(to_width);
     let constant = source.vector_type() == duckrs_common::vector::VectorType::Constant;
     let rows = if constant { 1 } else { count };
     let data = source.to_unified(rows);
-    let mut values = Vec::with_capacity(rows);
-    for row in 0..rows {
-        let index = data.sel.get(row);
-        if !data.validity.is_valid(index) {
-            values.push(None);
-            continue;
-        }
-        match decimal_at(&data, source_physical, index).checked_mul(factor) {
-            Some(value) if value.abs() < limit => values.push(Some(value)),
-            _ => return Ok(false),
-        }
-    }
     result.prepare_flat(rows.max(1));
-    macro_rules! write {
-        ($t:ty) => {{
-            let out = result.data_mut::<$t>();
-            for (row, value) in values.iter().enumerate() {
-                if let Some(value) = value {
-                    out[row] = *value as $t;
+    let all_valid = data.validity.all_valid();
+    // the values, each scaled up, into `$target`; false at the first that doesn't fit
+    macro_rules! scale {
+        ($source:ty, $target:ty) => {{
+            let values = data.data::<$source>();
+            let out = result.data_mut::<$target>();
+            let mut fits = true;
+            for (row, slot) in out.iter_mut().enumerate().take(rows) {
+                let index = data.sel.get(row);
+                if !all_valid && !data.validity.is_valid(index) {
+                    continue;
+                }
+                let value = i128::from(values[index]);
+                if unchecked {
+                    *slot = (value * factor) as $target;
+                } else {
+                    match value.checked_mul(factor) {
+                        Some(value) if value.abs() < limit => *slot = value as $target,
+                        _ => {
+                            fits = false;
+                            break;
+                        }
+                    }
                 }
             }
+            fits
         }};
     }
-    match target_physical {
-        PhysicalType::Int16 => write!(i16),
-        PhysicalType::Int32 => write!(i32),
-        PhysicalType::Int64 => write!(i64),
-        PhysicalType::Int128 => write!(i128),
-        _ => return Ok(false),
+    macro_rules! to_target {
+        ($source:ty) => {
+            match result.physical_type() {
+                PhysicalType::Int16 => scale!($source, i16),
+                PhysicalType::Int32 => scale!($source, i32),
+                PhysicalType::Int64 => scale!($source, i64),
+                PhysicalType::Int128 => scale!($source, i128),
+                _ => return Ok(false),
+            }
+        };
     }
-    for (row, value) in values.iter().enumerate() {
-        if value.is_none() {
-            result.set_null(row, true);
+    let fits = match source.physical_type() {
+        PhysicalType::Int16 => to_target!(i16),
+        PhysicalType::Int32 => to_target!(i32),
+        PhysicalType::Int64 => to_target!(i64),
+        PhysicalType::Int128 => to_target!(i128),
+        _ => return Ok(false),
+    };
+    if !fits {
+        return Ok(false);
+    }
+    if !all_valid {
+        for row in 0..rows {
+            if !data.validity.is_valid(data.sel.get(row)) {
+                result.set_null(row, true);
+            }
         }
     }
     if constant {
@@ -951,7 +1012,7 @@ fn decimal_cast(source: &Vector, result: &mut Vector, count: usize, mode: CastMo
     {
         return Ok(());
     }
-    if decimal_to_double(source, result, count) {
+    if decimal_to_double(source, result, count) || string_to_decimal_vector(source, result, count) {
         return Ok(());
     }
     let target = result.logical_type().clone();
@@ -974,6 +1035,58 @@ fn decimal_cast(source: &Vector, result: &mut Vector, count: usize, mode: CastMo
         result.set_constant();
     }
     Ok(())
+}
+
+/// VARCHAR to DECIMAL of a flat vector, each string read in place (`TryCastToDecimal`). False, with nothing done,
+/// where a string isn't one, for the row by row cast to say which, or to make it NULL.
+fn string_to_decimal_vector(source: &Vector, result: &mut Vector, count: usize) -> bool {
+    let Some((width, scale)) = result.logical_type().decimal_properties() else {
+        return false;
+    };
+    let physical = result.physical_type();
+    if source.logical_type().id() != LogicalTypeId::Varchar
+        || source.vector_type() != duckrs_common::vector::VectorType::Flat
+        || !matches!(
+            physical,
+            PhysicalType::Int16 | PhysicalType::Int32 | PhysicalType::Int64 | PhysicalType::Int128
+        )
+    {
+        return false;
+    }
+    let mut values = Vec::with_capacity(count);
+    for row in 0..count {
+        match source.str_at(row) {
+            None => values.push(None),
+            Some(text) => match string_to_decimal(text, width, scale) {
+                Some(value) => values.push(Some(value)),
+                None => return false,
+            },
+        }
+    }
+    result.prepare_flat(count.max(1));
+    macro_rules! write {
+        ($t:ty) => {{
+            let out = result.data_mut::<$t>();
+            for (row, value) in values.iter().enumerate() {
+                if let Some(value) = value {
+                    out[row] = *value as $t;
+                }
+            }
+        }};
+    }
+    match physical {
+        PhysicalType::Int16 => write!(i16),
+        PhysicalType::Int32 => write!(i32),
+        PhysicalType::Int64 => write!(i64),
+        PhysicalType::Int128 => write!(i128),
+        _ => return false,
+    }
+    for (row, value) in values.iter().enumerate() {
+        if value.is_none() {
+            result.set_null(row, true);
+        }
+    }
+    true
 }
 
 /// A DECIMAL as a DOUBLE: its integer over a power of ten (`DecimalToDouble`), which is the
@@ -1080,9 +1193,7 @@ fn is_ported_scalar(ty: &LogicalType) -> bool {
 pub(super) fn contains_type(ty: &LogicalType) -> bool {
     match ty.id() {
         LogicalTypeId::Type => true,
-        LogicalTypeId::List | LogicalTypeId::Array | LogicalTypeId::Map => {
-            ty.child_type().is_some_and(contains_type)
-        }
+        LogicalTypeId::List | LogicalTypeId::Array | LogicalTypeId::Map => ty.child_type().is_some_and(contains_type),
         LogicalTypeId::Struct | LogicalTypeId::Tuple | LogicalTypeId::Union => {
             ty.struct_children().iter().any(|(_, child)| contains_type(child))
         }
@@ -1208,7 +1319,9 @@ pub fn cast_vector(source: &Vector, result: &mut Vector, count: usize, mode: Cas
         result.prepare_flat(count.max(1));
         for row in 0..count {
             if unified.is_valid(row) && mode != CastMode::Try {
-                return Err(conversion_error(format!("Unimplemented type for cast ({from} -> VARIANT)")));
+                return Err(conversion_error(format!(
+                    "Unimplemented type for cast ({from} -> VARIANT)"
+                )));
             }
             result.set_null(row, true);
         }
@@ -1370,5 +1483,23 @@ mod tests {
         let below = 18446742974197923840i128;
         assert_eq!(f32::from_number(Number::Int(below + 1)), Some(below as f32));
         assert_eq!(below as f32 as f64, 18446742974197923840.0);
+    }
+
+    /// The one-pass parse of plain decimals reads what the general one does, and leaves the rest to it.
+    #[test]
+    fn plain_decimal_matches_any_decimal() {
+        // `|` between them, as some are empty or have spaces
+        let inputs = "0|1|-1|12.5|-12.50|0.07|1.|-0|-0.00|007|99.99|100.00|999999999999999999|1234567890123.45|12.345|\
+                      .5|-||1e2| 1|1_0|+1|1.2.3|--1|9999999999999.99";
+        for (width, scale) in [(15, 2), (4, 2), (2, 0), (18, 3), (38, 10), (3, 3)] {
+            for input in inputs.split('|') {
+                let plain = plain_decimal(input.as_bytes(), width, scale);
+                let any = any_decimal(input.as_bytes(), width, scale);
+                if plain.is_some() {
+                    assert_eq!(plain, any, "{input:?} as DECIMAL({width},{scale})");
+                }
+                assert_eq!(string_to_decimal(input.as_bytes(), width, scale), any, "{input:?}");
+            }
+        }
     }
 }

@@ -297,12 +297,29 @@ fn row_hashes(input: &Vector, rows: usize) -> Result<Vec<u64>> {
         PhysicalType::Double => hash_rows!(f64),
         PhysicalType::Interval => hash_rows!(Interval),
         PhysicalType::Varchar => {
-            for i in 0..rows {
-                out.push(if u.is_valid(i) {
-                    hash_bytes(u.str_at(i))
-                } else {
-                    NULL_HASH
-                });
+            // a window's strings, then the bytes of those not inlined, are asked for before any is hashed, so that
+            // their reads from memory overlap: rows of a join's build side are anywhere in it
+            const WINDOW: usize = 32;
+            let strings = u.data::<crate::types::StringT>();
+            for start in (0..rows).step_by(WINDOW) {
+                let end = (start + WINDOW).min(rows);
+                for i in start..end {
+                    crate::prefetch(&strings[u.sel.get(i)]);
+                }
+                for i in start..end {
+                    let string = &strings[u.sel.get(i)];
+                    if !string.is_inlined() && u.is_valid(i) {
+                        // SAFETY: the format keeps the vector's string buffer alive, and only the address is taken
+                        crate::prefetch(unsafe { string.as_bytes() });
+                    }
+                }
+                for i in start..end {
+                    out.push(if u.is_valid(i) {
+                        hash_bytes(u.str_at(i))
+                    } else {
+                        NULL_HASH
+                    });
+                }
             }
         }
         other => {

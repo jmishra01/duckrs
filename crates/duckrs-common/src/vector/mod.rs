@@ -250,6 +250,21 @@ impl Vector {
         Arc::make_mut(&mut self.flat_mut().data).as_mut_slice()
     }
 
+    /// The values of a flat or constant vector of integers or floats as their bytes, in the machine's order;
+    /// copies the buffer first if it is shared. Any bytes are such a value, so writing them is safe.
+    pub fn number_bytes_mut(&mut self) -> &mut [u8] {
+        use PhysicalType::*;
+        assert!(
+            matches!(
+                self.physical_type(),
+                Int8 | Int16 | Int32 | Int64 | Int128 | UInt8 | UInt16 | UInt32 | UInt64 | UInt128 | Float | Double
+            ),
+            "{} is not stored as a number",
+            self.ty
+        );
+        Arc::make_mut(&mut self.flat_mut().data).as_mut_slice::<u8>()
+    }
+
     /// Mutable strings of a flat VARCHAR/BLOB vector.
     ///
     /// # Safety
@@ -383,7 +398,8 @@ impl Vector {
             Repr::Dictionary { sel, child } => Vector {
                 ty: self.ty.clone(),
                 repr: Repr::Dictionary {
-                    sel: SelectionVector::from_vec((start..start + count).map(|i| sel.get(i) as u32).collect()),
+                    // the rows of its selection from `start` on, without a copy of their indices
+                    sel: sel.window(start, count),
                     child: child.clone(),
                 },
                 shredded: false,
@@ -490,6 +506,35 @@ impl Vector {
             self.resize(values.len());
         }
         // SAFETY: the strings are inlined or point into this vector's own string buffer.
+        unsafe { self.string_data_mut()[..values.len()].copy_from_slice(&values) };
+        if !self.validity().all_valid() {
+            for row in 0..values.len() {
+                self.validity_mut().set_valid(row);
+            }
+        }
+    }
+
+    /// [`Self::set_strs`] of the strings that are the ranges of `bytes` up to each of `ends` in turn (the first from
+    /// the start), with `bytes` taken into this vector's string buffer rather than copied there.
+    pub fn set_strs_owned(&mut self, bytes: Vec<u8>, ends: &[usize]) {
+        assert!(ends.iter().all(|&end| end <= bytes.len()), "a string past its bytes");
+        let len = bytes.len();
+        let base = self.string_buffer().adopt(bytes);
+        let mut start = 0;
+        let values: Vec<StringT> = ends
+            .iter()
+            .map(|&end| {
+                assert!(start <= end && end <= len, "strings out of order");
+                // SAFETY: `start..end` is within the adopted bytes, which the string buffer keeps where they are.
+                let string = unsafe { StringT::from_raw_parts(base.add(start), end - start) };
+                start = end;
+                string
+            })
+            .collect();
+        if self.capacity() < values.len() {
+            self.resize(values.len());
+        }
+        // SAFETY: the strings are inlined or point into bytes this vector's own string buffer keeps.
         unsafe { self.string_data_mut()[..values.len()].copy_from_slice(&values) };
         if !self.validity().all_valid() {
             for row in 0..values.len() {

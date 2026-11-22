@@ -9,8 +9,11 @@
 //! as rows are appended, and samples a chunk only when it is a full vector.
 
 use crate::catalog::TableCatalogEntry;
+use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::hash::hash_vector;
+use duckrs_common::serializer::BinarySerializer;
 use duckrs_common::types::{LogicalType, PhysicalType};
+use duckrs_common::vector::Vector;
 use duckrs_common::STANDARD_VECTOR_SIZE;
 use std::sync::OnceLock;
 
@@ -55,6 +58,7 @@ impl Pcg32 {
 }
 
 /// `HyperLogLog` (`HyperLogLogP<6>`).
+#[derive(Debug, Clone)]
 struct HyperLogLog {
     registers: [u8; Self::M],
 }
@@ -68,6 +72,13 @@ impl HyperLogLog {
     fn new() -> Self {
         Self {
             registers: [0; Self::M],
+        }
+    }
+
+    /// `Merge`: each register the larger of the two.
+    fn merge(&mut self, other: &Self) {
+        for (register, other) in self.registers.iter_mut().zip(other.registers) {
+            *register = (*register).max(other);
         }
     }
 
@@ -172,6 +183,125 @@ pub fn type_is_supported(ty: &LogicalType) -> bool {
         )
 }
 
+/// `HLLStorageType::HLL_V2`, the registers as they are.
+pub const HLL_V2: u8 = 2;
+/// `HLLStorageType::HLL_V1`, the dense HyperLogLog of redis that older files have.
+pub const HLL_V1: u8 = 1;
+
+/// `HLLV1::ToNew`: the registers of the dense redis HyperLogLog `data` (its `hllhdr`, then 4096 registers of 6 bits
+/// from the byte after `registers`), each new one the largest of as many old ones in turn. `None` if `data` is not
+/// one.
+pub fn registers_of_v1(data: &[u8]) -> Option<Vec<u8>> {
+    const HEADER: usize = 16;
+    const REGISTERS: usize = 1 << 12;
+    const BITS: usize = 6;
+    const HLL_DENSE: u8 = 0;
+    let registers = data.get(HEADER + 1..)?;
+    if !data.starts_with(b"HYLL") || data[4] != HLL_DENSE || registers.len() * 8 < REGISTERS * BITS {
+        return None;
+    }
+    // `HLL_DENSE_GET_REGISTER`
+    let register = |index: usize| -> u8 {
+        let (byte, bit) = (index * BITS / 8, index * BITS % 8);
+        let low = u16::from(registers[byte]);
+        let high = u16::from(registers.get(byte + 1).copied().unwrap_or(0));
+        (((low >> bit) | (high << (8 - bit))) & ((1 << BITS) - 1)) as u8
+    };
+    let per = REGISTERS / HyperLogLog::M;
+    Some(
+        (0..HyperLogLog::M)
+            .map(|i| (0..per).map(|j| register(i * per + j)).max().unwrap_or(0))
+            .collect(),
+    )
+}
+
+/// `DistinctStatistics`: a HyperLogLog of a sample of a column's rows, and how many rows it saw and sampled. A
+/// database file keeps one per column, which C++ updates as rows are appended.
+#[derive(Debug, Clone)]
+pub struct DistinctState {
+    log: HyperLogLog,
+    sample_count: u64,
+    total_count: u64,
+}
+
+impl Default for DistinctState {
+    fn default() -> Self {
+        Self {
+            log: HyperLogLog::new(),
+            sample_count: 0,
+            total_count: 0,
+        }
+    }
+}
+
+impl DistinctState {
+    /// The state a file has (`HLL_V2`): `None` if a register can't be one (`Invalid HyperLogLog register value`).
+    pub fn stored(registers: &[u8], sample_count: u64, total_count: u64) -> Option<Self> {
+        let registers: [u8; HyperLogLog::M] = registers.try_into().ok()?;
+        if registers.iter().any(|&register| register as usize > HyperLogLog::Q + 1) {
+            return None;
+        }
+        Some(Self {
+            log: HyperLogLog { registers },
+            sample_count,
+            total_count,
+        })
+    }
+
+    /// `UpdateSample` of `count` rows of `vector` of type `ty`: false if they can't be hashed.
+    pub fn update(&mut self, ty: &LogicalType, vector: &Vector, count: usize) -> bool {
+        if count == 0 {
+            return true;
+        }
+        let integral = ty.is_integral();
+        self.total_count += count as u64;
+        let Ok(hashes) = hash_vector(vector, count) else {
+            return false;
+        };
+        let unified = vector.to_unified(count);
+        let hash_data = hashes.to_unified(count);
+        let hash_values = hash_data.data::<u64>();
+        let log = &mut self.log;
+        let mut insert = |row: usize| {
+            if unified.is_valid(row) {
+                log.insert(hash_values[hash_data.sel.get(row)]);
+            }
+        };
+        // a chunk that is no full vector has its first rows of the sample's size counted, a full one the rows of
+        // the sample
+        let wanted = sample_size(integral).min(count);
+        if count != STANDARD_VECTOR_SIZE || wanted == count {
+            (0..wanted).for_each(&mut insert);
+        } else {
+            samples(integral).iter().take(wanted).copied().for_each(&mut insert);
+        }
+        self.sample_count += wanted as u64;
+        true
+    }
+
+    /// `Merge`.
+    pub fn merge(&mut self, other: &Self) {
+        self.log.merge(&other.log);
+        self.sample_count += other.sample_count;
+        self.total_count += other.total_count;
+    }
+
+    /// `DistinctStatistics::Serialize`, with its log as `HLL_V2`.
+    pub fn write(&self, s: &mut BinarySerializer) {
+        s.write_property_with_default(100, "sample_count", &self.sample_count);
+        s.write_property_with_default(101, "total_count", &self.total_count);
+        s.write_nullable_object(102, "log", |s| {
+            s.write_property(100, "type", &HLL_V2);
+            s.write_property(101, "data", &self.log.registers[..]);
+        });
+    }
+
+    /// `GetCount`.
+    pub fn count(&self) -> u64 {
+        distinct_count(&self.log, self.sample_count, self.total_count)
+    }
+}
+
 /// The distinct values of column `column` of `table` as C++'s statistics would count them, from
 /// the chunks it appended (`UpdateSample` for each, then `GetCount`).
 pub fn table_column_distinct(table: &TableCatalogEntry, column: usize) -> Option<u64> {
@@ -179,44 +309,31 @@ pub fn table_column_distinct(table: &TableCatalogEntry, column: usize) -> Option
     if !type_is_supported(ty) {
         return None;
     }
-    let integral = ty.is_integral();
-    let mut log = HyperLogLog::new();
-    let (mut sample_count, mut total_count) = (0u64, 0u64);
+    let mut state = DistinctState::default();
     let mut failed = false;
     table
         .for_each_chunk(column, |_, vector, count| {
-            if failed || count == 0 {
-                return;
-            }
-            total_count += count as u64;
-            let Ok(hashes) = hash_vector(vector, count) else {
-                failed = true;
-                return;
-            };
-            let unified = vector.to_unified(count);
-            let hash_data = hashes.to_unified(count);
-            let hash_values = hash_data.data::<u64>();
-            let mut insert = |row: usize| {
-                if unified.is_valid(row) {
-                    log.insert(hash_values[hash_data.sel.get(row)]);
-                }
-            };
-            // `UpdateSample`: a chunk that is no full vector has its first rows of the sample's size
-            // counted, a full one the rows of the sample
-            let wanted = sample_size(integral).min(count);
-            if count != STANDARD_VECTOR_SIZE || wanted == count {
-                (0..wanted).for_each(&mut insert);
-                sample_count += wanted as u64;
-            } else {
-                samples(integral).iter().take(wanted).copied().for_each(&mut insert);
-                sample_count += wanted as u64;
-            }
+            failed = failed || !state.update(ty, vector, count);
         })
         .ok()?;
     if failed {
         return None;
     }
-    Some(distinct_count(&log, sample_count, total_count))
+    Some(state.count())
+}
+
+/// [`DistinctState`] of column `column` of `rows`, from their chunks, if its type has one.
+pub fn rows_distinct(rows: &ColumnDataCollection, column: usize, ty: &LogicalType) -> Option<DistinctState> {
+    if !type_is_supported(ty) {
+        return None;
+    }
+    let mut state = DistinctState::default();
+    for chunk in rows.chunks() {
+        if !state.update(ty, chunk.column(column), chunk.len()) {
+            return None;
+        }
+    }
+    Some(state)
 }
 
 /// `DistinctStatistics::GetCount`: the Good-Turing estimate of the distinct values of all rows from
@@ -248,6 +365,61 @@ mod tests {
         let seed = Pcg32::new(0).next_u64();
         let drawn = Pcg32::new(seed).next_u64() as f64 * 2f64.powi(-64);
         assert_eq!(drawn, 0.806_044_809_746_107_3);
+    }
+
+    /// A dense redis HyperLogLog (`HLLV1`) with `set` registers of the given values, the others zero.
+    fn redis_log(set: &[(usize, u8)]) -> Vec<u8> {
+        let mut data = vec![0u8; 17 + 4096 * 6 / 8];
+        data[..4].copy_from_slice(b"HYLL");
+        for &(index, value) in set {
+            // `HLL_DENSE_SET_REGISTER`, from the byte after `registers`
+            let (byte, bit) = (17 + index * 6 / 8, index * 6 % 8);
+            data[byte] |= value << bit;
+            if bit > 2 {
+                data[byte + 1] |= value >> (8 - bit);
+            }
+        }
+        data
+    }
+
+    #[test]
+    fn v1_registers_are_the_largest_of_each_run() {
+        // 64 old registers make a new one: 0..64 the first, 64..128 the second
+        let data = redis_log(&[(3, 5), (40, 9), (64, 2), (127, 17), (4095, 63)]);
+        let registers = registers_of_v1(&data).unwrap();
+        assert_eq!(registers.len(), 64);
+        assert_eq!(&registers[..3], &[9, 17, 0]);
+        assert_eq!(registers[63], 63);
+        assert!(registers[2..63].iter().all(|&register| register == 0));
+        // what is not a dense redis log is not read
+        assert_eq!(registers_of_v1(&data[..100]), None);
+        let mut sparse = data.clone();
+        sparse[4] = 1;
+        assert_eq!(registers_of_v1(&sparse), None);
+    }
+
+    #[test]
+    fn stored_states_count_and_merge_as_counted_ones() {
+        let mut counted = DistinctState::default();
+        let mut log = HyperLogLog::new();
+        for value in 0..5000u64 {
+            log.insert(duckrs_common::hash::murmur64(value));
+        }
+        counted.log = log.clone();
+        (counted.sample_count, counted.total_count) = (5000, 20000);
+        let stored = DistinctState::stored(&log.registers, 5000, 20000).unwrap();
+        assert_eq!(stored.count(), counted.count());
+        // a register past `Q + 1` can't be one
+        let mut bad = log.registers;
+        bad[0] = HyperLogLog::Q as u8 + 2;
+        assert!(DistinctState::stored(&bad, 1, 1).is_none());
+        assert!(DistinctState::stored(&bad[..10], 1, 1).is_none());
+        // `Merge` takes the larger register and adds the counts
+        let mut merged = DistinctState::default();
+        merged.merge(&stored);
+        merged.merge(&stored);
+        assert_eq!(merged.log.registers, log.registers);
+        assert_eq!((merged.sample_count, merged.total_count), (10000, 40000));
     }
 
     #[test]

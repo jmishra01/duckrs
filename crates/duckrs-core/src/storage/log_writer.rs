@@ -32,12 +32,14 @@ use duckrs_common::vector::{DataChunk, SelectionVector, Vector};
 use duckrs_common::{Error, ErrorKind, Result, STANDARD_VECTOR_SIZE};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// `WAL_VERSION_NUMBER`.
 const WAL_VERSION: u64 = 2;
+/// `WAL_ENCRYPTED_VERSION_NUMBER`: the log of an encrypted file.
+const WAL_ENCRYPTED_VERSION: u64 = 3;
 
 type Key = (String, String);
 
@@ -135,8 +137,8 @@ impl Durable {
 }
 
 /// The records of one commit, as the version of the file has them.
-/// The bytes of some log records, the version they are in, and how many there are.
-struct Records(Vec<u8>, StorageVersion, u64);
+/// The bytes of some log records, the version they are in, how many there are, and how the file is encrypted.
+struct Records(Vec<u8>, StorageVersion, u64, Option<super::encryption::FileEncryption>);
 
 impl Records {
     fn entry(&mut self, wal: u64, body: impl FnOnce(&mut BinarySerializer)) {
@@ -150,8 +152,19 @@ impl Records {
         });
         let payload = s.into_bytes();
         self.0.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-        self.0.extend_from_slice(&checksum(&payload).to_le_bytes());
-        self.0.extend_from_slice(&payload);
+        match &self.3 {
+            // `ChecksumWriter::FlushEncrypted`
+            Some(encryption) => {
+                let framed = encryption
+                    .encrypt_log_entry(checksum(&payload), &payload)
+                    .expect("random bytes for a nonce");
+                self.0.extend_from_slice(&framed);
+            }
+            None => {
+                self.0.extend_from_slice(&checksum(&payload).to_le_bytes());
+                self.0.extend_from_slice(&payload);
+            }
+        }
         self.2 += 1;
     }
 
@@ -210,17 +223,30 @@ fn write_validity(s: &mut BinarySerializer, vector: &Vector, count: usize) -> bo
 fn write_vector(s: &mut BinarySerializer, vector: &Vector, ty: &LogicalType, count: usize) -> Result<()> {
     // `Vector::Serialize` of a GEOMETRY: its format, then the WKB as a list of blobs
     if ty.id() == LogicalTypeId::Geometry {
-        const WKB: u8 = 1;
-        s.write_property(99, "geometry_format", &WKB);
+        // before v1.5.0 (`Geometry::VERSION_ADDED`) without a format: the spatial extension's
+        let spatial = !s.should_serialize(StorageVersion::V1_5_0);
+        if !spatial {
+            const WKB: u8 = 1;
+            s.write_property(99, "geometry_format", &WKB);
+        }
         write_validity(s, vector, count);
-        s.write_list(102, "data", count, |s, row| {
+        let mut blobs = Vec::with_capacity(count);
+        for row in 0..count {
             let value = vector.get_value(row);
-            let wkb: &[u8] = match value.data() {
-                duckrs_common::value::ValueData::Bytes(bytes) if vector.is_valid(row) => bytes,
-                _ => &[],
-            };
-            s.write_varint_unsigned(wkb.len() as u64);
-            s.write_raw(wkb);
+            blobs.push(match value.data() {
+                duckrs_common::value::ValueData::Bytes(bytes) if vector.is_valid(row) => {
+                    if spatial {
+                        duckrs_common::geometry::to_spatial(bytes)?
+                    } else {
+                        bytes.to_vec()
+                    }
+                }
+                _ => Vec::new(),
+            });
+        }
+        s.write_list(102, "data", count, |s, row| {
+            s.write_varint_unsigned(blobs[row].len() as u64);
+            s.write_raw(&blobs[row]);
         });
         return Ok(());
     }
@@ -377,16 +403,15 @@ fn log_deletes(records: &mut Records, ids: &[u64]) -> Result<()> {
 /// replay are `ids`.
 fn log_update(
     records: &mut Records,
-    rows: &ColumnDataCollection,
+    chunk_column: &mut dyn FnMut(usize) -> Result<Vector>,
     column: usize,
     positions: &[usize],
     ids: &[u64],
 ) -> Result<()> {
     let mut done = 0;
     for part in positions.chunk_by(|a, b| a / STANDARD_VECTOR_SIZE == b / STANDARD_VECTOR_SIZE) {
-        let chunk = rows.chunk(part[0] / STANDARD_VECTOR_SIZE);
         let selection = part.iter().map(|at| (at % STANDARD_VECTOR_SIZE) as u32).collect();
-        let mut values = chunk.column(column).clone();
+        let mut values = chunk_column(part[0] / STANDARD_VECTOR_SIZE)?;
         values.slice(&SelectionVector::from_vec(selection), part.len());
         let mut row_ids = Vector::new(LogicalType::BIGINT, part.len());
         for (target, id) in row_ids.data_mut::<i64>().iter_mut().zip(&ids[done..]) {
@@ -405,7 +430,12 @@ fn log_update(
 }
 
 /// What changed of the rows of a table, in records.
-fn log_rows(records: &mut Records, name: &Key, table: &TableCatalogEntry) -> Result<()> {
+/// What writes the rows of a large append to blocks ahead of a checkpoint (`OptimisticDataWriter`): of a table, its
+/// rows in memory, the position of the first new one and its id.
+pub type WriteAhead<'a> =
+    &'a dyn Fn(&TableCatalogEntry, &ColumnDataCollection, usize, u64) -> Result<Vec<super::writer::WrittenGroup>>;
+
+fn log_rows(records: &mut Records, name: &Key, table: &TableCatalogEntry, ahead: Option<WriteAhead>) -> Result<()> {
     let mut log = table.log.lock();
     let count = table.row_count();
     let ids = table.row_ids(count);
@@ -421,13 +451,19 @@ fn log_rows(records: &mut Records, name: &Key, table: &TableCatalogEntry) -> Res
         }
     }
     records.use_table(name);
-    let storage = table.rows()?;
     let mut replayed = (*log.replayed).clone();
     let columns: Vec<usize> = log.updated_columns.iter().copied().collect();
     // a nested column takes more than a column in an update, and a replay sees it as a new row
     let nested = columns
         .iter()
         .any(|c| table.columns[*c].ty.physical_type() == PhysicalType::Struct);
+    // rows still in a file, of which nothing is new, need only the columns that were updated
+    // rows in a file, with those appended after them, are read where they are
+    let in_file = table.source().filter(|_| !nested);
+    let storage = match &in_file {
+        Some(_) => None,
+        None => Some(table.rows()?),
+    };
     let first_written = if nested {
         let all: Vec<u64> = replayed
             .ranges()
@@ -445,7 +481,21 @@ fn log_rows(records: &mut Records, name: &Key, table: &TableCatalogEntry) -> Res
             .unzip();
         if !positions.is_empty() {
             for column in &columns {
-                log_update(records, &storage, *column, &positions, &updated)?;
+                let mut chunk_column: Box<dyn FnMut(usize) -> Result<Vector>> = match (&in_file, &storage) {
+                    (Some(source), _) => {
+                        let ty = table.columns[*column].ty.clone();
+                        let mut cursor = crate::catalog::TableCursor::new(
+                            source.clone(),
+                            vec![*column],
+                            vec![ty],
+                            table.row_group_size(),
+                        );
+                        Box::new(move |chunk| Ok(cursor.chunk(chunk)?.column(0).clone()))
+                    }
+                    (None, Some(rows)) => Box::new(|chunk| Ok(rows.chunk(chunk).column(*column).clone())),
+                    (None, None) => unreachable!("the rows are read where they aren't in a file"),
+                };
+                log_update(records, &mut *chunk_column, *column, &positions, &updated)?;
             }
         }
         let gone = log.logged.missing_from(&ids);
@@ -454,28 +504,128 @@ fn log_rows(records: &mut Records, name: &Key, table: &TableCatalogEntry) -> Res
         replayed.remove(&gone);
         first_new
     };
-    let mut row = first_written / STANDARD_VECTOR_SIZE * STANDARD_VECTOR_SIZE;
-    for chunk in storage.chunks().skip(first_written / STANDARD_VECTOR_SIZE) {
-        let skip = first_written.saturating_sub(row);
-        let mut chunk = chunk.clone();
-        let count = chunk.len();
-        row += count;
-        if skip >= count {
-            continue;
-        }
-        if skip > 0 {
-            let selection = SelectionVector::from_vec((skip as u32..count as u32).collect());
-            chunk.slice(&selection, count - skip);
-        }
-        let mut result = Ok(());
-        records.entry(wal_type::INSERT_TUPLE, |s| result = write_chunk(s, &chunk));
-        result?;
+    if first_written < count {
+        let source = match (&in_file, &storage) {
+            (Some(source), _) => source.clone(),
+            (None, Some(rows)) => {
+                let parts = vec![super::appended::AppendedPart::Memory(Arc::new((**rows).clone()))];
+                let appended =
+                    super::appended::AppendedTable::new(parts, (*ids).clone(), table.types(), table.row_group_size());
+                Arc::new(appended) as Arc<dyn crate::catalog::TableSource>
+            }
+            (None, None) => unreachable!("the rows are read where they aren't in a file"),
+        };
+        drop(storage);
+        log_new_rows(records, table, &source, &ids, first_written, count, ahead)?;
     }
     replayed.fill(count);
     log.replayed = Arc::new(replayed);
     log.logged = ids;
     log.updated.clear();
     log.updated_columns.clear();
+    Ok(())
+}
+
+/// `DataTable::WriteToLog` of the rows of `table` from `first` on, of `source`, which has all its rows: row groups an
+/// append wrote to blocks go in as where they are (`WriteRowGroupData`), and so do the rows in memory after them where
+/// the append is a bulk one, of at least a row group (`LocalStorage::Flush`), which a commit writes to blocks now;
+/// other rows go in as rows. The table keeps its rows where the log says they are.
+fn log_new_rows(
+    records: &mut Records,
+    table: &TableCatalogEntry,
+    source: &Arc<dyn crate::catalog::TableSource>,
+    ids: &RowIds,
+    first: usize,
+    count: usize,
+    ahead: Option<WriteAhead>,
+) -> Result<()> {
+    use super::appended::{AppendedPart, AppendedTable, collection_between};
+    let types = table.types();
+    // the parts in front of the new rows stay; of those after, the row groups in blocks and the rows in memory
+    let mut kept = Vec::new();
+    let mut written = Vec::new();
+    let mut pending = ColumnDataCollection::new(types.clone());
+    let mut position = 0;
+    for part in AppendedTable::parts_of(source) {
+        let rows = match &part {
+            AppendedPart::Source(source) => source.row_count(),
+            AppendedPart::Written(group) => group.rows,
+            AppendedPart::Memory(memory) => memory.len(),
+        };
+        let end = position + rows;
+        if end <= first {
+            kept.push(part);
+        } else {
+            match part {
+                AppendedPart::Written(group) if position >= first && pending.is_empty() => written.push(group),
+                AppendedPart::Memory(memory) => {
+                    let from = first.saturating_sub(position);
+                    if from > 0 {
+                        kept.push(AppendedPart::Memory(Arc::new(collection_between(&memory, 0, from))));
+                    }
+                    pending.append_collection(&collection_between(&memory, from, memory.len()));
+                }
+                // new rows in a file or behind rows in memory: as rows, which the table has in memory then
+                part => {
+                    let rows = match &part {
+                        AppendedPart::Source(source) => source.read_all()?,
+                        AppendedPart::Written(group) => {
+                            let one = AppendedTable::new(
+                                vec![AppendedPart::Written(group.clone())],
+                                RowIds::of_ranges([(group.row_start, group.rows)], group.row_start + group.rows as u64),
+                                types.clone(),
+                                table.row_group_size(),
+                            );
+                            crate::catalog::TableSource::read_all(&one)?
+                        }
+                        AppendedPart::Memory(_) => unreachable!("handled above"),
+                    };
+                    let from = first.saturating_sub(position);
+                    if from > 0 {
+                        kept.push(AppendedPart::Memory(Arc::new(collection_between(&rows, 0, from))));
+                    }
+                    pending.append_collection(&collection_between(&rows, from, rows.len()));
+                }
+            }
+        }
+        position = end;
+    }
+    let first_pending = first + written.iter().map(|group| group.rows).sum::<usize>();
+    let bulk = count - first >= table.row_group_size();
+    let consecutive =
+        pending.is_empty() || ids.id(count - 1) - ids.id(first_pending) == (count - 1 - first_pending) as u64;
+    if let (true, true, Some(ahead)) = (bulk, consecutive, ahead)
+        && !pending.is_empty()
+    {
+        let groups = ahead(table, &pending, 0, ids.id(first_pending))?;
+        if !groups.is_empty() {
+            written.extend(groups.into_iter().map(Arc::new));
+            pending = ColumnDataCollection::new(types.clone());
+        }
+    }
+    // `FlushBlocks`: the blocks the append left open are written by now, so that the log can say where its row groups are
+    if let (false, Some(ahead)) = (written.is_empty(), ahead) {
+        ahead(table, &ColumnDataCollection::new(types.clone()), 0, 0)?;
+    }
+    if !written.is_empty() {
+        records.entry(wal_type::ROW_GROUP_DATA, |s| {
+            super::writer::write_row_group_data(s, &types, &written)
+        });
+    }
+    for chunk in pending.chunks() {
+        let mut result = Ok(());
+        records.entry(wal_type::INSERT_TUPLE, |s| result = write_chunk(s, chunk));
+        result?;
+    }
+    // where the rows are now: the row groups in blocks are kept out of memory
+    if !written.is_empty() {
+        kept.extend(written.into_iter().map(AppendedPart::Written));
+        if !pending.is_empty() {
+            kept.push(AppendedPart::Memory(Arc::new(pending)));
+        }
+        let appended = AppendedTable::new(kept, ids.clone(), types, table.row_group_size());
+        table.set_appended(Arc::new(appended));
+    }
     Ok(())
 }
 
@@ -522,6 +672,10 @@ pub struct WriteAheadLog {
     version: StorageVersion,
     /// `wal_entries_count`: the records since the last checkpoint.
     entries: u64,
+    /// Of a log that was replayed and isn't written to: where what it committed ends
+    replayed: Option<u64>,
+    /// of an encrypted file, whose log is encrypted as well
+    encryption: Option<super::encryption::FileEncryption>,
 }
 
 impl std::fmt::Debug for WriteAheadLog {
@@ -560,8 +714,32 @@ impl WriteAheadLog {
         self
     }
 
+    /// The log of a file encrypted as `encryption` says.
+    pub fn with_encryption(mut self, encryption: Option<super::encryption::FileEncryption>) -> Self {
+        self.encryption = encryption;
+        self
+    }
+
+    /// `WAL_VERSION_NUMBER`, or `WAL_ENCRYPTED_VERSION_NUMBER` of an encrypted file.
+    fn wal_version(&self) -> u64 {
+        if self.encryption.is_some() {
+            WAL_ENCRYPTED_VERSION
+        } else {
+            WAL_VERSION
+        }
+    }
+
     pub fn size(&self) -> u64 {
         self.size
+    }
+
+    /// A log that was replayed ends with what it committed at `end`, of entries of `version`: a checkpoint marks
+    /// it there (`WriteAheadLog::Initialize` of the size replay left), so that a crash between the end of the
+    /// checkpoint and the removal of the log leaves a log that says it is in the file.
+    pub fn with_replayed(mut self, replayed: Option<(u64, u64)>) -> Self {
+        let wanted = self.wal_version();
+        self.replayed = replayed.filter(|(_, version)| *version == wanted).map(|(end, _)| end);
+        self
     }
 
     /// `GetWALEntriesCount`.
@@ -585,9 +763,10 @@ impl WriteAheadLog {
             target: self.version,
             ..Default::default()
         });
+        let wal_version = self.wal_version();
         s.write_object_value(|s| {
             s.write_property(100, "wal_type", &wal_type::WAL_VERSION);
-            s.write_property(101, "version", &WAL_VERSION);
+            s.write_property(101, "version", &wal_version);
             // which file the log is of, from v1.3.0 on
             if s.should_serialize(StorageVersion::V1_3_0) {
                 s.write_list(102, "db_identifier", DB_IDENTIFIER_LEN, |s, i| {
@@ -656,8 +835,12 @@ impl WriteAheadLog {
     /// The tables that go and come back: each that changed its entry, as there are no records for
     /// ALTER, and what references one of those, as that keeps it from being dropped.
     fn written_again(&self, current: &Durable) -> BTreeSet<Key> {
+        // a table that ALTERs made of this one is the same table to the log
         let changed = |k: &Key, table: &Arc<TableCatalogEntry>| {
-            current.tables.get(k).is_some_and(|(_, new)| !Arc::ptr_eq(new, table))
+            current
+                .tables
+                .get(k)
+                .is_some_and(|(_, new)| !Arc::ptr_eq(new, table) && alters_since(new, table).is_none())
         };
         let mut again: BTreeSet<Key> = self
             .durable
@@ -691,8 +874,15 @@ impl WriteAheadLog {
     }
 
     /// What differs from what is durable, in records. Drops go first, as a name can come back.
-    fn differences(&self, catalog: &Catalog, name: &str, current: &Durable, block_size: usize) -> Result<Records> {
-        let mut records = Records(Vec::new(), self.version, 0);
+    fn differences(
+        &self,
+        catalog: &Catalog,
+        name: &str,
+        current: &Durable,
+        block_size: usize,
+        ahead: Option<WriteAhead>,
+    ) -> Result<Records> {
+        let mut records = Records(Vec::new(), self.version, 0, self.encryption.clone());
         let schema_of = |key: &Key| -> Result<Arc<SchemaCatalogEntry>> { catalog.schema_for(Some(&key.0)) };
         let gone = |old_same: bool, new_exists: bool| !new_exists || !old_same;
         // before the tables they are on go
@@ -734,6 +924,16 @@ impl WriteAheadLog {
             let tables: &BTreeMap<Key, (Key, Arc<TableCatalogEntry>)> = tables;
             !again.contains(k) && tables.get(k).is_some_and(|(_, other)| Arc::ptr_eq(other, table))
         };
+        // `WriteAlter`: the tables that ALTERs made of those the log knows, with the ALTERs since
+        let mut altered: BTreeMap<Key, Vec<g::AlterInfo>> = BTreeMap::new();
+        for (k, (_, table)) in &current.tables {
+            let Some((_, durable)) = self.durable.tables.get(k).filter(|_| !again.contains(k)) else {
+                continue;
+            };
+            if let Some(alters) = alters_since(table, durable) {
+                altered.insert(k.clone(), alters);
+            }
+        }
         for (k, (original, table, index)) in &self.durable.indexes {
             let same = current
                 .indexes
@@ -751,7 +951,7 @@ impl WriteAheadLog {
             .rev()
         {
             let (k, (original, table)) = tables[position];
-            if !same_table(k, table, &current.tables) {
+            if !same_table(k, table, &current.tables) && !altered.contains_key(k) {
                 records.drop_entry(wal_type::DROP_TABLE, original);
             }
         }
@@ -835,7 +1035,17 @@ impl WriteAheadLog {
         let tables: Vec<_> = current.tables.iter().collect();
         for position in parents_first(tables.iter().map(|(_, (_, table))| table)) {
             let (k, (original, table)) = tables[position];
-            if !same_table(k, table, &self.durable.tables) {
+            if let Some(alters) = altered.remove(k) {
+                for info in alters {
+                    let info = g::ParseInfo {
+                        info_type: super::serialization::generated::enums::parse_info_type::ALTER_INFO,
+                        kind: g::ParseInfoKind::AlterInfo(info),
+                    };
+                    records.entry(wal_type::ALTER_INFO, |s| {
+                        s.write_property(101, "info", &Some(Box::new(info)))
+                    });
+                }
+            } else if !same_table(k, table, &self.durable.tables) {
                 if again.contains(k) {
                     // its rows go in again, under the ids of a new table
                     *table.log.lock() = TableLog::default();
@@ -846,7 +1056,8 @@ impl WriteAheadLog {
                 };
                 records.entry(wal_type::CREATE_TABLE, |s| entry.write_members(s));
             }
-            log_rows(&mut records, original, table)?;
+            log_rows(&mut records, original, table, ahead)?;
+            table.alters.lock().clear();
         }
         for (k, (original, table, index)) in &current.indexes {
             let same = self
@@ -898,11 +1109,12 @@ impl WriteAheadLog {
         identifier: &[u8; DB_IDENTIFIER_LEN],
         iteration: u64,
         block_size: usize,
+        ahead: Option<WriteAhead>,
     ) -> Result<bool> {
         let current = Durable::of(catalog);
         self.check_storable(catalog, name, &current)?;
         let mut records = crate::execution::profiler::time_metric("storage.commit_local_storage_latency", || {
-            self.differences(catalog, name, &current, block_size)
+            self.differences(catalog, name, &current, block_size, ahead)
         })?;
         self.durable = current;
         if records.0.is_empty() {
@@ -918,9 +1130,24 @@ impl WriteAheadLog {
     /// `WriteCheckpoint`: before a checkpoint, for a crash during it to be told from one after it.
     /// Returns what the log held, to go back to if the checkpoint fails.
     pub fn mark_checkpoint(&mut self, path: &Path, root: MetaBlockPointer) -> Result<u64> {
+        if self.file.is_none()
+            && let Some(end) = self.replayed.take()
+        {
+            // what follows `end` was never committed, or is a marker of a checkpoint that didn't finish
+            let wal = log_path(path);
+            let mut file = OpenOptions::new()
+                .write(true)
+                .open(&wal)
+                .map_err(|error| io_error(&wal, error))?;
+            file.set_len(end).map_err(|error| io_error(&wal, error))?;
+            file.seek(std::io::SeekFrom::End(0))
+                .map_err(|error| io_error(&wal, error))?;
+            self.file = Some(file);
+            self.size = end;
+        }
         let size = self.size;
         if self.file.is_some() {
-            let mut records = Records(Vec::new(), self.version, 0);
+            let mut records = Records(Vec::new(), self.version, 0, self.encryption.clone());
             records.entry(wal_type::CHECKPOINT, |s| s.write_property(101, "meta_block", &root));
             records.entry(wal_type::WAL_FLUSH, |_| {});
             self.append(path, &records.0)?;
@@ -939,6 +1166,143 @@ impl WriteAheadLog {
 
     /// All of `catalog` is in the file now, and the log file is gone.
     pub fn checkpointed(&mut self, catalog: &Catalog) {
-        *self = Self::new(catalog);
+        // the file is in the version it was
+        let version = self.version;
+        let encryption = self.encryption.take();
+        *self = Self::new(catalog).with_version(version).with_encryption(encryption);
     }
+}
+
+/// `AlterInfo` of an ALTER of a column of `table`, now `altered`, as `WriteAlter` logs it: what the statement said,
+/// with the column it added as the table has it, and a cast to the new type for a type changed without USING.
+pub(crate) fn alter_record(
+    table: &TableCatalogEntry,
+    altered: &TableCatalogEntry,
+    kind: &duckrs_parser::ast::AlterKind,
+) -> Result<g::AlterInfo> {
+    use super::serialization::generated::enums::{alter_table_type, alter_type, on_entry_not_found};
+    use duckrs_parser::ast::AlterKind;
+    let column = |path: &[String]| path.first().cloned().unwrap_or_default();
+    let expression = |expr: &duckrs_parser::ast::Expr| -> Result<Option<Box<g::ParsedExpression>>> {
+        Ok(Some(Box::new(super::serialization::to_stored::expression(expr)?)))
+    };
+    let (alter_table_type, kind) = match kind {
+        AlterKind::RenameColumn { path, new_name } => (
+            alter_table_type::RENAME_COLUMN,
+            g::AlterTableInfoKind::RenameColumnInfo(g::RenameColumnInfo {
+                old_name: column(path),
+                new_name: new_name.clone(),
+            }),
+        ),
+        AlterKind::AddColumn {
+            column: added,
+            if_not_exists,
+            not_null,
+            unique,
+        } => {
+            let columns = altered.logical_columns();
+            let stored = columns
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(&added.name))
+                .ok_or_else(|| write_not_ported("an ADD COLUMN of a column the table doesn't have"))?;
+            (
+                alter_table_type::ADD_COLUMN,
+                g::AlterTableInfoKind::AddColumnInfo(g::AddColumnInfo {
+                    new_column: super::writer::stored_column(stored)?,
+                    if_column_not_exists: *if_not_exists,
+                    add_not_null: *not_null,
+                    add_unique: *unique,
+                }),
+            )
+        }
+        AlterKind::RemoveColumn {
+            path,
+            if_exists,
+            cascade,
+        } => (
+            alter_table_type::REMOVE_COLUMN,
+            g::AlterTableInfoKind::RemoveColumnInfo(g::RemoveColumnInfo {
+                removed_column: column(path),
+                if_column_exists: *if_exists,
+                cascade: *cascade,
+            }),
+        ),
+        AlterKind::ChangeColumnType { path, using, .. } => {
+            let name = column(path);
+            let target = altered
+                .columns
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(&name))
+                .map(|c| c.ty.clone())
+                .ok_or_else(|| write_not_ported("an ALTER TYPE of a column the table doesn't have"))?;
+            // `BindAlterTypes`: without USING, the column cast to the type
+            let using = match using {
+                Some(using) => (**using).clone(),
+                None => super::writer::parse_expression(&format!(
+                    "CAST({} AS {target})",
+                    duckrs_parser::ast::sql_identifier(&name)
+                ))?,
+            };
+            (
+                alter_table_type::ALTER_COLUMN_TYPE,
+                g::AlterTableInfoKind::ChangeColumnTypeInfo(g::ChangeColumnTypeInfo {
+                    column_name: name,
+                    target_type: target,
+                    expression: expression(&using)?,
+                    column_path: Vec::new(),
+                }),
+            )
+        }
+        AlterKind::SetDefault { path, expression: set } => (
+            alter_table_type::SET_DEFAULT,
+            g::AlterTableInfoKind::SetDefaultInfo(g::SetDefaultInfo {
+                column_name: column(path),
+                expression: match set {
+                    Some(set) => expression(set)?,
+                    None => None,
+                },
+                column_path: Vec::new(),
+            }),
+        ),
+        AlterKind::SetNotNull(path) => (
+            alter_table_type::SET_NOT_NULL,
+            g::AlterTableInfoKind::SetNotNullInfo(g::SetNotNullInfo {
+                column_name: column(path),
+                column_path: Vec::new(),
+            }),
+        ),
+        AlterKind::DropNotNull(path) => (
+            alter_table_type::DROP_NOT_NULL,
+            g::AlterTableInfoKind::DropNotNullInfo(g::DropNotNullInfo {
+                column_name: column(path),
+                column_path: Vec::new(),
+            }),
+        ),
+        _ => return Err(write_not_ported("this ALTER in a write-ahead log")),
+    };
+    let mut path = vec![table.catalog.clone()];
+    path.extend(schema_path(&table.schema));
+    path.push(table.name.clone());
+    Ok(g::AlterInfo {
+        type_: alter_type::ALTER_TABLE,
+        catalog: table.catalog.clone(),
+        schema: table.schema.clone(),
+        name: table.name.clone(),
+        if_not_found: on_entry_not_found::THROW_EXCEPTION,
+        allow_internal: false,
+        qualified_name: Some(QualifiedName { path }),
+        kind: g::AlterInfoKind::AlterTableInfo(g::AlterTableInfo { alter_table_type, kind }),
+    })
+}
+
+/// The ALTERs that made `table` of `durable`, oldest first, if it was made of it that way.
+fn alters_since(table: &Arc<TableCatalogEntry>, durable: &Arc<TableCatalogEntry>) -> Option<Vec<g::AlterInfo>> {
+    if Arc::ptr_eq(table, durable) {
+        return None;
+    }
+    let alters = table.alters.lock();
+    let from = alters
+        .iter()
+        .position(|alter| std::ptr::eq(alter.from.as_ptr(), Arc::as_ptr(durable)))?;
+    Some(alters[from..].iter().map(|alter| alter.info.clone()).collect())
 }

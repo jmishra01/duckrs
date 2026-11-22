@@ -220,6 +220,15 @@ impl TableCatalogEntry {
         Ok((!deleted.is_empty()).then_some(deleted))
     }
 
+    /// The entry whose rows and log state this one has: the table of the database for a copy of it whose rows are
+    /// still those, this one if it isn't a copy, `None` for a copy whose rows changed.
+    pub(crate) fn durable_base(self: &Arc<Self>) -> Option<Arc<Self>> {
+        match &self.origin {
+            Some(_) => self.same_as_origin(self.row_count()).cloned(),
+            None => Some(self.clone()),
+        }
+    }
+
     /// The table of the database, as long as this copy has the same rows in the same places.
     pub(crate) fn same_as_origin(&self, rows: usize) -> Option<&Arc<Self>> {
         let origin = self.origin.as_ref()?;
@@ -271,7 +280,8 @@ impl TableCatalogEntry {
             self.from_query.load(std::sync::atomic::Ordering::Relaxed),
             std::sync::atomic::Ordering::Relaxed,
         );
-        *table.source.write() = self.source();
+        *table.source.write() = self.source.read().clone();
+        table.set_checkpointed_columns(self.checkpointed(), self.checkpointed_columns());
         {
             // what is known of the rows stays known, other than how often they changed
             let theirs = self.statistics.lock();
@@ -291,6 +301,16 @@ impl TableCatalogEntry {
         *table.indexes.write() = self.indexes.read().clone();
         if origin.is_some() {
             table.versions = self.versions.clone();
+        } else {
+            // the entry a commit puts in the database: what the log knows of it, and the ALTERs it says since
+            let theirs = self.log.lock();
+            *table.log.lock() = super::TableLog {
+                logged: theirs.logged.clone(),
+                replayed: theirs.replayed.clone(),
+                updated: theirs.updated.clone(),
+                updated_columns: theirs.updated_columns.clone(),
+            };
+            table.alters.lock().clone_from(&self.alters.lock());
         }
         table.origin = origin;
         Arc::new(table)
@@ -570,6 +590,7 @@ impl Catalog {
             dirty: false,
             stops_checkpoints: false,
             held: Mutex::default(),
+            shares_temp: false,
         }
     }
 }
@@ -597,6 +618,8 @@ enum TableChange {
     /// Rows at the end, by themselves or ahead of keys that are known.
     Append(Vec<DataChunk>),
     Replace(ColumnDataCollection, Arc<RowIds>),
+    /// The rows are still in a file, but for the columns in memory that the source has.
+    ReplaceSource(Arc<dyn super::TableSource>, Arc<RowIds>),
 }
 
 struct PreparedTable {
@@ -620,6 +643,10 @@ pub struct Fork {
     stops_checkpoints: bool,
     /// The entries it changed.
     held: Mutex<HashSet<String>>,
+    /// Its temporary schema is that of another fork of the transaction, which commits it
+    /// (`MetaTransaction`: the temporary objects are the connection's, whatever database a
+    /// statement runs in).
+    shares_temp: bool,
 }
 
 impl Fork {
@@ -636,9 +663,33 @@ impl Fork {
         Arc::ptr_eq(&self.database, database)
     }
 
+    /// The temporary schema of this fork, which another fork of the transaction can share.
+    pub fn temp_schema(&self) -> Option<Arc<SchemaCatalogEntry>> {
+        self.catalog.schemas.read().get(TEMP_SCHEMA).cloned()
+    }
+
+    /// Takes the temporary schema of `owner`, another fork of the transaction: what a statement
+    /// created there is seen here, and only `owner` commits it.
+    pub fn share_temp(&mut self, owner: &Fork) {
+        let Some(temp) = owner.temp_schema() else { return };
+        self.catalog.schemas.write().insert(TEMP_SCHEMA.to_string(), temp);
+        self.base.retain(|saved| saved.schema.key() != TEMP_SCHEMA);
+        self.tables.retain(|table| key(&table.schema) != TEMP_SCHEMA);
+        self.shares_temp = true;
+    }
+
+    /// `changed_entries` of this fork, without the temporary ones of a shared schema.
+    fn changed_entries(&self) -> Vec<ChangedEntry> {
+        let mut entries = changed_entries(&self.base, &self.catalog);
+        if self.shares_temp {
+            entries.retain(|entry| entry.schema != TEMP_SCHEMA);
+        }
+        entries
+    }
+
     /// After a statement that can change the catalog: fails if another transaction got there first.
     pub fn claim_changes(&self) -> Result<()> {
-        let entries = changed_entries(&self.base, &self.catalog);
+        let entries = self.changed_entries();
         self.database
             .versions
             .lock()
@@ -682,6 +733,10 @@ impl Fork {
             }
             return Ok(Some(TableChange::Append(added)));
         }
+        if let (false, Some(source)) = (theirs_changed, table.source()) {
+            let ids = table.row_ids(table.row_count());
+            return Ok(Some(TableChange::ReplaceSource(source, ids)));
+        }
         let rows = table.rows()?.clone();
         let ids = table.row_ids(rows.len());
         if !theirs_changed {
@@ -694,7 +749,7 @@ impl Fork {
 
     /// `DuckTransactionManager::CommitTransaction`. Whoever calls this keeps everyone else out.
     pub fn commit(&self) -> Result<()> {
-        let entries = changed_entries(&self.base, &self.catalog);
+        let entries = self.changed_entries();
         let changed: HashSet<&str> = entries.iter().map(|entry| entry.key.as_str()).collect();
         self.check_drops(&entries)?;
         // the DEFERRED keys among the rows as the transaction leaves them, also of the tables it
@@ -791,6 +846,9 @@ impl Fork {
             }
         }
         for (name, schema) in own.iter() {
+            if self.shares_temp && name == TEMP_SCHEMA {
+                continue;
+            }
             let saved = self.base.iter().find(|saved| saved.schema.key() == *name);
             // one that another transaction dropped has nothing of this one: `check_drops`
             if saved.is_some() && !schemas.contains_key(name) {
@@ -985,6 +1043,12 @@ impl TableOrigin {
                 // who reads the rows mustn't get ids of others
                 let mut storage = table.write_storage()?;
                 *storage = rows;
+                table.set_row_ids(ids.committed(next));
+            }
+            TableChange::ReplaceSource(source, ids) => {
+                table.rows_rewritten();
+                let next = table.row_ids(table.row_count()).next();
+                table.keep_in_file(source);
                 table.set_row_ids(ids.committed(next));
             }
         }

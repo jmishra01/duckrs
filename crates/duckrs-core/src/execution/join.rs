@@ -39,10 +39,9 @@ use super::physical::{
     parallel_expression,
 };
 use super::temporary::{PartitionedSpill, SpillFile, current, estimated_bytes};
-use crate::planner::expression::{BoundExpr, BoundExprKind};
 use crate::optimizer::range_joins::{range_order, reorder_conditions};
+use crate::planner::expression::{BoundExpr, BoundExprKind};
 use crate::planner::logical::{JoinAlgorithm, JoinCondition};
-use duckrs_parser::ast::ComparisonOp;
 use crate::storage::log_writer::can_serialize;
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::sort_key::{KeyHasher, RowKey, create_row_keys};
@@ -50,6 +49,7 @@ use duckrs_common::types::LogicalType;
 use duckrs_common::value::{Value, ValueData};
 use duckrs_common::vector::{DataChunk, SelectionVector, StringCopy, Vector};
 use duckrs_common::{Error, ErrorKind, Result, STANDARD_VECTOR_SIZE};
+use duckrs_parser::ast::ComparisonOp;
 use duckrs_parser::ast::JoinType;
 use parking_lot::Mutex;
 use std::hash::{Hash, Hasher};
@@ -214,7 +214,12 @@ fn compare_keys(op: ComparisonOp, left: &[u8], right: &[u8]) -> bool {
 
 /// The positions `0..len`, whose keys `key(i)` ascend, with `left op key(i)`: a suffix for `<`
 /// and `<=`, a prefix for `>` and `>=`.
-fn matching_run<'a>(len: usize, key: impl Fn(usize) -> &'a [u8], op: ComparisonOp, left: &[u8]) -> std::ops::Range<usize> {
+fn matching_run<'a>(
+    len: usize,
+    key: impl Fn(usize) -> &'a [u8],
+    op: ComparisonOp,
+    left: &[u8],
+) -> std::ops::Range<usize> {
     let point = |pred: &dyn Fn(&[u8]) -> bool| {
         let (mut low, mut high) = (0, len);
         while low < high {
@@ -364,6 +369,10 @@ pub struct JoinBuild {
     spilled_rows: usize,
     /// what the rows in memory took of the memory limit
     reserved: usize,
+    /// per column, the vectors of the chunks that came in and are not in `columns` yet, each with the row it starts
+    /// at and its rows: threads hand their chunks over while they hold the build, and the copying waits for
+    /// [`Self::materialize`], which does it a column per thread
+    pending: Vec<Vec<(Vector, usize, usize)>>,
 }
 
 impl JoinBuild {
@@ -380,7 +389,41 @@ impl JoinBuild {
             spilled: vec![false; PARTITIONS],
             spilled_rows: 0,
             reserved: 0,
+            pending: types.iter().map(|_| Vec::new()).collect(),
         }
+    }
+
+    /// Copies the chunks that came in into `columns`, each column on a thread of its own when there are many rows.
+    fn materialize(&mut self) {
+        let rows: usize = self
+            .pending
+            .first()
+            .map_or(0, |column| column.iter().map(|&(_, _, len)| len).sum());
+        if rows == 0 {
+            return;
+        }
+        let count = self.count;
+        let copy = |target: &mut Vector, sources: Vec<(Vector, usize, usize)>| {
+            if target.capacity() < count {
+                target.resize(count.next_power_of_two());
+            }
+            for (source, offset, len) in sources {
+                let sel = SelectionVector::from_vec((0..len as u32).collect());
+                target.copy_from(&source, &sel, len, offset, StringCopy::Reference);
+            }
+        };
+        let pending: Vec<_> = self.pending.iter_mut().map(std::mem::take).collect();
+        if rows < MIN_PARALLEL_BUILD_ROWS || self.columns.len() < 2 {
+            for (target, sources) in self.columns.iter_mut().zip(pending) {
+                copy(target, sources);
+            }
+            return;
+        }
+        std::thread::scope(|scope| {
+            for (target, sources) in self.columns.iter_mut().zip(pending) {
+                scope.spawn(move || copy(target, sources));
+            }
+        });
     }
 
     /// The build rows listed in `rows`, as a chunk of their own.
@@ -465,6 +508,26 @@ impl Partition {
     fn rows(&self, group: usize) -> &[u32] {
         &self.rows[self.offsets[group] as usize..self.offsets[group + 1] as usize]
     }
+
+    /// Asks for where the rows of `group` are.
+    #[inline]
+    fn prefetch_offsets(&self, group: usize) {
+        if let Some(offset) = self.offsets.get(group) {
+            super::prefetch(offset);
+        }
+    }
+
+    /// Asks for the rows of `group`, reading where they are.
+    #[inline]
+    fn prefetch_rows(&self, group: usize) {
+        if let Some(row) = self
+            .offsets
+            .get(group)
+            .and_then(|&offset| self.rows.get(offset as usize))
+        {
+            super::prefetch(row);
+        }
+    }
 }
 
 /// The build side once all of it is there, which threads probe at once.
@@ -490,12 +553,55 @@ struct FinishedBuild {
 impl FinishedBuild {
     /// The partition and the group of `key`, if a build row has it.
     fn find(&self, key: &RowKey) -> Option<(usize, usize)> {
+        self.find_hashed(key_hash(key), key)
+    }
+
+    fn find_hashed(&self, hash: u64, key: &RowKey) -> Option<(usize, usize)> {
         // the hash picks the partition and the slot in its table both
-        let hash = key_hash(key);
         let partition = if self.partitioned { partition_of_hash(hash) } else { 0 };
         self.partitions[partition]
             .group(hash, key)
             .map(|group| (partition, group))
+    }
+
+    /// [`Self::find`] of each key, a window of them at a time: the keys of a window's candidate groups are
+    /// fetched for all of its rows first, so that their reads from memory overlap rather than wait one by one.
+    fn find_all(&self, keys: &[Option<RowKey>]) -> Vec<Option<(usize, usize)>> {
+        const WINDOW: usize = 32;
+        let hashes: Vec<u64> = keys.iter().map(|key| key.as_ref().map_or(0, key_hash)).collect();
+        let mut groups = Vec::with_capacity(keys.len());
+        for (keys, hashes) in keys.chunks(WINDOW).zip(hashes.chunks(WINDOW)) {
+            for (key, &hash) in keys.iter().zip(hashes) {
+                if key.is_some() {
+                    let partition = &self.partitions[if self.partitioned { partition_of_hash(hash) } else { 0 }];
+                    // every candidate is fetched and none taken, so this only reads the table
+                    partition.table.find(hash, |&group| {
+                        super::prefetch(&partition.keys[group as usize]);
+                        false
+                    });
+                }
+            }
+            groups.extend(
+                keys.iter()
+                    .zip(hashes)
+                    .map(|(key, &hash)| key.as_ref().and_then(|key| self.find_hashed(hash, key))),
+            );
+        }
+        groups
+    }
+
+    /// Asks for what [`Partition::rows`] reads for the probe rows ahead of `row`, whose groups are `groups`: where
+    /// the rows of the group of a row further on are, and the rows of the group of one nearer, whose place was asked
+    /// for before. Probe rows find groups all over the table, and the reads overlap so.
+    #[inline]
+    fn prefetch_chains(&self, groups: &[Option<(usize, usize)>], row: usize) {
+        const AHEAD: usize = 16;
+        if let Some(&Some((partition, group))) = groups.get(row + 2 * AHEAD) {
+            self.partitions[partition].prefetch_offsets(group);
+        }
+        if let Some(&Some((partition, group))) = groups.get(row + AHEAD) {
+            self.partitions[partition].prefetch_rows(group);
+        }
     }
 
     fn set_matched(&self, row: u32) {
@@ -812,12 +918,15 @@ impl PhysicalJoin {
         Ok(())
     }
 
-    /// Adds `chunk` to the build rows in memory.
+    /// Adds `chunk` to the build rows in memory, to be copied into the build columns later
+    /// ([`JoinBuild::materialize`]): copying is what threads would take turns at here. Its strings stay where they
+    /// are, in the buffers of the chunk, which the build columns keep.
     fn append_rows(build: &mut JoinBuild, chunk: &DataChunk, keys: Vec<BuildKey>) {
         let offset = build.count;
-        let sel = SelectionVector::from_vec((0..chunk.len() as u32).collect());
-        for (target, source) in build.columns.iter_mut().zip(chunk.columns()) {
-            target.copy_from(source, &sel, chunk.len(), offset, StringCopy::Deep);
+        if !chunk.is_empty() {
+            for (pending, source) in build.pending.iter_mut().zip(chunk.columns()) {
+                pending.push((source.clone(), offset, chunk.len()));
+            }
         }
         build.count += chunk.len();
         for (row, key) in keys.into_iter().enumerate() {
@@ -831,6 +940,7 @@ impl PhysicalJoin {
     /// Writes the largest partitions in memory to their files, about half of the rows with keys,
     /// and keeps the rest of the build rows in their order.
     fn spill_partitions(&self, build: &mut JoinBuild, spill: &JoinSpill) -> Result<()> {
+        build.materialize();
         if !build.partitioned {
             for (key, row) in std::mem::take(&mut build.keys[0]) {
                 build.keys[partition_of(&key)].push((key, row));
@@ -893,6 +1003,7 @@ impl PhysicalJoin {
 
     /// The build side, done.
     fn finish_build(build: &mut JoinBuild, threads: usize, total_count: usize, has_null_key: bool) -> FinishedBuild {
+        build.materialize();
         let count = build.count;
         FinishedBuild {
             data: DataChunk::from_columns(std::mem::take(&mut build.columns), count),
@@ -1067,9 +1178,7 @@ impl PhysicalJoin {
                             *null = key.is_none() || build.has_null_key;
                         }
                     }
-                    keys.iter()
-                        .map(|key| key.as_ref().and_then(|key| build.find(key)))
-                        .collect()
+                    build.find_all(&keys)
                 };
                 let count = kept.as_ref().map_or(input.len(), DataChunk::len);
                 let range_keys = if self.range.is_empty() {
@@ -1112,12 +1221,17 @@ impl PhysicalJoin {
                 return Ok((result, OperatorResult::NeedMoreInput));
             }
             let count = left.len();
-            let mut columns = Self::rows_of(input, left.clone()).columns().to_vec();
-            columns.extend_from_slice(Self::rows_of(data, right.clone()).columns());
-            let mut pairs = DataChunk::from_columns(columns, count);
+            // the pairs' rows, which a join that only marks its rows needs for a predicate only
+            let pairs_of = || {
+                let mut columns = Self::rows_of(input, left.clone()).columns().to_vec();
+                columns.extend_from_slice(Self::rows_of(data, right.clone()).columns());
+                DataChunk::from_columns(columns, count)
+            };
+            let mut pairs = (emit_pairs || self.predicate.is_some()).then(pairs_of);
             let matches = match &self.predicate {
                 Some(predicate) if self.join_type == JoinType::Mark => {
-                    let result = super::expression_executor::as_join_condition(|| execute(predicate, &pairs))?;
+                    let pairs = pairs.as_ref().expect("made for the predicate");
+                    let result = super::expression_executor::as_join_condition(|| execute(predicate, pairs))?;
                     let mut selected = Vec::new();
                     for (row, left) in left.iter().enumerate() {
                         match result.get_value(row).data() {
@@ -1130,7 +1244,8 @@ impl PhysicalJoin {
                     Some((SelectionVector::from_vec(selected), matched))
                 }
                 Some(predicate) => {
-                    let (sel, matched) = super::expression_executor::as_join_condition(|| select(predicate, &pairs))?;
+                    let pairs = pairs.as_ref().expect("made for the predicate");
+                    let (sel, matched) = super::expression_executor::as_join_condition(|| select(predicate, pairs))?;
                     (matched != count).then_some((sel, matched))
                 }
                 None => None,
@@ -1166,6 +1281,7 @@ impl PhysicalJoin {
             if !emit_pairs {
                 continue;
             }
+            let mut pairs = pairs.take().expect("made for the pairs to emit");
             if let Some((sel, matched)) = matches {
                 pairs.slice(&sel, matched);
             }
@@ -1289,10 +1405,14 @@ impl PhysicalJoin {
 
     /// The next pairs of a left and a build row with equal keys, at most a vector of them.
     fn next_key_pairs(&self, build: &FinishedBuild, probe: &mut Probe) -> (Vec<u32>, Vec<u32>) {
+        if matches!(self.join_type, JoinType::RightSemi | JoinType::RightAnti) {
+            return Self::next_unmatched_pairs(build, probe);
+        }
         let mut left = Vec::new();
         let mut right = Vec::new();
         while left.len() < STANDARD_VECTOR_SIZE && probe.row < probe.found.len() {
             let row = probe.row;
+            build.prefetch_chains(&probe.groups, row);
             let chain: &[u32] = match probe.groups[row] {
                 Some((partition, group)) if !(self.first_match_only() && probe.found[row]) => {
                     build.partitions[partition].rows(group)
@@ -1308,6 +1428,35 @@ impl PhysicalJoin {
                 right.extend_from_slice(&chain[probe.candidate..probe.candidate + take]);
             }
             probe.candidate += take;
+            if probe.candidate >= chain.len() {
+                probe.row += 1;
+                probe.candidate = 0;
+            }
+        }
+        (left, right)
+    }
+
+    /// [`Self::next_key_pairs`] of a join that gives the build rows that match or those that do not: a build row
+    /// that matched already is done, so it pairs with no more probe rows. A flag only ever turns true, so one that
+    /// another thread sets meanwhile only costs a pair.
+    fn next_unmatched_pairs(build: &FinishedBuild, probe: &mut Probe) -> (Vec<u32>, Vec<u32>) {
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+        while left.len() < STANDARD_VECTOR_SIZE && probe.row < probe.found.len() {
+            let row = probe.row;
+            build.prefetch_chains(&probe.groups, row);
+            let chain: &[u32] = match probe.groups[row] {
+                Some((partition, group)) => build.partitions[partition].rows(group),
+                None => &[],
+            };
+            while probe.candidate < chain.len() && left.len() < STANDARD_VECTOR_SIZE {
+                let candidate = chain[probe.candidate];
+                if !build.matched[candidate as usize].load(Ordering::Relaxed) {
+                    left.push(row as u32);
+                    right.push(candidate);
+                }
+                probe.candidate += 1;
+            }
             if probe.candidate >= chain.len() {
                 probe.row += 1;
                 probe.candidate = 0;
@@ -1386,15 +1535,14 @@ impl PhysicalJoin {
                 let count = input.len();
                 let mut mark = Vector::new(LogicalType::BOOLEAN, count.max(1));
                 mark.prepare_flat(count.max(1));
-                for (row, (found, null)) in found.iter().zip(&probe.nulls).enumerate() {
-                    let value = if *found {
-                        Value::boolean(true)
-                    } else if *null {
-                        Value::null(LogicalType::BOOLEAN)
-                    } else {
-                        Value::boolean(false)
-                    };
-                    mark.set_value(row, &value)?;
+                // a row that found a match is true, one that compared with a NULL NULL, the others false
+                for (slot, &found) in mark.data_mut::<bool>().iter_mut().zip(found.iter()) {
+                    *slot = found;
+                }
+                for (row, (&found, &null)) in found.iter().zip(&probe.nulls).enumerate() {
+                    if !found && null {
+                        mark.set_null(row, true);
+                    }
                 }
                 let mut columns = input.columns().to_vec();
                 columns.push(mark);
@@ -1456,7 +1604,10 @@ impl PhysicalOperator for PhysicalJoin {
         self.append(&mut self.build.lock(), chunk, keys, false)
     }
     fn parallel_sink(&self) -> bool {
-        self.conditions.iter().chain(&self.range).all(|c| parallel_expression(&c.right))
+        self.conditions
+            .iter()
+            .chain(&self.range)
+            .all(|c| parallel_expression(&c.right))
     }
     fn local_sink_state(&self) -> LocalSinkState {
         self.builders.fetch_add(1, Ordering::Relaxed);
@@ -1523,7 +1674,10 @@ impl PhysicalOperator for PhysicalJoin {
             .map_err(|_| Error::new(ErrorKind::Internal, "a join build side was finished twice"))
     }
     fn parallel_operator(&self) -> bool {
-        self.conditions.iter().chain(&self.range).all(|c| parallel_expression(&c.left))
+        self.conditions
+            .iter()
+            .chain(&self.range)
+            .all(|c| parallel_expression(&c.left))
             && self.predicate.as_ref().is_none_or(parallel_expression)
     }
     fn operator_state(&self) -> OperatorState {

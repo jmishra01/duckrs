@@ -301,6 +301,9 @@ pub struct Sniffed {
     pub mismatch: String,
     /// `CSVSniffer::LinesSniffed`
     pub lines_sniffed: usize,
+    /// a scan of the sniffer got to the end of the bytes it had: of the start of a file, it might have found
+    /// otherwise with more of it
+    pub reached_end: bool,
 }
 
 /// A chunk of rows as text, cut to the columns.
@@ -381,6 +384,8 @@ struct Sniffer<'a> {
     all_fail_max_line_size: bool,
     long_line: Option<usize>,
     candidates: Vec<Candidate>,
+    /// see [`Sniffed::reached_end`]
+    reached_end: std::cell::Cell<bool>,
 }
 
 impl Sniffer<'_> {
@@ -576,7 +581,12 @@ impl Sniffer<'_> {
 
     /// `GenerateStateMachineSearchSpace`
     fn search(&self) -> Vec<ColumnCountScanner> {
-        let new_line = self.options.new_line.unwrap_or_else(|| detect_new_line(self.data));
+        let new_line = self.options.new_line.unwrap_or_else(|| {
+            if memchr::memchr(b'\n', self.data).is_none() {
+                self.reached_end.set(true);
+            }
+            detect_new_line(self.data)
+        });
         let mut result = Vec::new();
         let mut first = None;
         for comment in self.comments() {
@@ -592,9 +602,11 @@ impl Sniffer<'_> {
                     };
                     let transitions = Arc::new(Transitions::new(&dialect));
                     let start = match self.options.skip {
-                        Some(skip) => {
-                            *first.get_or_insert_with(|| skip_rows(self.data, &dialect, &transitions, self.start, skip))
-                        }
+                        Some(skip) => *first.get_or_insert_with(|| {
+                            let start = skip_rows(self.data, &dialect, &transitions, self.start, skip);
+                            self.reached(start);
+                            start
+                        }),
                         None => self.start,
                     };
                     let machine = Machine::with_transitions(dialect, transitions, start);
@@ -636,10 +648,18 @@ impl Sniffer<'_> {
         valid / detected >= 0.6
     }
 
+    /// A scan of the sniffer is at `position`: see [`Sniffed::reached_end`].
+    fn reached(&self, position: usize) {
+        if position >= self.data.len() {
+            self.reached_end.set(true);
+        }
+    }
+
     /// `AnalyzeDialectCandidate`
     fn analyze(&mut self, mut scanner: ColumnCountScanner, stats: &mut Stats) {
         let options = self.options;
         scanner.parse_chunk(self.data);
+        self.reached(scanner.machine.position);
         if scanner.error() {
             match scanner.long_line() {
                 Some(size) => self.long_line = Some(size),
@@ -855,6 +875,7 @@ impl Sniffer<'_> {
     /// `RefineCandidateNextChunk`
     fn refine_next_chunk(&self, candidate: &mut Candidate) -> bool {
         candidate.scanner.parse_chunk(self.data);
+        self.reached(candidate.scanner.machine.position);
         let options = self.options;
         let lenient = options.null_padding || options.ignore_errors;
         for row in candidate.scanner.rows() {
@@ -1214,6 +1235,7 @@ pub fn sniff(
         all_fail_max_line_size: true,
         long_line: None,
         candidates: Vec::new(),
+        reached_end: std::cell::Cell::new(false),
     };
     if !options.auto_detect {
         let quote = options.quote.unwrap_or(Some(b'"'));
@@ -1238,18 +1260,21 @@ pub fn sniff(
                 timestamp_format: options.timestamp_format.clone(),
                 mismatch: String::new(),
                 lines_sniffed: 0,
+                reached_end: false,
             });
         }
         // `MinimalSniff`: the dialect is known, so the first row says how many columns there are
         let machine = Machine::new(dialect, start);
         let transitions = machine.transitions();
         let begin = skip_rows(data, &machine.dialect, &transitions, start, skip);
+        sniffer.reached(begin);
         let mut scanner = ColumnCountScanner::new(
             Machine::with_transitions(machine.dialect, transitions, begin),
             SNIFF_SIZE,
             options.maximum_line_size(),
         );
         scanner.parse_chunk(data);
+        sniffer.reached(scanner.machine.position);
         let columns = scanner.rows().first().map_or(1, |row| row.columns);
         sniffer.max_columns_found = columns;
         sniffer.lines_sniffed = scanner.rows().len();
@@ -1297,8 +1322,10 @@ pub fn sniff(
         } else {
             skip_rows(data, dialect, &transitions, start, candidate.skip)
         };
+        sniffer.reached(begin);
         let mut scanner = ValueScanner::new(Machine::with_transitions(dialect.clone(), transitions, begin));
         let sample = parse_sample(&mut scanner, data, columns_found, options);
+        sniffer.reached(scanner.machine.position);
         if sample.errors > 0 && !options.ignore_errors {
             continue;
         }
@@ -1352,6 +1379,7 @@ pub fn sniff(
         let mut i = 1;
         while i < chunks && !best.scanner.finished() {
             let sample = parse_sample(&mut best.scanner, data, columns_found, options);
+            sniffer.reached(best.scanner.machine.position);
             for (column, types) in best.types.iter_mut().enumerate() {
                 let is_bool = types.last().is_some_and(|t| *t == LogicalType::BOOLEAN);
                 while types.len() > 1 {
@@ -1431,6 +1459,7 @@ pub fn sniff(
         timestamp_format: timestamp_format.or_else(|| options.timestamp_format.clone()),
         mismatch,
         lines_sniffed: sniffer.lines_sniffed,
+        reached_end: sniffer.reached_end.get(),
     })
 }
 

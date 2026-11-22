@@ -7,6 +7,8 @@
 
 use super::block_manager::{corrupt, corrupted};
 use super::statistics::BaseStatistics;
+use duckrs_common::serializer::StorageVersion;
+use duckrs_common::types::PhysicalType;
 use duckrs_common::{Error, ErrorKind, Result};
 
 /// `CompressionType`.
@@ -14,8 +16,11 @@ pub const COMPRESSION_UNCOMPRESSED: u8 = 1;
 pub const COMPRESSION_CONSTANT: u8 = 2;
 pub const COMPRESSION_RLE: u8 = 3;
 pub const COMPRESSION_DICTIONARY: u8 = 4;
+pub const COMPRESSION_PFOR_DELTA: u8 = 5;
 pub const COMPRESSION_BITPACKING: u8 = 6;
 pub const COMPRESSION_FSST: u8 = 7;
+pub const COMPRESSION_CHIMP: u8 = 8;
+pub const COMPRESSION_PATAS: u8 = 9;
 pub const COMPRESSION_ALP: u8 = 10;
 pub const COMPRESSION_ALPRD: u8 = 11;
 pub const COMPRESSION_ROARING: u8 = 13;
@@ -30,8 +35,8 @@ const METADATA_GROUP_SIZE: usize = 2048;
 
 pub fn compression_name(compression: u8) -> &'static str {
     match compression {
-        8 => "Chimp",
-        9 => "Patas",
+        COMPRESSION_CHIMP => "Chimp",
+        COMPRESSION_PATAS => "Patas",
         12 => "ZSTD",
         _ => "this",
     }
@@ -44,10 +49,11 @@ pub fn storage_name(compression: u8) -> &'static str {
         COMPRESSION_CONSTANT => "Constant",
         COMPRESSION_RLE => "RLE",
         COMPRESSION_DICTIONARY => "Dictionary",
+        COMPRESSION_PFOR_DELTA => "PFOR",
         COMPRESSION_BITPACKING => "BitPacking",
         COMPRESSION_FSST => "FSST",
-        8 => "Chimp",
-        9 => "Patas",
+        COMPRESSION_CHIMP => "Chimp",
+        COMPRESSION_PATAS => "Patas",
         COMPRESSION_ALP => "ALP",
         COMPRESSION_ALPRD => "ALPRD",
         12 => "ZSTD",
@@ -55,6 +61,55 @@ pub fn storage_name(compression: u8) -> &'static str {
         COMPRESSION_EMPTY => "Empty Validity",
         COMPRESSION_DICT_FSST => "DICT_FSST",
         _ => "Unknown",
+    }
+}
+
+/// The `CompressionType` that `CompressionTypeToString` names `name`.
+pub fn compression_of_name(name: &str) -> Option<u8> {
+    (COMPRESSION_UNCOMPRESSED..=COMPRESSION_DICT_FSST).find(|compression| storage_name(*compression) == name)
+}
+
+/// `CompressionTypeIsAvailable` in a file of `version` (any, of none): `Err` with whether the method is
+/// deprecated, else not available yet.
+pub fn compression_availability(compression: u8, version: Option<StorageVersion>) -> std::result::Result<(), bool> {
+    let (minimum, maximum) = match compression {
+        COMPRESSION_PATAS | COMPRESSION_CHIMP => return Err(true),
+        COMPRESSION_DICTIONARY | COMPRESSION_FSST => (StorageVersion::V0_10_2, Some(StorageVersion::V1_2_0)),
+        COMPRESSION_ROARING | COMPRESSION_ZSTD => (StorageVersion::V1_2_0, None),
+        COMPRESSION_DICT_FSST => (StorageVersion::V1_3_0, None),
+        // not implemented: after every version
+        COMPRESSION_PFOR_DELTA => return if version.is_some() { Err(false) } else { Ok(()) },
+        _ => return Ok(()),
+    };
+    let Some(version) = version else { return Ok(()) };
+    if minimum > version {
+        return Err(false);
+    }
+    if maximum.is_some_and(|maximum| maximum < version) {
+        return Err(true);
+    }
+    Ok(())
+}
+
+/// `DBConfig::TryGetCompressionFunction`: whether a method can store a physical type (`TypeIsSupported` of
+/// each in `internal_compression_methods`).
+pub fn compression_supports(compression: u8, physical: PhysicalType) -> bool {
+    use PhysicalType::*;
+    let integer = matches!(
+        physical,
+        Bool | Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64 | Int128 | UInt128
+    );
+    let float = matches!(physical, Float | Double);
+    match compression {
+        COMPRESSION_CONSTANT => integer || float || physical == Bit,
+        COMPRESSION_UNCOMPRESSED => integer || float || matches!(physical, List | Interval | Bit | Varchar),
+        COMPRESSION_RLE => integer || float || physical == List,
+        COMPRESSION_BITPACKING => integer || physical == List,
+        COMPRESSION_DICTIONARY | COMPRESSION_FSST | COMPRESSION_ZSTD | COMPRESSION_DICT_FSST => physical == Varchar,
+        COMPRESSION_CHIMP | COMPRESSION_PATAS | COMPRESSION_ALP | COMPRESSION_ALPRD => float,
+        COMPRESSION_ROARING => matches!(physical, Bit | Bool),
+        COMPRESSION_EMPTY => physical == Bit,
+        _ => false,
     }
 }
 
@@ -174,12 +229,77 @@ fn packed_size(count: usize, width: usize) -> usize {
 fn unpack(data: &[u8], count: usize, width: usize, what: &str) -> Result<Vec<u128>> {
     bytes(data, 0, packed_size(count, width), what)?;
     if width <= 57 {
-        let mask = if width == 0 { 0 } else { u64::MAX >> (64 - width) };
-        return Ok((0..count)
-            .map(|i| u128::from(load_bits(data, i * width, mask)))
-            .collect());
+        let mut values = Vec::with_capacity(count);
+        unpack_groups(data, count, width, |group| {
+            values.extend(group.iter().map(|&value| u128::from(value)))
+        });
+        return Ok(values);
     }
     Ok((0..count).map(|i| read_bits(data, i * width, width)).collect())
+}
+
+/// [`unpack`] of values of at most 32 bits, as `u32`s.
+fn unpack_u32(data: &[u8], count: usize, width: usize, what: &str) -> Result<Vec<u32>> {
+    debug_assert!(width <= 32);
+    bytes(data, 0, packed_size(count, width), what)?;
+    let mut values = Vec::with_capacity(count);
+    unpack_groups(data, count, width, |group| {
+        values.extend(group.iter().map(|&value| value as u32))
+    });
+    Ok(values)
+}
+
+/// The most bits [`unpack_groups`] takes: a value and the bits before it in its first byte fit one `u64`.
+const MAX_GROUP_WIDTH: usize = 57;
+
+/// Calls `each` with `count` packed values of `width` bits (at most [`MAX_GROUP_WIDTH`]), 32 at a time and
+/// fewer the last time, each group unpacked by code for its width (`BitpackingPrimitives::UnPackBlock`).
+/// `data` must hold the [`packed_size`] of `count` values.
+fn unpack_groups(data: &[u8], count: usize, width: usize, mut each: impl FnMut(&[u64])) {
+    macro_rules! widths {
+        ($($width:literal)*) => {
+            match width {
+                $($width => unpack_groups_of::<$width>(data, count, &mut each),)*
+                _ => unreachable!("a bit width past {MAX_GROUP_WIDTH}"),
+            }
+        };
+    }
+    widths!(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37
+        38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57)
+}
+
+fn unpack_groups_of<const W: usize>(data: &[u8], count: usize, each: &mut impl FnMut(&[u64])) {
+    // a group's values read 8 bytes from their first one, up to 8 bytes past the group: the last groups
+    // read a copy with room for that
+    let group_bytes = ALGORITHM_GROUP_SIZE * W / 8;
+    let mut padded = [0u8; ALGORITHM_GROUP_SIZE * MAX_GROUP_WIDTH / 8 + 8];
+    let mut values = [0u64; ALGORITHM_GROUP_SIZE];
+    for start in (0..count).step_by(ALGORITHM_GROUP_SIZE) {
+        let at = start / ALGORITHM_GROUP_SIZE * group_bytes;
+        let group = match data.get(at..at + group_bytes + 8) {
+            Some(group) => group,
+            None => {
+                let available = &data[at..at + group_bytes];
+                padded[..group_bytes].copy_from_slice(available);
+                &padded[..group_bytes + 8]
+            }
+        };
+        unpack_32::<W>(group, &mut values);
+        each(&values[..ALGORITHM_GROUP_SIZE.min(count - start)]);
+    }
+}
+
+/// The 32 values of `W` bits at the start of `group`, which has 8 bytes past them.
+#[inline(always)]
+fn unpack_32<const W: usize>(group: &[u8], values: &mut [u64; ALGORITHM_GROUP_SIZE]) {
+    // one check here, so that the constant offsets below need none
+    assert!(group.len() >= ALGORITHM_GROUP_SIZE * W / 8 + 8);
+    let mask = if W == 0 { 0 } else { u64::MAX >> (64 - W) };
+    for (i, value) in values.iter_mut().enumerate() {
+        let bit = i * W;
+        let word = u64::from_le_bytes(group[bit / 8..bit / 8 + 8].try_into().expect("8 bytes"));
+        *value = (word >> (bit % 8)) & mask;
+    }
 }
 
 /// The bits from `bit` on that `mask` keeps (at most 57 of them): one load of the 8 bytes there.
@@ -197,9 +317,42 @@ fn load_bits(data: &[u8], bit: usize, mask: u64) -> u64 {
     (word >> (bit % 8)) & mask
 }
 
+/// Where a decoder puts the bytes of its values, in order: a buffer that grows, or a vector's own memory.
+pub trait ByteSink {
+    fn push(&mut self, bytes: &[u8]);
+}
+
+impl ByteSink for Vec<u8> {
+    #[inline]
+    fn push(&mut self, bytes: &[u8]) {
+        self.extend_from_slice(bytes);
+    }
+}
+
+/// A [`ByteSink`] of memory of a given size: what is pushed past its end is dropped, as a column's values past its
+/// rows are.
+pub struct SliceSink<'a> {
+    target: &'a mut [u8],
+    written: usize,
+}
+
+impl<'a> SliceSink<'a> {
+    pub fn new(target: &'a mut [u8]) -> Self {
+        Self { target, written: 0 }
+    }
+}
+
+impl ByteSink for SliceSink<'_> {
+    #[inline]
+    fn push(&mut self, bytes: &[u8]) {
+        let fits = bytes.len().min(self.target.len() - self.written);
+        self.target[self.written..self.written + fits].copy_from_slice(&bytes[..fits]);
+        self.written += fits;
+    }
+}
+
 /// [`unpack`] of values of at most 57 bits into values of at most 8 bytes, with the frame (and for
-/// DELTA_FOR the running sum) added: each value is read with one unaligned load of the 8 bytes at its
-/// first byte, and written at its width.
+/// DELTA_FOR the running sum) added, written at their width 32 at a time.
 #[allow(clippy::too_many_arguments, reason = "the parts of a FOR group")]
 fn unpack_narrow(
     packed: &[u8],
@@ -209,27 +362,35 @@ fn unpack_narrow(
     delta: bool,
     mut carry: u64,
     width: usize,
-    out: &mut Vec<u8>,
+    out: &mut impl ByteSink,
 ) {
-    let mask = if packed_width == 0 {
-        0
-    } else {
-        u64::MAX >> (64 - packed_width)
-    };
-    let start = out.len();
-    out.resize(start + rows * width, 0);
-    let target = &mut out[start..];
-    let load = |bit: usize| -> u64 { load_bits(packed, bit, mask) };
     macro_rules! write_all {
         ($ty:ty) => {{
-            for (row, slot) in target.chunks_exact_mut(std::mem::size_of::<$ty>()).enumerate() {
-                let mut value = load(row * packed_width).wrapping_add(frame);
+            const SIZE: usize = std::mem::size_of::<$ty>();
+            unpack_groups(packed, rows, packed_width, |values| {
+                let mut group = [0 as $ty; ALGORITHM_GROUP_SIZE];
+                let group = &mut group[..values.len()];
                 if delta {
-                    carry = value.wrapping_add(carry);
-                    value = carry;
+                    for (slot, &value) in group.iter_mut().zip(values) {
+                        carry = value.wrapping_add(frame).wrapping_add(carry);
+                        *slot = carry as $ty;
+                    }
+                } else {
+                    for (slot, &value) in group.iter_mut().zip(values) {
+                        *slot = value.wrapping_add(frame) as $ty;
+                    }
                 }
-                slot.copy_from_slice(&(value as $ty).to_le_bytes());
-            }
+                if cfg!(target_endian = "little") {
+                    // SAFETY: an integer has no padding, so its memory is `SIZE` initialized bytes, which on a
+                    // little-endian machine are those of the file
+                    let bytes = unsafe { std::slice::from_raw_parts(group.as_ptr().cast::<u8>(), group.len() * SIZE) };
+                    out.push(bytes);
+                } else {
+                    for value in group.iter() {
+                        out.push(&value.to_le_bytes());
+                    }
+                }
+            });
         }};
     }
     match width {
@@ -272,8 +433,9 @@ pub fn bitpacking_rows(segment: &[u8], count: usize, width: usize, rows: &[u32],
         value[..width].copy_from_slice(bytes(data, at, width, "a value of a bitpacking group")?);
         Ok(u128::from_le_bytes(value))
     };
-    // the FOR group of the last row: its index, frame, width and packed values
-    let mut current: Option<(usize, u128, usize, &[u8])> = None;
+    // the FOR group of the last row: its index, frame, width, the mask of its values and its packed values
+    let mut current: Option<(usize, u64, usize, u64, &[u8])> = None;
+    out.reserve(rows.len() * width);
     for &row in rows {
         let row = row as usize;
         if row >= count {
@@ -281,16 +443,12 @@ pub fn bitpacking_rows(segment: &[u8], count: usize, width: usize, rows: &[u32],
         }
         let index = row / METADATA_GROUP_SIZE;
         let local = row % METADATA_GROUP_SIZE;
-        if let Some((group, frame, packed_width, packed)) = current
+        if let Some((group, frame, packed_width, packed_mask, packed)) = current
             && group == index
         {
-            let packed_mask = if packed_width == 0 {
-                0
-            } else {
-                u64::MAX >> (64 - packed_width)
-            };
-            let value = u128::from(load_bits(packed, local * packed_width, packed_mask)).wrapping_add(frame);
-            out.extend_from_slice(&(value & mask).to_le_bytes()[..width]);
+            // a FOR group holds values of at most 8 bytes, which wrap as those of their width do
+            let value = load_bits(packed, local * packed_width, packed_mask).wrapping_add(frame);
+            push_le(out, value, width);
             continue;
         }
         let encoded = u32_at(
@@ -332,12 +490,12 @@ pub fn bitpacking_rows(segment: &[u8], count: usize, width: usize, rows: &[u32],
                     .ok_or_else(|| out_of_bounds("a bitpacking group"))?;
                 let rows_here = METADATA_GROUP_SIZE.min(count - index * METADATA_GROUP_SIZE);
                 bytes(packed, 0, packed_size(rows_here, packed_width), "a bitpacking group")?;
-                current = Some((index, frame, packed_width, packed));
                 let packed_mask = if packed_width == 0 {
                     0
                 } else {
                     u64::MAX >> (64 - packed_width)
                 };
+                current = Some((index, frame as u64, packed_width, packed_mask, packed));
                 u128::from(load_bits(packed, local * packed_width, packed_mask)).wrapping_add(frame)
             }
             _ => {
@@ -350,9 +508,21 @@ pub fn bitpacking_rows(segment: &[u8], count: usize, width: usize, rows: &[u32],
     Ok(())
 }
 
+/// Appends the low `width` bytes of `value`, little-endian: a store of the width's size for those of integers.
+#[inline]
+fn push_le(out: &mut Vec<u8>, value: u64, width: usize) {
+    match width {
+        1 => out.push(value as u8),
+        2 => out.extend_from_slice(&(value as u16).to_le_bytes()),
+        4 => out.extend_from_slice(&(value as u32).to_le_bytes()),
+        8 => out.extend_from_slice(&value.to_le_bytes()),
+        _ => out.extend_from_slice(&value.to_le_bytes()[..width]),
+    }
+}
+
 /// `BitpackingScanPartial`. A segment is groups of 2048 values, each with its own mode, and a table
 /// at the end of where they are, last group first.
-pub fn scan_bitpacking(segment: &[u8], count: usize, width: usize, out: &mut Vec<u8>) -> Result<()> {
+pub fn scan_bitpacking(segment: &[u8], count: usize, width: usize, out: &mut impl ByteSink) -> Result<()> {
     const HEADER_SIZE: usize = 8;
     const CONSTANT: u32 = 2;
     const CONSTANT_DELTA: u32 = 3;
@@ -402,7 +572,7 @@ pub fn scan_bitpacking(segment: &[u8], count: usize, width: usize, out: &mut Vec
         }
         let data = &segment[offset..end];
         let rows = METADATA_GROUP_SIZE.min(count - index * METADATA_GROUP_SIZE);
-        let mut push = |value: u128| out.extend_from_slice(&(value & mask).to_le_bytes()[..width]);
+        let mut push = |value: u128| out.push(&(value & mask).to_le_bytes()[..width]);
         match mode {
             CONSTANT => {
                 let value = number(data, 0)?;
@@ -509,6 +679,11 @@ impl StringRows {
 
     pub fn iter(&self) -> impl Iterator<Item = &[u8]> {
         (0..self.len()).map(|row| self.get(row))
+    }
+
+    /// The bytes of the strings, and where each ends.
+    pub fn into_parts(self) -> (Vec<u8>, Vec<usize>) {
+        (self.bytes, self.ends)
     }
 }
 
@@ -1378,9 +1553,8 @@ pub fn scan_dict_fsst(segment: &[u8], count: usize, out: &mut StringRows, nulls:
     Ok(())
 }
 
-/// A DICT_FSST segment as its dictionary and, per row, the entry it has (0 is NULL): what a scan
-/// turns into a dictionary vector (`DictFSSTCompressionStorage::StringScan` emits one too).
-pub fn decode_dict_fsst(segment: &[u8], count: usize) -> Result<(StringRows, Vec<u32>)> {
+/// The header, symbol table, lengths and indices of a DICT_FSST segment, checked as C++ checks them.
+fn parse_dict_fsst(segment: &[u8], count: usize) -> Result<DictFsst<'_>> {
     const HEADER_SIZE: usize = 16;
     const DICTIONARY: u8 = 0;
     const DICT_FSST: u8 = 1;
@@ -1418,14 +1592,12 @@ pub fn decode_dict_fsst(segment: &[u8], count: usize) -> Result<(StringRows, Vec
     let table = bytes(segment, position, table_size, what)?;
     position = align(position + table_size, 8);
     let packed = bytes(segment, position, packed_size(dict_count, lengths_width), what)?;
-    let lengths = unpack(packed, dict_count, lengths_width, what)?;
+    let lengths = unpack_u32(packed, dict_count, lengths_width, what)?;
     position = align(position + packed.len(), 8);
     let packed = bytes(segment, position, packed_size(count, indices_width), what)?;
-    let indices = if mode == FSST_ONLY {
-        Vec::new()
-    } else {
-        unpack(packed, count, indices_width, what)?
-    };
+    let indices = (mode != FSST_ONLY)
+        .then(|| unpack_u32(packed, count, indices_width, what))
+        .transpose()?;
 
     if lengths[0] != 0 {
         return Err(corrupted(
@@ -1437,24 +1609,73 @@ pub fn decode_dict_fsst(segment: &[u8], count: usize) -> Result<(StringRows, Vec
     } else {
         None
     };
-    let mut strings = StringRows::with_capacity(dict_count.min(1 << 16));
+    // where each entry ends; one past the dictionary fails when it is read, as it does in C++
+    let mut ends = Vec::with_capacity(lengths.len());
     let mut offset = 0usize;
     for &length in &lengths {
-        let length = length as usize;
-        let entry = offset
-            .checked_add(length)
-            .and_then(|end| dictionary.get(offset..end))
+        offset = offset.saturating_add(length as usize);
+        ends.push(offset);
+    }
+    Ok(DictFsst {
+        dictionary,
+        ends,
+        decoder,
+        indices,
+    })
+}
+
+/// A DICT_FSST segment, read as far as its entries: where each ends in the dictionary, and per row its entry
+/// (`None` of `FSST_ONLY`, where row `i` has entry `i + 1`).
+struct DictFsst<'a> {
+    dictionary: &'a [u8],
+    ends: Vec<usize>,
+    decoder: Option<FsstDecoder>,
+    indices: Option<Vec<u32>>,
+}
+
+impl DictFsst<'_> {
+    fn entry(&self, index: usize, out: &mut StringRows) -> Result<()> {
+        let start = if index == 0 { 0 } else { self.ends[index - 1] };
+        let entry = self
+            .dictionary
+            .get(start..self.ends[index])
             .ok_or_else(|| corrupted("Corrupted DICT_FSST segment: string lengths exceed the dictionary size"))?;
-        offset += length;
-        match &decoder {
-            Some(decoder) => strings.push_with(|out| decoder.decompress_into(entry, out))?,
-            None => strings.push(entry),
+        match &self.decoder {
+            Some(decoder) => out.push_with(|out| decoder.decompress_into(entry, out)),
+            None => {
+                out.push(entry);
+                Ok(())
+            }
         }
     }
-    if mode == FSST_ONLY {
-        return Ok((strings, (1..=count as u32).collect()));
+
+    /// The entry of row `row`, which must be one of the dictionary.
+    fn index_of(&self, row: usize) -> Result<u32> {
+        let index = match &self.indices {
+            Some(indices) => indices[row],
+            None => row as u32 + 1,
+        };
+        if index as usize >= self.ends.len() {
+            return Err(corrupted(
+                "Corrupted DICT_FSST segment: dictionary index is out of range",
+            ));
+        }
+        Ok(index)
     }
-    let indices: Vec<u32> = indices.into_iter().map(|index| index as u32).collect();
+}
+
+/// `DictFSSTCompressionState` read back: the entries of the dictionary, and per row its entry (0 the empty string
+/// a NULL has).
+pub fn decode_dict_fsst(segment: &[u8], count: usize) -> Result<(StringRows, Vec<u32>)> {
+    let parsed = parse_dict_fsst(segment, count)?;
+    let mut strings = StringRows::with_capacity(parsed.ends.len().min(1 << 16));
+    for index in 0..parsed.ends.len() {
+        parsed.entry(index, &mut strings)?;
+    }
+    let indices = match parsed.indices {
+        Some(indices) => indices,
+        None => return Ok((strings, (1..=count as u32).collect())),
+    };
     if indices.iter().any(|&index| index as usize >= strings.len()) {
         return Err(corrupted(
             "Corrupted DICT_FSST segment: dictionary index is out of range",
@@ -1463,9 +1684,66 @@ pub fn decode_dict_fsst(segment: &[u8], count: usize) -> Result<(StringRows, Vec
     Ok((strings, indices))
 }
 
+/// [`decode_dict_fsst`] with the entries but entry 0 (the empty string a NULL has) onto `entries`: per row where in
+/// `entries` its entry went, or 0 for a NULL (whose entry 0 of `entries` must stand for).
+pub fn decode_dict_fsst_onto(segment: &[u8], count: usize, entries: &mut StringRows) -> Result<Vec<u32>> {
+    let parsed = parse_dict_fsst(segment, count)?;
+    let dict_count = parsed.ends.len();
+    let base = entries.len() as u32;
+    for index in 1..dict_count {
+        parsed.entry(index, entries)?;
+    }
+    let shift = |index: u32| if index == 0 { 0 } else { base + index - 1 };
+    match parsed.indices {
+        Some(mut indices) => {
+            if indices.iter().any(|&index| index as usize >= dict_count) {
+                return Err(corrupted(
+                    "Corrupted DICT_FSST segment: dictionary index is out of range",
+                ));
+            }
+            for index in &mut indices {
+                *index = shift(*index);
+            }
+            Ok(indices)
+        }
+        None => Ok((1..=count as u32).map(shift).collect()),
+    }
+}
+
+/// The strings of rows `rows` of a DICT_FSST segment of `count` rows, onto `out`, each entry decoded for each row
+/// that has it; per row, whether it has entry 0, which a NULL has.
+pub fn decode_dict_fsst_rows(segment: &[u8], count: usize, rows: &[u32], out: &mut StringRows) -> Result<Vec<bool>> {
+    let parsed = parse_dict_fsst(segment, count)?;
+    let mut empty = Vec::with_capacity(rows.len());
+    for &row in rows {
+        if row as usize >= count {
+            return Err(corrupt("a row past the rows of a column"));
+        }
+        let index = parsed.index_of(row as usize)?;
+        empty.push(index == 0);
+        parsed.entry(index as usize, out)?;
+    }
+    Ok(empty)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn groups_unpack_as_bits_read_one_by_one() {
+        // bytes that aren't a pattern of any width, and counts that end inside a group and on one
+        let data: Vec<u8> = (0..4096u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+        for width in 0..=MAX_GROUP_WIDTH {
+            for count in [0, 1, 31, 32, 33, 100] {
+                let packed = &data[..packed_size(count, width)];
+                let mut unpacked = Vec::new();
+                unpack_groups(packed, count, width, |group| unpacked.extend_from_slice(group));
+                let expected: Vec<u64> = (0..count).map(|i| read_bits(packed, i * width, width) as u64).collect();
+                assert_eq!(unpacked, expected, "{count} values of {width} bits");
+            }
+        }
+    }
 
     fn fsst_segment(dict_end: u32, width: u32, table_offset: u32) -> Vec<u8> {
         let mut segment = vec![0; 256];

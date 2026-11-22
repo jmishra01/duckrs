@@ -461,6 +461,7 @@ impl Binder<'_> {
             self.bind_context.add_binding(Binding {
                 alias: "__mark_join".to_string(),
                 schema: None,
+                catalog: None,
                 table_index,
                 names: vec!["__mark_join_marker".to_string()],
                 types: vec![LogicalType::BOOLEAN],

@@ -212,19 +212,33 @@ fn binary<T: Arithmetic, OP: BinaryOperator>(args: &DataChunk, result: &mut Vect
         args.len(),
         |a, b| match OP::apply(a, b) {
             Some(r) => Ok(Some(r)),
-            None => Err(Error::new(
-                ErrorKind::OutOfRange,
-                format!(
-                    "Overflow in {} of {} ({} {} {})!",
-                    OP::NAME,
-                    T::PHYSICAL,
-                    a.render(),
-                    OP::SYMBOL,
-                    b.render()
-                ),
-            )),
+            None => Err(overflow_error::<T, OP>(a, b)),
         },
     )
+}
+
+/// The error of an operation that overflows, apart from the loop, which stays small enough to inline.
+#[cold]
+#[inline(never)]
+fn overflow_error<T: Arithmetic, OP: BinaryOperator>(a: T, b: T) -> Error {
+    Error::new(
+        ErrorKind::OutOfRange,
+        format!(
+            "Overflow in {} of {} ({} {} {})!",
+            OP::NAME,
+            T::PHYSICAL,
+            a.render(),
+            OP::SYMBOL,
+            b.render()
+        ),
+    )
+}
+
+/// A DECIMAL operation's overflow error, made apart from its loop: `message` of the operands.
+#[cold]
+#[inline(never)]
+fn decimal_error<T: std::fmt::Display>(a: T, b: T, message: fn(T, T) -> String) -> Error {
+    Error::new(ErrorKind::OutOfRange, message(a, b))
 }
 
 /// Unary `-` (`NegateOperator`).
@@ -328,10 +342,9 @@ fn decimal_add_overflow_check(args: &DataChunk, result: &mut Vector) -> Result<(
     executor::binary_fallible::<i128, i128, i128>(args.column(0), args.column(1), result, args.len(), |a, b| {
         match a.checked_add(b).filter(in_decimal_38) {
             Some(r) => Ok(Some(r)),
-            None => Err(Error::new(
-                ErrorKind::OutOfRange,
-                format!("Overflow in addition of DECIMAL(38) ({a} + {b});"),
-            )),
+            None => Err(decimal_error(a, b, |a, b| {
+                format!("Overflow in addition of DECIMAL(38) ({a} + {b});")
+            })),
         }
     })
 }
@@ -341,10 +354,9 @@ fn decimal_subtract_overflow_check(args: &DataChunk, result: &mut Vector) -> Res
     executor::binary_fallible::<i128, i128, i128>(args.column(0), args.column(1), result, args.len(), |a, b| {
         match a.checked_sub(b).filter(in_decimal_38) {
             Some(r) => Ok(Some(r)),
-            None => Err(Error::new(
-                ErrorKind::OutOfRange,
-                format!("Overflow in subtract of DECIMAL(38) ({a} - {b});"),
-            )),
+            None => Err(decimal_error(a, b, |a, b| {
+                format!("Overflow in subtract of DECIMAL(38) ({a} - {b});")
+            })),
         }
     })
 }
@@ -354,13 +366,12 @@ fn decimal_multiply_overflow_check_18(args: &DataChunk, result: &mut Vector) -> 
     executor::binary_fallible::<i64, i64, i64>(args.column(0), args.column(1), result, args.len(), |a, b| {
         match a.checked_mul(b).filter(|r| r.abs() <= DECIMAL_18_MAX) {
             Some(r) => Ok(Some(r)),
-            None => Err(Error::new(
-                ErrorKind::OutOfRange,
+            None => Err(decimal_error(a, b, |a, b| {
                 format!(
                     "Overflow in multiplication of DECIMAL(18) ({a} * {b}). You might want to add an explicit cast \
                      to a bigger decimal."
-                ),
-            )),
+                )
+            })),
         }
     })
 }
@@ -370,13 +381,12 @@ fn decimal_multiply_overflow_check_38(args: &DataChunk, result: &mut Vector) -> 
     executor::binary_fallible::<i128, i128, i128>(args.column(0), args.column(1), result, args.len(), |a, b| {
         match a.checked_mul(b).filter(in_decimal_38) {
             Some(r) => Ok(Some(r)),
-            None => Err(Error::new(
-                ErrorKind::OutOfRange,
+            None => Err(decimal_error(a, b, |a, b| {
                 format!(
                     "Overflow in multiplication of DECIMAL(38) ({a} * {b}). You might want to add an explicit cast \
                      to a decimal with a smaller scale."
-                ),
-            )),
+                )
+            })),
         }
     })
 }

@@ -854,53 +854,55 @@ fn to_base64(args: &DataChunk, result: &mut Vector) -> Result<()> {
 }
 
 fn from_base64(args: &DataChunk, result: &mut Vector) -> Result<()> {
-    strict_rows(args, result, |row| {
-        let input = text(&row[0]);
-        if !input.len().is_multiple_of(4) {
+    strict_rows(args, result, |row| Ok(Value::blob(decode_base64(&text(&row[0]))?)))
+}
+
+/// `Blob::FromBase64`.
+pub(crate) fn decode_base64(input: &str) -> Result<Vec<u8>> {
+    if !input.len().is_multiple_of(4) {
+        return Err(Error::new(
+            ErrorKind::Conversion,
+            format!("Could not decode string \"{input}\" as base64: length must be a multiple of 4"),
+        ));
+    }
+    let mut out = Vec::with_capacity(input.len() / 4 * 3);
+    let final_group = input.len().saturating_sub(4);
+    for (index, group) in input.as_bytes().chunks(4).enumerate() {
+        let base = index * 4;
+        let last = base == final_group;
+        if last && group[2] == b'=' && group[3] != b'=' {
             return Err(Error::new(
                 ErrorKind::Conversion,
-                format!("Could not decode string \"{input}\" as base64: length must be a multiple of 4"),
+                format!(
+                    "Could not decode string \"{input}\" as base64: data after the padding at position {}",
+                    base + 3
+                ),
             ));
         }
-        let mut out = Vec::with_capacity(input.len() / 4 * 3);
-        let final_group = input.len().saturating_sub(4);
-        for (index, group) in input.as_bytes().chunks(4).enumerate() {
-            let base = index * 4;
-            let last = base == final_group;
-            if last && group[2] == b'=' && group[3] != b'=' {
-                return Err(Error::new(
-                    ErrorKind::Conversion,
-                    format!(
-                        "Could not decode string \"{input}\" as base64: data after the padding at position {}",
-                        base + 3
-                    ),
-                ));
+        let mut bits = 0u32;
+        let mut padding = 0;
+        for (at, c) in group.iter().enumerate() {
+            bits <<= 6;
+            if last && at >= 2 && *c == b'=' {
+                padding += 1;
+            } else {
+                let Some(digit) = BASE64.iter().position(|b| b == c) else {
+                    return Err(Error::new(
+                        ErrorKind::Conversion,
+                        format!(
+                            "Could not decode string \"{input}\" as base64: invalid byte value '{c}' at \
+                             position {}",
+                            base + at
+                        ),
+                    ));
+                };
+                bits |= digit as u32;
             }
-            let mut bits = 0u32;
-            let mut padding = 0;
-            for (at, c) in group.iter().enumerate() {
-                bits <<= 6;
-                if last && at >= 2 && *c == b'=' {
-                    padding += 1;
-                } else {
-                    let Some(digit) = BASE64.iter().position(|b| b == c) else {
-                        return Err(Error::new(
-                            ErrorKind::Conversion,
-                            format!(
-                                "Could not decode string \"{input}\" as base64: invalid byte value '{c}' at \
-                                 position {}",
-                                base + at
-                            ),
-                        ));
-                    };
-                    bits |= digit as u32;
-                }
-            }
-            let bytes = bits.to_be_bytes();
-            out.extend_from_slice(&bytes[1..4 - padding]);
         }
-        Ok(Value::blob(out))
-    })
+        let bytes = bits.to_be_bytes();
+        out.extend_from_slice(&bytes[1..4 - padding]);
+    }
+    Ok(out)
 }
 
 fn set_of(name: &str, overloads: Vec<(Vec<LogicalType>, LogicalType, ScalarCallback)>) -> ScalarFunctionSet {

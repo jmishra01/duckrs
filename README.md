@@ -59,7 +59,7 @@ and SELECT (joins, WHERE, GROUP BY, aggregates, ORDER BY, LIMIT, DISTINCT) in me
   never counts that error as the one a test expects.
 - `crates/duckrs`: the public API (`Database`, `Connection`, `QueryResult`) over the engine.
   Phase 9 has started: `Database::open` reads files written by DuckDB and scans their tables in place: tables of scalar and
-  nested types, with deleted rows, in all compression but ZSTD and the old Chimp and Patas. Such a
+  nested types, with deleted rows, in all compression. Such a
   database takes no writes. Views, macros, sequences, types, defaults, generated columns, constraints and indexes come along, what a write-ahead log committed is replayed, and what isn't ported yet is an error. Files can be written too, in a format that DuckDB reads: commits go to a write-ahead log, and `CHECKPOINT` and closing the database write all of it, compressed with RLE, BitPacking, Roaring and dictionaries, apart from keys and indexes, which wait for Phase 10; see "Phase 9" in
   [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 - `tools/sqllogictest`: a port of DuckDB's sqllogictest runner. It runs the DuckDB `.test` corpus
