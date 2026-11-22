@@ -286,6 +286,9 @@ Each item gives the number of failing files in `test/` that it should fix, where
     yet and those that can't store the column's type (`VerifyCompressionType`), ADD COLUMN keeps one unchecked,
     the catalog, the log and `sql` keep it, and a checkpoint stores the column, its validity and children with
     only that method and UNCOMPRESSED in place of `force_compression` (`ColumnCheckpointInfo::GetCompressionType`)
+  - [x] `disabled_compression_methods`: a checkpoint leaves the methods out of what it chooses from, for every type,
+    before `force_compression` is looked up (`CompressionFunctionSet::GetCompressionFunctions`); the setting reads
+    back in the order of `CompressionType` (`RLE,Dictionary`)
   - [x] `read_duckdb` and the replacement scan of `.db` files; `enable_view_dependencies` (DROP ... CASCADE,
     refused DROP and ALTER, CREATE OR REPLACE of a view that reads itself)
   - [ ] `vector_type` (~20 files) and `duckdb_memory` (~17) report engine internals duckrs does not model

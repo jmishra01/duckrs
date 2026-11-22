@@ -55,6 +55,8 @@ pub struct CheckpointOptions<'a> {
     /// what the file is written in
     pub storage_version: StorageVersion,
     pub force_compression: &'a str,
+    /// `disabled_compression_methods`: the names of the methods no column is compressed with, in lower case
+    pub disabled_compression: &'a [String],
     /// `debug_force_bitpacking_mode`
     pub bitpacking_mode: &'a str,
     /// `zstd_min_string_length`
@@ -1325,6 +1327,8 @@ struct Writer<'a> {
     tables: MetaStream,
     /// The setting, in lower case.
     force_compression: String,
+    /// `disabled_compression_methods`, in lower case
+    disabled_compression: Vec<String>,
     variant_minimum_shredding_size: i64,
     force_variant_shredding: Option<LogicalType>,
     bitpacking_mode: super::bitpacking::Mode,
@@ -1822,6 +1826,7 @@ impl<'a> Writer<'a> {
             reserved: VecDeque::new(),
             tables: MetaStream::default(),
             force_compression: options.force_compression.to_lowercase(),
+            disabled_compression: options.disabled_compression.to_vec(),
             variant_minimum_shredding_size: options.variant_minimum_shredding_size,
             force_variant_shredding: options.force_variant_shredding.cloned(),
             bitpacking_mode: super::bitpacking::Mode::parse(options.bitpacking_mode),
@@ -2069,6 +2074,13 @@ impl<'a> Writer<'a> {
     }
 
     /// `DUCKDB_LOG_TRACE` of `DetectBestCompressionMethod`: the method chosen for a column, and its score.
+    /// `CompressionFunctionSet::GetCompressionFunctions`: whether `disabled_compression_methods` leaves the method
+    /// out.
+    fn is_disabled(&self, compression: u8) -> bool {
+        let name = compression_setting_name(compression);
+        self.disabled_compression.iter().any(|disabled| disabled == name)
+    }
+
     fn log_choice(&self, compression: u8, ty: &str, score: usize) {
         let (table, column) = &self.log_column;
         let line = format!(
@@ -2119,6 +2131,7 @@ impl<'a> Writer<'a> {
             let bits: Vec<bool> = data.iter().map(|byte| *byte != 0).collect();
             encode_roaring(&bits, self.block_size)
         };
+        methods.retain(|method| !self.is_disabled(*method));
         // `ForceCompression`: a forced method the type has leaves only it and UNCOMPRESSED
         let forced = methods
             .iter()
@@ -2399,7 +2412,11 @@ impl<'a> Writer<'a> {
             return self.write_plain_strings(&strings, valid, limit);
         }
         // `ZSTDStorage::StringInitAnalyze`: from v1.2.0 on
-        if force == "zstd" && self.version >= StorageVersion::V1_2_0 && !strings.is_empty() {
+        if force == "zstd"
+            && self.version >= StorageVersion::V1_2_0
+            && !strings.is_empty()
+            && !self.is_disabled(COMPRESSION_ZSTD)
+        {
             return self.write_zstd(&strings, valid);
         }
         // before v1.3.0: DICTIONARY and FSST, which DICT_FSST replaced. Their analyze samples at random, so
@@ -2407,11 +2424,11 @@ impl<'a> Writer<'a> {
         if force != "uncompressed" && valid.iter().any(|v| *v) {
             let plain_size: usize = strings.iter().map(|string| string.len() + 4).sum();
             let total = |segments: &Vec<Encoded>| segments.iter().map(|(bytes, _)| bytes.len()).sum::<usize>();
-            let dictionary = (force != "fsst")
+            let dictionary = (force != "fsst" && !self.is_disabled(COMPRESSION_DICTIONARY))
                 .then(|| encode_old_dictionary(&strings, valid, self.block_size, limit))
                 .flatten()
                 .map(|segments| (segments, COMPRESSION_DICTIONARY));
-            let fsst = (force != "dictionary")
+            let fsst = (force != "dictionary" && !self.is_disabled(COMPRESSION_FSST))
                 .then(|| SymbolTable::train(&strings))
                 .flatten()
                 .and_then(|table| encode_old_fsst(&strings, valid, self.block_size, limit, &table))
@@ -2476,6 +2493,7 @@ impl<'a> Writer<'a> {
             (estimate as f64 * penalty) as usize
         };
         let mut methods = vec![COMPRESSION_UNCOMPRESSED, COMPRESSION_ZSTD, COMPRESSION_DICT_FSST];
+        methods.retain(|method| !self.is_disabled(*method));
         let forced = match force {
             "zstd" => Some(COMPRESSION_ZSTD),
             "dict_fsst" => Some(COMPRESSION_DICT_FSST),
@@ -2599,8 +2617,9 @@ impl<'a> Writer<'a> {
     fn validity_choice(&self, valid: &[bool]) -> u8 {
         let force = self.force_compression.as_str();
         let plain_score = valid.len().div_ceil(8);
-        let roaring_score = (self.version >= StorageVersion::V1_2_0 && force != "uncompressed")
-            .then(|| super::roaring::final_analyze(valid, self.block_size));
+        let can_roaring =
+            self.version >= StorageVersion::V1_2_0 && force != "uncompressed" && !self.is_disabled(COMPRESSION_ROARING);
+        let roaring_score = can_roaring.then(|| super::roaring::final_analyze(valid, self.block_size));
         let use_roaring = roaring_score.is_some_and(|score| force == "roaring" || score < plain_score);
         let (chosen, score) = if use_roaring {
             (COMPRESSION_ROARING, roaring_score.expect("scored"))

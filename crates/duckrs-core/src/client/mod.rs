@@ -226,6 +226,8 @@ struct CheckpointSettings {
     storage_version: duckrs_common::serializer::StorageVersion,
     keep_free_blocks: bool,
     force: String,
+    /// `disabled_compression_methods`, in lower case
+    disabled_compression: Vec<String>,
     bitpacking_mode: String,
     row_group_size: u64,
     vacuum_tasks: usize,
@@ -243,6 +245,7 @@ impl CheckpointSettings {
             storage_version: self.storage_version,
             keep_free_blocks: self.keep_free_blocks,
             force_compression: &self.force,
+            disabled_compression: &self.disabled_compression,
             bitpacking_mode: &self.bitpacking_mode,
             row_group_size: self.row_group_size,
             vacuum_tasks: self.vacuum_tasks,
@@ -724,6 +727,18 @@ impl DatabaseInstance {
     fn checkpoint_settings(&self, file: &DatabaseFile) -> Result<CheckpointSettings> {
         let force = settings::current_value("force_compression", &self.settings.read(), &SettingValues::default());
         let force = force.and_then(|value| value.try_to_string().ok()).unwrap_or_default();
+        let disabled_compression = settings::current_value(
+            "disabled_compression_methods",
+            &self.settings.read(),
+            &SettingValues::default(),
+        );
+        let disabled_compression: Vec<String> = disabled_compression
+            .and_then(|value| value.try_to_string().ok())
+            .unwrap_or_default()
+            .split(',')
+            .map(|name| name.trim().to_lowercase())
+            .filter(|name| !name.is_empty())
+            .collect();
         let vacuum_tasks =
             settings::current_value("max_vacuum_tasks", &self.settings.read(), &SettingValues::default());
         let vacuum_tasks = vacuum_tasks
@@ -800,6 +815,7 @@ impl DatabaseInstance {
             storage_version: file.storage_version,
             keep_free_blocks: self.catalog.has_forks(),
             force,
+            disabled_compression,
             bitpacking_mode,
             row_group_size: file.row_group_size,
             vacuum_tasks: if self.catalog.has_forks() { 0 } else { vacuum_tasks },

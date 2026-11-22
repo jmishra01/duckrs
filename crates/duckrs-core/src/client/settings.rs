@@ -384,6 +384,26 @@ const COMPRESSION_TYPES: [&str; 16] = [
     "DICT_FSST",
 ];
 
+/// `CompressionTypeToString`, in the order of [`COMPRESSION_TYPES`].
+const COMPRESSION_TYPE_NAMES: [&str; 16] = [
+    "Auto",
+    "Uncompressed",
+    "Constant",
+    "RLE",
+    "Dictionary",
+    "PFOR",
+    "BitPacking",
+    "FSST",
+    "Chimp",
+    "Patas",
+    "ALP",
+    "ALPRD",
+    "ZSTD",
+    "Roaring",
+    "Empty Validity",
+    "DICT_FSST",
+];
+
 /// `EnumUtil::FromString<CompressionType>` of a name that is none.
 fn compression_type_error(input: &str) -> Error {
     let scores = COMPRESSION_TYPES
@@ -778,6 +798,27 @@ fn on_set(setting: &SettingDefinition, value: Value) -> Result<Value> {
             } else {
                 Value::varchar(format_bytes(parse_memory_limit(&input)?.unwrap_or(u64::MAX)))
             }
+        }
+        // `DisabledCompressionMethodsSetting::GetSetting`: the methods, once each in the order of `CompressionType`,
+        // as `CompressionTypeToString` names them; `none` clears them
+        "disabled_compression_methods" => {
+            let mut disabled = [false; COMPRESSION_TYPES.len()];
+            for entry in value.try_to_string()?.split(',') {
+                let entry = entry.trim();
+                if entry.eq_ignore_ascii_case("none") {
+                    disabled = [false; COMPRESSION_TYPES.len()];
+                    break;
+                }
+                if let Some(at) = COMPRESSION_TYPES.iter().position(|t| t.eq_ignore_ascii_case(entry)) {
+                    disabled[at] = true;
+                }
+            }
+            let names: Vec<&str> = COMPRESSION_TYPE_NAMES
+                .iter()
+                .zip(disabled)
+                .filter_map(|(name, disabled)| disabled.then_some(*name))
+                .collect();
+            Value::varchar(names.join(","))
         }
         _ => value,
     })
