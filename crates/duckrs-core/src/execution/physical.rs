@@ -707,7 +707,7 @@ impl PhysicalTableScan {
         // the VARIANT fields of the rows left, of the row group's
         let fields: Vec<usize> = self.variant_fields().into_iter().filter(|&p| fetched[p].is_none()).collect();
         for (position, mut field) in self.group_fields(source, group, &fields, group_rows)? {
-            field.slice(&SelectionVector::from_vec(selection.clone()), selection.len());
+            field.slice(&SelectionVector::from_vec(selection.to_vec()), selection.len());
             fetched[position] = Some(field);
         }
         for &position in &output {
