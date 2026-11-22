@@ -567,6 +567,24 @@ pub enum VariantStatistics {
     Inconsistent,
 }
 
+impl ColumnStatistics {
+    /// `BaseStatistics::CreateUnknown`: nothing is known.
+    pub fn unknown() -> Self {
+        Self {
+            min: None,
+            max: None,
+            can_be_null: true,
+            can_be_valid: true,
+            geometry: None,
+            strings: None,
+            distinct: None,
+            children: Vec::new(),
+            variant: None,
+            lists: None,
+        }
+    }
+}
+
 /// `StringStatsData`: what is known of the strings of a column besides their bounds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StringStatistics {

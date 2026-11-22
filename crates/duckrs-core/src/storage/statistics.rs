@@ -30,19 +30,12 @@ pub struct BaseStatistics {
     pub geometry: Option<duckrs_common::geometry::GeometryStats>,
     /// of a VARCHAR, the bounds the file has
     pub strings: Option<StringBounds>,
-    /// of a LIST or ARRAY its element's, of a STRUCT its fields'
+    /// of a VARIANT, its `VariantStatsShreddingState`
+    pub variant_state: Option<u8>,
+    /// of a shredded VARIANT, the type of its shredded part and the statistics of that
+    pub variant_shredded: Option<Box<(LogicalType, BaseStatistics)>>,
+    /// of a LIST or ARRAY its element's, of a STRUCT each field's
     pub children: Vec<BaseStatistics>,
-    /// of a VARIANT, `VariantStats`
-    pub variant: Option<Box<StoredVariantStats>>,
-    /// of a LIST, the lengths of its lists the file has (`ListStatsData`, from v2.1.0)
-    pub lists: Option<crate::catalog::ListLengths>,
-}
-
-/// `VariantStatsData`: the shredding state, and if shredded the type of the typed part and its statistics.
-#[derive(Debug, Clone)]
-pub struct StoredVariantStats {
-    pub state: u8,
-    pub shredded: Option<(LogicalType, BaseStatistics)>,
 }
 
 fn numeric_value(d: &mut BinaryDeserializer<'_>, physical: PhysicalType) -> Result<Option<[u8; 16]>> {
@@ -90,12 +83,12 @@ fn numeric_value(d: &mut BinaryDeserializer<'_>, physical: PhysicalType) -> Resu
 /// The bounds of a VARCHAR column's values: prefixes of them where `exact` is false (`StringStatsData`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StringBounds {
+    /// whether `min` and `max` are bounds: without them only the rest is known
+    pub has_bounds: bool,
     pub min: Vec<u8>,
     pub min_exact: bool,
     pub max: Vec<u8>,
     pub max_exact: bool,
-    /// whether there are bounds: there are none of no strings, whose lengths are still known
-    pub bounds_known: bool,
     pub has_unicode: bool,
     pub min_length: Option<u64>,
     pub max_length: Option<u64>,
@@ -117,17 +110,18 @@ fn string_stats(d: &mut BinaryDeserializer<'_>) -> Result<Option<StringBounds>> 
         let has_max_length = d.read_property::<bool>(203, "has_max_string_length")?;
         let max_length = d.read_property::<u32>(204, "max_string_length")? as usize;
         let (min, max) = (min.0, max.0);
-        if min.len() != LEGACY_MINMAX_SIZE || max.len() != LEGACY_MINMAX_SIZE {
-            return Ok(None);
-        }
-        // `LegacyGetMinMaxType`: no bounds, as of no strings, whose lengths are known all the same
-        if min[0] > max[0] || (min.iter().all(|b| *b == 0) && max.iter().all(|b| *b == 0xFF)) {
+        // `LegacyGetMinMaxType`: EMPTY_STATS or NO_STATS have no bounds, but the rest
+        if min.len() != LEGACY_MINMAX_SIZE
+            || max.len() != LEGACY_MINMAX_SIZE
+            || min[0] > max[0]
+            || (min.iter().all(|b| *b == 0) && max.iter().all(|b| *b == 0xFF))
+        {
             return Ok(Some(StringBounds {
+                has_bounds: false,
                 min: Vec::new(),
                 min_exact: false,
                 max: Vec::new(),
                 max_exact: false,
-                bounds_known: false,
                 has_unicode,
                 min_length: None,
                 max_length: has_max_length.then_some(max_length as u64),
@@ -143,11 +137,11 @@ fn string_stats(d: &mut BinaryDeserializer<'_>) -> Result<Option<StringBounds>> 
             bytes[..end].to_vec()
         };
         return Ok(Some(StringBounds {
+            has_bounds: true,
             min: trimmed(min),
             min_exact: exact,
             max: trimmed(max),
             max_exact: exact,
-            bounds_known: true,
             has_unicode,
             min_length: None,
             max_length: has_max_length.then_some(max_length as u64),
@@ -158,40 +152,38 @@ fn string_stats(d: &mut BinaryDeserializer<'_>) -> Result<Option<StringBounds>> 
     let min_max = d.read_optional_property::<RawBytes>(205, "min_max")?;
     let packed = d.read_property::<u32>(206, "packed_field")?;
     let total_length = d.read_optional_property::<u64>(207, "total_string_length")?;
-    // `StringStatsField::GetMinStringLength`: 0 for not set, the length plus one, or the most it can hold,
-    // which is no length either (`StringStatsData::HasMinStringLength`)
+    // `StringStatsField::GetMinStringLength`: 0 for not set, the length plus one, or the most it can hold
     let min_length = match (packed >> 11) & ((1 << 21) - 1) {
-        0 | MAXIMUM_MIN_STRING_LENGTH => None,
+        0 => None,
+        MAXIMUM_MIN_STRING_LENGTH => Some(u64::from(u32::MAX)),
         length => Some(u64::from(length - 1)),
     };
     let has_unicode = packed & 1 == 0;
     let max_length = max_length.filter(|length| *length != u32::MAX).map(u64::from);
     // `StringStatsField`
-    let Some(min_max) = min_max.filter(|m| m.0.len() == 2 * CURRENT_MINMAX_SIZE) else {
-        // no bounds, as of no strings, but what is known of their lengths
-        return Ok(max_length.is_some().then(|| StringBounds {
+    let min_size = ((packed >> 3) & 0xF) as usize;
+    let max_size = ((packed >> 7) & 0xF) as usize;
+    let Some(min_max) = min_max.filter(|m| {
+        m.0.len() == 2 * CURRENT_MINMAX_SIZE && min_size <= CURRENT_MINMAX_SIZE && max_size <= CURRENT_MINMAX_SIZE
+    }) else {
+        return Ok(Some(StringBounds {
+            has_bounds: false,
             min: Vec::new(),
             min_exact: false,
             max: Vec::new(),
             max_exact: false,
-            bounds_known: false,
             has_unicode,
             min_length,
             max_length,
             total_length,
         }));
     };
-    let min_size = ((packed >> 3) & 0xF) as usize;
-    let max_size = ((packed >> 7) & 0xF) as usize;
-    if min_size > CURRENT_MINMAX_SIZE || max_size > CURRENT_MINMAX_SIZE {
-        return Ok(None);
-    }
     Ok(Some(StringBounds {
+        has_bounds: true,
         min: min_max.0[..min_size].to_vec(),
         min_exact: packed & (1 << 1) != 0,
         max: min_max.0[CURRENT_MINMAX_SIZE..CURRENT_MINMAX_SIZE + max_size].to_vec(),
         max_exact: packed & (1 << 2) != 0,
-        bounds_known: true,
         has_unicode,
         min_length,
         max_length,
@@ -218,23 +210,23 @@ pub fn read_statistics(d: &mut BinaryDeserializer<'_>, ty: Option<&LogicalType>)
             max: bounds.and_then(|(_, max)| max),
             geometry,
             strings,
+            variant_state: nested.variant_state,
+            variant_shredded: nested.variant_shredded,
             children: nested.children,
-            variant: nested.variant,
-            lists: nested.lists,
         })
     })
 }
 
-/// The bounds of the values, of the types that have numeric statistics.
-type Bounds = Option<([u8; 16], Option<[u8; 16]>)>;
-
-/// The statistics in those of a nested type or a VARIANT.
+/// What statistics of a VARIANT or a nested type have besides their own.
 #[derive(Default)]
 struct Nested {
+    variant_state: Option<u8>,
+    variant_shredded: Option<Box<(LogicalType, BaseStatistics)>>,
     children: Vec<BaseStatistics>,
-    variant: Option<Box<StoredVariantStats>>,
-    lists: Option<crate::catalog::ListLengths>,
 }
+
+/// The bounds of the values, of the types that have numeric statistics.
+type Bounds = Option<([u8; 16], Option<[u8; 16]>)>;
 
 fn read_type_stats(
     d: &mut BinaryDeserializer<'_>,
@@ -247,21 +239,17 @@ fn read_type_stats(
         return Ok(None);
     };
     if ty.id() == LogicalTypeId::Variant {
-        // `VariantStats::Deserialize`: the statistics of the unshredded values and, if shredded, of the typed part
+        // `VariantStats::Deserialize`: the statistics of the unshredded part, and of a shredded one
         const SHREDDED: u8 = 2;
         let state: u8 = d.read_property(200, "shredding_state")?;
+        nested.variant_state = Some(state);
         let unshredded = duckrs_common::variant::unshredded_type();
         d.read_object_field(225, "unshredded_stats", |d| read_statistics(d, Some(&unshredded)))?;
-        let mut shredded_stats = None;
         if state == SHREDDED {
             let shredded: LogicalType = d.read_property(230, "shredded_type")?;
             let stats = d.read_object_field(235, "shredded_stats", |d| read_statistics(d, Some(&shredded)))?;
-            shredded_stats = Some((shredded, stats));
+            nested.variant_shredded = Some(Box::new((shredded, stats)));
         }
-        nested.variant = Some(Box::new(StoredVariantStats {
-            state,
-            shredded: shredded_stats,
-        }));
         return Ok(None);
     }
     // `GeometryStats::Deserialize`: the string stats of files of the spatial extension, or the extent,
@@ -315,14 +303,6 @@ fn read_type_stats(
         PhysicalType::List | PhysicalType::Array => {
             let child = d.read_object_field(200, "child_stats", |d| read_statistics(d, ty.child_type()))?;
             nested.children = vec![child];
-            // `ListStats::Deserialize`: each length that is there is known
-            if physical == PhysicalType::List {
-                nested.lists = Some(crate::catalog::ListLengths {
-                    min: d.read_optional_property::<u64>(201, "min_list_length")?,
-                    max: d.read_optional_property::<u64>(202, "max_list_length")?,
-                    total: d.read_optional_property::<u64>(203, "total_list_length")?,
-                });
-            }
             Ok(None)
         }
         PhysicalType::Bit | PhysicalType::Invalid | PhysicalType::Unknown => Ok(None),
@@ -332,6 +312,12 @@ fn read_type_stats(
             }
             let min = d.read_object(200, "min", |d| numeric_value(d, physical))?;
             let max = d.read_object(201, "max", |d| numeric_value(d, physical))?;
+            // `NumericStats::HasMinMax`: a minimum above the maximum, of no values, is no bounds
+            if let (Some(min), Some(max)) = (&min, &max)
+                && super::writer::compare(physical, min, max) == std::cmp::Ordering::Greater
+            {
+                return Ok(None);
+            }
             Ok(min.map(|min| (min, max)))
         }
     }

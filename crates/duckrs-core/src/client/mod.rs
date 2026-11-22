@@ -487,12 +487,13 @@ impl DatabaseInstance {
             &self.settings.read(),
             &SettingValues::default(),
         )
+        .filter(|value| !value.is_null())
         .and_then(|value| value.try_to_string().ok())
-        .filter(|name| !name.is_empty());
+        .filter(|text| !text.is_empty());
         let force_variant_shredding = match force_variant_shredding {
-            Some(name) => {
-                let ty = crate::planner::binder::Binder::new(&self.catalog).type_from_name(&name)?;
-                Some(duckrs_common::variant_shredding::forced_shredding_type(&ty))
+            Some(text) => {
+                let ty = crate::planner::binder::Binder::new(&self.catalog).type_from_name(&text)?;
+                Some(duckrs_common::variant::shredding::forced_shredded_type(&ty))
             }
             None => None,
         };

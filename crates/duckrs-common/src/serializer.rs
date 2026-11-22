@@ -480,6 +480,14 @@ impl BinarySerializer {
         self.end_property();
     }
 
+    /// `WriteProperty` of a `unique_ptr` that is there: the presence flag, then the object.
+    pub fn write_nullable_object(&mut self, field_id: u16, tag: &str, body: impl FnOnce(&mut Self)) {
+        self.begin_property(field_id, tag, false);
+        self.begin_nullable(true);
+        self.write_object_value(body);
+        self.end_property();
+    }
+
     /// `WriteList`: a property holding `count` elements written by `element`.
     pub fn write_list(&mut self, field_id: u16, tag: &str, count: usize, mut element: impl FnMut(&mut Self, usize)) {
         self.begin_property(field_id, tag, false);

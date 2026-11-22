@@ -22,7 +22,6 @@ pub mod string_util;
 pub mod types;
 pub mod value;
 pub mod variant;
-pub mod variant_shredding;
 pub mod vector;
 
 pub use error::{Error, ErrorKind, Result};

@@ -4005,13 +4005,17 @@ test/sql/storage/rowid_gaps/append_after_gap_checkpoint.test
 test/sql/storage/rowid_gaps/bulk_append_after_gap_checkpoint.test
 test/sql/storage/rowid_gaps/indexed_checkpoint_drop_row_group.test
 test/sql/storage/rowid_gaps/indexed_dense_vacuum_merge.test
+test/sql/storage/rowid_gaps/indexed_geometry_legacy_no_remap.test
 test/sql/storage/rowid_gaps/indexed_geometry_vacuum_remap.test
 test/sql/storage/rowid_gaps/indexed_incremental_vacuum_remap.test
+test/sql/storage/rowid_gaps/indexed_live_vacuum_no_rebuild.test
 test/sql/storage/rowid_gaps/indexed_old_storage_keeps_deleted_row_group.test
+test/sql/storage/rowid_gaps/indexed_rebuild_fallback_then_remap.test
 test/sql/storage/rowid_gaps/indexed_remap_duplicate_key_across_tasks.test
 test/sql/storage/rowid_gaps/indexed_remap_merges_across_gap.test
 test/sql/storage/rowid_gaps/indexed_remap_partial_chunk.test
 test/sql/storage/rowid_gaps/indexed_remap_same_key_rowid_collision.test
+test/sql/storage/rowid_gaps/indexes_geometry_legacy_no_merge_across_gap.test
 test/sql/storage/rowid_gaps/leading_gap_lookup.test
 test/sql/storage/rowid_gaps/old_storage_dense_rewrite.test
 test/sql/storage/rowid_gaps/wal_replay_after_gap_checkpoint.test
@@ -4078,7 +4082,9 @@ test/sql/storage/types/variant/append_shredded.test
 test/sql/storage/types/variant/index_fetch.test
 test/sql/storage/types/variant/struct_of_variant.test
 test/sql/storage/types/variant/test_all_types.test
+test/sql/storage/types/variant/test_all_types_single_object.test
 test/sql/storage/types/variant/test_all_types_single_table.test
+test/sql/storage/types/variant/test_all_types_variant.test
 test/sql/storage/types/variant/update.test
 test/sql/storage/types/variant/variant_case_sensitive_fields_shredded.test
 test/sql/storage/types/variant/variant_comparator_shredded.test
@@ -4559,6 +4565,7 @@ test/sql/types/geo/geometry_crs_persist.test
 test/sql/types/geo/geometry_crs_projjson.test
 test/sql/types/geo/geometry_crs_wkt2.test
 test/sql/types/geo/geometry_intersects.test
+test/sql/types/geo/geometry_legacy_recheckpoint.test
 test/sql/types/geo/geometry_nonascii_cast.test
 test/sql/types/geo/geometry_persist.test
 test/sql/types/geo/geometry_persist_wal.test
@@ -4566,6 +4573,7 @@ test/sql/types/geo/geometry_shred_deletes.test
 test/sql/types/geo/geometry_shred_empty.test
 test/sql/types/geo/geometry_shred_fetch.test
 test/sql/types/geo/geometry_shred_list.test
+test/sql/types/geo/geometry_shred_more.test
 test/sql/types/geo/geometry_shred_pk_append.test
 test/sql/types/geo/geometry_stats.test
 test/sql/types/geo/geometry_stats_prune.test
@@ -4573,6 +4581,7 @@ test/sql/types/geo/geometry_stats_prune_nan.test
 test/sql/types/geo/geometry_stats_prune_shredded.test
 test/sql/types/geo/geometry_storage_version.test
 test/sql/types/geo/geometry_try_cast_malformed.test
+test/sql/types/geo/geometry_update.test
 test/sql/types/geo/geometry_vertex_extract.test
 test/sql/types/geo/geometry_wkb.test
 test/sql/types/geo/geometry_wkb_depth.test
