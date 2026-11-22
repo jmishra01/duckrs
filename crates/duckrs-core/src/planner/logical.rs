@@ -169,8 +169,13 @@ pub enum LogicalOperatorKind {
     LimitPercent { percent: f64, offset: u64 },
     /// `LogicalSample`: a random part of the child's rows.
     Sample { options: SampleOptions },
-    /// `LogicalDistinct`: one row per distinct `targets`, the first one with DISTINCT ON (`on`).
-    Distinct { targets: Vec<BoundExpr>, on: bool },
+    /// `LogicalDistinct`: one row per distinct `targets`, the first one with DISTINCT ON (`on`), in the order of
+    /// `orders` where there are any (`order_by`, the ORDER BY of the statement).
+    Distinct {
+        targets: Vec<BoundExpr>,
+        on: bool,
+        orders: Vec<BoundOrderByNode>,
+    },
     /// `LogicalSecureView`: the plan of a SECURE VIEW, which it passes on. The optimizer pushes
     /// nothing into it, so that no expression of the query sees the rows the view hides.
     SecureView { view_name: String },
@@ -880,8 +885,10 @@ impl LogicalOperator {
             }
             LogicalOperatorKind::Filter { expressions }
             | LogicalOperatorKind::Projection { expressions, .. }
-            | LogicalOperatorKind::Unnest { expressions, .. }
-            | LogicalOperatorKind::Distinct { targets: expressions, .. } => expressions.iter_mut().collect(),
+            | LogicalOperatorKind::Unnest { expressions, .. } => expressions.iter_mut().collect(),
+            LogicalOperatorKind::Distinct { targets, orders, .. } => {
+                targets.iter_mut().chain(orders.iter_mut().map(|o| &mut o.expr)).collect()
+            }
             LogicalOperatorKind::LateralJoin {
                 correlated, predicate, ..
             } => correlated.iter_mut().chain(predicate.iter_mut()).collect(),

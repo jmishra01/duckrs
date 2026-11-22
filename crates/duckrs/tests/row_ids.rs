@@ -2,13 +2,14 @@
 //! file and the log too. A wrong id is a right answer to any query that doesn't ask for it, so this
 //! keeps its own list of the rows and asks after each step.
 
+mod common;
+
 use duckrs::{Connection, Database};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 fn path(name: &str) -> PathBuf {
-    let directory = std::env::temp_dir().join(format!("duckrs_row_ids_{}", std::process::id()));
-    std::fs::create_dir_all(&directory).unwrap();
+    let directory = common::directory("duckrs_row_ids_");
     let file = directory.join(name);
     for path in [file.clone(), PathBuf::from(format!("{}.wal", file.display()))] {
         let _ = std::fs::remove_file(path);

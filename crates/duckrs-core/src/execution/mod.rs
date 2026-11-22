@@ -489,9 +489,18 @@ fn create_physical(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
         }
         // only the optimizer sees the boundary
         LogicalOperatorKind::SecureView { .. } => children.remove(0),
-        LogicalOperatorKind::Distinct { targets, .. } => {
-            let (child, keys, columns) = computed_targets(children.remove(0), targets);
-            drop_computed(Box::new(PhysicalDistinct::new(&keys, child)), columns)
+        LogicalOperatorKind::Distinct { targets, orders, .. } => {
+            let count = targets.len();
+            let modifiers: Vec<_> = orders.iter().map(|o| o.modifiers).collect();
+            let expressions = targets.into_iter().chain(orders.into_iter().map(|o| o.expr)).collect();
+            let (child, mut keys, columns) = computed_targets(children.remove(0), expressions);
+            let orders: Vec<_> = keys
+                .split_off(count)
+                .into_iter()
+                .zip(modifiers)
+                .map(|(expr, modifiers)| crate::planner::logical::BoundOrderByNode { modifiers, expr })
+                .collect();
+            drop_computed(Box::new(PhysicalDistinct::new(&keys, &orders, child)), columns)
         }
         LogicalOperatorKind::Delete { table, returning, .. } => {
             Box::new(PhysicalDelete::new(types, children, table, returning))

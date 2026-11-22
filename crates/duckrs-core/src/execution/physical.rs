@@ -2797,16 +2797,20 @@ impl PhysicalOperator for PhysicalLimit {
 pub struct PhysicalDistinct {
     pub types: Vec<LogicalType>,
     pub targets: Vec<usize>,
+    /// DISTINCT ON keeps the first row of each group in this order (`first(x ORDER BY ...)`); without
+    /// one, the first row it sees
+    pub orders: Vec<(usize, duckrs_common::sort_key::OrderModifiers)>,
     pub children: Vec<Box<dyn PhysicalOperator>>,
     pub seen: Mutex<RowKeySet>,
     pub data: Mutex<ColumnDataCollection>,
 }
 
 impl PhysicalDistinct {
-    pub fn new(targets: &[BoundExpr], child: Box<dyn PhysicalOperator>) -> Self {
+    pub fn new(targets: &[BoundExpr], orders: &[BoundOrderByNode], child: Box<dyn PhysicalOperator>) -> Self {
         let types = child.types().to_vec();
         Self {
             targets: targets.iter().map(reference_index).collect(),
+            orders: orders.iter().map(|o| (reference_index(&o.expr), o.modifiers)).collect(),
             seen: Mutex::default(),
             data: Mutex::new(ColumnDataCollection::new(types.clone())),
             types,
@@ -2829,6 +2833,12 @@ impl PhysicalOperator for PhysicalDistinct {
         true
     }
     fn sink(&self, chunk: &DataChunk) -> Result<()> {
+        // in an order, the rows are sorted before the first of each group is kept
+        if !self.orders.is_empty() {
+            let mut data = self.data.lock();
+            data.append(chunk);
+            return check_buffered(&data);
+        }
         let columns: Vec<&Vector> = self.targets.iter().map(|&i| chunk.column(i)).collect();
         let keys = create_row_keys(&columns, chunk.len())?;
         let mut seen = self.seen.lock();
@@ -2852,6 +2862,32 @@ impl PhysicalOperator for PhysicalDistinct {
     }
     fn source_state(&self) -> SourceState {
         Box::new(0usize)
+    }
+    fn finalize(&self) -> Result<()> {
+        if self.orders.is_empty() {
+            return Ok(());
+        }
+        let mut data = self.data.lock();
+        let sorted = sort_collection(&data, &self.orders)?;
+        let mut kept = ColumnDataCollection::new(self.types.clone());
+        let mut seen = self.seen.lock();
+        for chunk in sorted.chunks() {
+            let columns: Vec<&Vector> = self.targets.iter().map(|&i| chunk.column(i)).collect();
+            let keys = create_row_keys(&columns, chunk.len())?;
+            let first: Vec<u32> = keys
+                .into_iter()
+                .enumerate()
+                .filter_map(|(i, key)| seen.insert(key).then_some(i as u32))
+                .collect();
+            if !first.is_empty() {
+                let mut rows = chunk.clone();
+                let count = first.len();
+                rows.slice(&SelectionVector::from_vec(first), count);
+                kept.append(&rows);
+            }
+        }
+        *data = kept;
+        Ok(())
     }
     fn get_data(&self, state: &mut SourceState) -> Result<Option<DataChunk>> {
         Ok(scan_collection(&self.data, state))

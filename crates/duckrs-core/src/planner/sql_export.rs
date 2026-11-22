@@ -952,9 +952,16 @@ impl Exporter<'_> {
                 select.sample = Some(options.clone());
                 Body::Select(select)
             }
-            Op::Distinct { targets, .. } => {
-                let child = self.export_child(op, 0)?;
+            Op::Distinct { targets, orders, .. } => {
+                let mut child = self.export_child(op, 0)?;
                 let child_fields = child.fields.clone();
+                // the ORDER BY of a DISTINCT ON picks the row it keeps, so it goes on the SELECT
+                if !orders.is_empty() {
+                    child = Relation {
+                        body: Body::Select(self.order(child, orders)?),
+                        fields: child_fields.clone(),
+                    };
+                }
                 let all_columns = targets.len() == child_fields.len()
                     && targets.iter().zip(&child_fields).all(|(t, f)| {
                         matches!(&t.kind, BoundExprKind::ColumnRef { binding, depth: 0 } if *binding == f.binding)
