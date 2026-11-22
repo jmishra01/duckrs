@@ -320,6 +320,7 @@ test/issues/general/test_2407.test
 test/issues/general/test_2416.test
 test/issues/general/test_24212.test
 test/issues/general/test_24245.test
+test/issues/general/test_24298.test
 test/issues/general/test_24328.test
 test/issues/general/test_24442.test
 test/issues/general/test_24542.test
