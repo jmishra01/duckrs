@@ -432,6 +432,9 @@ struct Keys {
     /// how many low bits of a hash the block index drops
     shift: u32,
     has_null: bool,
+    /// `PrefixRangeFilter` of keys whose span fits its bits: a bit per value from `min` to `max`, which says
+    /// exactly whether a value is a key
+    exact: Option<Vec<u64>>,
 }
 
 /// What types a filter can take its keys of: the integers keys of tables are.
@@ -472,6 +475,10 @@ impl Keys {
     fn may_contain(&self, value: i64) -> bool {
         if value < self.min || value > self.max {
             return false;
+        }
+        if let Some(bits) = &self.exact {
+            let at = (value - self.min) as u64;
+            return bits[(at / 64) as usize] & (1 << (at % 64)) != 0;
         }
         let h = hash(value);
         let bits = block_bits(h);
@@ -529,6 +536,7 @@ impl JoinFilter {
                 blocks: vec![0; blocks],
                 shift: 64 - blocks.trailing_zeros(),
                 has_null: false,
+                exact: None,
             };
             for_each_value(keys, count, |_, value| match value {
                 Some(value) => {
@@ -548,6 +556,26 @@ impl JoinFilter {
             Some(Published::Range(min, max)) => self.runtime_filter(Some(min), Some(max), count),
             _ => None,
         };
+        // the prefix-range filter of keys close enough together has a bit per value between them, and with that no
+        // row passes that is not a key
+        let mut value = value;
+        if runtime == Some(RuntimeFilter::PrefixRange)
+            && let Some(keys_found) = value.as_mut()
+            && keys_found.min <= keys_found.max
+            && let Some(span) = (keys_found.max as i128 - keys_found.min as i128 + 1).try_into().ok()
+            && u128::from(span as u64) <= SMALL_EXACT_PRF_BITS
+        {
+            let span: u64 = span;
+            let mut bits = vec![0u64; span.div_ceil(64) as usize];
+            let min = keys_found.min;
+            for_each_value(keys, count, |_, value| {
+                if let Some(value) = value {
+                    let at = (value - min) as u64;
+                    bits[(at / 64) as usize] |= 1 << (at % 64);
+                }
+            });
+            keys_found.exact = Some(bits);
+        }
         if self.keys.set(value).is_err() || self.published.set(published).is_err() || self.runtime.set(runtime).is_err()
         {
             // a join that runs twice would give a scan the keys of the time before
