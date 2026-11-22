@@ -636,24 +636,6 @@ impl Group<'_> {
             {
                 self.range(input)
             }
-            // `PropagatePowStats`
-            ("pow" | "power" | "**" | "^", [base, exponent]) => {
-                let float = |value: &Value| value.try_to_string().ok()?.parse::<f64>().ok();
-                let Range::Bounds(exponent_min, exponent_max) = self.range(exponent) else {
-                    return Range::Unknown;
-                };
-                let base = match self.range(base) {
-                    Range::Bounds(min, max) => float(&min).zip(float(&max)),
-                    _ => None,
-                };
-                let bounds = float(&exponent_min)
-                    .zip(float(&exponent_max))
-                    .and_then(|exponent| crate::optimizer::statistics::power_bounds(base, exponent));
-                match bounds {
-                    Some((min, max)) => Range::Bounds(Value::double(min), Value::double(max)),
-                    None => Range::Unknown,
-                }
-            }
             // `PropagateModuloStats` of integers: the bounds of the dividend and the divisor
             ("%", [input, divisor]) if expr.return_type.is_integral() => {
                 let (Range::Bounds(lmin, lmax), Range::Bounds(rmin, rmax)) = (self.range(input), self.range(divisor))
@@ -869,6 +851,24 @@ impl Group<'_> {
                     && matches!(self.range(base), Range::Bounds(min, _) if sign(&min) != Some(Ordering::Less)) =>
             {
                 self.monotone(expr, 0, true)
+            }
+            // `PropagatePowStats`, where the rule above does not apply
+            ("pow" | "power" | "**" | "^", [base, exponent]) => {
+                let float = |value: &Value| value.try_to_string().ok()?.parse::<f64>().ok();
+                let Range::Bounds(exponent_min, exponent_max) = self.range(exponent) else {
+                    return Range::Unknown;
+                };
+                let base = match self.range(base) {
+                    Range::Bounds(min, max) => float(&min).zip(float(&max)),
+                    _ => None,
+                };
+                let bounds = float(&exponent_min)
+                    .zip(float(&exponent_max))
+                    .and_then(|exponent| crate::optimizer::statistics::power_bounds(base, exponent));
+                match bounds {
+                    Some((min, max)) => Range::Bounds(Value::double(min), Value::double(max)),
+                    None => Range::Unknown,
+                }
             }
             ("__internal_barrier", [child]) => self.range(child),
             // a prefix of a string sorts as the string does

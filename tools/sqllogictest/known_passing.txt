@@ -3201,6 +3201,7 @@ test/sql/optimizer/struct_segment_pruning.test
 test/sql/optimizer/substring_zonemap_pruning.test
 test/sql/optimizer/sum_aggregate_stats_propagation.test
 test/sql/optimizer/table_filters.test
+test/sql/optimizer/temporal_cast_zonemap.test
 test/sql/optimizer/test_common_subplan_aggregate_columns.test
 test/sql/optimizer/test_common_subplan_cte_binding_order.test
 test/sql/optimizer/test_common_subplan_filtered_join.test
@@ -3225,6 +3226,7 @@ test/sql/optimizer/test_rowid_vector_pruning_results.test
 test/sql/optimizer/test_window_join_pushdown.test
 test/sql/optimizer/test_window_self_join.test
 test/sql/optimizer/tests_no_pushdown_under_samples.test
+test/sql/optimizer/timestamp_unit_cast_zonemap_pruning.test
 test/sql/optimizer/topn_window_elimination_argument_order.test
 test/sql/optimizer/topn_window_elimination_computed_filter.test
 test/sql/optimizer/topn_window_elimination_max_n.test

@@ -234,6 +234,93 @@ fn like_pushdown(expr: &BoundExpr) -> Option<TablePushdown> {
     Some(TablePushdown::Partially(bounds))
 }
 
+/// `GetTemporalCastMargin`: how far, in the units of the column's type, a cast of `source` to `target` can move a
+/// value away from the order of the column: 2h of DST ambiguity, a day of time of day, a second of rounding.
+fn temporal_cast_margin(source: &LogicalType, target: &LogicalType) -> Option<i64> {
+    use duckrs_common::types::LogicalTypeId::*;
+    const MICROS_PER_SEC: i64 = 1_000_000;
+    const MICROS_PER_HOUR: i64 = 3_600 * MICROS_PER_SEC;
+    const MICROS_PER_DAY: i64 = 24 * MICROS_PER_HOUR;
+    if source.id() == target.id() {
+        return matches!(source.id(), Date | Timestamp | TimestampTz | TimestampNs | TimestampTzNs | TimestampMs | TimestampSec)
+            .then_some(0);
+    }
+    Some(match (source.id(), target.id()) {
+        (Timestamp | TimestampTz, Timestamp | TimestampTz) => 2 * MICROS_PER_HOUR,
+        (Timestamp | TimestampTz, Date) => MICROS_PER_DAY,
+        (Timestamp | TimestampTz, TimestampMs | TimestampSec) => MICROS_PER_SEC,
+        (TimestampNs | TimestampTzNs, Timestamp | TimestampMs | TimestampSec) => MICROS_PER_SEC * 1000,
+        (TimestampNs | TimestampTzNs, Date) => MICROS_PER_DAY * 1000,
+        (TimestampMs, Date) => MICROS_PER_DAY / 1000,
+        (TimestampMs, TimestampSec) => 1000,
+        (TimestampSec, Date) => MICROS_PER_DAY / MICROS_PER_SEC,
+        (Date, Timestamp | TimestampMs | TimestampSec | TimestampNs) => 0,
+        (Date, TimestampTz | TimestampTzNs) => 1,
+        _ => return None,
+    })
+}
+
+/// `AdjustTemporalValue`: `value` moved by `margin` of its units; none where that overflows.
+fn adjust_temporal(value: &Value, margin: i64) -> Option<Value> {
+    use duckrs_common::value::ValueData;
+    if margin == 0 {
+        return Some(value.clone());
+    }
+    let data = match value.data() {
+        // `MakeTemporalValue` clamps a DATE to its range
+        ValueData::Int32(days) => {
+            let moved = i64::from(*days).checked_add(margin)?;
+            ValueData::Int32(moved.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32)
+        }
+        ValueData::Int64(raw) => ValueData::Int64(raw.checked_add(margin)?),
+        _ => return None,
+    };
+    Value::new(value.logical_type().clone(), data).ok()
+}
+
+/// `TryPushdownTemporalCastFilter`: `CAST(col AS T) > c` of temporal types gives the scan the optional
+/// `col >= c' - margin`, with `c` as a value of the column's type, so that its zone maps skip row groups.
+fn temporal_cast_pushdown(expr: &BoundExpr) -> Option<TablePushdown> {
+    let BoundExprKind::Comparison { op, left, right } = &expr.kind else {
+        return None;
+    };
+    let (cast, constant, op) = match (&left.kind, &right.kind) {
+        (BoundExprKind::Cast { .. }, BoundExprKind::Constant(value)) => (&**left, value, *op),
+        (BoundExprKind::Constant(value), BoundExprKind::Cast { .. }) => (&**right, value, super::statistics::flip(*op)),
+        _ => return None,
+    };
+    if !matches!(
+        op,
+        ComparisonOp::Equal
+            | ComparisonOp::LessThan
+            | ComparisonOp::LessThanOrEqual
+            | ComparisonOp::GreaterThan
+            | ComparisonOp::GreaterThanOrEqual
+    ) {
+        return None;
+    }
+    let BoundExprKind::Cast { child, .. } = &cast.kind else {
+        return None;
+    };
+    if !matches!(child.kind, BoundExprKind::ColumnRef { depth: 0, .. }) || constant.is_null() {
+        return None;
+    }
+    let margin = temporal_cast_margin(&child.return_type, &cast.return_type)?;
+    let value = crate::execution::parquet::try_cast_value(constant, &child.return_type)?;
+    let mut parts = Vec::new();
+    if matches!(op, ComparisonOp::GreaterThan | ComparisonOp::GreaterThanOrEqual | ComparisonOp::Equal) {
+        parts.push(compare(ComparisonOp::GreaterThanOrEqual, child, adjust_temporal(&value, -margin)?));
+    }
+    if matches!(op, ComparisonOp::LessThan | ComparisonOp::LessThanOrEqual | ComparisonOp::Equal) {
+        parts.push(compare(ComparisonOp::LessThanOrEqual, child, adjust_temporal(&value, margin)?));
+    }
+    let optional = match parts.len() {
+        1 => parts.pop().expect("one"),
+        _ => BoundExpr::new(BoundExprKind::Conjunction { and: true, children: parts }, LogicalType::BOOLEAN),
+    };
+    Some(TablePushdown::Optional(optional))
+}
+
 pub(super) fn table_pushdown(expr: &BoundExpr) -> TablePushdown {
     if let Some(pushdown) = like_pushdown(expr) {
         return pushdown;
@@ -334,7 +421,7 @@ pub(super) fn table_pushdown(expr: &BoundExpr) -> TablePushdown {
             };
             TablePushdown::Optional(optional)
         }
-        _ => TablePushdown::None,
+        _ => temporal_cast_pushdown(expr).unwrap_or(TablePushdown::None),
     }
 }
 
@@ -467,6 +554,15 @@ fn push_into(op: &mut LogicalOperator, before_statistics: bool) {
             }
             filters.push(column_first(conjunct));
         } else {
+            // `TryPushdownTemporalCastFilter` runs on filters that can throw too: the optional filter only skips
+            // row groups, and the filter itself stays
+            if can_move_ignoring_errors(&conjunct, &scan)
+                && let (Some(TablePushdown::Optional(pushed)), Some(optional)) =
+                    (temporal_cast_pushdown(&conjunct), optional.as_deref_mut())
+                && !optional.iter().any(|o| super::rewriter::expressions_equal(o, &pushed))
+            {
+                optional.push(pushed);
+            }
             expressions.push(conjunct);
         }
     }
