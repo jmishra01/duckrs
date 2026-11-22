@@ -272,7 +272,14 @@ Each item gives the number of failing files in `test/` that it should fix, where
     division by a column
   - [x] the scalar aggregate merger (`scalar_aggregate_merge_threshold`), over tables, `read_parquet`, `read_csv`
     and `read_json`; predicate factoring of ORs in filters
-  - [ ] secure views (7 files), `json_serialize_plan`, gamma's errors without IEEE
+  - [ ] `json_serialize_plan`, gamma's errors without IEEE
+  - [x] secure views as C++ has them: a `SECURE_VIEW` operator at the boundary that EXPLAIN and EXPLAIN ANALYZE show
+    with the view's name and the filters pushed into it, and nothing below; statistics and distinct counts leave a
+    view only if it emits every row it reads (`EmitsAllRows`); its estimate is frozen before filters go into it
+  - [ ] of secure views: the query-wide profiling totals still count the operators inside them
+    (`CollapseSecureViews`); EXPLAIN ANALYZE in the profiler's JSON (`secure_view_explain`); the exact prefix-range
+    join filter of few keys, which drops rows where duckrs's Bloom filter lets some through
+    (`secure_view_join_filter_pushdown`)
   - [x] temporal casts of a column compared with a constant give the scan an optional filter on the column, by
     the cast's margin (`TryPushdownTemporalCastFilter`, also of filters that can throw); TIMESTAMPTZ_NS columns have
     zone maps and `stats()` (`temporal_cast_zonemap`, `timestamp_unit_cast_zonemap_pruning`)

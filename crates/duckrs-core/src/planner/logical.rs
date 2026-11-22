@@ -183,7 +183,16 @@ pub enum LogicalOperatorKind {
     },
     /// `LogicalSecureView`: the plan of a SECURE VIEW, which it passes on. The optimizer pushes
     /// nothing into it, so that no expression of the query sees the rows the view hides.
-    SecureView { view_name: String },
+    SecureView {
+        view_name: String,
+        /// `LogicalSecureView::pushed_filters`: the filters pushed into the view, as text, which the boundary shows
+        /// in place of the operators inside it
+        pushed_filters: Vec<String>,
+        /// `propagate_statistics`: the view emits every row it reads, so the statistics of its columns may leave it
+        propagate_statistics: bool,
+        /// the estimate of its rows, frozen before filters were pushed into it
+        estimate: Option<u64>,
+    },
     /// `LogicalUnnest`: a row per element of the lists of `expressions`, next to the child's
     /// columns. A list that runs out gives NULL.
     Unnest {

@@ -2448,6 +2448,34 @@ impl PhysicalOperator for PhysicalColumnSelect {
     }
 }
 
+/// `PhysicalSecureView`: the boundary of a secure view, which passes its rows on as they are. Plans show it in
+/// place of the operators inside the view.
+#[derive(Debug)]
+pub struct PhysicalSecureView {
+    pub types: Vec<LogicalType>,
+    pub view_name: String,
+    pub pushed_filters: Vec<String>,
+    pub children: Vec<Box<dyn PhysicalOperator>>,
+}
+
+impl PhysicalOperator for PhysicalSecureView {
+    fn name(&self) -> &'static str {
+        "SECURE_VIEW"
+    }
+    fn types(&self) -> &[LogicalType] {
+        &self.types
+    }
+    fn children(&self) -> &[Box<dyn PhysicalOperator>] {
+        &self.children
+    }
+    fn parallel_operator(&self) -> bool {
+        true
+    }
+    fn execute(&self, input: DataChunk) -> Result<DataChunk> {
+        Ok(input)
+    }
+}
+
 /// The input column a resolved ORDER BY or DISTINCT expression reads.
 fn reference_index(expr: &BoundExpr) -> usize {
     match expr.kind {

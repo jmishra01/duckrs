@@ -355,14 +355,32 @@ impl FilterPushdown {
     /// inside that removes rows lets past. The boundary stays.
     fn pushdown_secure_view(self, mut op: LogicalOperator) -> LogicalOperator {
         let mut inside = FilterPushdown::default();
+        let mut pushed = Vec::new();
         for f in self.filters {
             let mut expr = f.filter;
+            // the operators inside the view are never shown: the boundary reports the filter instead
+            pushed.push(expr.to_string());
             if (can_throw(&expr) || expr.is_volatile()) && !contains_barrier(&expr) {
                 expr = crate::function::wrap_in_barrier(expr);
             }
             if !inside.add_filter(expr) {
                 return empty_result(&op);
             }
+        }
+        // the estimate of the view is frozen before anything goes in: otherwise the boundary would report what the
+        // statistics of the view's contents say about the caller's predicate
+        let frozen = (!pushed.is_empty()).then(|| plain_estimate(&op.children[0]));
+        if let LogicalOperatorKind::SecureView {
+            pushed_filters,
+            propagate_statistics,
+            estimate,
+            ..
+        } = &mut op.kind
+        {
+            if !*propagate_statistics && estimate.is_none() {
+                *estimate = frozen;
+            }
+            pushed_filters.extend(pushed);
         }
         let child = op.children.remove(0);
         op.children.push(inside.rewrite(child));
@@ -1274,4 +1292,16 @@ fn filter_removes_null(filter: &BoundExpr, right: &BTreeSet<usize>) -> bool {
         }
     }
     false
+}
+
+/// `LogicalOperator::EstimateCardinality` before the join order sets estimates: the rows of a scan, and otherwise the
+/// most rows of a child, as an operator reports them without knowing what it removes.
+fn plain_estimate(op: &LogicalOperator) -> u64 {
+    match &op.kind {
+        LogicalOperatorKind::Get { table, .. } => table.row_count() as u64,
+        LogicalOperatorKind::ExpressionGet { expressions, .. } => expressions.len() as u64,
+        LogicalOperatorKind::SecureView { estimate: Some(rows), .. } => *rows,
+        _ if op.children.is_empty() => super::join_order::estimated_cardinality(op),
+        _ => op.children.iter().map(plain_estimate).max().unwrap_or(1),
+    }
 }

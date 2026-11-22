@@ -2868,6 +2868,9 @@ impl Binder<'_> {
             bound.plan = LogicalOperator::new(
                 LogicalOperatorKind::SecureView {
                     view_name: view.name.clone(),
+                    pushed_filters: Vec::new(),
+                    propagate_statistics: false,
+                    estimate: None,
                 },
                 vec![plan],
             );

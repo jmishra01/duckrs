@@ -1447,6 +1447,12 @@ impl JoinOrderOptimizer {
                 }
                 stats
             }
+            K::SecureView { estimate: Some(rows), .. } => {
+                let child = self.stats(&op.children[0]);
+                let mut stats = child.project(&op.column_bindings());
+                stats.apply_cardinality(*rows as f64);
+                stats
+            }
             K::ColumnSelect { .. } | K::Order { .. } | K::SecureView { .. } => {
                 let child = self.stats(&op.children[0]);
                 child.project(&op.column_bindings())

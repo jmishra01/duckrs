@@ -945,6 +945,8 @@ struct StatisticsPropagator {
     sources: HashMap<ColumnBinding, (Arc<TableCatalogEntry>, usize)>,
     /// bindings that are another binding under a new name
     aliases: HashMap<ColumnBinding, ColumnBinding>,
+    /// `PropagateStatistics(LogicalSecureView)`: the columns of secure views whose statistics may not leave them
+    hidden: HashSet<ColumnBinding>,
     /// bindings an outer join puts NULLs in
     nullable: HashSet<ColumnBinding>,
     /// `StatisticsPropagationMode::FILTER_SIMPLIFICATION`
@@ -986,6 +988,9 @@ impl StatisticsPropagator {
 
     fn lookup(&mut self, binding: ColumnBinding) -> Stats {
         let base = self.base_of(binding);
+        if self.hidden.contains(&binding) || self.hidden.contains(&base) {
+            return unknown();
+        }
         if !self.stats.contains_key(&base)
             && let Some((table, column)) = self.sources.get(&base)
         {
@@ -1867,6 +1872,8 @@ impl StatisticsPropagator {
             // a VARIANT column has no `DistinctStatistics`
             if let BoundExprKind::ColumnRef { binding, depth: 0 } = &children[0].kind
                 && argument.id() != LogicalTypeId::Variant
+                && !self.hidden.contains(binding)
+                && !self.hidden.contains(&self.base_of(*binding))
                 && let Some((table, column)) = self.sources.get(&self.base_of(*binding)).cloned()
             {
                 argument_stats.distinct = table_distinct_counts(&table)
@@ -2869,6 +2876,19 @@ impl StatisticsPropagator {
         {
             for (i, stats) in columns.clone().into_iter().enumerate() {
                 self.stats.insert(ColumnBinding::new(*table_index, i), stats);
+            }
+        }
+        // `PropagateStatistics(LogicalSecureView)`: of a view that does not emit every row it reads, nothing of what
+        // its statistics say about its columns leaves it
+        if let K::SecureView {
+            propagate_statistics: false,
+            ..
+        } = &op.kind
+        {
+            for binding in op.column_bindings() {
+                let base = self.base_of(binding);
+                self.hidden.insert(binding);
+                self.hidden.insert(base);
             }
         }
         self.count_valid_as_count_star(op);
