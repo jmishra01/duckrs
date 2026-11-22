@@ -45,14 +45,14 @@ fn align(value: usize) -> usize {
 }
 
 /// `BitpackingPrimitives::MinimumBitWidth` of an unsigned 64-bit value.
-fn bit_width(value: usize) -> usize {
+pub(super) fn bit_width(value: usize) -> usize {
     let width = (usize::BITS - value.leading_zeros()) as usize;
     // `GetEffectiveWidth`
     if width + 8 > 64 { 64 } else { width }
 }
 
 /// `BitpackingPrimitives::GetRequiredSize`.
-fn packed_size(count: usize, width: usize) -> usize {
+pub(super) fn packed_size(count: usize, width: usize) -> usize {
     count.next_multiple_of(32) * width / 8
 }
 

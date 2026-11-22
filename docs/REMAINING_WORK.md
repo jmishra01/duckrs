@@ -155,8 +155,10 @@ Each item gives the number of failing files in `test/` that it should fix, where
     full, then FSST encoded if that saves enough, without indices where all strings are unique), with libfsst
     ported exactly (the sample, `buildSymbolTable` with its counters, `finalize`, `compressBulk`): segments are
     those of C++ byte for byte, but for a padding byte C++ leaves as it was
-  - [ ] before v1.3.0, DICTIONARY and FSST by score (their analyze samples at random, so C++ itself differs from
-    run to run; the smaller encoding is taken), the analyze of ALP and ALPRD (scored by their encoded size)
+  - [x] before v1.3.0, UNCOMPRESSED, DICTIONARY, FSST and (from v1.2.0) ZSTD by their `final_analyze` scores:
+    DICTIONARY's as C++ simulates its segments, FSST's as its random sampling of a quarter of the vectors gives
+    it on average (C++ itself differs from run to run there)
+  - [ ] the analyze of ALP and ALPRD (scored by their encoded size)
   - [x] blocks as C++ hands them out at a checkpoint: metadata sub-blocks the lowest free first, in the file's
     metadata blocks before new ones (`MetadataManager::AllocateHandle`), those the last checkpoint took freed
     unless kept (`MarkBlocksAsModified`, `ClearModifiedBlocks`), the free list's room taken as

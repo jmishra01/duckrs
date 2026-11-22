@@ -15,6 +15,7 @@ pub mod encode;
 pub mod encryption;
 mod fsst;
 mod index_data;
+mod old_string_analyze;
 pub mod layered;
 pub mod log_writer;
 pub mod metadata;
