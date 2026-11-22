@@ -35,10 +35,11 @@ struct Uses {
     paths: Vec<Path>,
 }
 
-pub fn push_down(plan: &mut LogicalOperator, statistics: Option<&mut super::statistics::StatisticsMap>) {
+pub fn push_down(plan: &mut LogicalOperator, mut statistics: Option<&mut super::statistics::StatisticsMap>) {
     if !supported(plan) {
         return;
     }
+    split_projections(plan, &mut statistics);
     let mut candidates: HashMap<ColumnBinding, LogicalType> = HashMap::new();
     collect_candidates(plan, &mut candidates);
     if candidates.is_empty() {
@@ -46,22 +47,7 @@ pub fn push_down(plan: &mut LogicalOperator, statistics: Option<&mut super::stat
     }
     let mut uses: HashMap<ColumnBinding, Uses> = HashMap::new();
     gather_plan(plan, &candidates, &mut uses);
-    // `ReferencedColumn::AddPath`: per column, the paths no other pushed path leads into
-    let mut pushed: HashMap<ColumnBinding, Vec<(Path, usize)>> = HashMap::new();
-    for (binding, uses) in uses {
-        if uses.whole || uses.paths.is_empty() {
-            continue;
-        }
-        let mut paths: Vec<Path> = Vec::new();
-        for path in uses.paths {
-            if paths.contains(&path) || paths.iter().any(|other| leads_into(other, &path)) {
-                continue;
-            }
-            paths.retain(|other| !leads_into(&path, other));
-            paths.push(path);
-        }
-        pushed.insert(binding, paths.into_iter().map(|path| (path, 0)).collect());
-    }
+    let mut pushed = unique_paths(uses);
     if pushed.is_empty() {
         return;
     }
@@ -87,6 +73,116 @@ pub fn push_down(plan: &mut LogicalOperator, statistics: Option<&mut super::stat
                 statistics.set_expression(ColumnBinding::new(binding.table_index, *at), &expression);
             }
         }
+    }
+}
+
+/// `ReferencedColumn::AddPath`: per column read only through paths, the paths no other of them leads into.
+fn unique_paths(uses: HashMap<ColumnBinding, Uses>) -> HashMap<ColumnBinding, Vec<(Path, usize)>> {
+    let mut pushed = HashMap::new();
+    for (binding, uses) in uses {
+        if uses.whole || uses.paths.is_empty() {
+            continue;
+        }
+        let mut paths: Vec<Path> = Vec::new();
+        for path in uses.paths {
+            if paths.contains(&path) || paths.iter().any(|other| leads_into(other, &path)) {
+                continue;
+            }
+            paths.retain(|other| !leads_into(&path, other));
+            paths.push(path);
+        }
+        pushed.insert(binding, paths.into_iter().map(|path| (path, 0)).collect());
+    }
+    pushed
+}
+
+/// `CheckPushdownExtract` and `RewriteExpressions` of a projection: a STRUCT column that a projection passes
+/// on, and that is only read through fields of it, becomes a column per field, the extracts of the column below.
+/// Projections above others go first, so the extracts reach the scans through views.
+fn split_projections(plan: &mut LogicalOperator, statistics: &mut Option<&mut super::statistics::StatisticsMap>) {
+    loop {
+        let mut candidates: HashMap<ColumnBinding, LogicalType> = HashMap::new();
+        collect_projection_candidates(plan, &mut candidates);
+        if candidates.is_empty() {
+            return;
+        }
+        let mut uses: HashMap<ColumnBinding, Uses> = HashMap::new();
+        gather_plan(plan, &candidates, &mut uses);
+        let mut pushed = unique_paths(uses);
+        if pushed.is_empty() {
+            return;
+        }
+        split_outputs(plan, &mut pushed, statistics);
+        if pushed.is_empty() {
+            return;
+        }
+        rewrite_plan(plan, &pushed);
+    }
+}
+
+/// The outputs of projections that are a STRUCT column of their child as it is.
+fn collect_projection_candidates(op: &LogicalOperator, candidates: &mut HashMap<ColumnBinding, LogicalType>) {
+    if let K::Projection { table_index, expressions } = &op.kind {
+        for (position, expr) in expressions.iter().enumerate() {
+            if matches!(expr.kind, BoundExprKind::ColumnRef { depth: 0, .. })
+                && expr.return_type.id() == LogicalTypeId::Struct
+            {
+                candidates.insert(ColumnBinding::new(*table_index, position), expr.return_type.clone());
+            }
+        }
+    }
+    for child in &op.children {
+        collect_projection_candidates(child, candidates);
+    }
+}
+
+/// Each pushed column of a projection becomes its first path, in its place, and the other paths are new
+/// outputs after the projection's.
+fn split_outputs(
+    op: &mut LogicalOperator,
+    pushed: &mut HashMap<ColumnBinding, Vec<(Path, usize)>>,
+    statistics: &mut Option<&mut super::statistics::StatisticsMap>,
+) {
+    if let K::Projection { table_index, expressions } = &mut op.kind {
+        let table_index = *table_index;
+        for position in 0..expressions.len() {
+            let binding = ColumnBinding::new(table_index, position);
+            let Some(paths) = pushed.get_mut(&binding) else {
+                continue;
+            };
+            let source = expressions[position].clone();
+            let built: Option<Vec<BoundExpr>> = paths
+                .iter()
+                .map(|(path, _)| {
+                    let (mut expression, _) = path_expression_of(&source.return_type, path)?;
+                    expression.walk_mut(&mut |e| {
+                        if matches!(e.kind, BoundExprKind::Reference(0)) {
+                            *e = source.clone();
+                        }
+                    });
+                    Some(expression)
+                })
+                .collect();
+            let Some(built) = built else {
+                pushed.remove(&binding);
+                continue;
+            };
+            for (index, (mut expression, (_, at))) in built.into_iter().zip(paths.iter_mut()).enumerate() {
+                expression.alias = source.alias.clone();
+                *at = if index == 0 { position } else { expressions.len() };
+                if let Some(statistics) = statistics.as_deref_mut() {
+                    statistics.set_expression(ColumnBinding::new(table_index, *at), &expression);
+                }
+                if index == 0 {
+                    expressions[position] = expression;
+                } else {
+                    expressions.push(expression);
+                }
+            }
+        }
+    }
+    for child in &mut op.children {
+        split_outputs(child, pushed, statistics);
     }
 }
 
