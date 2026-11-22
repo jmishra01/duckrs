@@ -402,7 +402,9 @@ impl Binder<'_> {
         let Some(argument) = &star.expr else {
             return Ok((columns, None));
         };
-        let mut binder = Binder::new(self.catalog);
+        // `TableFunctionBinder`: no columns, but the client's variables and settings
+        let mut binder = Binder::with_options(self.catalog, self.options.clone());
+        binder.session = self.session.clone();
         binder.macro_arguments = self.macro_arguments.clone();
         binder.parameters = self.parameters.clone();
         let bound = binder.bind_expression(argument)?;

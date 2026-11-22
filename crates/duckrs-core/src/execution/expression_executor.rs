@@ -1107,7 +1107,11 @@ pub fn execute(expr: &BoundExpr, input: &DataChunk) -> Result<Vector> {
                 }
                 return Ok(result);
             }
-            (function.function)(&arguments, &mut result).map_err(|error| {
+            let callback = |arguments: &DataChunk, result: &mut Vector| match &function.bound {
+                Some(bound) => bound(arguments, result),
+                None => (function.function)(arguments, result),
+            };
+            callback(&arguments, &mut result).map_err(|error| {
                 if error.message == DIVISION_BY_ZERO {
                     let message = format!(
                         "Division by zero in expression {expr}. Use TRY(...) to return NULL for this expression, or \

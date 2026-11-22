@@ -2898,6 +2898,37 @@ impl Binder<'_> {
         if name == "pragma_storage_info" {
             return self.bind_storage_info(call, table_ref).map(|op| table_function_rows(op, &name));
         }
+        // `DuckDBMemoryFunction`: a row per `MemoryTag`. duckrs does not account memory by tag (as
+        // `pragma_database_size` reports no memory usage), so every tag shows no bytes.
+        if name == "duckdb_memory" && call.args.is_empty() && call.name.qualification.iter().all(String::is_empty) {
+            const MEMORY_TAGS: [&str; 16] = [
+                "BASE_TABLE",
+                "HASH_TABLE",
+                "PARQUET_READER",
+                "CSV_READER",
+                "ORDER_BY",
+                "ART_INDEX",
+                "COLUMN_DATA",
+                "METADATA",
+                "OVERFLOW_STRINGS",
+                "IN_MEMORY_TABLE",
+                "ALLOCATOR",
+                "EXTENSION",
+                "TRANSACTION",
+                "EXTERNAL_FILE_CACHE",
+                "WINDOW",
+                "OBJECT_CACHE",
+            ];
+            let rows = MEMORY_TAGS
+                .iter()
+                .map(|tag| vec![Value::varchar(*tag), Value::bigint(0), Value::bigint(0)])
+                .collect();
+            let names = ["tag", "memory_usage_bytes", "temporary_storage_bytes"].map(str::to_string).to_vec();
+            let types = vec![LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT];
+            return self
+                .bind_rows(table_ref, &name, names, types, rows)
+                .map(|op| table_function_rows(op, &name));
+        }
         let generate_series = name == "generate_series";
         if !(generate_series || name == "range") || !call.name.qualification.is_empty() {
             // the table macros of the system catalog (`DefaultTableFunctionGenerator`)

@@ -1131,6 +1131,11 @@ impl ClientContext {
                 })
             },
             search_path: self.search_path.iter().map(|entry| entry.schema.clone()).collect(),
+            search_entries: self
+                .search_path
+                .iter()
+                .map(|entry| (entry.catalog.clone(), entry.schema.clone()))
+                .collect(),
             current_query: self.current_query.clone(),
             appended: self.appended.clone(),
             replacement_scans: self.replacement_scans.0.clone(),

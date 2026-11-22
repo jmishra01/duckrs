@@ -172,6 +172,8 @@ struct CsvArguments {
     rejects_line_size_limit: usize,
     /// `user_defined_parameters`: name and SQL text, as `sniff_csv` shows them
     user_arguments: Vec<(String, String)>,
+    /// `MultiFileOptions::schema`: the columns the files are mapped onto
+    schema: Option<Value>,
 }
 
 impl Binder<'_> {
@@ -617,6 +619,10 @@ impl Binder<'_> {
                     shown = false;
                     result.filename = filename_option(&value, &option)?;
                 }
+                "schema" if name != "sniff_csv" => {
+                    shown = false;
+                    result.schema = Some(value.clone());
+                }
                 "force_match" if name == "sniff_csv" => shown = false,
                 "store_rejects" => result.store_rejects = Some(is_true(&value, &option)?),
                 "rejects_table" => {
@@ -831,7 +837,111 @@ impl Binder<'_> {
     /// `ReadCSVBind`.
     pub(super) fn bind_read_csv(&mut self, call: &FunctionExpr, table_ref: &TableRef) -> Result<LogicalOperator> {
         let name = call.name.name.to_lowercase();
-        let arguments = self.csv_arguments(&name, call)?;
+        let mut arguments = self.csv_arguments(&name, call)?;
+        match arguments.schema.take() {
+            Some(schema) if !arguments.files.is_empty() => self.bind_csv_with_schema(&name, arguments, &schema, table_ref),
+            _ => self.bind_csv_arguments(&name, arguments, table_ref),
+        }
+    }
+
+    /// `MultiFileReader::Bind` with `schema`: the scan outputs the columns of the schema, each read
+    /// from the file column its key names (`MultiFileColumnMappingMode::BY_NAME`) and cast to its
+    /// type, or its default where no file column is named so. The files are read as they are bound
+    /// without it, and a projection over the scan maps them, where C++'s reader casts as it reads.
+    fn bind_csv_with_schema(
+        &mut self,
+        name: &str,
+        arguments: CsvArguments,
+        schema: &Value,
+        table_ref: &TableRef,
+    ) -> Result<LogicalOperator> {
+        use crate::execution::parquet_schema::{SchemaKey, SchemaParser};
+        use crate::planner::expression::BoundExpr;
+        if arguments.union_by_name {
+            return Err(binder_error("'schema' cannot be combined with union_by_name=true"));
+        }
+        let try_cast = |value: &Value, ty: &LogicalType| crate::execution::parquet::try_cast_value(value, ty);
+        let columns = {
+            let mut parse_type = |name: &str| self.csv_type(name);
+            SchemaParser {
+                parse_type: &mut parse_type,
+                try_cast: &try_cast,
+            }
+            .parse(schema)?
+        };
+        if columns.is_empty() {
+            return Err(binder_error("'schema' cannot be empty"));
+        }
+        // the scan of the files, under a binding of its own that the query does not see
+        let mut inner_ref = table_ref.clone();
+        inner_ref.column_name_alias.clear();
+        let scan = self.bind_csv_arguments(name, arguments, &inner_ref)?;
+        let binding = self.bind_context.bindings.pop().expect("the scan just bound");
+        let LogicalOperatorKind::CsvScan { scan: data, .. } = &scan.kind else {
+            unreachable!("read_csv binds a CsvScan")
+        };
+        let read_columns = data.names.len();
+        let column = |at: usize| {
+            BoundExpr::column_ref(
+                crate::planner::expression::ColumnBinding::new(binding.table_index, at),
+                binding.types[at].clone(),
+                binding.names[at].clone(),
+            )
+        };
+        let mut names = Vec::with_capacity(binding.names.len());
+        let mut types = Vec::with_capacity(binding.names.len());
+        let mut expressions = Vec::with_capacity(binding.names.len());
+        for schema_column in &columns {
+            let read = match &schema_column.key {
+                SchemaKey::Name(key) => data.names.iter().position(|n| n.eq_ignore_ascii_case(key)),
+                SchemaKey::FieldId(_) => None,
+            };
+            expressions.push(match read {
+                Some(at) => column(at).cast_to(&schema_column.ty, false),
+                None => BoundExpr::constant(schema_column.default.clone()),
+            });
+            names.push(schema_column.name.clone());
+            types.push(schema_column.ty.clone());
+        }
+        // the generated columns (filename and the hive partitions) after the schema's
+        for at in read_columns..binding.names.len() {
+            expressions.push(column(at));
+            names.push(binding.names[at].clone());
+            types.push(binding.types[at].clone());
+        }
+        let alias = if table_ref.alias.is_empty() {
+            name.to_string()
+        } else {
+            table_ref.alias.clone()
+        };
+        let names = Self::alias_columns(table_ref, &alias, names)?;
+        let table_index = self.generate_table_index();
+        self.bind_context.add_binding(Binding {
+            alias,
+            schema: None,
+            table_index,
+            names,
+            types,
+            row_id: None,
+            virtual_columns: Vec::new(),
+            generated: Vec::new(),
+        });
+        Ok(LogicalOperator::new(
+            LogicalOperatorKind::Projection {
+                table_index,
+                expressions,
+            },
+            vec![scan],
+        ))
+    }
+
+    fn bind_csv_arguments(
+        &mut self,
+        name: &str,
+        arguments: CsvArguments,
+        table_ref: &TableRef,
+    ) -> Result<LogicalOperator> {
+        let name = name.to_string();
         if arguments.files.is_empty() {
             return self.bind_empty_csv(table_ref, &name, arguments);
         }

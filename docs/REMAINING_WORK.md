@@ -181,7 +181,9 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [ ] string statistics for `stats()` from database files, per-column `USING COMPRESSION`
   - [x] `read_duckdb` and the replacement scan of `.db` files; `enable_view_dependencies` (DROP ... CASCADE,
     refused DROP and ALTER, CREATE OR REPLACE of a view that reads itself)
-  - [ ] `vector_type` (~20 files) and `duckdb_memory` (~17) report engine internals duckrs does not model
+  - [ ] `vector_type` (~20 files) reports engine internals duckrs does not model
+  - [x] `duckdb_memory()`: C++'s columns and a row per `MemoryTag`, volatile so common subplans do not share it;
+    duckrs does not account memory by tag, so every row reports 0 bytes in memory and in temporary storage
 - [ ] 10. `ATTACH`/`DETACH` and multi-database features (`sql/attach`: 47 failing, 52.5%)
   - [x] the search path (`CatalogSearchPath`): `SET schema`, `SET search_path`, `USE`, RESET; unqualified names
     looked up along it and created in its default schema; `current_schema(s)`, `current_query()`, SHOW SCHEMAS
@@ -230,9 +232,12 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] Top-N dynamic filters pushed into scans of tables and Parquet files, through order-keeping casts
     that cannot fail (`TopN::PushdownDynamicFilters`; `join_filter_pushdown_any_join`, `topn_dynamic_filter_cast`)
   - [ ] the operator log and profiler output a few tests read (`join_filter_pushdown_integer_chain`,
-    `cte_domain_join_filter`); `read_csv`'s `schema`; `COLUMNS(json_keys(getvariable(...)))` (`issue_16671`);
-    a filter on the right of a SEMI join through
-    a subquery's projection
+    `cte_domain_join_filter`); a filter on the right of a SEMI join through a subquery's projection
+  - [x] `read_csv`'s `schema`, mapped by name with a projection over the scan, so casts above it are not pushed
+    into the reader (`csv_type_pushdown_schema`); `COLUMNS(expr)` evaluated with the client's variables
+    (`issue_16671`); `in_search_path`, consistent within a query, for zone-map pruning on constant inputs
+    (`constant_function_zonemap_pruning`); common subplans refuse scans with a pushed-down sample, which C++
+    pushes only after that optimizer (`test_common_subplan_repeatability`)
   - [x] `can_throw` as C++ has it: only the functions C++ marks `SetFallible` can fail, by overload where C++ decides
     it at bind time (extracts, substring, unary `+`/`-`, `list_value`, ICU date parts of TIMESTAMPTZ)
   - [x] `CanThrow` of aggregates and window functions: `sum`/`avg` of HUGEINT and wide DECIMAL, `string_agg`, the
