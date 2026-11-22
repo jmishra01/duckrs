@@ -674,6 +674,26 @@ impl PhysicalTableScan {
                     continue;
                 }
             }
+            // a join filter of a column: one pass over the rows it has, without making chunks of them
+            if let (BoundExprKind::JoinFilter { child, filter, keep_null }, [position]) = (&conjunct.kind, positions.as_slice())
+                && matches!(child.kind, BoundExprKind::Reference(p) if p == *position)
+            {
+                let vector = fetched[*position].as_ref().expect("fetched above");
+                if let Some(kept) = filter.select(vector, selection.len(), *keep_null)
+                    && kept.len() < selection.len()
+                {
+                    let kept = Arc::new(kept);
+                    let keep = SelectionVector::Explicit(Arc::clone(&kept));
+                    for vector in fetched.iter_mut().flatten() {
+                        vector.slice(&keep, kept.len());
+                    }
+                    selection = narrowed(selection, kept, group_rows);
+                }
+                if selection.is_empty() {
+                    return Ok(());
+                }
+                continue;
+            }
             let mut kept: Vec<u32> = Vec::with_capacity(selection.len());
             for start in (0..selection.len()).step_by(STANDARD_VECTOR_SIZE) {
                 let count = STANDARD_VECTOR_SIZE.min(selection.len() - start);

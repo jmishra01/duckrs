@@ -1329,6 +1329,9 @@ impl PhysicalJoin {
 
     /// The next pairs of a left and a build row with equal keys, at most a vector of them.
     fn next_key_pairs(&self, build: &FinishedBuild, probe: &mut Probe) -> (Vec<u32>, Vec<u32>) {
+        if matches!(self.join_type, JoinType::RightSemi | JoinType::RightAnti) {
+            return Self::next_unmatched_pairs(build, probe);
+        }
         let mut left = Vec::new();
         let mut right = Vec::new();
         while left.len() < STANDARD_VECTOR_SIZE && probe.row < probe.found.len() {
@@ -1348,6 +1351,34 @@ impl PhysicalJoin {
                 right.extend_from_slice(&chain[probe.candidate..probe.candidate + take]);
             }
             probe.candidate += take;
+            if probe.candidate >= chain.len() {
+                probe.row += 1;
+                probe.candidate = 0;
+            }
+        }
+        (left, right)
+    }
+
+    /// [`Self::next_key_pairs`] of a join that gives the build rows that match or those that do not: a build row
+    /// that matched already is done, so it pairs with no more probe rows. A flag only ever turns true, so one that
+    /// another thread sets meanwhile only costs a pair.
+    fn next_unmatched_pairs(build: &FinishedBuild, probe: &mut Probe) -> (Vec<u32>, Vec<u32>) {
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+        while left.len() < STANDARD_VECTOR_SIZE && probe.row < probe.found.len() {
+            let row = probe.row;
+            let chain: &[u32] = match probe.groups[row] {
+                Some((partition, group)) => build.partitions[partition].rows(group),
+                None => &[],
+            };
+            while probe.candidate < chain.len() && left.len() < STANDARD_VECTOR_SIZE {
+                let candidate = chain[probe.candidate];
+                if !build.matched[candidate as usize].load(Ordering::Relaxed) {
+                    left.push(row as u32);
+                    right.push(candidate);
+                }
+                probe.candidate += 1;
+            }
             if probe.candidate >= chain.len() {
                 probe.row += 1;
                 probe.candidate = 0;

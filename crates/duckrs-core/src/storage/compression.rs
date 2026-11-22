@@ -433,8 +433,9 @@ pub fn bitpacking_rows(segment: &[u8], count: usize, width: usize, rows: &[u32],
         value[..width].copy_from_slice(bytes(data, at, width, "a value of a bitpacking group")?);
         Ok(u128::from_le_bytes(value))
     };
-    // the FOR group of the last row: its index, frame, width and packed values
-    let mut current: Option<(usize, u128, usize, &[u8])> = None;
+    // the FOR group of the last row: its index, frame, width, the mask of its values and its packed values
+    let mut current: Option<(usize, u64, usize, u64, &[u8])> = None;
+    out.reserve(rows.len() * width);
     for &row in rows {
         let row = row as usize;
         if row >= count {
@@ -442,16 +443,12 @@ pub fn bitpacking_rows(segment: &[u8], count: usize, width: usize, rows: &[u32],
         }
         let index = row / METADATA_GROUP_SIZE;
         let local = row % METADATA_GROUP_SIZE;
-        if let Some((group, frame, packed_width, packed)) = current
+        if let Some((group, frame, packed_width, packed_mask, packed)) = current
             && group == index
         {
-            let packed_mask = if packed_width == 0 {
-                0
-            } else {
-                u64::MAX >> (64 - packed_width)
-            };
-            let value = u128::from(load_bits(packed, local * packed_width, packed_mask)).wrapping_add(frame);
-            out.extend_from_slice(&(value & mask).to_le_bytes()[..width]);
+            // a FOR group holds values of at most 8 bytes, which wrap as those of their width do
+            let value = load_bits(packed, local * packed_width, packed_mask).wrapping_add(frame);
+            push_le(out, value, width);
             continue;
         }
         let encoded = u32_at(
@@ -493,12 +490,12 @@ pub fn bitpacking_rows(segment: &[u8], count: usize, width: usize, rows: &[u32],
                     .ok_or_else(|| out_of_bounds("a bitpacking group"))?;
                 let rows_here = METADATA_GROUP_SIZE.min(count - index * METADATA_GROUP_SIZE);
                 bytes(packed, 0, packed_size(rows_here, packed_width), "a bitpacking group")?;
-                current = Some((index, frame, packed_width, packed));
                 let packed_mask = if packed_width == 0 {
                     0
                 } else {
                     u64::MAX >> (64 - packed_width)
                 };
+                current = Some((index, frame as u64, packed_width, packed_mask, packed));
                 u128::from(load_bits(packed, local * packed_width, packed_mask)).wrapping_add(frame)
             }
             _ => {
@@ -509,6 +506,18 @@ pub fn bitpacking_rows(segment: &[u8], count: usize, width: usize, rows: &[u32],
         out.extend_from_slice(&(value & mask).to_le_bytes()[..width]);
     }
     Ok(())
+}
+
+/// Appends the low `width` bytes of `value`, little-endian: a store of the width's size for those of integers.
+#[inline]
+fn push_le(out: &mut Vec<u8>, value: u64, width: usize) {
+    match width {
+        1 => out.push(value as u8),
+        2 => out.extend_from_slice(&(value as u16).to_le_bytes()),
+        4 => out.extend_from_slice(&(value as u32).to_le_bytes()),
+        8 => out.extend_from_slice(&value.to_le_bytes()),
+        _ => out.extend_from_slice(&value.to_le_bytes()[..width]),
+    }
 }
 
 /// `BitpackingScanPartial`. A segment is groups of 2048 values, each with its own mode, and a table
