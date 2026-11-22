@@ -1143,6 +1143,8 @@ test/sql/attach/attach_detach_same_name_transaction.test
 test/sql/attach/attach_different_alias.test
 test/sql/attach/attach_duckdb_type.test
 test/sql/attach/attach_enable_external_access.test
+test/sql/attach/attach_encrypted_storage_version.test
+test/sql/attach/attach_encrypted_v1_4_file.test
 test/sql/attach/attach_enums.test
 test/sql/attach/attach_export_import.test
 test/sql/attach/attach_expr.test
@@ -3383,6 +3385,7 @@ test/sql/peg_parser/identifier.test
 test/sql/peg_parser/parser/copy_file_name.test
 test/sql/peg_parser/peg_syntax_error.test
 test/sql/peg_parser/qualified_operator.test
+test/sql/peg_parser/transformer/attach_statement.test
 test/sql/peg_parser/transformer/between_asymmetric.test
 test/sql/peg_parser/transformer/drop_statement.test
 test/sql/peg_parser/transformer/is_predicate_operators.test
@@ -3815,6 +3818,7 @@ test/sql/storage/compression/dict_fsst/dict_fsst_corrupt_indices_width.test
 test/sql/storage/compression/dict_fsst/dict_fsst_corrupt_mode.test
 test/sql/storage/compression/dict_fsst/dict_fsst_corrupt_string_length.test
 test/sql/storage/compression/dict_fsst/dict_fsst_count_bound.test
+test/sql/storage/compression/dict_fsst/dict_fsst_expression_filter.test
 test/sql/storage/compression/dict_fsst/dict_fsst_test.test
 test/sql/storage/compression/dict_fsst/dictionary_covers_validity.test
 test/sql/storage/compression/dict_fsst/dictionary_storage_info.test
@@ -4052,6 +4056,7 @@ test/sql/storage/storage_exceeds_block_large_string.test
 test/sql/storage/storage_exceeds_single_block.test
 test/sql/storage/storage_exceeds_single_block_strings.test
 test/sql/storage/storage_exceeds_single_block_types.test
+test/sql/storage/storage_option_coverage.test
 test/sql/storage/storage_types.test
 test/sql/storage/storage_version_65.test
 test/sql/storage/storage_versions.test

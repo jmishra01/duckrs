@@ -334,6 +334,8 @@ pub struct DatabaseListing {
     pub storage_version: Option<String>,
     /// `AttachedDatabase::GetAttachOptions`: the options of its ATTACH that went to its storage, by name, as given
     pub options: Vec<(String, String)>,
+    /// `Catalog::GetEncryptionCipher`, of an encrypted file
+    pub cipher: Option<String>,
 }
 
 /// `TypeVisitor`: `visit` for a type and all types in it.

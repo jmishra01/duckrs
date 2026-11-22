@@ -2123,7 +2123,6 @@ impl Binder<'_> {
                         Value::boolean(internal),
                         text("duckdb"),
                         Value::boolean(read_only),
-                        // nothing is encrypted yet
                         Value::boolean(false),
                         null_text(),
                         Value::null(tags.clone()),
@@ -2142,6 +2141,10 @@ impl Binder<'_> {
                     let mut row = database(&listed.name, oid, listed.path.as_deref(), false, listed.read_only);
                     row[4] = tags_of(listed.storage_version.as_deref())?;
                     row[10] = map_of(&listed.options)?;
+                    if let Some(cipher) = &listed.cipher {
+                        row[8] = Value::boolean(true);
+                        row[9] = text(cipher);
+                    }
                     rows.insert(index.min(rows.len()), row);
                 }
                 (

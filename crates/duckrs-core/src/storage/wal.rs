@@ -100,6 +100,21 @@ struct FileState {
     db_identifier: [u8; DB_IDENTIFIER_LEN],
     iteration: u64,
     before_v2: bool,
+    /// of an encrypted file, whose log is encrypted as well
+    encryption: Option<super::encryption::FileEncryption>,
+}
+
+impl FileState {
+    fn of(buffer: &BufferManager) -> Self {
+        let blocks = buffer.block_manager();
+        let header = blocks.header();
+        Self {
+            db_identifier: blocks.main_header().db_identifier,
+            iteration: header.iteration,
+            before_v2: checkpoint::is_before_v2(&header),
+            encryption: blocks.encryption().cloned(),
+        }
+    }
 }
 
 /// `ThrowVersionError`.
@@ -424,8 +439,11 @@ impl Reader<'_> {
     /// `ReplayVersion`.
     fn read_version(&mut self, d: &mut BinaryDeserializer<'_>) -> Result<()> {
         self.version = d.read_property(101, "version")?;
-        if self.version == ENCRYPTED_VERSION {
-            return Err(not_ported("an encrypted write-ahead log"));
+        if self.version == ENCRYPTED_VERSION && self.file.encryption.is_none() {
+            return Err(Error::new(
+                ErrorKind::Io,
+                "Failed to read WAL: the WAL is marked as encrypted, but the database is not",
+            ));
         }
         if self.version > ENCRYPTED_VERSION {
             let version = self.version;
@@ -594,6 +612,42 @@ impl Reader<'_> {
             let entry = self.read_entry(&mut d)?;
             return Ok((entry, position + d.position()));
         }
+        // the size of the entry stays plain, then come the nonce, the encrypted checksum and entry, and GCM's tag
+        if self.version == ENCRYPTED_VERSION
+            && let Some(encryption) = &self.file.encryption
+        {
+            let size = data
+                .get(position..position + 8)
+                .map(|bytes| u64::from_le_bytes(bytes.try_into().expect("8 bytes")))
+                .ok_or_else(|| torn("a log ends inside the header of an entry"))?;
+            let start = position + 8;
+            let end = usize::try_from(size)
+                .ok()
+                .and_then(|size| size.checked_add(encryption.log_entry_overhead()))
+                .and_then(|framed| start.checked_add(framed))
+                .filter(|&end| end <= data.len() && size != 0)
+                .ok_or_else(|| {
+                    torn(&format!(
+                        "Corrupt Encrypted WAL file: entry size exceeded remaining data in file at byte position \
+                         {start} (found entry with size {size} bytes, file size {} bytes)",
+                        data.len()
+                    ))
+                })?;
+            let (stored, entry) = encryption.decrypt_log_entry(&data[start..end])?;
+            let computed = checksum(&entry);
+            if stored != computed {
+                return Err(Error::new(
+                    ErrorKind::DataCorruption,
+                    format!(
+                        "Corrupt WAL file: entry at byte position {start} computed checksum {computed} does not \
+                         match stored checksum {stored}"
+                    ),
+                ));
+            }
+            let mut d = self.deserializer(&entry);
+            let entry = self.read_entry(&mut d)?;
+            return Ok((entry, end));
+        }
         let header = data
             .get(position..position + FRAME_HEADER_SIZE)
             .ok_or_else(|| torn("a log ends inside the header of an entry"))?;
@@ -752,12 +806,7 @@ pub(super) fn read_records(path: &Path, buffer: &BufferManager) -> Result<Vec<Re
     let Some(data) = read_log(&with_suffix(path, ".wal"))? else {
         return Ok(Vec::new());
     };
-    let header = buffer.block_manager().header();
-    let file = FileState {
-        db_identifier: buffer.block_manager().main_header().db_identifier,
-        iteration: header.iteration,
-        before_v2: checkpoint::is_before_v2(&header),
-    };
+    let file = FileState::of(buffer);
     replay_log(&data, path, buffer, &file, LogKind::Main)
 }
 
@@ -778,11 +827,7 @@ pub(super) fn replayed_end(path: &Path, buffer: &BufferManager) -> Result<Replay
         return Ok(ReplayedLog::None);
     };
     let header = buffer.block_manager().header();
-    let file = FileState {
-        db_identifier: buffer.block_manager().main_header().db_identifier,
-        iteration: header.iteration,
-        before_v2: checkpoint::is_before_v2(&header),
-    };
+    let file = FileState::of(buffer);
     let Ok(scanned) = scan(&data, &file, LogKind::Main) else {
         return Ok(ReplayedLog::None);
     };

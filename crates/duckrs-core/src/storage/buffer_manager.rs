@@ -185,6 +185,7 @@ mod tests {
                 &directory.join("b.db"),
                 16384,
                 duckrs_common::serializer::StorageVersion::DEFAULT,
+                None,
             )
             .unwrap(),
         );

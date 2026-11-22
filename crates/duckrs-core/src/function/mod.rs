@@ -42,6 +42,8 @@ pub mod test_vector_types;
 pub(crate) mod time_casts;
 pub mod variant;
 
+pub(crate) use strings::decode_base64;
+
 use crate::planner::expression::{BoundExpr, BoundExprKind};
 use duckrs_common::Result;
 use duckrs_common::types::{LogicalType, LogicalTypeId};

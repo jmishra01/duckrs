@@ -6,6 +6,7 @@
 //! starts with the checksum of the rest of it. Nothing here interprets what is in a block.
 
 use super::checksum::checksum;
+use super::encryption::{Cipher, ENCRYPTED_BLOCK_HEADER_SIZE, EncryptionRequest, FileEncryption, Version};
 use duckrs_common::serializer::StorageVersion;
 use duckrs_common::{Error, ErrorKind, Result};
 use parking_lot::Mutex;
@@ -76,16 +77,29 @@ fn u64_at(data: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(data[offset..offset + 8].try_into().expect("8 bytes"))
 }
 
-/// `MainHeader`, without what only encrypted files use.
+/// `MainHeader`.
 #[derive(Debug, Clone)]
 pub struct MainHeader {
     pub version_number: u64,
     pub flags: [u64; FLAG_COUNT],
     pub library_git_desc: String,
     pub library_git_hash: String,
-    /// Tells a write-ahead log of this file from those of others.
+    /// Tells a write-ahead log of this file from those of others, and salts the key of an encrypted one.
     pub db_identifier: [u8; DB_IDENTIFIER_LEN],
+    /// of an encrypted file: how it is encrypted ([`FileEncryption::metadata`]), and the canary with its nonce and tag
+    encryption_metadata: [u8; ENCRYPTION_METADATA_LEN],
+    canary: [u8; 8],
+    canary_nonce: [u8; 12],
+    canary_tag: [u8; 16],
 }
+
+/// Where the parts of the main header are, past its checksum.
+const DESC_AT: usize = 12 + FLAG_COUNT * 8;
+const METADATA_AT: usize = DESC_AT + 2 * MAX_VERSION_SIZE;
+const IDENTIFIER_AT: usize = METADATA_AT + ENCRYPTION_METADATA_LEN;
+const CANARY_AT: usize = IDENTIFIER_AT + DB_IDENTIFIER_LEN;
+const CANARY_NONCE_AT: usize = CANARY_AT + 8;
+const CANARY_TAG_AT: usize = CANARY_NONCE_AT + 12;
 
 impl MainHeader {
     fn read(data: &[u8]) -> Result<Self> {
@@ -110,21 +124,80 @@ impl MainHeader {
             let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
             String::from_utf8_lossy(&bytes[..end]).into_owned()
         };
-        let desc_at = 12 + FLAG_COUNT * 8;
-        let identifier_at = desc_at + 2 * MAX_VERSION_SIZE + ENCRYPTION_METADATA_LEN;
+        let array = |at: usize, len: usize| &data[at..at + len];
         Ok(Self {
             version_number,
             flags,
-            library_git_desc: text(desc_at),
-            library_git_hash: text(desc_at + MAX_VERSION_SIZE),
-            db_identifier: data[identifier_at..identifier_at + DB_IDENTIFIER_LEN]
-                .try_into()
-                .expect("the length of the slice"),
+            library_git_desc: text(DESC_AT),
+            library_git_hash: text(DESC_AT + MAX_VERSION_SIZE),
+            db_identifier: array(IDENTIFIER_AT, DB_IDENTIFIER_LEN).try_into().expect("16 bytes"),
+            encryption_metadata: array(METADATA_AT, ENCRYPTION_METADATA_LEN).try_into().expect("8 bytes"),
+            canary: array(CANARY_AT, 8).try_into().expect("8 bytes"),
+            canary_nonce: array(CANARY_NONCE_AT, 12).try_into().expect("12 bytes"),
+            canary_tag: array(CANARY_TAG_AT, 16).try_into().expect("16 bytes"),
         })
     }
 
-    fn is_encrypted(&self) -> bool {
+    pub fn is_encrypted(&self) -> bool {
         self.flags[0] & ENCRYPTED_DATABASE_FLAG != 0
+    }
+
+    /// `SingleFileBlockManager::CheckAndAddEncryptionKey` and the checks of `LoadExistingDatabase`: the encryption of
+    /// the file, if it is encrypted and `request` opens it.
+    fn encryption(
+        &self,
+        path: &Path,
+        request: Option<&EncryptionRequest>,
+        read_only: bool,
+    ) -> Result<Option<FileEncryption>> {
+        let catalog_error = |message: String| Error::new(ErrorKind::Catalog, message);
+        let path = path.display();
+        if !self.is_encrypted() {
+            if request.is_some() {
+                return Err(catalog_error(format!(
+                    "A key is explicitly specified, but database \"{path}\" is not encrypted"
+                )));
+            }
+            return Ok(None);
+        }
+        let Some(request) = request else {
+            return Err(catalog_error(format!(
+                "Cannot open encrypted database \"{path}\" without a key"
+            )));
+        };
+        if !read_only && !request.writable {
+            return Err(super::encryption::read_only_crypto());
+        }
+        let invalid = || Error::new(ErrorKind::InvalidInput, "No valid encryption version found!");
+        let version = Version::from_number(self.encryption_metadata[3]).ok_or_else(invalid)?;
+        let stored = Cipher::from_number(self.encryption_metadata[2]).ok_or_else(invalid)?;
+        let key = super::encryption::derive_key(&request.key, &self.db_identifier);
+        let encryption = FileEncryption::new(key, stored, version);
+        if !encryption.check_canary(&self.canary, &self.canary_nonce, &self.canary_tag) {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "Wrong encryption key used to open the database file",
+            ));
+        }
+        if let Some(given) = request.cipher
+            && given != stored
+        {
+            return Err(catalog_error(format!(
+                "Cannot open encrypted database \"{path}\" with a different cipher ({}) than the one used to create \
+                 it ({})",
+                given.name(),
+                stored.name()
+            )));
+        }
+        // a cipher other than GCM has to be asked for, so that a file can't be downgraded to it unnoticed
+        if stored != Cipher::Gcm && request.cipher.is_none() {
+            return Err(catalog_error(format!(
+                "Cannot open encrypted database \"{path}\" without explicitly specifying the encryption cipher for \
+                 security reasons. Please make sure you understand the security implications and re-attach the \
+                 database specifying the desired cipher."
+            )));
+        }
+        Ok(Some(encryption))
     }
 }
 
@@ -205,6 +278,8 @@ pub struct SingleFileBlockManager {
     /// what the main header says of the version now, after `rewrite_main_header`
     main_version: std::sync::atomic::AtomicU64,
     state: Mutex<State>,
+    /// of an encrypted file: how, with the key
+    encryption: Option<FileEncryption>,
 }
 
 #[derive(Debug)]
@@ -221,8 +296,9 @@ struct State {
 }
 
 impl SingleFileBlockManager {
-    /// `LoadExistingDatabase`, up to the free list, which takes the metadata layer to read.
-    pub fn open(path: &Path, read_only: bool) -> Result<Self> {
+    /// `LoadExistingDatabase`, up to the free list, which takes the metadata layer to read. `encryption` is what
+    /// `ATTACH` gave to open an encrypted file with.
+    pub fn open(path: &Path, read_only: bool, encryption: Option<&EncryptionRequest>) -> Result<Self> {
         let mut file = OpenOptions::new()
             .read(true)
             .write(!read_only)
@@ -238,17 +314,27 @@ impl SingleFileBlockManager {
             return Err(invalid_file(path));
         }
         let mut buffer = vec![0; FILE_HEADER_SIZE];
-        read_checked(&mut file, path, 0, &mut buffer)?;
+        // the main header is never encrypted
+        read_checked(&mut file, path, 0, &mut buffer, None)?;
         let main_header = MainHeader::read(&buffer[BLOCK_HEADER_SIZE..])?;
-        if main_header.is_encrypted() {
-            return Err(Error::not_implemented(
-                "reading an encrypted database file is not yet ported to duckrs",
-            ));
-        }
-        read_checked(&mut file, path, FILE_HEADER_SIZE as u64, &mut buffer)?;
-        let h1 = DatabaseHeader::read(&buffer[BLOCK_HEADER_SIZE..])?;
-        read_checked(&mut file, path, FILE_HEADER_SIZE as u64 * 2, &mut buffer)?;
-        let h2 = DatabaseHeader::read(&buffer[BLOCK_HEADER_SIZE..])?;
+        let encryption = main_header.encryption(path, encryption, read_only)?;
+        let header_size = header_size(encryption.as_ref());
+        read_checked(
+            &mut file,
+            path,
+            FILE_HEADER_SIZE as u64,
+            &mut buffer,
+            encryption.as_ref(),
+        )?;
+        let h1 = DatabaseHeader::read(&buffer[header_size..])?;
+        read_checked(
+            &mut file,
+            path,
+            FILE_HEADER_SIZE as u64 * 2,
+            &mut buffer,
+            encryption.as_ref(),
+        )?;
+        let h2 = DatabaseHeader::read(&buffer[header_size..])?;
         let (active_header, header) = if h1.iteration > h2.iteration { (0, h1) } else { (1, h2) };
         verify_block_alloc_size(header.block_alloc_size)?;
         let reader = file.try_clone().map_err(|e| io_error(path, e))?;
@@ -265,12 +351,22 @@ impl SingleFileBlockManager {
                 multi_use_blocks: HashMap::new(),
                 metadata_blocks: std::collections::BTreeMap::new(),
             }),
+            encryption,
         })
     }
 
-    /// `CreateNewDatabase`: a file with no blocks in `version`, which DuckDB can open too.
-    pub fn create(path: &Path, block_alloc_size: u64, version: StorageVersion) -> Result<Self> {
+    /// `CreateNewDatabase`: a file with no blocks in `version`, which DuckDB can open too, encrypted as `encryption`
+    /// asks (with GCM unless it names a cipher).
+    pub fn create(
+        path: &Path,
+        block_alloc_size: u64,
+        version: StorageVersion,
+        encryption: Option<&EncryptionRequest>,
+    ) -> Result<Self> {
         verify_block_alloc_size(block_alloc_size)?;
+        if encryption.is_some_and(|request| !request.writable) {
+            return Err(super::encryption::read_only_crypto());
+        }
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -282,15 +378,27 @@ impl SingleFileBlockManager {
         let data = &mut buffer[BLOCK_HEADER_SIZE..];
         data[..4].copy_from_slice(MAGIC_BYTES);
         data[4..12].copy_from_slice(&main_header_version_number(version).to_le_bytes());
-        let desc_at = 12 + FLAG_COUNT * 8;
         let description = concat!("duckrs ", env!("CARGO_PKG_VERSION")).as_bytes();
-        data[desc_at..desc_at + description.len()].copy_from_slice(description);
-        let identifier_at = desc_at + 2 * MAX_VERSION_SIZE + ENCRYPTION_METADATA_LEN;
-        // the identifier is there from v1.4.0 on
-        if version >= StorageVersion::V1_4_0 {
-            data[identifier_at..identifier_at + DB_IDENTIFIER_LEN].copy_from_slice(&new_db_identifier(path));
+        data[DESC_AT..DESC_AT + description.len()].copy_from_slice(description);
+        // the identifier is there from v1.4.0 on, and salts the key of an encrypted file
+        let mut identifier = [0; DB_IDENTIFIER_LEN];
+        if let Some(request) = encryption {
+            super::encryption::random_bytes(&mut identifier)?;
+            let key = super::encryption::derive_key(&request.key, &identifier);
+            let file_encryption = FileEncryption::new(key, request.cipher.unwrap_or(Cipher::Gcm), request.version);
+            data[12..20].copy_from_slice(&ENCRYPTED_DATABASE_FLAG.to_le_bytes());
+            data[METADATA_AT..METADATA_AT + ENCRYPTION_METADATA_LEN].copy_from_slice(&file_encryption.metadata());
+            let (canary, nonce, tag) = file_encryption.canary()?;
+            data[CANARY_AT..CANARY_AT + 8].copy_from_slice(&canary);
+            data[CANARY_NONCE_AT..CANARY_NONCE_AT + 12].copy_from_slice(&nonce);
+            data[CANARY_TAG_AT..CANARY_TAG_AT + 16].copy_from_slice(&tag);
+        } else if version >= StorageVersion::V1_4_0 {
+            identifier = new_db_identifier(path);
         }
-        write_checked(&mut file, path, 0, &mut buffer)?;
+        data[IDENTIFIER_AT..IDENTIFIER_AT + DB_IDENTIFIER_LEN].copy_from_slice(&identifier);
+        write_checked(&mut file, path, 0, &mut buffer, None)?;
+        let main_header = MainHeader::read(&buffer[BLOCK_HEADER_SIZE..])?;
+        let file_encryption = main_header.encryption(path, encryption, false)?;
 
         let header = DatabaseHeader {
             iteration: 0,
@@ -303,12 +411,28 @@ impl SingleFileBlockManager {
         };
         for slot in 1..=2 {
             buffer.fill(0);
-            header.write(&mut buffer[BLOCK_HEADER_SIZE..]);
-            write_checked(&mut file, path, FILE_HEADER_SIZE as u64 * slot, &mut buffer)?;
+            header.write(&mut buffer[header_size(file_encryption.as_ref())..]);
+            write_checked(
+                &mut file,
+                path,
+                FILE_HEADER_SIZE as u64 * slot,
+                &mut buffer,
+                file_encryption.as_ref(),
+            )?;
         }
         file.sync_all().map_err(|e| io_error(path, e))?;
         drop(file);
-        Self::open(path, false)
+        Self::open(path, false, encryption)
+    }
+
+    /// How the file is encrypted, if it is.
+    pub fn encryption(&self) -> Option<&FileEncryption> {
+        self.encryption.as_ref()
+    }
+
+    /// `GetBlockHeaderSize`: what is in front of what a block holds.
+    fn header_size(&self) -> usize {
+        header_size(self.encryption.as_ref())
     }
 
     pub fn path(&self) -> &Path {
@@ -329,7 +453,7 @@ impl SingleFileBlockManager {
 
     /// `GetBlockSize`: what a block holds.
     pub fn block_size(&self) -> usize {
-        self.block_alloc_size() - BLOCK_HEADER_SIZE
+        self.block_alloc_size() - self.header_size()
     }
 
     pub fn free_list(&self) -> Vec<u64> {
@@ -412,6 +536,13 @@ impl SingleFileBlockManager {
     /// `Read`: the block without its checksum, which is verified.
     pub fn read_block(&self, block_id: u64) -> Result<Vec<u8>> {
         let location = self.location(block_id)?;
+        if let Some(encryption) = &self.encryption {
+            let mut block = vec![0; self.block_alloc_size()];
+            self.read_at(location, &mut block)?;
+            encryption.decrypt_block(&mut block)?;
+            verify_checksum(&block, ENCRYPTED_BLOCK_HEADER_SIZE, location)?;
+            return Ok(block.split_off(ENCRYPTED_BLOCK_HEADER_SIZE));
+        }
         let mut sum = [0; BLOCK_HEADER_SIZE];
         let mut buffer = vec![0; self.block_alloc_size() - BLOCK_HEADER_SIZE];
         self.read_at(location, &mut sum)?;
@@ -456,20 +587,23 @@ impl SingleFileBlockManager {
     /// be a new one, which grows it.
     pub fn write_block(&self, block_id: u64, data: &[u8]) -> Result<()> {
         let alloc_size = self.block_alloc_size();
-        if data.len() != alloc_size - BLOCK_HEADER_SIZE {
+        let header_size = self.header_size();
+        if data.len() != alloc_size - header_size {
             return Err(Error::new(
                 ErrorKind::Internal,
-                format!(
-                    "a block holds {} bytes, not {}",
-                    alloc_size - BLOCK_HEADER_SIZE,
-                    data.len()
-                ),
+                format!("a block holds {} bytes, not {}", alloc_size - header_size, data.len()),
             ));
         }
         let mut buffer = vec![0; alloc_size];
-        buffer[BLOCK_HEADER_SIZE..].copy_from_slice(data);
+        buffer[header_size..].copy_from_slice(data);
         let location = BLOCK_START + block_id * alloc_size as u64;
-        write_checked(&mut self.file.lock(), &self.path, location, &mut buffer)?;
+        write_checked(
+            &mut self.file.lock(),
+            &self.path,
+            location,
+            &mut buffer,
+            self.encryption.as_ref(),
+        )?;
         let mut state = self.state.lock();
         state.header.block_count = state.header.block_count.max(block_id + 1);
         Ok(())
@@ -506,9 +640,9 @@ impl SingleFileBlockManager {
         }
         let mut file = self.file.lock();
         let mut buffer = vec![0; FILE_HEADER_SIZE];
-        read_checked(&mut file, &self.path, 0, &mut buffer)?;
+        read_checked(&mut file, &self.path, 0, &mut buffer, None)?;
         buffer[BLOCK_HEADER_SIZE + 4..BLOCK_HEADER_SIZE + 12].copy_from_slice(&number.to_le_bytes());
-        write_checked(&mut file, &self.path, 0, &mut buffer)?;
+        write_checked(&mut file, &self.path, 0, &mut buffer, None)?;
         drop(file);
         self.main_version.store(number, std::sync::atomic::Ordering::SeqCst);
         Ok(())
@@ -521,9 +655,9 @@ impl SingleFileBlockManager {
         header.iteration = state.header.iteration + 1;
         let slot = 1 - state.active_header;
         let mut buffer = vec![0; FILE_HEADER_SIZE];
-        header.write(&mut buffer[BLOCK_HEADER_SIZE..]);
+        header.write(&mut buffer[self.header_size()..]);
         let location = FILE_HEADER_SIZE as u64 * (slot as u64 + 1);
-        write_checked(&mut file, &self.path, location, &mut buffer)?;
+        write_checked(&mut file, &self.path, location, &mut buffer, self.encryption.as_ref())?;
         file.sync_all().map_err(|e| io_error(&self.path, e))?;
         state.active_header = slot;
         state.header = header;
@@ -544,8 +678,35 @@ fn new_db_identifier(path: &Path) -> [u8; DB_IDENTIFIER_LEN] {
     result
 }
 
-/// `ReadAndChecksum`.
-fn read_checked(file: &mut File, path: &Path, location: u64, buffer: &mut [u8]) -> Result<()> {
+/// `GetBlockHeaderSize`: the checksum, and in front of it the nonce and tag of an encrypted file.
+fn header_size(encryption: Option<&FileEncryption>) -> usize {
+    if encryption.is_some() {
+        ENCRYPTED_BLOCK_HEADER_SIZE
+    } else {
+        BLOCK_HEADER_SIZE
+    }
+}
+
+/// `CheckChecksum`: the checksum in the 8 bytes before `header_size` is that of what follows.
+fn verify_checksum(block: &[u8], header_size: usize, location: u64) -> Result<()> {
+    let stored = u64_at(block, header_size - BLOCK_HEADER_SIZE);
+    let computed = checksum(&block[header_size..]);
+    if stored != computed {
+        return Err(corrupt(format!(
+            "computed checksum {computed} does not match stored checksum {stored} in block at location {location}"
+        )));
+    }
+    Ok(())
+}
+
+/// `ReadAndChecksum`, decrypting an encrypted file's header or block.
+fn read_checked(
+    file: &mut File,
+    path: &Path,
+    location: u64,
+    buffer: &mut [u8],
+    encryption: Option<&FileEncryption>,
+) -> Result<()> {
     file.seek(SeekFrom::Start(location)).map_err(|e| io_error(path, e))?;
     crate::execution::profiler::track_read(buffer.len());
     file.read_exact(buffer).map_err(|e| {
@@ -555,20 +716,26 @@ fn read_checked(file: &mut File, path: &Path, location: u64, buffer: &mut [u8]) 
             io_error(path, e)
         }
     })?;
-    let stored = u64_at(buffer, 0);
-    let computed = checksum(&buffer[BLOCK_HEADER_SIZE..]);
-    if stored != computed {
-        return Err(corrupt(format!(
-            "computed checksum {computed} does not match stored checksum {stored} in block at location {location}"
-        )));
+    if let Some(encryption) = encryption {
+        encryption.decrypt_block(buffer)?;
     }
-    Ok(())
+    verify_checksum(buffer, header_size(encryption), location)
 }
 
-/// `ChecksumAndWrite`.
-fn write_checked(file: &mut File, path: &Path, location: u64, buffer: &mut [u8]) -> Result<()> {
-    let sum = checksum(&buffer[BLOCK_HEADER_SIZE..]);
-    buffer[..BLOCK_HEADER_SIZE].copy_from_slice(&sum.to_le_bytes());
+/// `ChecksumAndWrite`, encrypting the header or block of an encrypted file (`buffer` holding it at its header size).
+fn write_checked(
+    file: &mut File,
+    path: &Path,
+    location: u64,
+    buffer: &mut [u8],
+    encryption: Option<&FileEncryption>,
+) -> Result<()> {
+    let header_size = header_size(encryption);
+    let sum = checksum(&buffer[header_size..]);
+    buffer[header_size - BLOCK_HEADER_SIZE..header_size].copy_from_slice(&sum.to_le_bytes());
+    if let Some(encryption) = encryption {
+        encryption.encrypt_block(buffer)?;
+    }
     file.seek(SeekFrom::Start(location)).map_err(|e| io_error(path, e))?;
     crate::execution::profiler::track_write(buffer.len());
     file.write_all(buffer).map_err(|e| io_error(path, e))
@@ -589,8 +756,8 @@ mod tests {
     fn a_new_file_has_no_blocks() {
         let directory = directory("new");
         let path = directory.join("new.db");
-        drop(SingleFileBlockManager::create(&path, 16384, StorageVersion::DEFAULT).unwrap());
-        let blocks = SingleFileBlockManager::open(&path, true).unwrap();
+        drop(SingleFileBlockManager::create(&path, 16384, StorageVersion::DEFAULT, None).unwrap());
+        let blocks = SingleFileBlockManager::open(&path, true, None).unwrap();
         let header = blocks.header();
         assert_eq!(header.iteration, 0);
         assert_eq!(header.meta_block, INVALID_BLOCK);
@@ -599,7 +766,7 @@ mod tests {
         assert!(blocks.main_header().library_git_desc.starts_with("duckrs"));
         assert!(blocks.read_block(0).is_err());
         assert!(
-            SingleFileBlockManager::create(&path, 16384, StorageVersion::DEFAULT).is_err(),
+            SingleFileBlockManager::create(&path, 16384, StorageVersion::DEFAULT, None).is_err(),
             "it is there"
         );
         std::fs::remove_dir_all(&directory).unwrap();
@@ -609,7 +776,7 @@ mod tests {
     fn blocks_and_headers_survive_reopening_and_headers_take_turns() {
         let directory = directory("blocks");
         let path = directory.join("blocks.db");
-        let blocks = SingleFileBlockManager::create(&path, 16384, StorageVersion::DEFAULT).unwrap();
+        let blocks = SingleFileBlockManager::create(&path, 16384, StorageVersion::DEFAULT, None).unwrap();
         let data = vec![7; blocks.block_size()];
         blocks.write_block(0, &data).unwrap();
         blocks.write_block(1, &vec![9; blocks.block_size()]).unwrap();
@@ -622,7 +789,7 @@ mod tests {
         blocks.write_header(header).unwrap();
         drop(blocks);
 
-        let blocks = SingleFileBlockManager::open(&path, true).unwrap();
+        let blocks = SingleFileBlockManager::open(&path, true, None).unwrap();
         assert_eq!(blocks.header().iteration, 2);
         assert_eq!(blocks.header().meta_block, 0);
         assert_eq!(blocks.header().block_count, 2);
@@ -635,7 +802,7 @@ mod tests {
         bytes[newest + BLOCK_HEADER_SIZE] ^= 1;
         std::fs::write(&path, &bytes).unwrap();
         assert!(
-            SingleFileBlockManager::open(&path, true).is_err(),
+            SingleFileBlockManager::open(&path, true, None).is_err(),
             "C++ gives up here too"
         );
         std::fs::remove_dir_all(&directory).unwrap();
@@ -645,7 +812,9 @@ mod tests {
     fn invalid_block_sizes_are_refused() {
         let directory = directory("size");
         for size in [0, 1000, 16385, 524288] {
-            assert!(SingleFileBlockManager::create(&directory.join("x.db"), size, StorageVersion::DEFAULT).is_err());
+            assert!(
+                SingleFileBlockManager::create(&directory.join("x.db"), size, StorageVersion::DEFAULT, None).is_err()
+            );
         }
         std::fs::remove_dir_all(&directory).unwrap();
     }

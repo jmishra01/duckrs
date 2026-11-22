@@ -14,6 +14,7 @@ libm = "0.2"
 libc = "0.2"
 sha1 = "0.10"
 sha2 = "0.10"
+ring = "0.17"
 arrow = { version = "60", default-features = false }
 parquet = { version = "60", features = ["arrow_canonical_extension_types"] }
 duckrs = { path = "crates/duckrs" }

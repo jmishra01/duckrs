@@ -118,6 +118,41 @@ pub struct AttachOptions {
     pub hidden: bool,
     /// `StorageOptions`: the options that go to the storage, by name, as given (`AttachOptions::options`)
     pub listed: Vec<(String, String)>,
+    /// `ENCRYPTION_KEY` and what goes with it
+    pub encryption: Option<storage::encryption::EncryptionRequest>,
+}
+
+/// `StorageOptions::SetEncryptionVersion`: the encryption version a new file gets. Version 1 needs v1.5.0, so an
+/// explicit older storage version takes version 0, unless version 1 was asked for; encryption needs v1.4.0.
+fn encryption_version_for(
+    storage_version: Option<&(String, StorageVersion)>,
+    asked: Option<storage::encryption::Version>,
+) -> Result<storage::encryption::Version> {
+    use storage::encryption::Version;
+    if let Some((given, version)) = storage_version {
+        if *version < StorageVersion::V1_4_0 {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "Explicit provided STORAGE_VERSION (\"{given}\") and ENCRYPTION_KEY (storage >= v1.4.0) are not \
+                     compatible"
+                ),
+            ));
+        }
+        if *version < StorageVersion::V1_5_0 && asked != Some(Version::V0) {
+            if asked == Some(Version::V1) {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "Explicit provided STORAGE_VERSION (\"{given}\") is not compatible with \
+                         'debug_encryption_version = v1' (storage >= v1.5.0)"
+                    ),
+                ));
+            }
+            return Ok(Version::V0);
+        }
+    }
+    Ok(asked.unwrap_or(Version::V1))
 }
 
 /// `BooleanValue::Get(DefaultCastAs(BOOLEAN))` of an ATTACH option: one without a value is true.
@@ -362,9 +397,18 @@ impl DatabaseInstance {
         }
         let requested = options.storage_version.as_ref().map(|(_, version)| *version);
         if !storage::is_database_file(path) {
-            let version = requested.unwrap_or_else(|| default_storage_version(options.settings.as_ref()));
+            let mut version = requested.unwrap_or_else(|| default_storage_version(options.settings.as_ref()));
+            // `SingleFileStorageManager::LoadDatabase`: the default encryption format needs at least v1.5.0
+            if requested.is_none() && options.encryption.is_some() {
+                version = version.max(StorageVersion::V1_5_0);
+            }
             // checkpoints write v2.1.0 at the newest
-            storage::create_database(path, options.block_size, version.min(StorageVersion::V2_1_0))?;
+            storage::create_database(
+                path,
+                options.block_size,
+                version.min(StorageVersion::V2_1_0),
+                options.encryption.as_ref(),
+            )?;
         }
         let name = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
         let mut db = Self::with_file_access(None);
@@ -372,7 +416,7 @@ impl DatabaseInstance {
         if let Some(settings) = &options.settings {
             db.settings = settings.clone();
         }
-        let buffer = storage::load_database(path, &db.catalog, read_only)?;
+        let buffer = storage::load_database(path, &db.catalog, read_only, options.encryption.as_ref())?;
         // `SingleFileBlockManager::Initialize`: an explicit version can go up, not down
         let file_version = buffer.block_manager().storage_version()?;
         let storage_version = match requested {
@@ -432,7 +476,11 @@ impl DatabaseInstance {
                 }
             }
         }
-        let log = Mutex::new(WriteAheadLog::new(&db.catalog).with_version(storage_version));
+        let log = Mutex::new(
+            WriteAheadLog::new(&db.catalog)
+                .with_version(storage_version)
+                .with_encryption(buffer.block_manager().encryption().cloned()),
+        );
         db.catalog.set_storage_version(storage_version);
         db.file = Some(DatabaseFile {
             path: path.to_path_buf(),
@@ -549,6 +597,7 @@ impl DatabaseInstance {
             wal_size: 0,
             storage_version: None,
             options: self.attach_options.clone(),
+            cipher: None,
         };
         if let Some(file) = &self.file {
             listing.storage_version = Some(file.storage_version.display_name(true));
@@ -558,6 +607,7 @@ impl DatabaseInstance {
             listing.total_blocks = blocks.header().block_count;
             listing.free_blocks = blocks.free_list().len() as u64;
             listing.wal_size = storage::log_writer::log_size(&file.path);
+            listing.cipher = blocks.encryption().map(|encryption| encryption.cipher.name().to_string());
         }
         listing
     }
@@ -1451,7 +1501,9 @@ impl ClientContext {
             Some(size) => parse_setting_bytes(&size)?,
             None => None,
         };
-        Ok(QueryMemory::new(limit, directory, max_temp_size))
+        let memory = QueryMemory::new(limit, directory, max_temp_size);
+        memory.set_encrypt_files(text("temp_file_encryption").is_some_and(|value| value == "true"));
+        Ok(memory)
     }
 
     /// The `threads` setting: all the machine has, unless someone said otherwise.
@@ -2674,6 +2726,9 @@ impl ClientContext {
         let mut options = AttachOptions::default();
         let mut mode_given = false;
         let mut compress_given = false;
+        let mut encryption_key: Option<Vec<u8>> = None;
+        let mut encryption_cipher = None;
+        let mut encryption_version = None;
         // the options given as expressions, such as `TYPE getvariable('t')`, by their values
         let mut given: Vec<(String, duckrs_parser::ast::Literal)> = info.options.clone();
         for (name, expression) in &info.parsed_options {
@@ -2813,9 +2868,22 @@ impl ClientContext {
                         ));
                     }
                 }
-                // `StorageOptions::Initialize` has these
-                other @ ("encryption_key" | "encryption_cipher" | "debug_encryption_version") => {
-                    return Err(crate::unported(format!("ATTACH with {other}")));
+                // `StorageOptions::Initialize`
+                "encryption_key" => {
+                    if value.kind != duckrs_parser::ast::LiteralKind::String {
+                        return Err(Error::new(
+                            ErrorKind::Binder,
+                            format!("\"{}\" is not a valid key. A key must be of type VARCHAR", value.text),
+                        ));
+                    }
+                    if value.text.is_empty() {
+                        return Err(Error::new(ErrorKind::Binder, "Not a valid key. A key cannot be empty"));
+                    }
+                    encryption_key = Some(value.text.clone().into_bytes());
+                }
+                "encryption_cipher" => encryption_cipher = Some(storage::encryption::Cipher::parse(&value.text)?),
+                "debug_encryption_version" => {
+                    encryption_version = Some(storage::encryption::Version::parse(&value.text)?);
                 }
                 other => {
                     return Err(Error::new(
@@ -2824,6 +2892,15 @@ impl ClientContext {
                     ));
                 }
             }
+        }
+        if let Some(key) = encryption_key {
+            let version = encryption_version_for(options.storage_version.as_ref(), encryption_version)?;
+            options.encryption = Some(storage::encryption::EncryptionRequest {
+                key,
+                cipher: encryption_cipher,
+                version,
+                writable: self.setting_text("debug_force_mbedtls_unsafe") == "true",
+            });
         }
         let in_memory = path.is_empty() || path == ":memory:";
         // `StorageManager::Initialize`
@@ -2982,6 +3059,19 @@ impl ClientContext {
         }
         self.home.attached.write().insert(name.to_lowercase(), database);
         Ok(())
+    }
+
+    /// Whether an encrypted database is attached that takes writes.
+    fn writable_encrypted_database(&self) -> bool {
+        let mut databases = vec![self.home.clone()];
+        databases.extend(self.home.attached.read().values().cloned());
+        databases.iter().any(|database| {
+            database.file_access.is_none()
+                && database
+                    .file
+                    .as_ref()
+                    .is_some_and(|file| file.buffer.block_manager().encryption().is_some())
+        })
     }
 
     fn database_list(&self) -> std::sync::Weak<dyn DatabaseList> {
@@ -3647,6 +3737,33 @@ impl ClientContext {
                     && let Some(transaction) = &mut self.transaction
                 {
                     transaction.invalidation_policy = value.try_to_string()?.to_uppercase();
+                }
+                // `ForceMbedtlsUnsafeSetting::SetGlobal`: without httpfs, nothing else writes an encrypted database
+                if (name.eq_ignore_ascii_case("force_mbedtls_unsafe")
+                    || name.eq_ignore_ascii_case("debug_force_mbedtls_unsafe"))
+                    && !value.is_null()
+                    && value.try_to_string()? == "false"
+                    && self.writable_encrypted_database()
+                {
+                    return Err(Error::new(
+                        ErrorKind::InvalidConfiguration,
+                        "Failed to autoload HTTPFS. Cannot disable MbedTLS, HTTPFS extension is required to write \
+                         encrypted databases.",
+                    ));
+                }
+                // `ForceVariantShredding::SetGlobal` (`UnboundType::TryParseAndDefaultBind`): a type it can parse
+                if (name.eq_ignore_ascii_case("force_variant_shredding")
+                    || name.eq_ignore_ascii_case("debug_force_variant_shredding"))
+                    && let Some(text) = (!value.is_null()).then(|| value.try_to_string()).transpose()?
+                    && !text.is_empty()
+                    && crate::planner::binder::Binder::new(&self.catalog())
+                        .type_from_name(&text)
+                        .is_err()
+                {
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        format!("Could not parse type string '{text}'"),
+                    ));
                 }
                 let mut global = self.home.settings.write();
                 if let Some(setting) = logging::is_logging_setting(name) {

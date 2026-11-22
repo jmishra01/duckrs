@@ -38,6 +38,8 @@ use std::sync::Arc;
 
 /// `WAL_VERSION_NUMBER`.
 const WAL_VERSION: u64 = 2;
+/// `WAL_ENCRYPTED_VERSION_NUMBER`: the log of an encrypted file.
+const WAL_ENCRYPTED_VERSION: u64 = 3;
 
 type Key = (String, String);
 
@@ -135,8 +137,8 @@ impl Durable {
 }
 
 /// The records of one commit, as the version of the file has them.
-/// The bytes of some log records, the version they are in, and how many there are.
-struct Records(Vec<u8>, StorageVersion, u64);
+/// The bytes of some log records, the version they are in, how many there are, and how the file is encrypted.
+struct Records(Vec<u8>, StorageVersion, u64, Option<super::encryption::FileEncryption>);
 
 impl Records {
     fn entry(&mut self, wal: u64, body: impl FnOnce(&mut BinarySerializer)) {
@@ -150,8 +152,19 @@ impl Records {
         });
         let payload = s.into_bytes();
         self.0.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-        self.0.extend_from_slice(&checksum(&payload).to_le_bytes());
-        self.0.extend_from_slice(&payload);
+        match &self.3 {
+            // `ChecksumWriter::FlushEncrypted`
+            Some(encryption) => {
+                let framed = encryption
+                    .encrypt_log_entry(checksum(&payload), &payload)
+                    .expect("random bytes for a nonce");
+                self.0.extend_from_slice(&framed);
+            }
+            None => {
+                self.0.extend_from_slice(&checksum(&payload).to_le_bytes());
+                self.0.extend_from_slice(&payload);
+            }
+        }
         self.2 += 1;
     }
 
@@ -661,6 +674,8 @@ pub struct WriteAheadLog {
     entries: u64,
     /// Of a log that was replayed and isn't written to: where what it committed ends
     replayed: Option<u64>,
+    /// of an encrypted file, whose log is encrypted as well
+    encryption: Option<super::encryption::FileEncryption>,
 }
 
 impl std::fmt::Debug for WriteAheadLog {
@@ -699,6 +714,21 @@ impl WriteAheadLog {
         self
     }
 
+    /// The log of a file encrypted as `encryption` says.
+    pub fn with_encryption(mut self, encryption: Option<super::encryption::FileEncryption>) -> Self {
+        self.encryption = encryption;
+        self
+    }
+
+    /// `WAL_VERSION_NUMBER`, or `WAL_ENCRYPTED_VERSION_NUMBER` of an encrypted file.
+    fn wal_version(&self) -> u64 {
+        if self.encryption.is_some() {
+            WAL_ENCRYPTED_VERSION
+        } else {
+            WAL_VERSION
+        }
+    }
+
     pub fn size(&self) -> u64 {
         self.size
     }
@@ -707,9 +737,8 @@ impl WriteAheadLog {
     /// it there (`WriteAheadLog::Initialize` of the size replay left), so that a crash between the end of the
     /// checkpoint and the removal of the log leaves a log that says it is in the file.
     pub fn with_replayed(mut self, replayed: Option<(u64, u64)>) -> Self {
-        self.replayed = replayed
-            .filter(|(_, version)| *version == WAL_VERSION)
-            .map(|(end, _)| end);
+        let wanted = self.wal_version();
+        self.replayed = replayed.filter(|(_, version)| *version == wanted).map(|(end, _)| end);
         self
     }
 
@@ -734,9 +763,10 @@ impl WriteAheadLog {
             target: self.version,
             ..Default::default()
         });
+        let wal_version = self.wal_version();
         s.write_object_value(|s| {
             s.write_property(100, "wal_type", &wal_type::WAL_VERSION);
-            s.write_property(101, "version", &WAL_VERSION);
+            s.write_property(101, "version", &wal_version);
             // which file the log is of, from v1.3.0 on
             if s.should_serialize(StorageVersion::V1_3_0) {
                 s.write_list(102, "db_identifier", DB_IDENTIFIER_LEN, |s, i| {
@@ -852,7 +882,7 @@ impl WriteAheadLog {
         block_size: usize,
         ahead: Option<WriteAhead>,
     ) -> Result<Records> {
-        let mut records = Records(Vec::new(), self.version, 0);
+        let mut records = Records(Vec::new(), self.version, 0, self.encryption.clone());
         let schema_of = |key: &Key| -> Result<Arc<SchemaCatalogEntry>> { catalog.schema_for(Some(&key.0)) };
         let gone = |old_same: bool, new_exists: bool| !new_exists || !old_same;
         // before the tables they are on go
@@ -1117,7 +1147,7 @@ impl WriteAheadLog {
         }
         let size = self.size;
         if self.file.is_some() {
-            let mut records = Records(Vec::new(), self.version, 0);
+            let mut records = Records(Vec::new(), self.version, 0, self.encryption.clone());
             records.entry(wal_type::CHECKPOINT, |s| s.write_property(101, "meta_block", &root));
             records.entry(wal_type::WAL_FLUSH, |_| {});
             self.append(path, &records.0)?;
@@ -1138,7 +1168,8 @@ impl WriteAheadLog {
     pub fn checkpointed(&mut self, catalog: &Catalog) {
         // the file is in the version it was
         let version = self.version;
-        *self = Self::new(catalog).with_version(version);
+        let encryption = self.encryption.take();
+        *self = Self::new(catalog).with_version(version).with_encryption(encryption);
     }
 }
 
