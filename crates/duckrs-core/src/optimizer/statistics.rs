@@ -52,7 +52,7 @@ pub(crate) fn has_ordered_statistics(ty: &LogicalType) -> bool {
     ty.is_numeric()
         || matches!(
             ty.id(),
-            Boolean | Date | Time | TimestampSec | TimestampMs | Timestamp | TimestampNs | TimestampTz | Varchar
+            Boolean | Date | Time | TimestampSec | TimestampMs | Timestamp | TimestampNs | TimestampTz | TimestampTzNs | Varchar
         )
 }
 

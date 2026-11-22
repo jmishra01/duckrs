@@ -262,6 +262,9 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] the scalar aggregate merger (`scalar_aggregate_merge_threshold`), over tables, `read_parquet`, `read_csv`
     and `read_json`; predicate factoring of ORs in filters
   - [ ] secure views (7 files), `json_serialize_plan`, gamma's errors without IEEE
+  - [x] temporal casts of a column compared with a constant give the scan an optional filter on the column, by
+    the cast's margin (`TryPushdownTemporalCastFilter`, also of filters that can throw); TIMESTAMPTZ_NS columns have
+    zone maps and `stats()` (`temporal_cast_zonemap`, `timestamp_unit_cast_zonemap_pruning`)
   - [x] INTERVAL bounds of row groups in database files: written from v2.0.0 by the normalized intervals and
     read into zone maps (`interval_row_group_pruning`, `interval_column_stats_pruning`)
   - [x] statistics and zone maps of `%` (`PropagateModuloStats`: signed and unsigned, DECIMAL, FLOAT/DOUBLE, a
