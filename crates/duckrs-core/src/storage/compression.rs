@@ -680,6 +680,11 @@ impl StringRows {
     pub fn iter(&self) -> impl Iterator<Item = &[u8]> {
         (0..self.len()).map(|row| self.get(row))
     }
+
+    /// The bytes of the strings, and where each ends.
+    pub fn into_parts(self) -> (Vec<u8>, Vec<usize>) {
+        (self.bytes, self.ends)
+    }
 }
 
 /// Reads the block of an overflow string.

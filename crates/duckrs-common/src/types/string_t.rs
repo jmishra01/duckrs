@@ -164,6 +164,8 @@ const CHUNK_SIZE: usize = 16 * 1024;
 struct Arena {
     chunks: Vec<Box<[u8]>>,
     used: usize,
+    /// buffers of bytes the heap took as they are ([`StringHeap::adopt`])
+    adopted: Vec<Vec<u8>>,
 }
 
 /// An append-only arena for string bytes (`StringHeap`). Bytes never move once added, so
@@ -207,9 +209,19 @@ impl StringHeap {
         unsafe { StringT::from_raw_parts(ptr, bytes.len()) }
     }
 
+    /// Takes `bytes` into the heap as they are, without copying them, and gives where they now are: strings may
+    /// point into them while the heap is alive.
+    pub fn adopt(&self, bytes: Vec<u8>) -> *const u8 {
+        // the bytes of a vector stay where they are when the vector moves
+        let ptr = bytes.as_ptr();
+        self.arena.lock().adopted.push(bytes);
+        ptr
+    }
+
     /// Bytes allocated so far, for memory accounting.
     pub fn allocated(&self) -> usize {
-        self.arena.lock().chunks.iter().map(|c| c.len()).sum()
+        let arena = self.arena.lock();
+        arena.chunks.iter().map(|c| c.len()).sum::<usize>() + arena.adopted.iter().map(Vec::capacity).sum::<usize>()
     }
 }
 

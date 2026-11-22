@@ -410,7 +410,9 @@ fn scan_dictionary_column(
         }
     }
     let mut dictionary = Vector::new(ty.clone(), entries.len());
-    dictionary.set_strs(entries.iter());
+    // the decoded strings stay where they were decoded
+    let (bytes, ends) = entries.into_parts();
+    dictionary.set_strs_owned(bytes, &ends);
     dictionary.set_null(0, true);
     dictionary.slice(&SelectionVector::from_vec(selection), rows);
     Ok(dictionary)

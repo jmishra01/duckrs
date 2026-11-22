@@ -74,6 +74,11 @@ impl StringBuffer {
         self.heap.add(bytes)
     }
 
+    /// Takes `bytes` into this buffer without copying them ([`StringHeap::adopt`]).
+    pub fn adopt(&self, bytes: Vec<u8>) -> *const u8 {
+        self.heap.adopt(bytes)
+    }
+
     /// Keeps `other` alive as long as this buffer, so strings pointing into it stay valid.
     pub(crate) fn add_reference(&self, other: &Arc<StringBuffer>) {
         // A buffer referencing itself would be a reference cycle (a leak).

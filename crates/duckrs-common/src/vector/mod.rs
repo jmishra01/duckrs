@@ -514,6 +514,35 @@ impl Vector {
         }
     }
 
+    /// [`Self::set_strs`] of the strings that are the ranges of `bytes` up to each of `ends` in turn (the first from
+    /// the start), with `bytes` taken into this vector's string buffer rather than copied there.
+    pub fn set_strs_owned(&mut self, bytes: Vec<u8>, ends: &[usize]) {
+        assert!(ends.iter().all(|&end| end <= bytes.len()), "a string past its bytes");
+        let len = bytes.len();
+        let base = self.string_buffer().adopt(bytes);
+        let mut start = 0;
+        let values: Vec<StringT> = ends
+            .iter()
+            .map(|&end| {
+                assert!(start <= end && end <= len, "strings out of order");
+                // SAFETY: `start..end` is within the adopted bytes, which the string buffer keeps where they are.
+                let string = unsafe { StringT::from_raw_parts(base.add(start), end - start) };
+                start = end;
+                string
+            })
+            .collect();
+        if self.capacity() < values.len() {
+            self.resize(values.len());
+        }
+        // SAFETY: the strings are inlined or point into bytes this vector's own string buffer keeps.
+        unsafe { self.string_data_mut()[..values.len()].copy_from_slice(&values) };
+        if !self.validity().all_valid() {
+            for row in 0..values.len() {
+                self.validity_mut().set_valid(row);
+            }
+        }
+    }
+
     /// Keeps `buffer` alive for as long as this vector's string buffer, so strings pointing into
     /// it may be stored here (through `string_data_mut`).
     pub(crate) fn keep_buffer_alive(&mut self, buffer: &Arc<StringBuffer>) {
