@@ -673,6 +673,21 @@ impl JoinFilter {
     /// `published` for values of `ty`: a scan whose column the join's key is a cast of that cannot
     /// fail compares the column with the keys cast to its type (`FinalizeFilters`). A key that
     /// does not fit leaves no filter, or the range for an IN list.
+    /// `DynamicFilter::CheckStatistics` of integers: whether no key the build published lies in `low..=high`, the
+    /// bounds of a vector of the scan's column of `ty`.
+    pub fn excludes_range(&self, ty: &LogicalType, low: i64, high: i64) -> bool {
+        let outside = |key: &Key| key.int.is_some_and(|k| k < low || k > high);
+        match self.published_for(ty) {
+            Some(Published::Single(key)) => outside(&key),
+            Some(Published::In(keys)) => keys.iter().all(outside),
+            Some(Published::Range(min, max)) => match (min.int, max.int) {
+                (Some(min), Some(max)) => max < low || min > high,
+                _ => false,
+            },
+            None => false,
+        }
+    }
+
     fn published_for(&self, ty: &LogicalType) -> Option<Published> {
         let published = self.published.get()?.as_ref()?;
         if *ty == self.ty {
@@ -1173,10 +1188,15 @@ fn push_into(
             let Some(column_id) = column_ids.get(position) else {
                 return false;
             };
-            let Some(definition) = table.columns.get(*column_id) else {
+            // the row id, which the scan's vectors know without reading anything
+            let row_id = (*column_id == crate::planner::logical::COLUMN_IDENTIFIER_ROW_ID)
+                .then(|| (LogicalType::BIGINT, "rowid".to_string()));
+            let Some((ty, name)) =
+                row_id.or_else(|| table.columns.get(*column_id).map(|d| (d.ty.clone(), d.name.clone())))
+            else {
                 return false;
             };
-            let Some(pushed) = filter.on_column(position, &definition.ty, &definition.name, casts) else {
+            let Some(pushed) = filter.on_column(position, &ty, &name, casts) else {
                 return false;
             };
             if let Pushed::Join(filter) = filter {

@@ -168,6 +168,11 @@ pub trait TableSource: std::fmt::Debug + Send + Sync {
     fn column_statistics(&self) -> Option<Vec<ColumnStatistics>>;
     /// What the file says about a column per group, without reading its values.
     fn zones(&self, column: usize) -> Result<Vec<ColumnZone>>;
+    /// `ColumnSegment` statistics: per segment of a column, or of the field at `path` of a STRUCT column, the row
+    /// it starts at, its rows and what is known of its values. None where the source keeps none.
+    fn segment_zones(&self, _column: usize, _path: &[usize]) -> Result<Vec<(usize, usize, ColumnZone)>> {
+        Ok(Vec::new())
+    }
     /// `pragma_storage_info`: the segments, in the order that C++ lists them. Reading what fills
     /// `segment_info` takes their blocks, so that is only done on request.
     fn segments(&self, include_info: bool) -> Result<Vec<SegmentInfo>>;
@@ -405,6 +410,9 @@ pub struct TableStatistics {
     pub distinct: Option<Arc<TableDistinctCounts>>,
     /// Per column that a filter asked about, a zone per row group, as far as rows stayed the same.
     pub zones: std::collections::HashMap<usize, Arc<Vec<ColumnZone>>>,
+    /// Per column, or field of a STRUCT column by its path, a zone per vector (`ColumnSegment` statistics), as
+    /// far as rows stayed the same.
+    pub vector_zones: std::collections::HashMap<(usize, String), Arc<Vec<ColumnZone>>>,
     /// How many rows at the start `columns` covers. As in C++ rows that go leave it as it is, and
     /// it only says what values can be.
     pub covered: usize,
@@ -421,6 +429,7 @@ impl TableStatistics {
         self.covered = 0;
         self.updated.clear();
         self.zones.clear();
+        self.vector_zones.clear();
         self.unreported = false;
     }
 
@@ -431,6 +440,12 @@ impl TableStatistics {
         for zones in self.zones.values_mut() {
             if zones.len() > groups {
                 Arc::make_mut(zones).truncate(groups);
+            }
+        }
+        let vectors = position / duckrs_common::STANDARD_VECTOR_SIZE;
+        for zones in self.vector_zones.values_mut() {
+            if zones.len() > vectors {
+                Arc::make_mut(zones).truncate(vectors);
             }
         }
     }

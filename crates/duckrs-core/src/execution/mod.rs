@@ -316,6 +316,8 @@ fn create_physical(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
                 index_rows,
                 sample,
                 extracts,
+                rows_read: std::sync::atomic::AtomicU64::new(0),
+                vector_prune: std::sync::OnceLock::new(),
             })
         }
         LogicalOperatorKind::CsvScan { scan, .. } => Box::new(PhysicalCsvScan { types, scan }),
@@ -829,7 +831,7 @@ impl Pipeline<'_> {
             }
             self.sink.combine_local_input(self.input, local)
         };
-        std::thread::scope(|scope| {
+        let finished = std::thread::scope(|scope| {
             for _ in 0..threads.min(morsels) {
                 scope.spawn(|| {
                     let run = || temporary::with_memory(Arc::clone(&memory), worker);
@@ -840,6 +842,10 @@ impl Pipeline<'_> {
                 });
             }
         });
+        let () = finished;
+        if let Some(profiler) = &query_profiler {
+            profiler.set_rows_scanned(self.source);
+        }
         error.into_inner().map_or(Ok(()), Err)
     }
 
@@ -861,6 +867,9 @@ impl Pipeline<'_> {
                 if self.is_finished() {
                     break;
                 }
+            }
+            if let Some(profiler) = &profiler {
+                profiler.set_rows_scanned(self.source);
             }
             // `PipelineExecutor::FinishProcessing`: what the operators hold back goes on up
             for index in 0..self.operators.len() {

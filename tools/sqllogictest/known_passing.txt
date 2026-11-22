@@ -3226,6 +3226,7 @@ test/sql/optimizer/test_not_comparison_simplification.test
 test/sql/optimizer/test_rollup_column_pruning.test
 test/sql/optimizer/test_rowid_pruning.test
 test/sql/optimizer/test_rowid_pushdown_deletes.test
+test/sql/optimizer/test_rowid_vector_pruning.test
 test/sql/optimizer/test_rowid_vector_pruning_results.test
 test/sql/optimizer/test_window_join_pushdown.test
 test/sql/optimizer/test_window_self_join.test
