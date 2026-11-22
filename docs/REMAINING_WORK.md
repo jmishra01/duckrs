@@ -277,9 +277,10 @@ Each item gives the number of failing files in `test/` that it should fix, where
     with the view's name and the filters pushed into it, and nothing below; statistics and distinct counts leave a
     view only if it emits every row it reads (`EmitsAllRows`); its estimate is frozen before filters go into it
   - [ ] of secure views: the query-wide profiling totals still count the operators inside them
-    (`CollapseSecureViews`); EXPLAIN ANALYZE in the profiler's JSON (`secure_view_explain`); the exact prefix-range
-    join filter of few keys, which drops rows where duckrs's Bloom filter lets some through
-    (`secure_view_join_filter_pushdown`)
+    (`CollapseSecureViews`); EXPLAIN ANALYZE in the profiler's JSON (`secure_view_explain`)
+  - [x] the prefix-range join filter of keys close together is exact: a bit per value between the smallest and the
+    largest key, so only keys pass where the Bloom filter let others through
+  - [ ] dynamic filters of the build side's bounds through inequality joins (`secure_view_join_filter_pushdown`)
   - [x] temporal casts of a column compared with a constant give the scan an optional filter on the column, by
     the cast's margin (`TryPushdownTemporalCastFilter`, also of filters that can throw); TIMESTAMPTZ_NS columns have
     zone maps and `stats()` (`temporal_cast_zonemap`, `timestamp_unit_cast_zonemap_pruning`)
