@@ -3150,6 +3150,8 @@ test/sql/optimizer/expression/uncommitted_appends_fold_guard.test
 test/sql/optimizer/false_or_null_segment_pruning.test
 test/sql/optimizer/in_list_row_group_pruning.test
 test/sql/optimizer/instr_zonemap_pruning.test
+test/sql/optimizer/interval_column_stats_pruning.test
+test/sql/optimizer/interval_row_group_pruning.test
 test/sql/optimizer/joins/join_order_deep_setop_chain.test
 test/sql/optimizer/late_materialization_pushdown_extract.test
 test/sql/optimizer/late_materialization_table_filters.test
