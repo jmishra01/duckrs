@@ -668,9 +668,10 @@ Each item gives the number of failing files in `test/` that it should fix, where
 - [ ] 48. v1 gate: TPC-H SF10 geometric mean ≤ 1.5× C++ DuckDB, and no query slower than 3×. The runner
   prints the gate after `--engine=both`. On TPC-H SF1 (8 threads, all 22 answers correct) duckrs is at
   1.53× (none above 3×: Q21 2.7×; Q02 0.5×, Q08 0.95×), from 12.7× at the start of item 47.
-  SF10, both engines on the file C++ wrote: 0.60× on 2026-11-22 after part 67, all 22 answers correct and all 22
-  faster than C++ (Q18 0.93×, Q16 0.91×, Q03 0.87×, Q13 0.84×, Q21 0.81×; Q06 0.28×, Q15 0.23×), with the load
-  average 10 at the start and 13 at the end. Before that, 0.65× after part 65 (Q13 and Q21 0.94×) with the load
+  SF10, both engines on the file C++ wrote: 0.60× on 2026-11-22 after part 69, all 22 answers correct and all 22
+  faster than C++ (Q09 0.96×, Q13 0.93×, Q01 0.87×, Q18 0.86×; Q06 0.29×, Q15 0.19×), with the load average 4 at the
+  start and 16 at the end. Before that, 0.60× after part 67 (Q18 0.93×, Q16 0.91×) with the load average 10 at the
+  start and 13 at the end; 0.65× after part 65 (Q13 and Q21 0.94×) with the load
   average 19 at the start and 27 at the end; 0.64× after part 63 (Q10 0.96×, Q09, Q13, Q18 and Q21
   0.93×) with the load average 4 at the start and 14 at the end, the quietest run yet; 0.63× after part 60 (Q22 1.44×, Q16 1.07×,
   Q10 1.06×) with the load average rising from 10 to 32, which slowed C++'s Q01 to 0.85s from its usual 0.5s;
@@ -714,7 +715,9 @@ Each item gives the number of failing files in `test/` that it should fix, where
   and the join filter's Bloom check prefetches its blocks: Q10 1.8s of CPU from 2.0s. A scan checks a join filter
   over a whole row group's values at once rather than through chunks of 2048 for the expression executor, selected
   rows of a bitpacked column are fetched in u64 with a store of their width each, and RIGHT SEMI and RIGHT ANTI
-  joins pair no probe rows with build rows that matched already: Q21 about 12% fewer cycles. duckrs
+  joins pair no probe rows with build rows that matched already: Q21 about 12% fewer cycles. A group table lookup
+  asks for the entry of the row 32 rows ahead, so that the reads of a table larger than the caches overlap: Q18,
+  whose subquery groups 60M rows into 15M groups, about 14% fewer cycles (5.0s of CPU from 6.0s). duckrs
   had no way to load SF10 itself, as an append kept its rows in memory (more than 2 GiB failed); appends now write
   their full row groups to blocks as they fill (an INSERT of 80M rows takes 90MB). duckrs now loads SF10 into its
   own file (COPY of the `.tbl` files: lineitem 24s against C++'s 22s, the rest under 5s each; at most 710MB
