@@ -335,6 +335,12 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] LEFT join equality groups, `debug_force_no_cross_product`, `approximate_join_order_threshold`
   - [ ] LEFT joins reordered inside the join graph (C++'s CD-C conflict detector, `left_join_cardinality_estimation`)
 - [ ] 17. Column lifetime, unused columns, TopN, expression rewriter (small dirs under `test/optimizer`)
+  - [x] `DUPLICATE_GROUPS` (`RemoveDuplicateGroups`): a group of the same column as an earlier one goes, and so does
+    one computed of a single column that is a group (not of floats or intervals), computed again in a projection
+    above the aggregate
+  - [ ] a BETWEEN with exclusive bounds, printed as two comparisons in one (`test_between_tostring`);
+    `RECURSIVE_KEY_JOIN` (`test_row_comparison_simplification`); LATERAL with grouping sets is not decorrelated
+    (`common_aggregate_positional_consumers`); `json_serialize_plan` (`materialized_cte_column_count`)
   - [x] `CastCanThrow` of nested, DECIMAL and timestamp casts; `x * 0` and `x // 0` (`ArithmeticSimplificationRule`);
     `prefix` decided by statistics only in a one-column filter on a scan; empty statistics fold no `constant_or_null`
   - [x] count/min/max from row group statistics (`TryExecuteAggregates`), of tables and single Parquet files, with

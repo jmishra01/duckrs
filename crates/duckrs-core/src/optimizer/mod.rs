@@ -58,6 +58,7 @@ mod window_join_pushdown;
 mod window_self_join;
 pub mod unnest_rewriter;
 pub mod unused_columns;
+mod duplicate_groups;
 mod extract_pushdown;
 
 use crate::planner::expression::{BoundExpr, BoundExprKind};
@@ -74,6 +75,8 @@ pub struct OptimizerOptions {
     pub statistics_propagation: bool,
     pub empty_result_pullup: bool,
     pub unused_columns: bool,
+    /// `DUPLICATE_GROUPS`
+    pub duplicate_groups: bool,
     pub row_number_rewriter: bool,
     pub type_pushdown: bool,
     pub scalar_fn_pushdown: bool,
@@ -151,6 +154,7 @@ impl Default for OptimizerOptions {
             statistics_propagation: true,
             empty_result_pullup: true,
             unused_columns: true,
+            duplicate_groups: true,
             row_number_rewriter: true,
             type_pushdown: true,
             scalar_fn_pushdown: true,
@@ -213,6 +217,7 @@ impl OptimizerOptions {
             statistics_propagation: false,
             empty_result_pullup: false,
             unused_columns: false,
+            duplicate_groups: false,
             row_number_rewriter: false,
             type_pushdown: false,
             scalar_fn_pushdown: false,
@@ -274,6 +279,7 @@ impl OptimizerOptions {
             statistics_propagation: !off("statistics_propagation"),
             empty_result_pullup: !off("empty_result_pullup"),
             unused_columns: !off("unused_columns"),
+            duplicate_groups: !off("duplicate_groups"),
             row_number_rewriter: !off("window_rewriter"),
             type_pushdown: !off("type_pushdown"),
             scalar_fn_pushdown: !off("scalar_fn_pushdown"),
@@ -460,6 +466,10 @@ pub fn optimize_timed(
     }
     if options.redundant_order_keys {
         plan = run("redundant_order_keys", plan, &mut redundant_order_keys::remove);
+    }
+    // `DUPLICATE_GROUPS`, before statistics, which work out the groups as they are then
+    if options.duplicate_groups {
+        plan = run("duplicate_groups", plan, &mut duplicate_groups::remove);
     }
     // `PushdownGet` has put the filters into the scans by the time statistics see them, as table filters that
     // statistics check while the copies of what went in partly stay above
