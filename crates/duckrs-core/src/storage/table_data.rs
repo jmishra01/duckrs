@@ -923,6 +923,65 @@ impl DiskTable {
 }
 
 impl TableSource for DiskTable {
+    fn segment_zones(&self, column: usize, path: &[usize]) -> Result<Vec<(usize, usize, ColumnZone)>> {
+        let mut ty = self.table.columns[column].ty.clone();
+        for &field in path {
+            ty = match ty.struct_children().get(field) {
+                Some((_, child)) => child.clone(),
+                None => return Ok(Vec::new()),
+            };
+        }
+        let mut result = Vec::new();
+        let mut group_start = 0usize;
+        for group in 0..self.table.row_groups.len() {
+            let mut stored = self.persistent_column(group, column)?;
+            for &field in path {
+                if field >= stored.children.len() {
+                    return Ok(Vec::new());
+                }
+                stored = stored.children.swap_remove(field);
+            }
+            // the NULLs of each segment, from the validity segments over the same rows; without them, maybe
+            let validity: Vec<(usize, usize, bool)> = match &stored.validity {
+                Some(validity) => {
+                    let mut start = 0;
+                    validity
+                        .pointers
+                        .iter()
+                        .map(|p| {
+                            let range = (start, p.tuple_count, p.statistics.has_null);
+                            start += p.tuple_count;
+                            range
+                        })
+                        .collect()
+                }
+                None => Vec::new(),
+            };
+            let varchar = ty.id() == LogicalTypeId::Varchar;
+            let mut start = 0usize;
+            for pointer in &stored.pointers {
+                let rows = pointer.tuple_count;
+                let has_null = stored.validity.is_none()
+                    || validity.iter().any(|&(s, n, null)| null && s < start + rows && start < s + n);
+                let (min, max) = if varchar {
+                    string_bounds(pointer.statistics.strings.as_ref())
+                } else {
+                    (bound_of(&ty, pointer.statistics.min.as_ref())?, bound_of(&ty, pointer.statistics.max.as_ref())?)
+                };
+                let zone = ColumnZone {
+                    unknown: min.is_none() && pointer.statistics.has_no_null,
+                    min,
+                    max,
+                    has_null,
+                    ..ColumnZone::default()
+                };
+                result.push((group_start + start, rows, zone));
+                start += rows;
+            }
+            group_start += self.table.row_groups[group].tuple_count as usize;
+        }
+        Ok(result)
+    }
     fn fetch_rows(&self, group: usize, column: usize, rows: &[u32]) -> Result<Vector> {
         // rows one by one only pay off when few are wanted; otherwise the column is decoded whole
         let group_rows = self.table.row_groups[group].tuple_count as usize;

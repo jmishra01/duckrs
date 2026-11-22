@@ -211,6 +211,12 @@ pub trait PhysicalOperator: fmt::Debug + Send + Sync {
         None
     }
 
+    /// `query.total_rows_scanned` of a scan that counts the rows it reads itself, before its filters; without
+    /// one, the rows it gives on count.
+    fn rows_read(&self) -> Option<u64> {
+        None
+    }
+
     /// The filters a scan got when the plan was made physical that are not in its logical plan: those of a
     /// Top-N above it, as `Filters` shows them.
     fn planned_filters(&self) -> Vec<String> {
@@ -274,9 +280,64 @@ pub struct PhysicalTableScan {
     pub sample: Option<crate::planner::logical::TableSample>,
     /// per position of `column_ids`, the field of the column it outputs in its place, if any
     pub extracts: Vec<Option<Arc<crate::planner::logical::PushedExtract>>>,
+    /// `TableScanState::rows_scanned`: the rows of the vectors it read, before its filter
+    pub rows_read: std::sync::atomic::AtomicU64,
+    /// `prune` with each STRUCT field it reads (`struct_extract` of a column) as a position past `column_ids`, and
+    /// the column and field of each of those positions, worked out once
+    pub vector_prune: std::sync::OnceLock<Option<(BoundExpr, Vec<(usize, crate::planner::logical::PushedExtract)>)>>,
 }
 
 impl PhysicalTableScan {
+    /// `RowGroup::CheckZonemapSegments`: whether no row of the vector of `count` rows from `first_row` can pass the
+    /// filters of the scan, by the row ids it holds and the statistics of its columns' segments.
+    fn vector_skips(&self, ids: &RowIds, first_row: usize, count: usize) -> bool {
+        let Some(prune) = &self.prune else {
+            return false;
+        };
+        if count == 0 {
+            return false;
+        }
+        // a join filter on the row ids: the vector's row ids are known, so it is read only if one of them passes
+        let conjuncts: Vec<&BoundExpr> = match self.filter.as_ref().map(|f| &f.kind) {
+            Some(BoundExprKind::Conjunction { and: true, children }) => children.iter().collect(),
+            Some(_) => self.filter.iter().collect(),
+            None => Vec::new(),
+        };
+        for conjunct in conjuncts {
+            if let BoundExprKind::JoinFilter { child, filter, .. } = &conjunct.kind
+                && let BoundExprKind::Reference(position) = child.kind
+                && self.column_ids.get(position) == Some(&COLUMN_IDENTIFIER_ROW_ID)
+                && filter.excludes_range(&child.return_type, ids.id(first_row) as i64, ids.id(first_row + count - 1) as i64)
+            {
+                return true;
+            }
+        }
+        let vector = first_row / STANDARD_VECTOR_SIZE;
+        let Some((prune, fields)) = self.vector_prune.get_or_init(|| struct_fields_of(prune, &self.column_ids)) else {
+            return false;
+        };
+        let zone = |index: usize| -> Option<crate::catalog::ColumnZone> {
+            if let Some((column, extract)) = index.checked_sub(self.column_ids.len()).and_then(|at| fields.get(at)) {
+                let zones = super::zone_map::vector_zones_of(&self.table, *column, Some(extract));
+                return zones.get(vector).filter(|zone| !zone.unknown).cloned();
+            }
+            match *self.column_ids.get(index)? {
+                COLUMN_IDENTIFIER_ROW_ID => Some(crate::catalog::ColumnZone {
+                    min: Some(duckrs_common::value::Value::bigint(ids.id(first_row) as i64)),
+                    max: Some(duckrs_common::value::Value::bigint(ids.id(first_row + count - 1) as i64)),
+                    ..crate::catalog::ColumnZone::default()
+                }),
+                COLUMN_IDENTIFIER_ROW_NUMBER => None,
+                column => {
+                    let extract = self.extracts.get(index).and_then(|e| e.as_deref());
+                    let zones = super::zone_map::vector_zones_of(&self.table, column, extract);
+                    zones.get(vector).filter(|zone| !zone.unknown).cloned()
+                }
+            }
+        };
+        super::zone_map::never_true(&zone, prune)
+    }
+
     /// Whether a Top-N above has a boundary that no row of row group `group` sorts before, by the group's zone
     /// maps: the group is not read (`DynamicFilterData::CheckStatistics`).
     fn top_n_skips(&self, group: usize, rows: usize) -> bool {
@@ -399,6 +460,7 @@ impl PhysicalTableScan {
         done: &[usize],
         group: Option<(&dyn TableSource, usize)>,
     ) -> Result<Option<DataChunk>> {
+        self.rows_read.fetch_add(result.len() as u64, std::sync::atomic::Ordering::Relaxed);
         // the filter reads what it scans, so the columns go after that and before the slice
         let mut selected = None;
         if let Some(filter) = &self.filter {
@@ -635,7 +697,18 @@ impl PhysicalTableScan {
                 column => source.fetch_rows(group, column, selection),
             }
         };
-        let mut selection: Vec<u32> = (0..group_rows as u32).collect();
+        // the vectors whose row ids the filters rule out are not read
+        let mut selection: Vec<u32> = Vec::with_capacity(group_rows);
+        for start in (0..group_rows).step_by(STANDARD_VECTOR_SIZE) {
+            let count = STANDARD_VECTOR_SIZE.min(group_rows - start);
+            if !self.vector_skips(ids, first_row + start, count) {
+                selection.extend(start as u32..(start + count) as u32);
+            }
+        }
+        self.rows_read.fetch_add(selection.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        if selection.is_empty() {
+            return Ok(());
+        }
         let mut fetched: Vec<Option<Vector>> = vec![None; self.column_ids.len()];
         // what stands in a chunk for a column no filter has read yet
         let unread: Vec<Vector> = (0..self.column_ids.len())
@@ -742,7 +815,11 @@ impl PhysicalOperator for PhysicalTableScan {
     fn name(&self) -> &'static str {
         "TABLE_SCAN"
     }
+    fn rows_read(&self) -> Option<u64> {
+        Some(self.rows_read.load(std::sync::atomic::Ordering::Relaxed))
+    }
     fn parallel_source(&self) -> Option<(SharedSourceState, usize)> {
+        self.rows_read.store(0, std::sync::atomic::Ordering::Relaxed);
         if self.index_rows.is_some() || self.sample.is_some() || !self.filter.as_ref().is_none_or(parallel_expression) {
             return None;
         }
@@ -789,6 +866,9 @@ impl PhysicalOperator for PhysicalTableScan {
             if count == 0 {
                 break;
             }
+            if self.vector_skips(&state.ids, first_row, count) {
+                continue;
+            }
             let mut columns = self.scan_columns(chunk, &state.ids, first_row, Some(&state.scan))?;
             for (position, field) in &fields {
                 columns[*position] = field.range(local * STANDARD_VECTOR_SIZE, chunk.len());
@@ -816,6 +896,9 @@ impl PhysicalOperator for PhysicalTableScan {
         let storage = self.table.rows()?;
         let chunk = storage.chunk(index);
         let count = chunk.len().min(state.rows.saturating_sub(first_row));
+        if self.vector_skips(&state.ids, first_row, count) {
+            return Ok(None);
+        }
         let columns = self.scan_columns(chunk, &state.ids, first_row, None)?;
         let mut result = DataChunk::from_columns(columns, chunk.len());
         if count < chunk.len() {
@@ -832,6 +915,7 @@ impl PhysicalOperator for PhysicalTableScan {
     /// The scan sees the rows the table had when it started, like a transaction's snapshot
     /// (so that `INSERT INTO t FROM t` ends): the next chunk and how many rows remain.
     fn source_state(&self) -> SourceState {
+        self.rows_read.store(0, std::sync::atomic::Ordering::Relaxed);
         let remaining = self.table.row_count();
         let groups = groups_to_scan(&self.table, &self.column_ids, self.prune.as_ref(), remaining);
         let source = self.table.source();
@@ -979,7 +1063,7 @@ impl PhysicalOperator for PhysicalTableScan {
                     sample_selection = Some(selected);
                 }
             }
-            if !wanted {
+            if !wanted || self.vector_skips(ids, first_row, STANDARD_VECTOR_SIZE.min(*remaining)) {
                 *remaining -= STANDARD_VECTOR_SIZE.min(*remaining);
                 continue;
             }
@@ -4695,4 +4779,75 @@ pub(crate) fn top_n_filters_of(filter: Option<&BoundExpr>) -> Vec<String> {
         .filter(|c| matches!(c.kind, BoundExprKind::TopNFilter { .. }))
         .map(|c| c.to_string())
         .collect()
+}
+
+/// `prune` with each `struct_extract` of a column of the scan, of constant fields, as a position past `column_ids`,
+/// and the table column and field of each: the segments of a STRUCT's fields have statistics of their own.
+fn struct_fields_of(
+    prune: &BoundExpr,
+    column_ids: &[usize],
+) -> Option<(BoundExpr, Vec<(usize, crate::planner::logical::PushedExtract)>)> {
+    // the column of the chain of extracts `expr` is, and the expression of the field on `Reference(0)`
+    fn chain(expr: &BoundExpr) -> Option<(usize, BoundExpr, Vec<String>)> {
+        let BoundExprKind::Function { function, children, .. } = &expr.kind else {
+            return None;
+        };
+        if function.name != "struct_extract" || children.len() != 2 || !matches!(children[1].kind, BoundExprKind::Constant(_)) {
+            return None;
+        }
+        let key = match &children[1].kind {
+            BoundExprKind::Constant(value) => value.try_to_string().ok()?,
+            _ => unreachable!("checked"),
+        };
+        let (position, base, mut names) = match &children[0].kind {
+            BoundExprKind::Reference(position) => (
+                *position,
+                BoundExpr::new(BoundExprKind::Reference(0), children[0].return_type.clone()),
+                Vec::new(),
+            ),
+            _ => chain(&children[0])?,
+        };
+        let mut field = expr.clone();
+        if let BoundExprKind::Function { children, .. } = &mut field.kind {
+            children[0] = base;
+        }
+        names.push(key);
+        Some((position, field, names))
+    }
+    fn rewrite(
+        expr: &mut BoundExpr,
+        column_ids: &[usize],
+        fields: &mut Vec<(usize, crate::planner::logical::PushedExtract)>,
+    ) {
+        if let Some((position, field, names)) = chain(expr)
+            && let Some(&column) = column_ids.get(position)
+            && column != COLUMN_IDENTIFIER_ROW_ID
+            && column != COLUMN_IDENTIFIER_ROW_NUMBER
+        {
+            let ty = expr.return_type.clone();
+            let at = match fields.iter().position(|(c, f)| *c == column && f.names == names) {
+                Some(at) => at,
+                None => {
+                    fields.push((
+                        column,
+                        crate::planner::logical::PushedExtract {
+                            names,
+                            expression: field,
+                            variant_path: None,
+                        },
+                    ));
+                    fields.len() - 1
+                }
+            };
+            *expr = BoundExpr::new(BoundExprKind::Reference(column_ids.len() + at), ty);
+            return;
+        }
+        for child in expr.children_mut() {
+            rewrite(child, column_ids, fields);
+        }
+    }
+    let mut prune = prune.clone();
+    let mut fields = Vec::new();
+    rewrite(&mut prune, column_ids, &mut fields);
+    Some((prune, fields))
 }

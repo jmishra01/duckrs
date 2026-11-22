@@ -192,6 +192,18 @@ fn compute_zones(table: &TableCatalogEntry, column: usize, known: &[ColumnZone])
             zones.push(ColumnZone::default());
         }
         let zone = zones.last_mut().expect("just pushed one");
+        add_to_zone(zone, vector, count);
+    });
+    // with what can't be read there is nothing to go by, which means reading every group
+    if read.is_err() {
+        return Vec::new();
+    }
+    zones
+}
+
+/// What `count` values of `vector` add to `zone`: their bounds by the keys they sort by, NULLs, and the lengths of
+/// strings.
+fn add_to_zone(zone: &mut ColumnZone, vector: &duckrs_common::vector::Vector, count: usize) {
         let Ok(keys) = group_keys(&[vector], count) else {
             zone.unknown = true;
             return;
@@ -239,10 +251,173 @@ fn compute_zones(table: &TableCatalogEntry, column: usize, known: &[ColumnZone])
                 zone.has_unicode |= !text.is_ascii();
             }
         }
+}
+
+/// `ColumnSegment` statistics, which a scan checks per vector (`RowGroup::CheckZonemapSegments`): a zone per vector
+/// of a column of a table in memory, or of the field `extract` of a STRUCT column. Bounds where the values have
+/// ordered statistics, otherwise only whether there are NULLs. None for tables in files.
+pub(crate) fn vector_zones_of(
+    table: &TableCatalogEntry,
+    column: usize,
+    extract: Option<&crate::planner::logical::PushedExtract>,
+) -> Arc<Vec<ColumnZone>> {
+    let key = (column, extract.map(|e| e.names.join(".")).unwrap_or_default());
+    if let Some(source) = table.source() {
+        return file_vector_zones(table, &*source, column, extract, key);
+    }
+    let vectors = table.row_count().div_ceil(duckrs_common::STANDARD_VECTOR_SIZE);
+    let (version, known) = {
+        let mut cached = table.statistics.lock();
+        if cached.unreported {
+            cached.forget();
+        }
+        let known = cached.vector_zones.get(&key).cloned().unwrap_or_default();
+        if known.len() == vectors {
+            return known;
+        }
+        (cached.version, known)
+    };
+    let mut zones = known.to_vec();
+    let first = zones.len();
+    let read = table.for_each_chunk(column, |index, vector, count| {
+        if index < first {
+            return;
+        }
+        let field;
+        let vector = match extract {
+            Some(extract) => {
+                let input = duckrs_common::vector::DataChunk::from_columns(vec![vector.clone()], count);
+                match crate::execution::expression_executor::execute(&extract.expression, &input) {
+                    Ok(result) => {
+                        field = result;
+                        &field
+                    }
+                    Err(_) => {
+                        zones.push(ColumnZone {
+                            unknown: true,
+                            ..ColumnZone::default()
+                        });
+                        return;
+                    }
+                }
+            }
+            None => vector,
+        };
+        let ty = vector.logical_type();
+        let mut zone = ColumnZone::default();
+        if has_ordered_statistics(ty) || matches!(ty.id(), LogicalTypeId::Interval | LogicalTypeId::Uuid | LogicalTypeId::Enum) {
+            add_to_zone(&mut zone, vector, count);
+        } else {
+            // values without ordered statistics (nested ones among them): nothing to go by
+            zone.unknown = true;
+        }
+        zones.push(zone);
     });
-    // with what can't be read there is nothing to go by, which means reading every group
     if read.is_err() {
-        return Vec::new();
+        return Arc::default();
+    }
+    let zones = Arc::new(zones);
+    let mut cached = table.statistics.lock();
+    if cached.version == version {
+        cached.vector_zones.insert(key, zones.clone());
+    }
+    zones
+}
+
+/// [`vector_zones_of`] of a table in a file: the zones of the segments over each vector, joined.
+fn file_vector_zones(
+    table: &TableCatalogEntry,
+    source: &dyn crate::catalog::TableSource,
+    column: usize,
+    extract: Option<&crate::planner::logical::PushedExtract>,
+    key: (usize, String),
+) -> Arc<Vec<ColumnZone>> {
+    let version = {
+        let cached = table.statistics.lock();
+        if let Some(zones) = cached.vector_zones.get(&key) {
+            return zones.clone();
+        }
+        cached.version
+    };
+    // the fields of a STRUCT the extracts lead to, by position
+    let mut path = Vec::new();
+    if let Some(extract) = extract {
+        let mut expr = &extract.expression;
+        while let BoundExprKind::Function { function, children, .. } = &expr.kind {
+            if function.name != "struct_extract" || children.len() != 2 {
+                return Arc::default();
+            }
+            let BoundExprKind::Constant(key) = &children[1].kind else {
+                return Arc::default();
+            };
+            let fields = children[0].return_type.struct_children();
+            let field = match key.as_i128() {
+                Some(index) => usize::try_from(index).ok(),
+                None => key
+                    .try_to_string()
+                    .ok()
+                    .and_then(|name| fields.iter().position(|(n, _)| n.eq_ignore_ascii_case(&name))),
+            };
+            let Some(field) = field.filter(|&f| f < fields.len()) else {
+                return Arc::default();
+            };
+            path.push(field);
+            expr = &children[0];
+        }
+        if !matches!(expr.kind, BoundExprKind::Reference(0)) {
+            return Arc::default();
+        }
+        path.reverse();
+    }
+    let Ok(segments) = source.segment_zones(column, &path) else {
+        return Arc::default();
+    };
+    let rows = table.row_count();
+    let vectors = rows.div_ceil(duckrs_common::STANDARD_VECTOR_SIZE);
+    let mut zones = Vec::with_capacity(vectors);
+    let mut at = 0;
+    for vector in 0..vectors {
+        let (first, last) = (vector * duckrs_common::STANDARD_VECTOR_SIZE, ((vector + 1) * duckrs_common::STANDARD_VECTOR_SIZE).min(rows));
+        while at < segments.len() && segments[at].0 + segments[at].1 <= first {
+            at += 1;
+        }
+        let mut zone: Option<ColumnZone> = None;
+        let mut covered = first;
+        for (start, count, segment) in segments[at..].iter().take_while(|(start, ..)| *start < last) {
+            if *start > covered {
+                break;
+            }
+            covered = start + count;
+            zone = Some(match zone {
+                None => segment.clone(),
+                Some(joined) => {
+                    let is = |op, a: &Value, b: &Value| compare_values(op, a, b) == Some(true);
+                    ColumnZone {
+                        min: match (joined.min, segment.min.clone()) {
+                            (Some(a), Some(b)) => Some(if is(ComparisonOp::LessThan, &b, &a) { b } else { a }),
+                            (a, b) => a.or(b),
+                        },
+                        max: match (joined.max, segment.max.clone()) {
+                            (Some(a), Some(b)) => Some(if is(ComparisonOp::GreaterThan, &b, &a) { b } else { a }),
+                            (a, b) => a.or(b),
+                        },
+                        has_null: joined.has_null || segment.has_null,
+                        unknown: joined.unknown || segment.unknown,
+                        ..ColumnZone::default()
+                    }
+                }
+            });
+        }
+        // rows no segment covers: nothing is known of them
+        zones.push(zone.filter(|_| covered >= last).unwrap_or(ColumnZone {
+            unknown: true,
+            ..ColumnZone::default()
+        }));
+    }
+    let zones = Arc::new(zones);
+    let mut cached = table.statistics.lock();
+    if cached.version == version {
+        cached.vector_zones.insert(key, zones.clone());
     }
     zones
 }
@@ -465,18 +640,35 @@ impl Group<'_> {
                 if (is_timestamp(&child.return_type) && is_timestamp(&expr.return_type))
                     || (is_timestamp_tz(&child.return_type) && is_timestamp_tz(&expr.return_type)) =>
             {
-                self.through(expr, child)
+                // the infinities sort above the smallest values, and a cast to another unit moves those: of bounds
+                // that hold one, nothing is known
+                let infinite = |value: &Value| value.try_to_string().is_ok_and(|text| text.contains("infinity"));
+                match self.through(expr, child) {
+                    Range::Bounds(min, max)
+                        if [&min, &max].into_iter().any(infinite)
+                            || matches!(self.range(child), Range::Bounds(ref a, ref b) if infinite(a) || infinite(b)) =>
+                    {
+                        Range::Unknown
+                    }
+                    other => other,
+                }
             }
             BoundExprKind::Cast { child, try_cast: false } if keeps_order(&child.return_type, &expr.return_type) => {
                 self.through(expr, child)
             }
+            // the date parts of an INTERVAL do not follow its order (1 year and 400 days)
             BoundExprKind::Function { function, children, .. }
-                if children.len() == 1 && MONOTONE_FUNCTIONS.contains(&function.name.as_str()) =>
+                if children.len() == 1
+                    && MONOTONE_FUNCTIONS.contains(&function.name.as_str())
+                    && children[0].return_type.id() != LogicalTypeId::Interval =>
             {
                 self.through(expr, &children[0])
             }
+            // what follows the order of a timestamp does not follow that of an INTERVAL: epoch counts 365.25 days
+            // a year where the comparison counts 360
             BoundExprKind::Function { function, children, .. }
-                if monotone_argument(&function.name, children).is_some() =>
+                if monotone_argument(&function.name, children)
+                    .is_some_and(|(at, _)| children[at].return_type.id() != LogicalTypeId::Interval) =>
             {
                 let (varying, increasing) = monotone_argument(&function.name, children).expect("checked");
                 self.monotone(expr, varying, increasing)
@@ -578,6 +770,16 @@ impl Group<'_> {
         let zone = self.zone(*index)?;
         let (low, high) = zone.lengths?;
         Some((low, high, zone.has_unicode))
+    }
+
+    /// Whether `expr` can be NULL in the group: a column with NULLs, or anything that is not known never to be.
+    fn may_be_null(&self, expr: &BoundExpr) -> bool {
+        match &expr.kind {
+            BoundExprKind::Constant(value) => value.is_null(),
+            BoundExprKind::Reference(index) => self.zone(*index).is_none_or(|zone| zone.has_null),
+            BoundExprKind::Cast { child, try_cast: false } => self.may_be_null(child),
+            _ => true,
+        }
     }
 
     /// The range of what is any of `exprs`.
@@ -882,6 +1084,10 @@ impl Group<'_> {
             }
             ("greatest" | "least", [_, ..]) => {
                 let greatest = name == "greatest";
+                // `greatest` and `least` skip NULLs: where an argument can be NULL, the result can be any other one
+                if children.iter().any(|child| self.may_be_null(child)) {
+                    return self.union(children.iter());
+                }
                 let mut bounds: Option<(Value, Value)> = None;
                 for child in children {
                     let Range::Bounds(min, max) = self.range(child) else {
@@ -905,6 +1111,14 @@ impl Group<'_> {
                 bounds.map_or(Range::Unknown, |(min, max)| Range::Bounds(min, max))
             }
             // a function of one column and a constant that keeps or reverses the order of values
+            // adding months clamps to the end of the month, which does not keep the order of timestamps
+            ("+" | "-", [left, right])
+                if [left, right].into_iter().any(|side| {
+                    constant(side).is_some_and(|c| matches!(c.data(), duckrs_common::value::ValueData::Interval(i) if i.months != 0))
+                }) =>
+            {
+                Range::Unknown
+            }
             ("+" | "-" | "*" | "/" | "//", [left, right]) => {
                 let (varying, increasing) = match (constant(left), constant(right)) {
                     (None, Some(c)) => match (name, sign(&c)) {

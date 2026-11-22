@@ -117,6 +117,13 @@ impl OperatorProfiler {
         }
     }
 
+    /// The rows a scan that counts them read, in place of those it gave on (`TableScanState::rows_scanned`).
+    pub fn set_rows_scanned(&self, op: &dyn PhysicalOperator) {
+        if let Some(rows) = op.rows_read().filter(|_| is_scan(op)) {
+            self.operators.lock().entry(key(op)).or_default().rows_scanned = rows;
+        }
+    }
+
     /// `op` took `time`, without giving on rows (a sink taking its input).
     pub fn add_time(&self, op: &dyn PhysicalOperator, time: Duration) {
         self.operators.lock().entry(key(op)).or_default().time += time;

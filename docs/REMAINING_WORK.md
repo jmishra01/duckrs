@@ -276,6 +276,13 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] temporal casts of a column compared with a constant give the scan an optional filter on the column, by
     the cast's margin (`TryPushdownTemporalCastFilter`, also of filters that can throw); TIMESTAMPTZ_NS columns have
     zone maps and `stats()` (`temporal_cast_zonemap`, `timestamp_unit_cast_zonemap_pruning`)
+  - [x] segment zone maps (`RowGroup::CheckZonemapSegments`): a scan skips the vectors that no row of can pass
+    its filters, by zones per vector of tables in memory, the segments' statistics of tables in files, the fields
+    of STRUCT columns, the row ids, and join filters on the row ids; `query.total_rows_scanned` counts the rows of
+    the vectors scans read, before their filters, as C++ does (`test_rowid_vector_pruning`)
+  - [ ] the segments of tables in memory as C++ sizes them: duckrs zones them per vector, finer than C++, so
+    `nested_null_segment_pruning` scans fewer rows than its exact count; the bytes late materialization reads
+    (`test_rowid_vector_pruning_prefetch`)
   - [x] INTERVAL bounds of row groups in database files: written from v2.0.0 by the normalized intervals and
     read into zone maps (`interval_row_group_pruning`, `interval_column_stats_pruning`)
   - [x] statistics and zone maps of `%` (`PropagateModuloStats`: signed and unsigned, DECIMAL, FLOAT/DOUBLE, a
