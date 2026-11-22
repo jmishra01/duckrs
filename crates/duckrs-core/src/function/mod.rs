@@ -74,7 +74,13 @@ pub struct ScalarFunction {
     pub cannot_error: bool,
     /// `RandomLocalState` of `random()`: its engine, seeded from the client's when first run
     pub random: Option<Arc<parking_lot::Mutex<Option<crate::execution::random_engine::RandomEngine>>>>,
+    /// The callback with the function's bind data (`FunctionData`), run in place of `function`:
+    /// what a function reads of the client, such as the search path of `in_search_path`.
+    pub bound: Option<BoundCallback>,
 }
+
+/// [`ScalarFunction::bound`].
+pub type BoundCallback = Arc<dyn Fn(&DataChunk, &mut Vector) -> Result<()> + Send + Sync>;
 
 impl ScalarFunction {
     pub fn new(
@@ -93,6 +99,7 @@ impl ScalarFunction {
             error_on_zero: false,
             cannot_error: false,
             random: None,
+            bound: None,
         }
     }
 
@@ -108,6 +115,7 @@ impl ScalarFunction {
             error_on_zero: self.error_on_zero,
             cannot_error: true,
             random: self.random.clone(),
+            bound: self.bound.clone(),
         }
     }
 
@@ -123,6 +131,7 @@ impl ScalarFunction {
             error_on_zero: !null,
             cannot_error: self.cannot_error,
             random: self.random.clone(),
+            bound: self.bound.clone(),
         }
     }
 

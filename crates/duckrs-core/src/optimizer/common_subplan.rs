@@ -629,7 +629,6 @@ impl Finder {
             | K::Order { .. }
             | K::TopN { .. }
             | K::Distinct { .. }
-            | K::ExpressionGet { .. }
             | K::DummyScan { .. }
             | K::Join { .. }
             | K::MarkJoin { .. }
@@ -641,6 +640,10 @@ impl Finder {
             | K::Range { .. }
             | K::ColumnSelect { .. } => true,
             // C++ refuses scans of virtual columns; the binder scans `rowid` without outputting it
+            // C++ pushes a sample into its scan (`SamplingPushdown`) only after this optimizer, so a
+            // sample never shares here; a sample without a seed is not repeatable either
+            // (`SampleIsRepeatable`)
+            K::Get { sample: Some(_), .. } => false,
             K::Get {
                 index_rows,
                 column_ids,
@@ -655,6 +658,10 @@ impl Finder {
                 };
                 index_rows.is_none() && !rowid
             }
+            // the rows of a volatile table function differ between its calls
+            K::ExpressionGet { function, .. } => function
+                .as_deref()
+                .is_none_or(|f| !crate::planner::expression::VOLATILE_TABLE_FUNCTIONS.contains(&f)),
             // `LogicalColumnDataGet`: not too many rows to compare
             K::ChunkGet { chunks, .. } => chunks.iter().map(|c| c.len()).sum::<usize>() < 1000,
             _ => false,

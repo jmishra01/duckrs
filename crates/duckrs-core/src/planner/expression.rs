@@ -238,6 +238,10 @@ pub(crate) const VOLATILE_FUNCTIONS: &[&str] = &[
     "uuidv7",
 ];
 
+/// The table functions computed while binding that are `FunctionStability::VOLATILE`: they read
+/// live state, so two calls in one query are not the same rows.
+pub(crate) const VOLATILE_TABLE_FUNCTIONS: &[&str] = &["duckdb_memory"];
+
 /// The functions that give the same in one query, but not in the next (`FunctionStability::CONSISTENT_WITHIN_QUERY`):
 /// they may move as other expressions do, but are not worked out when the query is planned.
 pub(crate) const CONSISTENT_WITHIN_QUERY_FUNCTIONS: &[&str] = &[
@@ -247,6 +251,7 @@ pub(crate) const CONSISTENT_WITHIN_QUERY_FUNCTIONS: &[&str] = &[
     "current_timestamp",
     "current_date",
     "today",
+    "in_search_path",
 ];
 
 /// What a lambda function does with its lambda.
