@@ -203,6 +203,54 @@ fn scan_filter_lines_marked(filters: &[(BoundExpr, bool)]) -> String {
     }))
 }
 
+/// The fields of STRUCT columns a filter reads, as C++ shows them: of a column whose field the scan reads in its
+/// place (`IsPushdownExtract`), the filter is one on that field, named by its path (`s.a`); otherwise the key is the
+/// field's name (`struct_extract(s, 'a')`).
+fn with_field_names(filter: &BoundExpr, extracted: &dyn Fn(&crate::planner::expression::ColumnBinding) -> bool) -> BoundExpr {
+    use crate::planner::expression::BoundExprKind as E;
+    fn path(expr: &BoundExpr) -> Option<(crate::planner::expression::ColumnBinding, String)> {
+        match &expr.kind {
+            E::ColumnRef { binding, depth: 0 } => Some((*binding, expr.alias.clone())),
+            E::Function { function, children, .. } if function.name == "struct_extract" && children.len() == 2 => {
+                let field = field_name(&children[0], &children[1])?;
+                let (binding, base) = path(&children[0])?;
+                (!base.is_empty()).then(|| (binding, format!("{base}.{field}")))
+            }
+            _ => None,
+        }
+    }
+    fn field_name(child: &BoundExpr, key: &BoundExpr) -> Option<String> {
+        let E::Constant(index) = &key.kind else {
+            return None;
+        };
+        let index = usize::try_from(index.try_to_string().ok()?.parse::<i64>().ok()?).ok()?;
+        let field = child.return_type.struct_children().get(index)?.0.clone();
+        (!field.is_empty()).then_some(field)
+    }
+    let mut copy = filter.clone();
+    copy.walk_mut(&mut |e| {
+        let E::Function { function, children, .. } = &mut e.kind else {
+            return;
+        };
+        if function.name != "struct_extract" || children.len() != 2 {
+            return;
+        }
+        match path(e) {
+            Some((binding, name)) if extracted(&binding) => {
+                *e = BoundExpr::column_ref(binding, e.return_type.clone(), name);
+            }
+            _ => {
+                if let E::Function { children, .. } = &mut e.kind
+                    && let Some(field) = field_name(&children[0], &children[1])
+                {
+                    children[1] = BoundExpr::constant(duckrs_common::value::Value::varchar(field));
+                }
+            }
+        }
+    });
+    copy
+}
+
 pub(crate) fn filter_text(filter: &BoundExpr) -> String {
     let text = filter.to_string();
     let Some(inner) = text.strip_prefix('(').and_then(|t| t.strip_suffix(')')) else {
@@ -494,7 +542,18 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
                         e.alias = definition.name.clone();
                     }
                 });
-                filter
+                // the scan reads fields of the column, not all of it
+                let extracted = |binding: &crate::planner::expression::ColumnBinding| {
+                    let Some(column) = column_ids.get(binding.column_index).filter(|_| binding.table_index == *table_index)
+                    else {
+                        return false;
+                    };
+                    let positions: Vec<usize> = (0..column_ids.len()).filter(|&at| column_ids[at] == *column).collect();
+                    let is_extract = |at: &usize| extracts.get(*at).is_some_and(|extract| extract.is_some());
+                    positions.iter().any(is_extract)
+                        && positions.iter().all(|at| is_extract(at) || *at == binding.column_index)
+                };
+                with_field_names(&filter, &extracted)
             };
             let renamed: Vec<BoundExpr> = filters.iter().map(rename).collect();
             let filters = &renamed;
