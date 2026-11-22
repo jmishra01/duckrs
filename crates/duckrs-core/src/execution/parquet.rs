@@ -2639,6 +2639,7 @@ pub fn scan_statistics(scan: &ParquetScanData) -> Vec<Option<crate::catalog::Col
                 continue;
             };
             let mut stats = crate::catalog::ColumnStatistics {
+                lists: None,
                 variant: None,
                 min: None,
                 max: None,

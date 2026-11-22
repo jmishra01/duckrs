@@ -33,6 +33,7 @@ type Stats = ColumnStatistics;
 
 pub(super) fn unknown() -> Stats {
     Stats {
+        lists: None,
         variant: None,
         min: None,
         max: None,
@@ -360,6 +361,7 @@ fn compute_ordered_statistics(table: &Arc<TableCatalogEntry>, positions: Option<
             usable.then_some(value)
         };
         statistics.push(Stats {
+            lists: None,
             variant: None,
             min: count_at.checked_sub(2).and_then(bound),
             max: count_at.checked_sub(1).and_then(bound),
@@ -631,6 +633,10 @@ fn union(a: Stats, b: Stats) -> Stats {
         _ => (smaller(a.min, b.min), larger(a.max, b.max)),
     };
     Stats {
+        lists: match (a.lists, b.lists) {
+            (Some(a), Some(b)) => Some(a.merge(&b, true)),
+            _ => None,
+        },
         variant: None,
         min,
         max,
@@ -657,6 +663,24 @@ fn union(a: Stats, b: Stats) -> Stats {
     }
 }
 
+/// Whether statistics of `ty` are `ListStats` with lengths: a LIST or MAP (not an ARRAY, whose `ArrayStats`
+/// have none).
+pub(super) fn list_type(ty: &LogicalType) -> bool {
+    matches!(ty.id(), LogicalTypeId::List | LogicalTypeId::Map)
+}
+
+/// `BaseStatistics::FromConstant` of a constant: its lists have bounds but no total (`SetLengthBounds`), as
+/// have the lists in it, whose merged totals are then unknown too. A table's lists, from their values, keep theirs.
+fn constant_list_lengths(mut stats: Stats) -> Stats {
+    if stats.can_be_valid
+        && let Some(lists) = &mut stats.lists
+    {
+        lists.total = None;
+    }
+    stats.children = stats.children.into_iter().map(constant_list_lengths).collect();
+    stats
+}
+
 /// `BaseStatistics::FromConstant`: the statistics of one value, its children's too.
 fn value_stats(value: &Value, ty: &LogicalType) -> Stats {
     use duckrs_common::value::ValueData;
@@ -665,6 +689,7 @@ fn value_stats(value: &Value, ty: &LogicalType) -> Stats {
         can_be_null: false,
         can_be_valid: false,
         children: empty_children(ty),
+        lists: list_type(ty).then(crate::catalog::ListLengths::empty),
         ..unknown()
     };
     fn empty_children(ty: &LogicalType) -> Vec<Stats> {
@@ -672,6 +697,7 @@ fn value_stats(value: &Value, ty: &LogicalType) -> Stats {
             can_be_null: false,
             can_be_valid: false,
             children: empty_children(child),
+            lists: list_type(child).then(crate::catalog::ListLengths::empty),
             ..unknown()
         };
         match ty.id() {
@@ -685,6 +711,7 @@ fn value_stats(value: &Value, ty: &LogicalType) -> Stats {
             can_be_null: true,
             can_be_valid: false,
             children: empty_children(ty),
+            lists: list_type(ty).then(crate::catalog::ListLengths::empty),
             ..unknown()
         };
     }
@@ -700,6 +727,7 @@ fn value_stats(value: &Value, ty: &LogicalType) -> Stats {
                 can_be_null: false,
                 can_be_valid: true,
                 children: vec![merged],
+                lists: list_type(ty).then(|| crate::catalog::ListLengths::of_length(items.len() as u64)),
                 ..unknown()
             }
         }
@@ -723,6 +751,7 @@ fn value_stats(value: &Value, ty: &LogicalType) -> Stats {
             };
             let bound = has_ordered_statistics(ty).then(|| value.clone());
             Stats {
+                lists: None,
                 variant: None,
                 min: bound.clone(),
                 max: bound,
@@ -955,6 +984,7 @@ impl StatisticsPropagator {
     fn expression(&mut self, expr: &mut BoundExpr, in_filter: bool) -> Stats {
         match &mut expr.kind {
             BoundExprKind::Constant(value) if value.is_null() => Stats {
+                lists: None,
                 variant: None,
                 min: None,
                 max: None,
@@ -972,7 +1002,7 @@ impl StatisticsPropagator {
                     LogicalTypeId::List | LogicalTypeId::Array | LogicalTypeId::Struct
                 ) =>
             {
-                value_stats(value, &expr.return_type)
+                constant_list_lengths(value_stats(value, &expr.return_type))
             }
             BoundExprKind::Constant(value) => {
                 let geometry = geometry_stats_of(value);
@@ -988,6 +1018,7 @@ impl StatisticsPropagator {
                 };
                 let value = has_ordered_statistics(&expr.return_type).then(|| value.clone());
                 Stats {
+                    lists: None,
                     variant: None,
                     min: value.clone(),
                     max: value,
@@ -1262,6 +1293,20 @@ impl StatisticsPropagator {
         if child.return_type.id() == LogicalTypeId::Variant {
             return super::variant_statistics::cast_from_variant(&stats, &target).unwrap_or_else(unknown);
         }
+        // `StatisticsPropagateArrayToList`: lists as long as the arrays, of the same elements
+        if child.return_type.id() == LogicalTypeId::Array
+            && target.id() == LogicalTypeId::List
+            && child.return_type.child_type() == target.child_type()
+        {
+            let size = child.return_type.array_size().map(|size| size as u64);
+            return Stats {
+                can_be_null: stats.can_be_null,
+                can_be_valid: stats.can_be_valid,
+                children: stats.children,
+                lists: Some(crate::catalog::ListLengths::bounds(size, size)),
+                ..unknown()
+            };
+        }
         // `CastStatistics::CanPropagate`: of numbers to numbers, by their physical types, DECIMAL
         // too; a DATE or a TIMESTAMP, whose -infinity sorts above its smallest values, is left out
         let numeric = |ty: &LogicalType| {
@@ -1460,6 +1505,89 @@ impl StatisticsPropagator {
                 ..unknown()
             };
         }
+        // `ListLengthPropagateStats`: the lengths of the lists bound their `length`, which is a constant (NULL for
+        // a NULL list) where they are all as long
+        if matches!(function.name.as_str(), "length" | "len" | "array_length")
+            && let [child] = stats.as_slice()
+            && list_type(&children[0].return_type)
+            && let Some(lists) = &child.lists
+            && let (Some(min), Some(max)) = (lists.known_min(), lists.max)
+        {
+            let (min, max) = (min as i64, max as i64);
+            let result = Stats {
+                min: Some(Value::bigint(min)),
+                max: Some(Value::bigint(max)),
+                can_be_null: child.can_be_null,
+                can_be_valid: child.can_be_valid,
+                ..unknown()
+            };
+            if min == max {
+                let alias = expr.alias.clone();
+                let list = children.remove(0);
+                *expr = constant_or_null(vec![BoundExpr::constant(Value::bigint(min)), list]).with_alias(alias);
+            }
+            return result;
+        }
+        // `ListValueStats`: as many elements as arguments, each of which they can be
+        if matches!(function.name.as_str(), "list_value" | "list_pack") && list_type(&return_type) {
+            let child = stats.iter().cloned().reduce(union).unwrap_or_else(unknown);
+            return Stats {
+                can_be_null: false,
+                can_be_valid: true,
+                children: vec![child],
+                lists: Some(crate::catalog::ListLengths::bounds(
+                    Some(stats.len() as u64),
+                    Some(stats.len() as u64),
+                )),
+                ..unknown()
+            };
+        }
+        // `ListConcatStats`: any of the inputs' elements, as many as theirs together; a NULL list adds none
+        if matches!(
+            function.name.as_str(),
+            "list_concat" | "list_cat" | "array_concat" | "array_cat" | "||" | "concat"
+        ) && list_type(&return_type)
+            && let Some(merged) = stats.iter().cloned().reduce(union)
+        {
+            let mut min = 0u64;
+            let mut max = Some(0u64);
+            for child in &stats {
+                let lengths = child.lists.unwrap_or(crate::catalog::ListLengths::bounds(None, None));
+                if !child.can_be_null
+                    && let Some(child_min) = lengths.known_min()
+                {
+                    min = min.saturating_add(child_min);
+                }
+                max = max.zip(lengths.max).and_then(|(a, b)| a.checked_add(b));
+            }
+            return Stats {
+                lists: Some(crate::catalog::ListLengths::bounds(Some(min), max)),
+                ..merged
+            };
+        }
+        // `ListFlattenStats`: the elements of the inner lists, as many as all of them together
+        if function.name == "flatten"
+            && let [child] = stats.as_slice()
+            && let Some(inner) = child.children.first()
+        {
+            let product = |a: Option<u64>, b: Option<u64>| a.zip(b).and_then(|(a, b)| a.checked_mul(b));
+            let outer = child.lists.unwrap_or(crate::catalog::ListLengths::bounds(None, None));
+            let nested = inner.lists.unwrap_or(crate::catalog::ListLengths::bounds(None, None));
+            let min = if inner.can_be_null {
+                None
+            } else {
+                product(outer.known_min(), nested.known_min())
+            };
+            return Stats {
+                can_be_null: child.can_be_null,
+                can_be_valid: child.can_be_valid,
+                lists: Some(crate::catalog::ListLengths::bounds(
+                    Some(min.unwrap_or(0)),
+                    product(outer.max, nested.max),
+                )),
+                ..inner.clone()
+            };
+        }
         // `StringStats` of `length`: the longest string bounds it, and so does the shortest without unicode
         if matches!(function.name.as_str(), "length" | "len" | "char_length" | "character_length" | "strlen" | "octet_length")
             && let [child] = stats.as_slice()
@@ -1540,6 +1668,7 @@ impl StatisticsPropagator {
             }
             let (min, max) = if least { (loose, anchored) } else { (anchored, loose) };
             return Stats {
+                lists: None,
                 variant: None,
                 min,
                 max,
@@ -1703,6 +1832,7 @@ impl StatisticsPropagator {
                 return unknown();
             };
             return Stats {
+                lists: None,
                 variant: None,
                 min: Some(min),
                 max: Some(max),
@@ -1799,6 +1929,7 @@ impl StatisticsPropagator {
                 (0, negated_low.max(high))
             };
             return Stats {
+                lists: None,
                 variant: None,
                 min: int_value(min),
                 max: int_value(max),
@@ -1860,6 +1991,7 @@ impl StatisticsPropagator {
                 return unknown();
             };
             return Stats {
+                lists: None,
                 variant: None,
                 min: int_value(min),
                 max: int_value(max),
@@ -3175,6 +3307,7 @@ impl StatisticsPropagator {
             crate::execution::expression_executor::try_evaluate_scalar(&value)
         };
         Some(Stats {
+            lists: None,
             variant: None,
             min: cast(min),
             max: cast(max),
@@ -3212,6 +3345,20 @@ pub(super) fn stats_fields(stats: &Stats, ty: &LogicalType) -> Option<Value> {
         let unknown_child = unknown();
         stats_fields(stats.children.get(at).unwrap_or(&unknown_child), child_type)
     };
+    // `ListStats::ToStruct`: the lengths that are known
+    if list_type(ty)
+        && let Some(lists) = &stats.lists
+    {
+        for (name, value) in [
+            ("min_list_length", lists.known_min()),
+            ("max_list_length", lists.max),
+            ("total_list_length", lists.total),
+        ] {
+            if let Some(value) = value {
+                fields.push((name.to_string(), Value::ubigint(value)));
+            }
+        }
+    }
     match ty.id() {
         LogicalTypeId::List | LogicalTypeId::Array => {
             fields.push(("child_stats".to_string(), child(0, ty.child_type()?)?));
@@ -3434,6 +3581,7 @@ fn monotone_bounds(
         return None;
     }
     Some(Stats {
+        lists: None,
         variant: None,
         min: Some(out_low),
         max: Some(out_high),
@@ -3551,6 +3699,7 @@ fn date_part_stats(name: &str, child: &Stats, child_type: &LogicalType, return_t
         return None;
     }
     Some(Stats {
+        lists: None,
         variant: None,
         min: Some(low),
         max: Some(high),
