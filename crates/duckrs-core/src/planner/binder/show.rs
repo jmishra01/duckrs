@@ -197,10 +197,62 @@ pub(crate) fn platform() -> String {
     format!("{os}_{arch}{postfix}")
 }
 
+/// `internal_extensions` of `extension_helper.cpp`.
+const DEFAULT_EXTENSIONS: [(&str, &str); 30] = [
+    ("core_functions", "Core function library"),
+    ("icu", "Adds support for time zones and collations using the ICU library"),
+    ("excel", "Adds support for Excel-like format strings"),
+    ("parquet", "Adds support for reading and writing parquet files"),
+    ("tpch", "Adds TPC-H data generation and query support"),
+    ("tpcds", "Adds TPC-DS data generation and query support"),
+    ("httpfs", "Adds support for reading and writing files over a HTTP(S) connection"),
+    ("json", "Adds support for JSON operations"),
+    ("autocomplete", "Adds support for autocomplete in the shell"),
+    ("motherduck", "Enables motherduck integration with the system"),
+    ("mysql_scanner", "Adds support for connecting to a MySQL database"),
+    ("odbc_scanner", "Adds support for connecting to remote databases over ODBC"),
+    ("sqlite_scanner", "Adds support for reading and writing SQLite database files"),
+    ("postgres_scanner", "Adds support for connecting to a Postgres database"),
+    ("inet", "Adds support for IP-related data types and functions"),
+    ("spatial", "Geospatial extension that adds support for working with spatial data and functions"),
+    ("aws", "Provides features that depend on the AWS SDK"),
+    ("azure", "Adds a filesystem abstraction for Azure blob storage to DuckDB"),
+    ("encodings", "All unicode encodings to UTF-8"),
+    ("iceberg", "Adds support for Apache Iceberg"),
+    ("vss", "Adds indexing support to accelerate Vector Similarity Search"),
+    ("delta", "Adds support for Delta Lake"),
+    ("fts", "Adds support for Full-Text Search Indexes"),
+    ("ui", "Adds local UI for DuckDB"),
+    ("ducklake", "Adds support for DuckLake, SQL as a Lakehouse Format"),
+    ("quack", "The DuckDB 'Quack' Client/Server Protocol"),
+    ("vortex", "Adds support for reading and writing files using the Vortex file format"),
+    ("lance", "Adds support for querying Lance datasets"),
+    ("avro", "Adds support for reading Avro files"),
+    ("unity_catalog", "Adds support for connecting to Unity Catalog"),
+];
+
+/// `internal_aliases` of `extension_alias.cpp`: (alias, extension).
+const EXTENSION_ALIASES: [(&str, &str); 10] = [
+    ("http", "httpfs"),
+    ("https", "httpfs"),
+    ("md", "motherduck"),
+    ("mysql", "mysql_scanner"),
+    ("odbc", "odbc_scanner"),
+    ("s3", "httpfs"),
+    ("postgres", "postgres_scanner"),
+    ("sqlite", "sqlite_scanner"),
+    ("sqlite3", "sqlite_scanner"),
+    ("uc_catalog", "unity_catalog"),
+];
+
+/// The extensions duckrs has compiled in, as C++'s `linked_extensions` of a build with them.
+const LINKED_EXTENSIONS: [&str; 3] = ["core_functions", "json", "parquet"];
+
 const DESCRIBE_NAMES: [&str; 6] = ["column_name", "column_type", "null", "key", "default", "extra"];
 
-const SYSTEM_TABLES: [&str; 18] = [
+const SYSTEM_TABLES: [&str; 19] = [
     "duckdb_functions",
+    "duckdb_extensions",
     "pragma_user_agent",
     "duckdb_dialects",
     "duckdb_keywords",
@@ -2025,6 +2077,57 @@ impl Binder<'_> {
                     .map(|(word, category)| vec![text(&word), text(category)])
                     .collect(),
             ),
+            // `DuckDBExtensionsInit`: the default extensions, installed or not, and those linked into duckrs,
+            // which are loaded; duckrs installs no others, so there is no directory of them to list
+            "duckdb_extensions" => {
+                let list = LogicalType::list(varchar.clone());
+                let version = format!("v{}", env!("CARGO_PKG_VERSION"));
+                let mut entries: std::collections::BTreeMap<&str, (&str, bool)> = DEFAULT_EXTENSIONS
+                    .iter()
+                    .map(|(name, description)| (*name, (*description, false)))
+                    .collect();
+                for name in LINKED_EXTENSIONS {
+                    entries.entry(name).or_insert(("", true)).1 = true;
+                }
+                let rows = entries
+                    .into_iter()
+                    .map(|(name, (description, linked))| {
+                        let aliases = EXTENSION_ALIASES
+                            .iter()
+                            .filter(|(_, extension)| *extension == name)
+                            .map(|(alias, _)| text(alias))
+                            .collect();
+                        Ok(vec![
+                            text(name),
+                            Value::boolean(linked),
+                            Value::boolean(linked),
+                            text(if linked { "(BUILT-IN)" } else { "" }),
+                            text(description),
+                            Value::list(varchar.clone(), aliases)?,
+                            text(if linked { &version } else { "" }),
+                            text(if linked { "STATICALLY_LINKED" } else { "NOT_INSTALLED" }),
+                            text(""),
+                            // a built-in extension is not signed
+                            Value::null(varchar.clone()),
+                        ])
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                (
+                    vec![
+                        ("extension_name", varchar.clone()),
+                        ("loaded", boolean.clone()),
+                        ("installed", boolean.clone()),
+                        ("install_path", varchar.clone()),
+                        ("description", varchar.clone()),
+                        ("aliases", list),
+                        ("extension_version", varchar.clone()),
+                        ("install_mode", varchar.clone()),
+                        ("installed_from", varchar.clone()),
+                        ("signature_key_fingerprint", varchar.clone()),
+                    ],
+                    rows,
+                )
+            }
             // `PragmaVersionFunction`
             "pragma_version" => {
                 let version = format!("v{}", env!("CARGO_PKG_VERSION"));
