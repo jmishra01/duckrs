@@ -1,5 +1,7 @@
 //! Writes files and logs, reads them back, and kills what writes them. `tools/check_written.py` has the real DuckDB read one of them.
 
+mod common;
+
 use duckrs::{Connection, Database};
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
@@ -7,8 +9,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 fn path(name: &str) -> PathBuf {
-    let directory = std::env::temp_dir().join(format!("duckrs-write-{}", std::process::id()));
-    std::fs::create_dir_all(&directory).unwrap();
+    let directory = common::directory("duckrs-write-");
     let path = directory.join(name);
     let _ = std::fs::remove_file(&path);
     path

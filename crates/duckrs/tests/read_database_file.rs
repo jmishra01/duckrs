@@ -1,6 +1,8 @@
 //! Reads files written by the real DuckDB and compares every row with what DuckDB read from them.
 //! `tests/fixtures/generate.sh` makes both.
 
+mod common;
+
 use duckrs::{Connection, Database, Error, ErrorKind};
 use std::path::{Path, PathBuf};
 
@@ -10,8 +12,7 @@ fn fixture(name: &str) -> PathBuf {
 
 /// A copy of a file and its log, for what opens it to write: a checkpoint would change the fixture.
 fn writable_copy(file: &str) -> PathBuf {
-    let directory = std::env::temp_dir().join(format!("duckrs-read-{}", std::process::id()));
-    std::fs::create_dir_all(&directory).unwrap();
+    let directory = common::directory("duckrs-read-");
     let path = directory.join(file);
     std::fs::copy(fixture(file), &path).unwrap();
     let log = format!("{file}.wal");
