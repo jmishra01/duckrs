@@ -511,6 +511,15 @@ fn compare(physical: PhysicalType, a: &[u8; 16], b: &[u8; 16]) -> Ordering {
         PhysicalType::UInt128 => ints!(u128),
         PhysicalType::Float => floats!(f32),
         PhysicalType::Double => floats!(f64),
+        // `interval_t::operator<`: by the normalized intervals
+        PhysicalType::Interval => {
+            let read = |x: &[u8; 16]| Interval {
+                months: i32::from_le_bytes(x[..4].try_into().expect("four bytes")),
+                days: i32::from_le_bytes(x[4..8].try_into().expect("four bytes")),
+                micros: i64::from_le_bytes(x[8..].try_into().expect("eight bytes")),
+            };
+            read(a).cmp(&read(b))
+        }
         _ => Ordering::Equal,
     }
 }
@@ -555,9 +564,6 @@ pub(super) fn raw_bytes(vector: &Vector, count: usize) -> Result<Vec<u8>> {
 
 /// The smallest and largest value of the rows that aren't NULL.
 fn bounds(physical: PhysicalType, data: &[u8], width: usize, valid: &[bool]) -> Option<([u8; 16], [u8; 16])> {
-    if physical == PhysicalType::Interval {
-        return None;
-    }
     let mut result: Option<([u8; 16], [u8; 16])> = None;
     for (value, _) in data.chunks_exact(width).zip(valid).filter(|(_, valid)| **valid) {
         let mut bytes = [0; 16];
@@ -635,6 +641,14 @@ fn write_bound(s: &mut BinarySerializer, field: u16, tag: &str, physical: Physic
             PhysicalType::UInt128 => value!(u128),
             PhysicalType::Float => value!(f32),
             PhysicalType::Double => value!(f64),
+            PhysicalType::Interval => {
+                let interval = Interval {
+                    months: i32::from_le_bytes(bytes[..4].try_into().expect("four bytes")),
+                    days: i32::from_le_bytes(bytes[4..8].try_into().expect("four bytes")),
+                    micros: i64::from_le_bytes(bytes[8..].try_into().expect("eight bytes")),
+                };
+                s.write_property(101, "value", &interval);
+            }
             _ => {}
         }
     });

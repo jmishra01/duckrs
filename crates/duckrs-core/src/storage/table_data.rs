@@ -766,7 +766,9 @@ impl DiskTable {
     fn bound(&self, column: usize, bytes: Option<&[u8; 16]>) -> Result<Option<Value>> {
         let ty = &self.table.columns[column].ty;
         let width = fixed_width(ty.physical_type());
-        let (Some(bytes), Some(width)) = (bytes, width.filter(|_| has_ordered_statistics(ty))) else {
+        // INTERVAL bounds are of the normalized intervals, as `interval_t` orders them
+        let ordered = has_ordered_statistics(ty) || ty.id() == LogicalTypeId::Interval;
+        let (Some(bytes), Some(width)) = (bytes, width.filter(|_| ordered)) else {
             return Ok(None);
         };
         let mut vector = Vector::new(ty.clone(), 1);
@@ -778,7 +780,9 @@ impl DiskTable {
 /// The bound of a value of `ty` in its little-endian bytes.
 fn bound_of(ty: &LogicalType, bytes: Option<&[u8; 16]>) -> Result<Option<Value>> {
     let width = fixed_width(ty.physical_type());
-    let (Some(bytes), Some(width)) = (bytes, width.filter(|_| has_ordered_statistics(ty))) else {
+    // INTERVAL bounds are of the normalized intervals, as `interval_t` orders them
+    let ordered = has_ordered_statistics(ty) || ty.id() == LogicalTypeId::Interval;
+    let (Some(bytes), Some(width)) = (bytes, width.filter(|_| ordered)) else {
         return Ok(None);
     };
     let mut vector = Vector::new(ty.clone(), 1);

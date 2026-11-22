@@ -257,11 +257,13 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] VARCHAR bounds of tables in a file: string statistics read (legacy 8-byte and current 12-byte forms) and
     written as `StatsWriter<string_t>` and `StringStats::Serialize` do, with unicode, lengths and totals
   - [ ] string comparisons that C++'s prefixes can't decide but exact bounds do (`a = b` prunes more here), an
-    OR of columns proven false is an empty result here where C++ scans no row groups, INTERVAL and TIMESTAMPTZ_NS
-    bounds, week, division by a column
+    OR of columns proven false is an empty result here where C++ scans no row groups, TIMESTAMPTZ_NS bounds, week,
+    division by a column
   - [x] the scalar aggregate merger (`scalar_aggregate_merge_threshold`), over tables, `read_parquet`, `read_csv`
     and `read_json`; predicate factoring of ORs in filters
   - [ ] secure views (7 files), `json_serialize_plan`, gamma's errors without IEEE
+  - [x] INTERVAL bounds of row groups in database files: written from v2.0.0 by the normalized intervals and
+    read into zone maps (`interval_row_group_pruning`, `interval_column_stats_pruning`)
   - [x] statistics and zone maps of `%` (`PropagateModuloStats`: signed and unsigned, DECIMAL, FLOAT/DOUBLE, a
     column divisor, and bounds with a NULL where `error_on_division_by_zero` is off), of `//` on UHUGEINT past the
     range of an i128, and of `power` (`PropagatePowStats`)
