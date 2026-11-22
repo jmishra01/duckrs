@@ -998,7 +998,8 @@ impl Binder<'_> {
                 name,
             ))
         };
-        // DISTINCT ON keeps the first row of each group as ORDER BY sees them
+        // DISTINCT ON comes before the ORDER BY, which it takes over to keep the first row of each group as the ORDER
+        // BY sees them (`LogicalDistinct::order_by`)
         let mut prepared = prepared;
         if let Some(distinct) = prepared
             .iter()
@@ -1006,10 +1007,11 @@ impl Binder<'_> {
             && let Some(order) = prepared
                 .iter()
                 .position(|m| matches!(m, PreparedModifier::Order(_) | PreparedModifier::OrderAll(_)))
-            && order > distinct
+            && order < distinct
         {
             prepared.swap(distinct, order);
         }
+        let mut kinds = Vec::with_capacity(prepared.len());
         // ORDER BY and DISTINCT see the values as their collation does
         let default_collation = self.default_collation();
         let collated_column = |i: usize| -> Result<BoundExpr> {
@@ -1023,10 +1025,12 @@ impl Binder<'_> {
                 PreparedModifier::Distinct => LogicalOperatorKind::Distinct {
                     targets: (0..column_count).map(collated_column).collect::<Result<_>>()?,
                     on: false,
+                    orders: Vec::new(),
                 },
                 PreparedModifier::DistinctOn(indexes) => LogicalOperatorKind::Distinct {
                     targets: indexes.into_iter().map(collated_column).collect::<Result<_>>()?,
                     on: true,
+                    orders: Vec::new(),
                 },
                 PreparedModifier::LimitPercent { percent, offset } => {
                     LogicalOperatorKind::LimitPercent { percent, offset }
@@ -1069,6 +1073,21 @@ impl Binder<'_> {
                     LogicalOperatorKind::Limit { limit, offset, failure }
                 }
             };
+            kinds.push(kind);
+        }
+        if let Some(distinct) = kinds
+            .iter()
+            .position(|k| matches!(k, LogicalOperatorKind::Distinct { on: true, .. }))
+            && let Some(LogicalOperatorKind::Order { orders }) = kinds[distinct + 1..]
+                .iter()
+                .find(|k| matches!(k, LogicalOperatorKind::Order { .. }))
+        {
+            let orders = orders.clone();
+            if let LogicalOperatorKind::Distinct { orders: taken, .. } = &mut kinds[distinct] {
+                *taken = orders;
+            }
+        }
+        for kind in kinds {
             let children = if matches!(kind, LogicalOperatorKind::EmptyResult { .. }) {
                 vec![]
             } else {

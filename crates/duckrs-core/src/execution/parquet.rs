@@ -1108,7 +1108,7 @@ fn row_groups_to_scan(
             let zone = |at: usize| -> Option<crate::catalog::ColumnZone> {
                 if let Some((leaf, element)) = element_leaves.get(at).and_then(Option::as_ref) {
                     // `TransformColumnStatistics` of a LIST or MAP: unknown validity, the elements' statistics
-                    let elements = group_zone(scan, metadata, group, *leaf, element)?;
+                    let elements = group_zone(metadata, group, *leaf, element)?;
                     return (!elements.unknown).then(|| crate::catalog::ColumnZone {
                         has_null: true,
                         elements: Some(Box::new(elements)),
@@ -1116,7 +1116,7 @@ fn row_groups_to_scan(
                     });
                 }
                 if let Some(leaf) = leaves.get(at) {
-                    let zone = group_zone(scan, metadata, group, (*leaf)?, &scan.types[at])?;
+                    let zone = group_zone(metadata, group, (*leaf)?, &scan.types[at])?;
                     return (!zone.unknown).then_some(zone);
                 }
                 let value = scan.known_value(at, path)?;
@@ -2585,7 +2585,7 @@ pub fn partition_statistics(scan: &ParquetScanData) -> Option<Vec<(u64, Vec<Opti
             let zones = leaves
                 .iter()
                 .enumerate()
-                .map(|(at, leaf)| group_zone(scan, &metadata, group, (*leaf)?, &scan.types[at]).filter(|z| !z.unknown))
+                .map(|(at, leaf)| group_zone(&metadata, group, (*leaf)?, &scan.types[at]).filter(|z| !z.unknown))
                 .collect();
             let exact = leaves.iter().all(|leaf| {
                 leaf.and_then(|leaf| group.column(leaf).statistics())
@@ -2687,7 +2687,7 @@ pub fn scan_statistics(scan: &ParquetScanData) -> Vec<Option<crate::catalog::Col
             let string_column = matches!(scan.types[column].id(), LogicalTypeId::Varchar | LogicalTypeId::Blob);
             let mut strings: Option<crate::catalog::StringStatistics> = None;
             for group in metadata.row_groups() {
-                let Some(zone) = group_zone(scan, &metadata, group, leaf, &scan.types[column]) else {
+                let Some(zone) = group_zone(&metadata, group, leaf, &scan.types[column]) else {
                     usable = false;
                     break;
                 };
@@ -2911,7 +2911,6 @@ fn stored_type(scan: &ParquetScanData, path: &str, name: &str) -> Option<Logical
 /// What the statistics of row group `group` say of the scan's column `column`, stored in `leaf`: `None` where
 /// there are none, `unknown` where they have no bounds DuckDB can use.
 fn group_zone(
-    scan: &ParquetScanData,
     metadata: &ParquetMetaData,
     group: &parquet::file::metadata::RowGroupMetaData,
     leaf: usize,

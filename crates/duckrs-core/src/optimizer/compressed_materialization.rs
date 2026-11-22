@@ -479,11 +479,11 @@ impl Pass<'_> {
     /// `CompressDistinct`: every column passes through, so every one it does not deduplicate on
     /// by an expression can be compressed.
     fn compress_distinct(&mut self, op: &mut LogicalOperator) -> HashMap<ColumnBinding, ColumnBinding> {
-        let K::Distinct { targets, .. } = &op.kind else {
+        let K::Distinct { targets, orders, .. } = &op.kind else {
             unreachable!()
         };
         let mut referenced = HashSet::new();
-        for target in targets {
+        for target in targets.iter().chain(orders.iter().map(|o| &o.expr)) {
             if !matches!(target.kind, BoundExprKind::ColumnRef { depth: 0, .. }) {
                 collect(target, &mut referenced);
             }

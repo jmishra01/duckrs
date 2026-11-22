@@ -282,7 +282,7 @@ Each item gives the number of failing files in `test/` that it should fix, where
     with the row bounds of `range` and Parquet row groups); `ArrayGenericFoldStats`; large INs of an inner
     join's predicate become MARK joins; `EXPLAIN (FORMAT yaml)`; scan filters of a column as one conjunction
   - [ ] struct fields pushed into a scan through a view's projection (`unused_columns/deliver_child_columns`)
-  - [ ] the ORDER BY of DISTINCT ON inside the DISTINCT, so its keys can be dropped (`remove_redundant_order_keys`)
+  - [x] the ORDER BY of DISTINCT ON inside the DISTINCT (`LogicalDistinct::order_by`), so its keys can be dropped (`remove_redundant_order_keys`)
   - [x] the values aggregates keep for their rows count toward `memory_limit` with the bytes of their strings,
     BLOBs and BITs (`bitagg_memory_limit`)
   - [ ] EXPLAIN shapes: join-dependent filters, projection placement, filter pullup join order, recursive CTE join
