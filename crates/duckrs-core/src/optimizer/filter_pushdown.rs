@@ -444,37 +444,8 @@ impl FilterPushdown {
         if partition_bindings.is_empty() {
             return self.finish_pushdown(op);
         }
-        // `OnlyRanksWithoutArguments`
-        let only_ranks = windows.iter().all(|w| {
-            matches!(
-                w.function,
-                WindowFunction::RowNumber
-                    | WindowFunction::Rank
-                    | WindowFunction::DenseRank
-                    | WindowFunction::PercentRank
-                    | WindowFunction::CumeDist
-                    | WindowFunction::Ntile
-            ) && !window_can_throw(w)
-                && w.children.is_empty()
-                && w.filter.is_none()
-                && w.start_expr.is_none()
-                && w.end_expr.is_none()
-        });
-        // `ComparesWindowPartitions`
-        let compares_partitions = |filter: &BoundExpr| {
-            let Some(compared) = compared_expression(filter) else {
-                return false;
-            };
-            windows.iter().all(|w| {
-                w.partitions.iter().any(|p| match (&p.kind, &compared.kind) {
-                    (
-                        BoundExprKind::ColumnRef { binding: a, .. },
-                        BoundExprKind::ColumnRef { binding: b, .. },
-                    ) => a == b,
-                    _ => expressions_equal(p, compared),
-                })
-            })
-        };
+        let only_ranks = only_ranks_without_arguments(windows);
+        let compares_partitions = |filter: &BoundExpr| compares_window_partitions(windows, filter);
         let mut below = FilterPushdown::default();
         let mut remaining = Vec::new();
         for f in std::mem::take(&mut self.filters) {
@@ -953,6 +924,39 @@ fn side_of_disjunction(expr: &BoundExpr, side: &BTreeSet<usize>) -> Option<Bound
 
 /// `FilterCombiner::GetComparedExpression`: the one side that is not constant of a comparison,
 /// or the first child of BETWEEN and IN.
+/// `FilterPushdown::OnlyRanksWithoutArguments`: the windows rank rows by nothing but their partitions and orders.
+pub(super) fn only_ranks_without_arguments(windows: &[crate::planner::expression::BoundWindow]) -> bool {
+    windows.iter().all(|w| {
+        matches!(
+            w.function,
+            WindowFunction::RowNumber
+                | WindowFunction::Rank
+                | WindowFunction::DenseRank
+                | WindowFunction::PercentRank
+                | WindowFunction::CumeDist
+                | WindowFunction::Ntile
+        ) && !window_can_throw(w)
+            && w.children.is_empty()
+            && w.filter.is_none()
+            && w.start_expr.is_none()
+            && w.end_expr.is_none()
+    })
+}
+
+/// `FilterPushdown::ComparesWindowPartitions`: `filter` compares a partition of every window with constants.
+pub(super) fn compares_window_partitions(windows: &[crate::planner::expression::BoundWindow], filter: &BoundExpr) -> bool {
+    let Some(compared) = compared_expression(filter) else {
+        return false;
+    };
+    !windows.is_empty()
+        && windows.iter().all(|w| {
+            w.partitions.iter().any(|p| match (&p.kind, &compared.kind) {
+                (BoundExprKind::ColumnRef { binding: a, .. }, BoundExprKind::ColumnRef { binding: b, .. }) => a == b,
+                _ => expressions_equal(p, compared),
+            })
+        })
+}
+
 fn compared_expression(filter: &BoundExpr) -> Option<&BoundExpr> {
     if filter.is_volatile() {
         return None;
