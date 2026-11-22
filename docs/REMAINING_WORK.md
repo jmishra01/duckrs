@@ -307,7 +307,7 @@ Each item gives the number of failing files in `test/` that it should fix, where
     (1.5.6 gives 256 for `x + 100` of 0 with `filter_pushdown` disabled); duckrs keeps the window there
   - [x] self-join aggregate (TPC-DS q95's `ws_wh` as `GROUP BY keys HAVING min(x) <> max(x)`); volatile
     uncorrelated IN subqueries are MARK joins too
-  - [ ] `duckdb_types()` and the other system functions as `LogicalGet`s in EXPLAIN (`self_join_aggregate`)
+  - [x] `duckdb_types()` and the other system functions as scans of the function in EXPLAIN (`self_join_aggregate`)
   - [x] compressed materialization, stages 1-3: integral and VARCHAR columns of ORDER BY, DISTINCT, aggregate
     groups and the build side and single key pair of comparison joins (casts, `__internal_compress_integral_*`,
     `__internal_compress_string_*`); calling them is the binder error C++ gives

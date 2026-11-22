@@ -3182,6 +3182,7 @@ test/sql/optimizer/scalar_aggregate_merge_files_plan.test
 test/sql/optimizer/scalar_aggregate_merge_plan.test
 test/sql/optimizer/secure_view_fallible_functions.test
 test/sql/optimizer/secure_view_pushdown_compression.test
+test/sql/optimizer/self_join_aggregate.test
 test/sql/optimizer/sign_row_group_pruning.test
 test/sql/optimizer/statistics/list_length_stats_propagation.test
 test/sql/optimizer/string_row_group_pruning.test

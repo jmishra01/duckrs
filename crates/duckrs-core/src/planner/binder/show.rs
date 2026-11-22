@@ -361,6 +361,7 @@ impl Binder<'_> {
             .collect();
         Ok(LogicalOperator::new(
             LogicalOperatorKind::ExpressionGet {
+                function: None,
                 table_index,
                 types,
                 expressions,
