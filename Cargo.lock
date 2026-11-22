@@ -759,6 +759,7 @@ dependencies = [
  "criterion",
  "duckrs-common",
  "duckrs-core",
+ "libc",
 ]
 
 [[package]]
@@ -1825,6 +1826,7 @@ version = "0.0.1"
 dependencies = [
  "clap",
  "duckrs",
+ "libc",
  "libduckdb-sys",
  "md-5",
  "regex",

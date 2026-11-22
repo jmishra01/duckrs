@@ -256,6 +256,8 @@ fn main() -> ExitCode {
         }
     });
     let _ = std::fs::remove_dir_all(&config.scratch);
+    // Workers killed for running too long, and runs killed before, leave theirs.
+    sweep_scratch();
     let mut reports = reports.into_inner().unwrap();
     reports.sort_by(|a, b| a.path.cmp(&b.path));
 
@@ -471,6 +473,28 @@ fn run_isolated(args: &Args, root: &std::path::Path, file: &str, index: usize) -
             let tail: Vec<&str> = err.lines().rev().take(15).collect();
             let tail: Vec<&str> = tail.into_iter().rev().collect();
             error(format!("worker crashed ({status})\n{}", tail.join("\n")))
+        }
+    }
+}
+
+/// Removes the `duckrs-sqllogictest-{pid}` directories whose process is gone.
+fn sweep_scratch() {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let pid = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("duckrs-sqllogictest-"))
+            .and_then(|pid| pid.parse::<libc::pid_t>().ok());
+        let gone = pid.is_some_and(|pid| {
+            // SAFETY: signal 0 only asks whether the process exists.
+            let found = unsafe { libc::kill(pid, 0) } == 0;
+            !found && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        });
+        if gone {
+            let _ = std::fs::remove_dir_all(entry.path());
         }
     }
 }
