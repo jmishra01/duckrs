@@ -220,6 +220,33 @@ Each item gives the number of failing files in `test/` that it should fix, where
     which C++ scans a constant segment with
   - [ ] of shredded VARIANTs: pushdown of extracts into the shredded part; C++'s order of the fields of a shredded
     object (that of an `unordered_map`); shredded GEOMETRY
+  - [x] of shredded VARIANTs: pushdown of extracts into the shredded part; shredded GEOMETRY (typed, with its
+    extent; written to Parquet it errors, as in C++)
+  - [ ] the key order of VARIANT objects (`parquet/variant/variant_object_key_order`): a C++ VARIANT row keeps one
+    key slot per field of an object, in the order the objects are opened (`json_to_variant.hpp`: an object
+    reserves its slots, its keys in document order, when it is converted; `{"z":[{"c":..,"b":..}],"a":{"y":..,
+    "x":..},"empty":{}}` has `z, a, empty, c, b, y, x`). `variant_to_parquet_variant` writes those slots as the
+    dictionary and sorts only the field ids of each object by name (`parquet_variant_encoding.cpp`). duckrs sorts
+    the keys of an object as it builds it (`VariantNode::Object`) and stores them sorted and once each, so the
+    order is gone: a format change, where each object keeps the order of its keys, set by the conversions from
+    JSON and STRUCT and by the readers of database files and Parquet, and used by their writers
+  - [x] extracts of fields (`struct_extract`) and VARIANT keys (`variant_extract`), cast or not, pushed into table
+    and Parquet scans (`ColumnIndex::IsPushdownExtract`), through the projections that pass a column on; EXPLAIN
+    shows `s.a`. Not under TRY for a CAST, nor below a window
+  - [x] a pushed down path of keys of a shredded VARIANT in a database file is read from its shredded part alone,
+    where every value of a row group is there or the key is missing (otherwise the column, then the extracts)
+  - [x] filters on a path of a VARIANT in a scan read the path's column (`PushdownExtract` of table filters), and
+    row groups are left out by the statistics of a path that is fully shredded all the way, cast to the filter's
+    type (`VariantStats::PushdownExtract`)
+  - [x] a path whose values are partly in the unshredded part (`VariantStats::PushdownExtract` in the scan); late
+    materialization (`LateMaterialization`: a TopN, LIMIT or SAMPLE over a table scan becomes a SEMI join on the
+    row ID, with optional filters on the copy), which re-applies the pushed paths (`pushdown_extract_reapplied`);
+    pushed paths of a Parquet scan in SQL export
+  - [x] Parquet's shredded paths: a pushed down path that a file has all of in its `typed_value`, of the type it is
+    cast to, is read from there alone (`CreateVariantTypedValuePushdown`); row groups are left out by the
+    statistics of a path of a VARIANT, by key or by index, cast to the filter's type (`ExpressionFilter::
+    CheckStatistics` through `VariantExtractPropagateStats`)
+  - [x] late materialization of Parquet scans, on `file_index` and `file_row_number` (`ParquetGetRowIdColumns`)
   - [x] a crash between the end of a checkpoint and the removal of its log: a log that its marker says is in the
     file goes on open (`IsCheckpointClean`), and the checkpoint of a replayed log marks it where what it committed
     ends, before the new header goes in
