@@ -668,9 +668,10 @@ Each item gives the number of failing files in `test/` that it should fix, where
 - [ ] 48. v1 gate: TPC-H SF10 geometric mean ≤ 1.5× C++ DuckDB, and no query slower than 3×. The runner
   prints the gate after `--engine=both`. On TPC-H SF1 (8 threads, all 22 answers correct) duckrs is at
   1.53× (none above 3×: Q21 2.7×; Q02 0.5×, Q08 0.95×), from 12.7× at the start of item 47.
-  SF10, both engines on the file C++ wrote: 0.64× on 2026-11-21 after part 63, all 22 answers correct and all 22
-  faster than C++ (Q10 0.96×, Q09, Q13, Q18 and Q21 0.93×; Q22 0.65×, Q06 0.27×, Q15 0.22×), with the load average
-  4 at the start and 14 at the end, the quietest run yet. Before that, 0.63× after part 60 (Q22 1.44×, Q16 1.07×,
+  SF10, both engines on the file C++ wrote: 0.65× on 2026-11-22 after part 65, all 22 answers correct and all 22
+  faster than C++ (Q13 and Q21 0.94×, Q16 and Q18 0.93×, Q10 0.91×; Q22 0.66×, Q06 0.31×, Q15 0.22×), with the load
+  average 19 at the start and 27 at the end. Before that, 0.64× after part 63 (Q10 0.96×, Q09, Q13, Q18 and Q21
+  0.93×) with the load average 4 at the start and 14 at the end, the quietest run yet; 0.63× after part 60 (Q22 1.44×, Q16 1.07×,
   Q10 1.06×) with the load average rising from 10 to 32, which slowed C++'s Q01 to 0.85s from its usual 0.5s;
   0.68× after part 52, the GROUP BY rewrite done (none above 3×: Q01 1.49×, Q09 1.10×; Q10 0.97×, Q18 0.73×,
   Q15 0.17×), with the machine's load average rising from 18 to 58 during the run. Earlier that day: 0.71× after part
@@ -707,7 +708,9 @@ Each item gives the number of failing files in `test/` that it should fix, where
   of CPU from 0.54s. Q22's scan of customer read all its columns, below the column select that hides the marker
   of an IN list's MARK join; the unused columns pass narrows that select and goes on below it, and a hash join
   prefetches the keys of 32 probe rows' candidates before it compares them: Q22 0.58s of CPU from 0.93s, Q03 1.02s
-  from 1.18s. duckrs
+  from 1.18s. Q10's GROUP BY hashes strings of customer rows that the join reads in the order of the orders, so
+  hashing prefetches the string entries of 32 rows and then the bytes of those not inlined before it hashes them,
+  and the join filter's Bloom check prefetches its blocks: Q10 1.8s of CPU from 2.0s. duckrs
   had no way to load SF10 itself, as an append kept its rows in memory (more than 2 GiB failed); appends now write
   their full row groups to blocks as they fill (an INSERT of 80M rows takes 90MB). duckrs now loads SF10 into its
   own file (COPY of the `.tbl` files: lineitem 24s against C++'s 22s, the rest under 5s each; at most 710MB
