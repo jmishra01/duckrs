@@ -934,6 +934,10 @@ pub fn record(op: &dyn crate::execution::physical::PhysicalOperator) {
         if matches!(op.name(), "TABLE_SCAN" | "READ_PARQUET") {
             list.push(op.dynamic_filters());
         }
+        // what is inside a secure view is not shown, so neither are its scans
+        if op.name() == "SECURE_VIEW" {
+            return;
+        }
         for child in op.children() {
             collect(child.as_ref(), list);
         }

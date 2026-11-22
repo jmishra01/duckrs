@@ -1406,6 +1406,7 @@ test/sql/catalog/view/nested_view_search_path.test
 test/sql/catalog/view/recursive_view.test
 test/sql/catalog/view/recursive_view_with_dependencies.test
 test/sql/catalog/view/secure_view.test
+test/sql/catalog/view/secure_view_persistence.test
 test/sql/catalog/view/test_loosely_qualified_view_sql.test
 test/sql/catalog/view/test_stacked_view.test
 test/sql/catalog/view/test_view.test
@@ -3193,7 +3194,10 @@ test/sql/optimizer/scalar_aggregate_merge_files.test
 test/sql/optimizer/scalar_aggregate_merge_files_plan.test
 test/sql/optimizer/scalar_aggregate_merge_plan.test
 test/sql/optimizer/secure_view_fallible_functions.test
+test/sql/optimizer/secure_view_join_order.test
+test/sql/optimizer/secure_view_pushdown.test
 test/sql/optimizer/secure_view_pushdown_compression.test
+test/sql/optimizer/secure_view_statistics.test
 test/sql/optimizer/self_join_aggregate.test
 test/sql/optimizer/sign_row_group_pruning.test
 test/sql/optimizer/statistics/list_length_stats_propagation.test

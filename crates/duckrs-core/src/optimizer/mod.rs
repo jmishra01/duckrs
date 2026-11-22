@@ -346,6 +346,9 @@ pub fn optimize_timed(
         };
     // a plan that has been through here before has its comparisons back in the predicates
     range_joins::restore_predicates(&mut plan);
+    // `LogicalSecureView::AnalyzeStatistics`, before the filters the optimizer pushes into a view are mistaken for
+    // the view restricting its own rows
+    analyze_secure_views(&mut plan);
     if options.expression_rewriter {
         plan = run("expression_rewriter", plan, &mut |mut plan| {
             rewriter::rewrite_plan(&mut plan);
@@ -632,4 +635,38 @@ pub(crate) fn conjunction_of(mut expressions: Vec<BoundExpr>) -> BoundExpr {
         },
         LogicalType::BOOLEAN,
     )
+}
+
+/// `LogicalSecureView::AnalyzeStatistics`: a secure view may expose the statistics of its contents only if it emits
+/// every row it reads.
+fn analyze_secure_views(op: &mut LogicalOperator) {
+    use crate::planner::logical::LogicalOperatorKind as K;
+    if matches!(op.kind, K::SecureView { .. }) {
+        let emits = emits_all_rows(&op.children[0]);
+        if let K::SecureView { propagate_statistics, .. } = &mut op.kind {
+            *propagate_statistics = emits;
+        }
+    }
+    for child in &mut op.children {
+        analyze_secure_views(child);
+    }
+}
+
+/// `EmitsAllRows`: whether `op` and what is below it emit every row they read.
+fn emits_all_rows(op: &LogicalOperator) -> bool {
+    use crate::planner::logical::LogicalOperatorKind as K;
+    let own = match &op.kind {
+        // a nested secure view applies the same rule to its own contents
+        K::SecureView { .. } => return true,
+        K::Projection { .. } | K::Order { .. } | K::ExpressionGet { .. } | K::DummyScan { .. } | K::ColumnSelect { .. } => true,
+        K::Get {
+            filters,
+            optional_filters,
+            zone_filters,
+            sample,
+            ..
+        } => filters.is_empty() && optional_filters.is_empty() && zone_filters.is_empty() && sample.is_none(),
+        _ => false,
+    };
+    own && op.children.iter().all(emits_all_rows)
 }

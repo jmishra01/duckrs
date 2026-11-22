@@ -414,6 +414,18 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
         info
     };
     match &op.kind {
+        // `PhysicalSecureView::ParamsToString`
+        K::SecureView {
+            view_name,
+            pushed_filters,
+            ..
+        } => {
+            let mut info = entry("View", view_name.clone());
+            if !pushed_filters.is_empty() {
+                info.extend(entry("Filters", pushed_filters.join("\n")));
+            }
+            info
+        }
         // `PhysicalTableScan::ParamsToString` of a table function without `to_string`
         K::ExpressionGet {
             function: Some(function), ..
@@ -726,6 +738,8 @@ pub(super) fn logical_tree(op: &LogicalOperator, estimate: Option<&PlanEstimate>
     if matches!(op.kind, K::ColumnSelect { .. }) {
         return logical_tree(&op.children[0], aligned.map(|e| &e.children[0]));
     }
+    // `HidesChildren`: nothing of what is inside a secure view is shown
+    let hidden = matches!(op.kind, K::SecureView { .. });
     ExplainNode {
         name: logical_name(op).to_string(),
         info: operator_info(op, false),
@@ -735,6 +749,7 @@ pub(super) fn logical_tree(op: &LogicalOperator, estimate: Option<&PlanEstimate>
             .children
             .iter()
             .enumerate()
+            .filter(|_| !hidden)
             .map(|(at, child)| logical_tree(child, aligned.map(|e| &e.children[at])))
             .collect(),
     }
@@ -1023,9 +1038,11 @@ pub(super) fn physical_tree(
         info,
         estimate: estimate.map(|e| e.cardinality),
         rows: analyzed_rows(op),
+        // `HidesChildren`: nothing of what is inside a secure view is shown
         children: children
             .iter()
             .enumerate()
+            .filter(|_| op.name() != "SECURE_VIEW")
             .map(|(at, child)| {
                 physical_tree(
                     child.as_ref(),

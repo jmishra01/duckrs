@@ -511,7 +511,16 @@ fn create_physical(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             Box::new(sample)
         }
         // only the optimizer sees the boundary
-        LogicalOperatorKind::SecureView { .. } => children.remove(0),
+        LogicalOperatorKind::SecureView {
+            view_name,
+            pushed_filters,
+            ..
+        } => Box::new(physical::PhysicalSecureView {
+            types,
+            view_name,
+            pushed_filters,
+            children,
+        }),
         LogicalOperatorKind::Distinct { targets, orders, .. } => {
             let count = targets.len();
             let modifiers: Vec<_> = orders.iter().map(|o| o.modifiers).collect();
