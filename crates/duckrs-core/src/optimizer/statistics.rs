@@ -461,9 +461,17 @@ fn compute_distinct_counts(table: &Arc<TableCatalogEntry>) -> Option<TableDistin
     // a file keeps them, as C++ does, and counting them again would read all of the table
     let stored = table.distinct_states();
     let columns = match stored {
+        // a column without one (a change put it in memory) is counted from its rows alone
         Some(states) => states
             .iter()
-            .map(|state| state.as_ref().map(|state| state.count()))
+            .enumerate()
+            .map(|(column, state)| match state {
+                Some(state) => Some(state.count()),
+                None if super::distinct_statistics::type_is_supported(&table.columns[column].ty) => {
+                    super::distinct_statistics::table_column_distinct(table, column)
+                }
+                None => None,
+            })
             .collect(),
         None => (0..table.columns.len())
             .map(|column| super::distinct_statistics::table_column_distinct(table, column))

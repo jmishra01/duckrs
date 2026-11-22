@@ -246,15 +246,15 @@ impl TableSource for LayeredTable {
         Ok(result)
     }
 
-    /// `DistinctStatistics` stay as they are through a DELETE, as in C++: while every column is the file's, the
-    /// file's. A column a change put in memory has none, so then they are counted again from the rows.
+    /// `DistinctStatistics` stay as they are through a DELETE, as in C++: of the columns that are the file's, the
+    /// file's. A column a change put in memory has none, which is counted again from the rows.
     fn distinct_states(&self) -> Option<Vec<Option<crate::optimizer::distinct_statistics::DistinctState>>> {
         let base = self.base.distinct_states()?;
         let states = self.columns.iter().map(|layer| match layer {
-            Layer::Base(column) => base.get(*column).cloned(),
+            Layer::Base(column) => base.get(*column).cloned().flatten(),
             Layer::Memory { .. } => None,
         });
-        states.collect()
+        Some(states.collect())
     }
 
     fn column_statistics(&self) -> Option<Vec<ColumnStatistics>> {
