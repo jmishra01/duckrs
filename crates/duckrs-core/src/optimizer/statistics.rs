@@ -2045,6 +2045,153 @@ impl StatisticsPropagator {
                 children: Vec::new(),
             };
         }
+        // `PropagatePowStats`
+        if children.len() == 2 && matches!(function.name.as_str(), "pow" | "power" | "**" | "^") {
+            let float = |value: &Option<Value>| value.as_ref()?.try_to_string().ok()?.parse::<f64>().ok();
+            let (left, right) = (&stats[0], &stats[1]);
+            let (Some(exponent_min), Some(exponent_max)) = (float(&right.min), float(&right.max)) else {
+                return unknown();
+            };
+            let base = float(&left.min).zip(float(&left.max));
+            let Some((min, max)) = power_bounds(base, (exponent_min, exponent_max)) else {
+                return unknown();
+            };
+            return Stats {
+                lists: None,
+                variant: None,
+                min: Some(Value::double(min)),
+                max: Some(Value::double(max)),
+                can_be_null: left.can_be_null || right.can_be_null,
+                can_be_valid: true,
+                geometry: None,
+                strings: None,
+                distinct: None,
+                children: Vec::new(),
+            };
+        }
+        // `PropagateModuloStats` of DECIMAL, on the unscaled values, and of FLOAT and DOUBLE (`FloatingModuloBounds`)
+        if children.len() == 2
+            && function.name == "%"
+            && matches!(return_type.id(), LogicalTypeId::Decimal | LogicalTypeId::Float | LogicalTypeId::Double)
+        {
+            let (left, right) = (&stats[0], &stats[1]);
+            let text = |value: &Option<Value>| value.as_ref().and_then(|v| v.try_to_string().ok());
+            let can_be_null = |zero_divisor: bool| left.can_be_null || right.can_be_null || zero_divisor;
+            let result = |min: Value, max: Value, can_be_null: bool| Stats {
+                lists: None,
+                variant: None,
+                min: Some(min),
+                max: Some(max),
+                can_be_null,
+                can_be_valid: true,
+                geometry: None,
+                strings: None,
+                distinct: None,
+                children: Vec::new(),
+            };
+            if let Some((width, scale)) = return_type.decimal_properties() {
+                let unscaled = |value: &Option<Value>| decimal_unscaled(&text(value)?, scale);
+                let (Some(lmin), Some(lmax), Some(rmin), Some(rmax)) =
+                    (unscaled(&left.min), unscaled(&left.max), unscaled(&right.min), unscaled(&right.max))
+                else {
+                    return unknown();
+                };
+                let zero_divisor = rmin <= 0 && rmax >= 0;
+                if (rmin == 0 && rmax == 0) || (zero_divisor && !function.null_on_zero) {
+                    return unknown();
+                }
+                let (mut min, mut max) = (lmin.min(0), lmax.max(0));
+                let (abs_min, abs_max) = (rmin.abs(), rmax.abs());
+                let max_abs = abs_min.max(abs_max);
+                let min_abs = if zero_divisor { 0 } else { abs_min.min(abs_max) };
+                if !zero_divisor && -min_abs < lmin && lmax < min_abs {
+                    (min, max) = (lmin, lmax);
+                } else {
+                    min = min.max(-(max_abs - 1));
+                    max = max.min(max_abs - 1);
+                }
+                let (Ok(min), Ok(max)) = (Value::decimal(min, width, scale), Value::decimal(max, width, scale)) else {
+                    return unknown();
+                };
+                return result(min, max, can_be_null(zero_divisor));
+            }
+            let float = |value: &Option<Value>| text(value)?.parse::<f64>().ok();
+            let (Some(lmin), Some(lmax), Some(rmin), Some(rmax)) =
+                (float(&left.min), float(&left.max), float(&right.min), float(&right.max))
+            else {
+                return unknown();
+            };
+            if ![lmin, lmax, rmin, rmax].iter().all(|v| v.is_finite()) {
+                return unknown();
+            }
+            let zero_divisor = rmin <= 0.0 && rmax >= 0.0;
+            // x % 0 is NaN under IEEE semantics and raises by default: only where it is NULL are bounds derived
+            if (rmin == 0.0 && rmax == 0.0) || (zero_divisor && !function.null_on_zero) {
+                return unknown();
+            }
+            let (mut min, mut max) = (lmin.min(0.0), lmax.max(0.0));
+            let max_abs = rmin.abs().max(rmax.abs());
+            let min_abs = if zero_divisor { 0.0 } else { rmin.abs().min(rmax.abs()) };
+            if !zero_divisor && -min_abs < lmin && lmax < min_abs {
+                (min, max) = (lmin, lmax);
+            } else {
+                min = min.max(-max_abs);
+                max = max.min(max_abs);
+            }
+            let typed = |v: f64| {
+                if return_type.id() == LogicalTypeId::Float {
+                    Value::float(v as f32)
+                } else {
+                    Value::double(v)
+                }
+            };
+            return result(typed(min), typed(max), can_be_null(zero_divisor));
+        }
+        // UHUGEINT bounds past what an i128 holds, in the type itself as C++ computes them
+        if children.len() == 2
+            && return_type.id() == LogicalTypeId::UHugeInt
+            && matches!(function.name.as_str(), "%" | "//")
+        {
+            let as_u128 = |value: &Option<Value>| value.as_ref()?.try_to_string().ok()?.parse::<u128>().ok();
+            let (left, right) = (&stats[0], &stats[1]);
+            let (Some(rmin), Some(rmax)) = (as_u128(&right.min), as_u128(&right.max)) else {
+                return unknown();
+            };
+            let left_bounds = as_u128(&left.min).zip(as_u128(&left.max));
+            let bounds = if function.name == "%" {
+                // `UnsignedModuloBounds`; `ModuloFullRange` of a dividend without statistics, and a divisor range
+                // with 0 in it raises
+                let (lmin, lmax) = left_bounds.unwrap_or((0, u128::MAX));
+                if rmax == 0 || (rmin == 0 && !function.null_on_zero) {
+                    None
+                } else if lmax < rmin {
+                    Some((lmin, lmax))
+                } else {
+                    Some((0, lmax.min(rmax - 1)))
+                }
+            } else {
+                // `DividePropagateStatistics`: the divisor's range has no 0, and the corners bound the result
+                match left_bounds {
+                    Some((lmin, lmax)) if rmin > 0 => Some((lmin / rmax, lmax / rmin)),
+                    _ => None,
+                }
+            };
+            let Some((min, max)) = bounds else {
+                return unknown();
+            };
+            return Stats {
+                lists: None,
+                variant: None,
+                min: Some(Value::uhugeint(min)),
+                max: Some(Value::uhugeint(max)),
+                can_be_null: left.can_be_null || right.can_be_null || rmin == 0,
+                can_be_valid: true,
+                geometry: None,
+                strings: None,
+                distinct: None,
+                children: Vec::new(),
+            };
+        }
         if children.len() == 2 && return_type.is_integral() && matches!(function.name.as_str(), "%" | "//") {
             let (left, right) = (&stats[0], &stats[1]);
             // `ModuloFullRange`: a dividend without statistics spans its type
@@ -2062,25 +2209,9 @@ impl StatisticsPropagator {
             let zero_divisor = rmin <= 0 && rmax >= 0;
             let can_be_null = left.can_be_null || right.can_be_null || zero_divisor;
             let bounds = if function.name == "%" {
-                // `SignedModuloBounds`; a divisor range with 0 in it raises, so nothing is derived
-                if zero_divisor {
-                    None
-                } else {
-                    let (mut min, mut max) = (lmin.min(0), lmax.max(0));
-                    let (Some(abs_min), Some(abs_max)) = (rmin.checked_abs(), rmax.checked_abs()) else {
-                        return unknown();
-                    };
-                    let max_abs = abs_min.max(abs_max);
-                    let min_abs = if zero_divisor { 0 } else { abs_min.min(abs_max) };
-                    if !zero_divisor && -min_abs < lmin && lmax < min_abs {
-                        (min, max) = (lmin, lmax);
-                    } else {
-                        let bound = max_abs - 1;
-                        min = min.max(-bound);
-                        max = max.min(bound);
-                    }
-                    Some((min, max))
-                }
+                // `SignedModuloBounds` (and `UnsignedModuloBounds`, which it agrees with on unsigned values). A
+                // divisor range with 0 in it raises, unless `error_on_division_by_zero` is off and x % 0 is NULL
+                integer_modulo_bounds((lmin, lmax), (rmin, rmax), &return_type, function.null_on_zero)
             } else if zero_divisor {
                 // `DividePropagateStatistics`: a divisor range with 0 in it says nothing
                 None
@@ -3813,5 +3944,85 @@ fn date_part_stats(name: &str, child: &Stats, child_type: &LogicalType, return_t
         strings: None,
         distinct: None,
         children: Vec::new(),
+    })
+}
+
+/// The unscaled value of a decimal written as `text`, at `scale` digits after the point.
+fn decimal_unscaled(text: &str, scale: u8) -> Option<i128> {
+    let (negative, digits) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    let (whole, fraction) = digits.split_once('.').unwrap_or((digits, ""));
+    if fraction.len() > usize::from(scale) || !whole.chars().chain(fraction.chars()).all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let mut unscaled: i128 = if whole.is_empty() { 0 } else { whole.parse().ok()? };
+    for _ in 0..scale {
+        unscaled = unscaled.checked_mul(10)?;
+    }
+    let mut fraction_value: i128 = if fraction.is_empty() { 0 } else { fraction.parse().ok()? };
+    for _ in fraction.len()..usize::from(scale) {
+        fraction_value = fraction_value.checked_mul(10)?;
+    }
+    let value = unscaled.checked_add(fraction_value)?;
+    Some(if negative { -value } else { value })
+}
+
+/// `SignedModuloBounds` (and `UnsignedModuloBounds`, which it agrees with on unsigned values) of an integer `%` of
+/// `type`: a divisor range with 0 in it raises, unless `null_on_zero`, where x % 0 is NULL.
+pub(crate) fn integer_modulo_bounds(
+    (lmin, lmax): (i128, i128),
+    (rmin, rmax): (i128, i128),
+    ty: &LogicalType,
+    null_on_zero: bool,
+) -> Option<(i128, i128)> {
+    let zero_divisor = rmin <= 0 && rmax >= 0;
+    if (rmin == 0 && rmax == 0) || (zero_divisor && !null_on_zero) {
+        return None;
+    }
+    let (mut min, mut max) = (lmin.min(0), lmax.max(0));
+    // |rmin| is not representable for the type's minimum, whose bound is the type's range anyway
+    if integer_range(ty).is_none_or(|(type_min, _)| rmin != type_min) {
+        let (abs_min, abs_max) = (rmin.checked_abs()?, rmax.checked_abs()?);
+        let max_abs = abs_min.max(abs_max);
+        let min_abs = if zero_divisor { 0 } else { abs_min.min(abs_max) };
+        if !zero_divisor && -min_abs < lmin && lmax < min_abs {
+            (min, max) = (lmin, lmax);
+        } else {
+            let bound = max_abs - 1;
+            min = min.max(-bound);
+            max = max.min(bound);
+        }
+    }
+    Some((min, max))
+}
+
+/// `PropagatePowStats`: the bounds of `power(base, exponent)`. A power of 0 is 1, whatever the base; otherwise the
+/// exponent is one non-negative integer and the base finite.
+pub(crate) fn power_bounds(base: Option<(f64, f64)>, (exponent_min, exponent_max): (f64, f64)) -> Option<(f64, f64)> {
+    if exponent_min == 0.0 && exponent_max == 0.0 {
+        return Some((1.0, 1.0));
+    }
+    if !exponent_min.is_finite() || exponent_min != exponent_max || exponent_min < 0.0 || exponent_min.trunc() != exponent_min {
+        return None;
+    }
+    let (base_min, base_max) = base?;
+    if !base_min.is_finite() || !base_max.is_finite() {
+        return None;
+    }
+    let (power_min, power_max) = (base_min.powf(exponent_min), base_max.powf(exponent_min));
+    if !power_min.is_finite() || !power_max.is_finite() {
+        return None;
+    }
+    // odd powers keep the order; even powers fall toward zero and rise away from it
+    Some(if exponent_min % 2.0 != 0.0 {
+        (power_min, power_max)
+    } else if base_min <= 0.0 && base_max >= 0.0 {
+        (0.0, power_min.max(power_max))
+    } else if base_max < 0.0 {
+        (power_max, power_min)
+    } else {
+        (power_min, power_max)
     })
 }
