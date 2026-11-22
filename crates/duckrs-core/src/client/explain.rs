@@ -626,7 +626,9 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
             info
         }
         K::Order { orders } => entry("Order By", order_text(orders)),
-        K::TopN { orders, limit, offset } => {
+        K::TopN {
+            orders, limit, offset, ..
+        } => {
             let mut info = entry("Top", limit.to_string());
             if *offset > 0 {
                 info.extend(entry("Offset", offset.to_string()));
@@ -985,6 +987,25 @@ pub(super) fn physical_tree(
         Some(logical) => operator_info(logical, true),
         None => op.explain_details().into_iter().map(|d| (String::new(), d)).collect(),
     };
+    // the filters the plan gave a scan once it was planned (a Top-N's), after those it had
+    let pushed = op.planned_filters();
+    if !pushed.is_empty() {
+        match info.iter_mut().find(|(key, _)| key == "Filters") {
+            Some((_, filters)) => {
+                for line in pushed {
+                    filters.push('\n');
+                    filters.push_str(&line);
+                }
+            }
+            None => {
+                let at = info
+                    .iter()
+                    .position(|(key, _)| !matches!(key.as_str(), "Table" | "Type" | "Function" | "Projections"))
+                    .unwrap_or(info.len());
+                info.insert(at, ("Filters".to_string(), pushed.join("\n")));
+            }
+        }
+    }
     // C++ only knows when the scan has started
     if analyze
         && let Some(K::Get {

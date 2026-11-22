@@ -227,8 +227,8 @@ Each item gives the number of failing files in `test/` that it should fix, where
     (`pushdown_window_partition_expression`)
   - [x] join filters into `read_parquet` scans, through inner blockwise NL joins too, and their
     `Dynamic Filters` (`join_filter_pushdown_any_join` up to its Top-N checks)
-  - [ ] Top-N dynamic filters pushed into scans (`join_filter_pushdown_any_join`, `topn_dynamic_filter_cast`):
-    the Top-N keeps its boundary to itself
+  - [x] Top-N dynamic filters pushed into scans of tables and Parquet files, through order-keeping casts
+    that cannot fail (`TopN::PushdownDynamicFilters`; `join_filter_pushdown_any_join`, `topn_dynamic_filter_cast`)
   - [ ] the operator log and profiler output a few tests read (`join_filter_pushdown_integer_chain`,
     `cte_domain_join_filter`); `read_csv`'s `schema`; `COLUMNS(json_keys(getvariable(...)))` (`issue_16671`);
     a filter on the right of a SEMI join through

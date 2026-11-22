@@ -211,6 +211,12 @@ pub trait PhysicalOperator: fmt::Debug + Send + Sync {
         None
     }
 
+    /// The filters a scan got when the plan was made physical that are not in its logical plan: those of a
+    /// Top-N above it, as `Filters` shows them.
+    fn planned_filters(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Whether a join has rows to emit through `get_data` after its input is done
     /// (`IsSource` of RIGHT and FULL joins).
     fn has_unmatched_source(&self) -> bool {
@@ -271,6 +277,24 @@ pub struct PhysicalTableScan {
 }
 
 impl PhysicalTableScan {
+    /// Whether a Top-N above has a boundary that no row of row group `group` sorts before, by the group's zone
+    /// maps: the group is not read (`DynamicFilterData::CheckStatistics`).
+    fn top_n_skips(&self, group: usize, rows: usize) -> bool {
+        let conjuncts: Vec<&BoundExpr> = match self.filter.as_ref().map(|f| &f.kind) {
+            Some(BoundExprKind::Conjunction { and: true, children }) => children.iter().collect(),
+            Some(_) => self.filter.iter().collect(),
+            None => return false,
+        };
+        conjuncts.into_iter().any(|conjunct| {
+            let BoundExprKind::TopNFilter { child, filter } = &conjunct.kind else {
+                return false;
+            };
+            filter.expression_on((**child).clone()).is_some_and(|passes| {
+                super::zone_map::group_never_true(&self.table, &self.column_ids, group, rows, &passes)
+            })
+        })
+    }
+
     /// What the columns of a scan are for rows of a chunk that starts at `first_row`.
     fn scan_columns(
         &self,
@@ -862,6 +886,9 @@ impl PhysicalOperator for PhysicalTableScan {
     fn dynamic_filters(&self) -> Option<String> {
         dynamic_filters_of(self.filter.as_ref())
     }
+    fn planned_filters(&self) -> Vec<String> {
+        top_n_filters_of(self.filter.as_ref())
+    }
     fn row_groups_scanned(&self) -> Option<(usize, usize)> {
         if self.index_rows.is_some() {
             return None;
@@ -906,6 +933,9 @@ impl PhysicalOperator for PhysicalTableScan {
                 if first_row >= rows || (aligned && !groups.get(group).is_none_or(|g| *g)) {
                     continue;
                 }
+                if aligned && self.top_n_skips(group, rows) {
+                    continue;
+                }
                 let group_rows = source.group_rows(group).min(rows - first_row);
                 self.scan_group_filtered(&*source, group, first_row, group_rows, ids, &mut |chunk| {
                     pending.push_back(chunk);
@@ -917,7 +947,8 @@ impl PhysicalOperator for PhysicalTableScan {
             // all chunks but the last are full, so that a chunk tells where its rows are
             let index = *next;
             let first_row = index * STANDARD_VECTOR_SIZE;
-            let wanted = groups.get(index / self.table.chunks_per_row_group()).is_none_or(|g| *g);
+            let group = index / self.table.chunks_per_row_group();
+            let wanted = groups.get(group).is_none_or(|g| *g) && !self.top_n_skips(group, self.table.row_count());
             *next += 1;
             // `RowGroup::Scan`: a SYSTEM sample skips whole vectors, or keeps rows of one at its rate
             let mut sample_selection = None;
@@ -2367,6 +2398,8 @@ pub struct PhysicalOrder {
     /// a Top-N's boundary (`TopNHeap`'s boundary value): the sort key of the last row it keeps, once
     /// it has as many rows as it needs, so that rows that sort after it are not kept
     boundary: Mutex<Option<Vec<u8>>>,
+    /// the filter of the boundary that the scans below apply (`PhysicalTopN::dynamic_filter`)
+    pub dynamic: Option<Arc<super::join_filter::TopNFilter>>,
 }
 
 /// A Top-N sorts what it has when it has twice what it needs, and at least this.
@@ -2405,6 +2438,7 @@ impl PhysicalOrder {
             data: Mutex::new(ColumnDataCollection::new(types.clone())),
             spill: (top.is_none() && SortSpill::can_spill(&types)).then(Mutex::default),
             boundary: Mutex::default(),
+            dynamic: None,
             types,
             children: vec![child],
         }
@@ -2468,8 +2502,10 @@ impl PhysicalOperator for PhysicalOrder {
         }
         let mut data = self.data.lock();
         data.append(&rows);
-        // what is behind the first rows now never gets back in
-        if keep > 0 && data.len() as u64 > keep.saturating_mul(2).max(TOP_N_MIN_BUFFERED_ROWS) {
+        // what is behind the first rows now never gets back in. The first time it has the rows it keeps it has
+        // a boundary, as `TopNHeap` does, for the rows to come and the scans below
+        let first_boundary = boundary.is_none() && data.len() as u64 >= keep;
+        if keep > 0 && (first_boundary || data.len() as u64 > keep.saturating_mul(2).max(TOP_N_MIN_BUFFERED_ROWS)) {
             *data = rows_of_collection(&sort_collection(&data, &self.orders)?, 0, keep);
             if data.len() as u64 == keep {
                 let last = data.chunk(data.chunk_count() - 1);
@@ -2477,6 +2513,10 @@ impl PhysicalOperator for PhysicalOrder {
                 let mut one = last.clone();
                 one.slice(&SelectionVector::from_vec(vec![row as u32]), 1);
                 *boundary = self.sort_keys(&one)?.pop();
+                // `TopNBoundaryValue::UpdateValue`: the scans get its first sort key
+                if let (Some(dynamic), Some(&(column, _))) = (&self.dynamic, self.orders.first()) {
+                    dynamic.set(one.get_value(column, 0));
+                }
             }
         }
         check_buffered(&data)
@@ -4641,4 +4681,18 @@ pub(crate) fn dynamic_filters_of(filter: Option<&BoundExpr>) -> Option<String> {
         })
         .collect();
     (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+/// The Top-N filters among the conjuncts of a scan's filter, as `Filters` shows them.
+pub(crate) fn top_n_filters_of(filter: Option<&BoundExpr>) -> Vec<String> {
+    let conjuncts: Vec<&BoundExpr> = match filter.map(|f| &f.kind) {
+        Some(BoundExprKind::Conjunction { and: true, children }) => children.iter().collect(),
+        Some(_) => filter.into_iter().collect(),
+        None => Vec::new(),
+    };
+    conjuncts
+        .into_iter()
+        .filter(|c| matches!(c.kind, BoundExprKind::TopNFilter { .. }))
+        .map(|c| c.to_string())
+        .collect()
 }

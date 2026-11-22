@@ -1557,6 +1557,9 @@ impl PhysicalOperator for PhysicalParquetScan {
     fn dynamic_filters(&self) -> Option<String> {
         crate::execution::physical::dynamic_filters_of(self.filter.as_ref())
     }
+    fn planned_filters(&self) -> Vec<String> {
+        crate::execution::physical::top_n_filters_of(self.filter.as_ref())
+    }
     fn row_groups_scanned(&self) -> Option<(usize, usize)> {
         self.prune.as_ref()?;
         let (mut scanned, mut total) = (0, 0);

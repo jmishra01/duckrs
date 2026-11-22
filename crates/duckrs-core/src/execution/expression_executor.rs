@@ -920,6 +920,13 @@ pub fn execute(expr: &BoundExpr, input: &DataChunk) -> Result<Vector> {
             }
             Ok(result)
         }
+        BoundExprKind::TopNFilter { child, filter } => {
+            let Some(passes) = filter.expression() else {
+                return Ok(Vector::constant(&Value::boolean(true)));
+            };
+            let values = execute(child, input)?;
+            execute(&passes, &DataChunk::from_columns(vec![values], count))
+        }
         BoundExprKind::ListLambda {
             kind,
             list,
@@ -1233,6 +1240,13 @@ pub fn select(expr: &BoundExpr, input: &DataChunk) -> Result<(SelectionVector, u
                 input.len(),
             ),
         });
+    }
+    if let BoundExprKind::TopNFilter { child, filter } = &expr.kind {
+        let Some(passes) = filter.expression() else {
+            return Ok((SelectionVector::from_vec((0..input.len() as u32).collect()), input.len()));
+        };
+        let values = execute(child, input)?;
+        return select(&passes, &DataChunk::from_columns(vec![values], input.len()));
     }
     if let Some(selected) = select_column_constant(expr, input)? {
         return Ok(selected);

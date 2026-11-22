@@ -912,7 +912,9 @@ impl Exporter<'_> {
                 let child = self.export_child(op, 0)?;
                 Body::Select(self.order(child, orders)?)
             }
-            Op::TopN { orders, limit, offset } => {
+            Op::TopN {
+                orders, limit, offset, ..
+            } => {
                 let child = self.export_child(op, 0)?;
                 let mut select = self.order(child, orders)?;
                 select.limit = Some(self.limit_values(Some(*limit), *offset, false)?);
@@ -2414,7 +2416,9 @@ impl Exporter<'_> {
                 }
                 return Ok(expr);
             }
-            BoundExprKind::JoinFilter { .. } => return Err("A join filter has no SQL export".into()),
+            BoundExprKind::JoinFilter { .. } | BoundExprKind::TopNFilter { .. } => {
+                return Err("A dynamic filter has no SQL export".into());
+            }
             BoundExprKind::Reference(index) => {
                 let Some(expr) = self.lambdas.last().and_then(|l| l.get(*index)) else {
                     return Err("A bound reference has no SQL export".into());

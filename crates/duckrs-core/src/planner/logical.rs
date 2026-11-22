@@ -158,6 +158,8 @@ pub enum LogicalOperatorKind {
         orders: Vec<BoundOrderByNode>,
         limit: u64,
         offset: u64,
+        /// `LogicalTopN::dynamic_filter`: the filter of its boundary it gave the scans below
+        dynamic: Option<Arc<crate::execution::join_filter::TopNFilter>>,
     },
     /// `LogicalLimit` with constant values: skips `offset` rows, then keeps `limit` rows (all
     /// of them with `None`).

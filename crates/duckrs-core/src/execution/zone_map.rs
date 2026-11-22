@@ -1412,6 +1412,18 @@ fn keeps_order(source: &LogicalType, target: &LogicalType) -> bool {
     (source.is_numeric() && target.is_numeric()) || matches!((source.id(), target.id()), (Date, Timestamp))
 }
 
+/// Whether the rows of row group `group` of the table all fail `filter`.
+pub fn group_never_true(
+    table: &TableCatalogEntry,
+    column_ids: &[usize],
+    group: usize,
+    rows: usize,
+    filter: &BoundExpr,
+) -> bool {
+    let zone = |index| table_zone(table, column_ids, group, rows, index);
+    never_true(&zone, filter)
+}
+
 /// Per row group of the table, whether a scan with `filter` must read it.
 pub fn groups_to_scan(
     table: &TableCatalogEntry,

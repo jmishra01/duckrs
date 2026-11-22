@@ -619,6 +619,7 @@ test/optimizer/pushdown/issue_17042.test
 test/optimizer/pushdown/issue_18202.test
 test/optimizer/pushdown/issue_18603.test
 test/optimizer/pushdown/join_filter_pushdown.test
+test/optimizer/pushdown/join_filter_pushdown_any_join.test
 test/optimizer/pushdown/join_filter_pushdown_bloom_cast.test
 test/optimizer/pushdown/join_filter_pushdown_cast.test
 test/optimizer/pushdown/join_filter_pushdown_cast_variant.test
@@ -3100,6 +3101,7 @@ test/sql/merge/merge_into_too_few_columns.test
 test/sql/merge/merge_into_update_star.test
 test/sql/merge/merge_multi_match_error.test
 test/sql/merge/merge_not_matched_by_source_join_order.test
+test/sql/multi_file/multi_file_schema_filter_casts.test
 test/sql/optimizer/anti_join_empty_rhs_projection_map.test
 test/sql/optimizer/any_extremum_rewrite.test
 test/sql/optimizer/array_extract_row_group_pruning.test
@@ -4303,6 +4305,7 @@ test/sql/topn/test_top_n_structs.test
 test/sql/topn/test_top_n_window_row_group_pruner.test
 test/sql/topn/top_n_materialization.test
 test/sql/topn/top_n_pruning_read_ahead.test
+test/sql/topn/topn_dynamic_filter_cast.test
 test/sql/topn/tpcds_q14_topn.test
 test/sql/topn/tpcds_q59_topn.test
 test/sql/transactions/aborted_transaction_commit.test
