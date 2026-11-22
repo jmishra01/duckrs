@@ -720,6 +720,7 @@ test/optimizer/transitive_filters.test
 test/optimizer/union_exclude.test
 test/optimizer/unnest_rewriter_issue_14542.test
 test/optimizer/unused_columns/cte_unused_columns.test
+test/optimizer/unused_columns/deliver_child_columns.test
 test/optimizer/unused_columns/distinct_on_projection_pushdown.test
 test/optimizer/unused_window_columns.test
 test/optimizer/using_optimizer.test
@@ -743,6 +744,7 @@ test/parquet/gzip_footer_oob.test
 test/parquet/issue_22144.test
 test/parquet/min_max_long_varchar_22515.test
 test/parquet/parquet_combine.test
+test/parquet/parquet_extract_pushdown.test
 test/parquet/parquet_schema_lossy_filter_cast.test
 test/parquet/parquet_schema_renamed_struct_filter.test
 test/parquet/parquet_version.test
@@ -790,6 +792,7 @@ test/parquet/variant/variant_list_shredding.test
 test/parquet/variant/variant_malicious.test
 test/parquet/variant/variant_multiple_files.test
 test/parquet/variant/variant_nanos_tz.test
+test/parquet/variant/variant_partial_stats.test
 test/parquet/variant/variant_partially_shredded.test
 test/parquet/variant/variant_short_string_boundary.test
 test/parquet/variant/variant_shred_unsigned_types.test
@@ -804,6 +807,7 @@ test/parquet/variant/variant_shredding_required_fields.test
 test/parquet/variant/variant_shredding_serialize.test
 test/parquet/variant/variant_small_decimal.test
 test/parquet/variant/variant_snowflake_test.test
+test/parquet/variant/variant_stats_propagation.test
 test/parquet/variant/variant_to_parquet_variant.test
 test/parquet/variant/variant_write_partially_shredded.test
 test/planner/projection_binding.test
@@ -1929,6 +1933,7 @@ test/sql/copy/parquet/read_single_parquet_file_late_materialization.test
 test/sql/copy/parquet/recursive_parquet_union_by_name.test
 test/sql/copy/parquet/replacement_scan_custom_extension.test
 test/sql/copy/parquet/rle_bool.test
+test/sql/copy/parquet/shredded_variant_stats.test
 test/sql/copy/parquet/spark_v2.test
 test/sql/copy/parquet/struct_column_reader_skip.test
 test/sql/copy/parquet/struct_skip_pushdown_null.test
@@ -1949,6 +1954,7 @@ test/sql/copy/parquet/union_by_name_struct_extract_stats.test
 test/sql/copy/parquet/union_by_name_struct_filter.test
 test/sql/copy/parquet/union_by_name_struct_projection.test
 test/sql/copy/parquet/union_by_name_varchar_blob.test
+test/sql/copy/parquet/variant_array_row_group_pruning.test
 test/sql/copy/parquet/variant_binary_as_string_stats.test
 test/sql/copy/parquet/variant_shredded_decimal_scale.test
 test/sql/copy/parquet/writer/parquet_dictionary_index_width.test
@@ -3984,8 +3990,10 @@ test/sql/storage/memory/in_memory_disabled_zstd.test
 test/sql/storage/metadata/full_table_metadata_reuse.test
 test/sql/storage/metadata/full_table_metadata_reuse_v7.test
 test/sql/storage/metadata/multi_table_metadata_reuse.test
+test/sql/storage/metadata/partial_column_metadata_reuse.test
 test/sql/storage/metadata/partial_column_metadata_reuse_drop_column.test
 test/sql/storage/metadata/partial_column_metadata_reuse_small_block.test
+test/sql/storage/metadata/partial_column_metadata_reuse_v7.test
 test/sql/storage/metadata/partial_table_metadata_reuse.test
 test/sql/storage/metadata/unchanged_table_statistics.test
 test/sql/storage/mix/test_update_delete_string.test
@@ -4970,6 +4978,7 @@ test/sql/types/variant/variant_object_key_order_json.test
 test/sql/types/variant/variant_shredded_vector_depth_limit.test
 test/sql/types/variant/variant_stats_merge_decimal.test
 test/sql/types/variant/variant_struct_cast_parent_projection.test
+test/sql/types/variant/variant_struct_field_subquery.test
 test/sql/types/variant/variant_struct_field_subquery_cast_parent.test
 test/sql/types/variant/variant_to_array_try_cast.test
 test/sql/types/variant/variant_to_json_null.test

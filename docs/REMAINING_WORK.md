@@ -242,8 +242,11 @@ Each item gives the number of failing files in `test/` that it should fix, where
     type (`VariantStats::PushdownExtract`)
   - [x] a path whose values are partly in the unshredded part (`VariantStats::PushdownExtract` in the scan); late
     materialization (`LateMaterialization`: a TopN, LIMIT or SAMPLE over a table scan becomes a SEMI join on the
-    row ID, with optional filters on the copy), which re-applies the pushed paths (`pushdown_extract_reapplied`);
-    pushed paths of a Parquet scan in SQL export
+    row ID, with optional filters on the copy); pushed paths of a Parquet scan in SQL export
+  - [ ] late materialization of a scan whose paths are pushed (`pushdown_extract_reapplied`): main runs the
+    pushdown extract after `LATE_MATERIALIZATION`, where C++ runs it before, so a scan that only needs a path of a
+    column looks to need all of it. Running it first needs main's late materialization to take the pushed paths
+    (their types, and those of the copy of the scan)
   - [x] Parquet's shredded paths: a pushed down path that a file has all of in its `typed_value`, of the type it is
     cast to, is read from there alone (`CreateVariantTypedValuePushdown`); row groups are left out by the
     statistics of a path of a VARIANT, by key or by index, cast to the filter's type (`ExpressionFilter::
