@@ -756,6 +756,10 @@ pub(super) fn logical_tree(op: &LogicalOperator, estimate: Option<&PlanEstimate>
 }
 
 thread_local! {
+    /// The details of each operator of the plan being rendered, by its address, while a profile wants them as its
+    /// `extra_info`.
+    static INFOS: std::cell::RefCell<Option<std::collections::HashMap<usize, Vec<(String, String)>>>> =
+        const { std::cell::RefCell::new(None) };
     /// The working and recurring tables of the recursive CTEs being rendered, and their table
     /// indexes.
     static RECURSIVE_TABLES: std::cell::RefCell<Vec<(usize, usize, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -775,6 +779,19 @@ pub(super) fn analyzed_tree(
     let tree = physical_tree(op, logical, estimate, true);
     ANALYZED.with(|a| *a.borrow_mut() = previous);
     tree
+}
+
+/// [`analyzed_tree`], and the details it shows of each operator, by its address.
+pub(super) fn analyzed_tree_with_infos(
+    op: &dyn PhysicalOperator,
+    logical: Option<&LogicalOperator>,
+    estimate: Option<&PlanEstimate>,
+    profiler: std::sync::Arc<crate::execution::profiler::OperatorProfiler>,
+) -> (ExplainNode, std::collections::HashMap<usize, Vec<(String, String)>>) {
+    INFOS.with(|i| *i.borrow_mut() = Some(std::collections::HashMap::new()));
+    let tree = analyzed_tree(op, logical, estimate, profiler);
+    let infos = INFOS.with(|i| i.borrow_mut().take()).unwrap_or_default();
+    (tree, infos)
 }
 
 /// `OperatorProfiler`'s `operator_cardinality` of `op`, when the plan ran.
@@ -1033,6 +1050,16 @@ pub(super) fn physical_tree(
     if analyze && let Some((scanned, total)) = op.row_groups_scanned() {
         info.push(("Row Groups Scanned".to_string(), format!("{scanned} / {total}")));
     }
+    INFOS.with(|infos| {
+        if let Some(infos) = infos.borrow_mut().as_mut() {
+            // the profile shows the estimate with the other details (`ParamsToString`)
+            let mut details = info.clone();
+            if let Some(estimate) = estimate {
+                details.push(("Estimated Cardinality".to_string(), estimate.cardinality.to_string()));
+            }
+            infos.insert(crate::execution::profiler::key(op), details);
+        }
+    });
     ExplainNode {
         name,
         info,
@@ -1218,7 +1245,405 @@ fn render_yaml_node(node: &ExplainNode, indent: usize, out: &mut String) {
 
 /// How EXPLAIN shows a plan: `format` is that of the statement, and `upper` is `operator_casing`.
 pub(super) fn render(node: &ExplainNode, format: &str, upper: bool) -> String {
+    render_with_query(node, format, upper, None)
+}
+
+/// The `Summary` box `QueryProfiler::RenderQueryTree` puts above the operator tree.
+pub(super) fn summary_box(time: std::time::Duration) -> String {
+    let seconds = time.as_secs_f64();
+    let timing = if seconds >= 1.0 {
+        format!("{seconds:.2}s")
+    } else if seconds >= 0.1 {
+        format!("{seconds:.3}s")
+    } else {
+        format!("{seconds:.4}s")
+    };
+    let title = "Summary";
+    let key = "Total Time: ";
+    let content = (title.len() + 2).max(key.len() + timing.len());
+    let width = content + 4;
+    format!(
+        "╭─ {title} {}╮\n│ {key}{}{timing} │\n╰{}╯\n",
+        "─".repeat(width - 5 - title.len()),
+        " ".repeat(content - key.len() - timing.len()),
+        "─".repeat(width - 2)
+    )
+}
+
+/// `RenderTree::CreateNode(ProfilingNode)` over the profile of an EXPLAIN ANALYZE run, under its `QUERY` root.
+pub(super) fn profile_tree(root: Option<crate::execution::profiler::ProfileNode>) -> ExplainNode {
+    fn node(profile: &crate::execution::profiler::ProfileNode) -> ExplainNode {
+        let mut info: Vec<(String, String)> = profile
+            .extra_info
+            .iter()
+            .map(|(key, value)| {
+                let key = if key == "Estimated Cardinality" { ESTIMATED_CARDINALITY } else { key };
+                (key.to_string(), value.clone())
+            })
+            .collect();
+        if profile.row_groups.1 > 0 && !info.iter().any(|(key, _)| key == "Row Groups Scanned") {
+            info.push((
+                "Row Groups Scanned".to_string(),
+                format!("{} / {}", profile.row_groups.0, profile.row_groups.1),
+            ));
+        }
+        info.push((CARDINALITY.to_string(), profile.metrics.rows.to_string()));
+        info.push((TIMING.to_string(), format!("{:.2}s", profile.metrics.time.as_secs_f64())));
+        ExplainNode {
+            name: profile.op_type.clone(),
+            info,
+            estimate: None,
+            rows: None,
+            children: profile.children.iter().map(node).collect(),
+        }
+    }
+    let children: Vec<ExplainNode> = root.iter().map(node).collect();
+    ExplainNode {
+        name: "QUERY".to_string(),
+        info: Vec::new(),
+        estimate: None,
+        rows: None,
+        children,
+    }
+}
+
+const CARDINALITY: &str = "__cardinality__";
+const ESTIMATED_CARDINALITY: &str = "__estimated_cardinality__";
+const TIMING: &str = "__timing__";
+
+/// A node of a `RenderTree`: its name, its `extra_text`, and where its children are.
+struct GridNode {
+    x: usize,
+    y: usize,
+    name: String,
+    extra: Vec<(String, String)>,
+    children: Vec<(usize, usize)>,
+}
+
+/// `RenderTree::CreateTree`: each node at its column and depth, a node taking the column of its first child.
+fn grid(root: &ExplainNode, raw_keys: bool) -> Vec<GridNode> {
+    fn place(node: &ExplainNode, x: usize, y: usize, raw_keys: bool, out: &mut Vec<GridNode>) -> usize {
+        let estimate = node.estimate.map(|e| (ESTIMATED_CARDINALITY.to_string(), e.to_string()));
+        let extra = node
+            .info
+            .iter()
+            .chain(estimate.iter())
+            .filter(|(_, value)| !value.is_empty())
+            .map(|(key, value)| {
+                let key = if key.is_empty() {
+                    "Details".to_string()
+                } else if !raw_keys && key.starts_with("__") {
+                    sanitize_key(key)
+                } else {
+                    key.clone()
+                };
+                (key, value.clone())
+            })
+            .collect();
+        let at = out.len();
+        out.push(GridNode {
+            x,
+            y,
+            name: node.name.clone(),
+            extra,
+            children: Vec::new(),
+        });
+        if node.children.is_empty() {
+            return 1;
+        }
+        let mut width = 0;
+        for child in &node.children {
+            let child_x = x + width;
+            out[at].children.push((child_x, y + 1));
+            width += place(child, child_x, y + 1, raw_keys, out);
+        }
+        width
+    }
+    let mut out = Vec::new();
+    place(root, 0, 0, raw_keys, &mut out);
+    out.sort_by_key(|node| (node.y, node.x));
+    out
+}
+
+/// `RenderTree::SanitizeKeyNames`: `__estimated_cardinality__` is shown as `Estimated Cardinality`.
+fn sanitize_key(key: &str) -> String {
+    key.replace("__", "")
+        .split('_')
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().chain(chars.flat_map(|c| c.to_lowercase())).collect(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<String>>()
+        .join(" ")
+}
+
+/// `QueryProfiler::JSONSanitize`.
+fn json_sanitize(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// `GRAPHVIZTreeRenderer::ToStreamInternal`.
+fn render_graphviz(root: &ExplainNode) -> String {
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    for node in grid(root, false) {
+        let mut body = vec![node.name.clone()];
+        for (key, value) in &node.extra {
+            body.push(format!("{key}:\\n{}", json_sanitize(value)));
+        }
+        nodes.push(format!("    node_{}_{} [label=\"{}\"];", node.x, node.y, body.join("\\n───\\n")));
+        for (cx, cy) in &node.children {
+            edges.push(format!("    node_{}_{} -> node_{cx}_{cy};", node.x, node.y));
+        }
+    }
+    format!(
+        "\ndigraph G {{\n    node [shape=box, style=rounded, fontname=\"Courier New\", fontsize=10];\n{}\n{}\n}}\n\t",
+        nodes.join("\n"),
+        edges.join("\n")
+    )
+}
+
+/// `CompactTreeRenderer`: an operator a line, indented by its depth. Of a profile, a line of the query's
+/// time comes first (`RenderProfiler`).
+fn render_compact(root: &ExplainNode, query: Option<std::time::Duration>) -> String {
     let mut out = String::new();
+    if let Some(time) = query {
+        out.push_str(&format!("QUERY (time={:.4}s)\n", time.as_secs_f64()));
+    }
+    let nodes = grid(root, true);
+    fn line(nodes: &[GridNode], at: (usize, usize), depth: usize, out: &mut String) {
+        let Some(node) = nodes.iter().find(|node| (node.x, node.y) == at) else {
+            return;
+        };
+        let mut stats = Vec::new();
+        let mut properties = Vec::new();
+        for (key, value) in &node.extra {
+            if key == CARDINALITY {
+                stats.push(format!("rows={value}"));
+            } else if key == ESTIMATED_CARDINALITY {
+                stats.push(format!("est={value}"));
+            } else if key == TIMING {
+                stats.push(format!("time={value}"));
+            } else {
+                let key = if key.starts_with("__") { sanitize_key(key) } else { key.clone() };
+                let value: Vec<&str> = value.split('\n').map(str::trim).filter(|v| !v.is_empty()).collect();
+                properties.push(format!("{key}: {}", value.join(", ")));
+            }
+        }
+        out.push_str(&" ".repeat(depth * 2));
+        out.push_str(&node.name);
+        if !stats.is_empty() {
+            out.push_str(&format!(" ({})", stats.join(", ")));
+        }
+        if !properties.is_empty() {
+            out.push(' ');
+            out.push_str(&properties.join("; "));
+        }
+        out.push('\n');
+        for child in &node.children {
+            line(nodes, *child, depth + 1, out);
+        }
+    }
+    line(&nodes, (0, 0), 0, &mut out);
+    out
+}
+
+/// `SanitizeMermaidLabel`: backticks and quotes are escaped, and a literal `\n` becomes a line break.
+fn mermaid_label(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() * 2);
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '`' => out.push_str("\\`"),
+            '"' => out.push_str("\\\""),
+            '\\' if chars.peek() == Some(&'n') => {
+                chars.next();
+                out.push_str("\n\t");
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// `MermaidTreeRenderer::ToStreamInternal`.
+fn render_mermaid(root: &ExplainNode) -> String {
+    let mut out = String::from("flowchart TD\n");
+    let mut edges = Vec::new();
+    for node in grid(root, false) {
+        let mut extra = String::new();
+        for (key, value) in &node.extra {
+            extra.push_str(&format!("\n\t{key}: {}", mermaid_label(&json_sanitize(value))));
+        }
+        out.push_str(&format!(
+            "    node_{}_{}[\"`**{}**{extra}`\"]\n\n",
+            node.x,
+            node.y,
+            mermaid_label(node.name.trim())
+        ));
+        for (cx, cy) in &node.children {
+            edges.push(format!("    node_{}_{} --> node_{cx}_{cy}\n", node.x, node.y));
+        }
+    }
+    out.extend(edges);
+    out
+}
+
+/// `ClassifyKind` of the HTML renderer: the colour of a node.
+fn html_kind(name: &str, leaf: bool, extra: &[(String, String)]) -> &'static str {
+    let has = |part: &str| name.contains(part);
+    if has("CTE") {
+        "cte"
+    } else if has("SCAN") || has("GET") {
+        "scan"
+    } else if has("JOIN") || name == "CROSS_PRODUCT" {
+        "join"
+    } else if has("WINDOW") {
+        "window"
+    } else if has("AGGREGATE") || has("GROUP_BY") || has("DISTINCT") {
+        "aggregate"
+    } else if has("ORDER_BY") || has("TOP_N") {
+        "order"
+    } else if has("PROJECTION") {
+        "projection"
+    } else if has("UNION") {
+        "union"
+    } else if has("FILTER") {
+        "filter"
+    } else if leaf && extra.iter().any(|(key, _)| key == "Table" || key == "Function") {
+        "scan"
+    } else {
+        "generic"
+    }
+}
+
+/// A double as yyjson writes it.
+fn json_double(value: f64) -> String {
+    if value.fract() == 0.0 && value.abs() < 1e15 {
+        format!("{value:.1}")
+    } else {
+        format!("{value}")
+    }
+}
+
+/// `BuildNodeJSON` of the HTML renderer: the node at `at`, its children after it.
+fn html_node(nodes: &[GridNode], at: (usize, usize), total: &mut f64, timed: &mut bool, out: &mut String) {
+    let Some(node) = nodes.iter().find(|node| (node.x, node.y) == at) else {
+        return;
+    };
+    out.push_str("{\"name\":");
+    json_string_compact(&node.name, out);
+    out.push_str(",\"kind\":");
+    json_string_compact(html_kind(&node.name, node.children.is_empty(), &node.extra), out);
+    let mut details = Vec::new();
+    for (key, value) in &node.extra {
+        if key == CARDINALITY || key == ESTIMATED_CARDINALITY {
+            let field = if key == CARDINALITY { "cardinality" } else { "estimated_cardinality" };
+            out.push_str(&format!(",\"{field}\":{}", value.parse::<i64>().unwrap_or(0)));
+        } else if key == TIMING {
+            let seconds: f64 = value.trim_end_matches('s').parse().unwrap_or(0.0);
+            out.push_str(&format!(",\"timing\":{}", json_double(seconds)));
+            *total += seconds;
+            *timed = true;
+        } else {
+            let key = if key.starts_with("__") { sanitize_key(key) } else { key.clone() };
+            let mut detail = String::from("{\"key\":");
+            json_string_compact(&key, &mut detail);
+            detail.push_str(",\"values\":[");
+            for (i, line) in value.split('\n').enumerate() {
+                if i > 0 {
+                    detail.push(',');
+                }
+                json_string_compact(line, &mut detail);
+            }
+            detail.push_str("]}");
+            details.push(detail);
+        }
+    }
+    out.push_str(",\"details\":[");
+    out.push_str(&details.join(","));
+    out.push_str("],\"children\":[");
+    for (i, child) in node.children.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        html_node(nodes, *child, total, timed, out);
+    }
+    out.push_str("]}");
+}
+
+fn json_string_compact(text: &str, out: &mut String) {
+    json_string(text, out);
+}
+
+/// HTML-escaped text (`AppendEscapedHTML`).
+fn escape_html(text: &str) -> String {
+    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// `HTMLTreeRenderer::ToStreamInternal`: the plan as JSON, in the viewer page. `query` is the run of
+/// EXPLAIN ANALYZE: how long it took, and its SQL.
+fn render_html(root: &ExplainNode, query: Option<(std::time::Duration, &str)>) -> String {
+    let nodes = grid(root, true);
+    let mut node_json = String::new();
+    let mut total = 0.0;
+    let mut timed = false;
+    html_node(&nodes, (0, 0), &mut total, &mut timed, &mut node_json);
+    let mut doc = format!("{{\"analyze\":{timed},\"total_time\":{}", json_double(total));
+    if let Some((time, sql)) = query {
+        let seconds = json_double(time.as_secs_f64());
+        doc.push_str(&format!(
+            ",\"query\":{{\"real_time\":{seconds},\"cpu_time\":{},\"bytes_read\":0,\"bytes_written\":0,\"sql\":",
+            json_double(total)
+        ));
+        json_string_compact(&escape_html(sql), &mut doc);
+        doc.push_str(",\"timings\":[]}");
+    }
+    doc.push_str(",\"root\":");
+    doc.push_str(&node_json);
+    doc.push('}');
+    // the JSON must not end the <script> it is in
+    let doc = doc.replace('<', "\\u003c").replace('>', "\\u003e");
+    include_str!("html_template.html").replace("__PLAN_JSON__", &doc)
+}
+
+/// [`render`], with the run of EXPLAIN ANALYZE the tree is the profile of.
+pub(super) fn render_with_query(
+    node: &ExplainNode,
+    format: &str,
+    upper: bool,
+    query: Option<(std::time::Duration, &str)>,
+) -> String {
+    let mut out = String::new();
+    if format == "no_output" {
+        return out;
+    }
+    if format == "compact" {
+        return render_compact(node, query.map(|(time, _)| time));
+    }
+    if format == "graphviz" {
+        return render_graphviz(node);
+    } else if format == "mermaid" {
+        return render_mermaid(node);
+    } else if format == "html" {
+        return render_html(node, query);
+    }
     if format == "json" {
         out.push_str("[\n");
         render_json_node(node, 1, &mut out);

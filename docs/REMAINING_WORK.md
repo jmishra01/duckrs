@@ -276,7 +276,7 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] secure views as C++ has them: a `SECURE_VIEW` operator at the boundary that EXPLAIN and EXPLAIN ANALYZE show
     with the view's name and the filters pushed into it, and nothing below; statistics and distinct counts leave a
     view only if it emits every row it reads (`EmitsAllRows`); its estimate is frozen before filters go into it
-  - [ ] of secure views: the query-wide profiling totals still count the operators inside them
+  - [x] of secure views in the profile: the view's node keeps the time of what is below it, which is left out
     (`CollapseSecureViews`); EXPLAIN ANALYZE in the profiler's JSON (`secure_view_explain`)
   - [x] the prefix-range join filter of keys close together is exact: a bit per value between the smallest and the
     largest key, so only keys pass where the Bloom filter let others through
@@ -405,6 +405,13 @@ Each item gives the number of failing files in `test/` that it should fix, where
 - [ ] 26. Set operations, `SAMPLE`, `RETURNING`, `WITH ORDINALITY`, `UNNEST` (`setops` 8, `sample` 7, `returning` 2, `ordinality` 0, `unnest` 2)
 - [ ] 27. SQL variables: `SET VARIABLE`, `getvariable` (`sql/variables`: 3 failing)
 - [ ] 28. `EXPLAIN` / `EXPLAIN ANALYZE` and profiling (`explain` 7, `profiling` 3, `detailed_profiler` 1)
+  - [x] the `graphviz`, `mermaid`, `html` (the viewer page, `html_template.html`) and `compact` formats; EXPLAIN
+    ANALYZE in any format but text renders the profile (`QUERY`, `RESULT_COLLECTOR`, `EXPLAIN_ANALYZE` above the
+    plan, with estimates), in text with the `Summary` box of its total time; without a FORMAT it follows
+    `enable_profiling`, and leaves `profiling_output` alone; `no_output` renders nothing; unknown formats, the
+    values of `profiling_renderer_settings` and a `profiling_output` of another file type are errors
+  - [ ] profile files in `html`, `compact`, `graphviz`, `mermaid` and `yaml` (only `json` is written), the SQL
+    highlighting of the HTML page, and the bytes read and written of a query (`tree_renderer_branches`)
 - [ ] 29. Query progress bar (`sql/progress`: 1 failing)
 - [ ] 29a. The parser and errors (`sql/parser`: 23 failing, 66.7%; `sql/error`: 12 failing, 47.8%)
   - [x] `has_error` as the HAS_ERROR operator (a macro of its name shadows it, exported as `system.main.has_error`);
@@ -564,14 +571,15 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [ ] the text of C++ where tests match it (`AS r(column0, ...)` table aliases, its formatter,
     result-type casts); the `*_plan` tests compare C++ plans
 - [ ] 40. Logging and error messages (`sql/logging` 8, `sql/error` 13, `test/logging` 2)
-- [ ] 40a. The query profiler (`sql/pragma/profiling`: 21 of 36 pass)
+- [ ] 40a. The query profiler (`sql/pragma/profiling`: 26 of 36 pass)
   - [x] `enable_profiling = 'json'`, `profiling_output`, `tracked_metrics` (globs), `profiling_coverage`,
     `legacy_metrics_format`; the grouped JSON of `ToResultTree` with the operator tree
   - [x] measured: query time, CPU time, intermediate rows and size bytes, rows scanned, planner, optimizer
     (per pass) and physical planner times, I/O bytes and operations (WAL writes left out, as in C++),
     checkpoint, attach, WAL write, commit and replay latencies, WAL replay entry count
   - [x] `wal_autocheckpoint_entries`; `disable_checkpoint_on_shutdown` also covers attached databases
-  - [ ] exact `query.total_bytes_scanned`, row groups of local storage, memory metrics, secure views
+  - [ ] exact `query.total_bytes_scanned` and `operator.bytes_scanned` (Parquet chunk sizes, CSV and JSON file
+    bytes; `test_profiling_bytes_scanned*`), row groups of local storage, memory metrics, secure views
   - [ ] the `query_tree` text output, `duckdb_available_metrics()`, `enable_profiling()` / `disable_profiling()`
     as table functions, the profiler log entries
 - [ ] 41. **C API** (`duckrs-capi`): implement `duckdb.h`, then pass `test/api/capi/*`. There is no code for this yet.

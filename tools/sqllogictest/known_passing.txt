@@ -646,6 +646,7 @@ test/optimizer/pushdown/table_or_pushdown.test
 test/optimizer/pushdown/test_constant_or_null_pushdown.test
 test/optimizer/pushdown/test_pushdown_cte_group_by_all.test
 test/optimizer/pushdown/timestamp_to_date_infinity_pushdown.test
+test/optimizer/pushdown/timestamp_to_date_pushdown.test
 test/optimizer/pushdown/type_pushdown_projection_index.test
 test/optimizer/pushdown/type_pushdown_virtual_column.test
 test/optimizer/pushdown/volatile_filter_aggregate_distinct.test
@@ -2138,7 +2139,10 @@ test/sql/execution/lazy_chunk_scalar_execution.test
 test/sql/execution/physical_verify_vector.test
 test/sql/execution/positional_scan_nested.test
 test/sql/explain/explain_execute.test
+test/sql/explain/explain_formats.test
 test/sql/explain/order_by_topn_explain_fqn.test
+test/sql/explain/test_explain.test
+test/sql/explain/test_explain_analyze.test
 test/sql/explain/test_explain_table_scan.test
 test/sql/export/empty_export.test
 test/sql/export/export_compression_level.test
@@ -2925,6 +2929,8 @@ test/sql/join/test_merge_join_predicate.test
 test/sql/join/test_nested_inequality.test
 test/sql/join/test_predicate_binding.test
 test/sql/join/test_string_payload.test
+test/sql/json/copy_geojson_column_option_constant.test
+test/sql/json/copy_geojson_write_bbox_constant.test
 test/sql/json/copy_json_null_options.test
 test/sql/json/issues/internal_issue1035.test
 test/sql/json/issues/internal_issue2732.test
@@ -2937,6 +2943,7 @@ test/sql/json/issues/internal_issue4403.test
 test/sql/json/issues/internal_issue4794.test
 test/sql/json/issues/internal_issue5288.test
 test/sql/json/issues/issue10751and11152.test
+test/sql/json/issues/issue10784.test
 test/sql/json/issues/issue10866.test
 test/sql/json/issues/issue11804.test
 test/sql/json/issues/issue12861.test
@@ -3004,6 +3011,7 @@ test/sql/json/table/json_multi_file_reader.test
 test/sql/json/table/json_table_in_out_fullkey_quoting.test
 test/sql/json/table/json_table_in_out_threads.test
 test/sql/json/table/multi_file_hang.test
+test/sql/json/table/read_json_dates_vector_boundary.test
 test/sql/json/table/read_json_ignore_errors_spanning.test
 test/sql/json/table/read_json_records_param_types.test
 test/sql/json/table/read_json_root_bignum.test
@@ -3029,6 +3037,7 @@ test/sql/json/test_json_group_window_macro.test
 test/sql/json/test_json_macros.test
 test/sql/json/test_json_path_long_index.test
 test/sql/json/test_json_persistence.test
+test/sql/json/test_json_serialize_plan.test
 test/sql/json/test_json_serialize_sql.test
 test/sql/json/test_json_sqlite.test
 test/sql/json/test_serialized_decimal_no_type_info.test
@@ -3106,6 +3115,7 @@ test/sql/merge/merge_into_update_star.test
 test/sql/merge/merge_multi_match_error.test
 test/sql/merge/merge_not_matched_by_source_join_order.test
 test/sql/multi_file/multi_file_schema_filter_casts.test
+test/sql/optimizer/aggregate_group_domain_cardinality.test
 test/sql/optimizer/anti_join_empty_rhs_projection_map.test
 test/sql/optimizer/any_extremum_rewrite.test
 test/sql/optimizer/array_extract_row_group_pruning.test
@@ -3119,10 +3129,12 @@ test/sql/optimizer/coalesce_zonemap_pruning.test
 test/sql/optimizer/constant_function_zonemap_pruning.test
 test/sql/optimizer/contains_row_group_pruning.test
 test/sql/optimizer/cse_error_capture.test
+test/sql/optimizer/cse_volatile_aggregate_filter.test
 test/sql/optimizer/date_part_row_group_pruning.test
 test/sql/optimizer/distinct_sibling_column_pruning.test
 test/sql/optimizer/distinctness_statistics.test
 test/sql/optimizer/distinctness_statistics_nested.test
+test/sql/optimizer/distinctness_statistics_plan.test
 test/sql/optimizer/divide_zonemap_pruning.test
 test/sql/optimizer/empty_string_concat_pruning.test
 test/sql/optimizer/expression/date_trunc_non_interval_parts.test
@@ -3132,6 +3144,7 @@ test/sql/optimizer/expression/enum_full_domain_fold_guard.test
 test/sql/optimizer/expression/list_comprehension_casts.test
 test/sql/optimizer/expression/list_comprehension_rewrite.test
 test/sql/optimizer/expression/not_constant_or_null.test
+test/sql/optimizer/expression/test_between_tostring.test
 test/sql/optimizer/expression/test_casting_negative_integer_to_bit.test
 test/sql/optimizer/expression/test_common_aggregate.test
 test/sql/optimizer/expression/test_comparison_simplification.test
@@ -3170,6 +3183,7 @@ test/sql/optimizer/monotone_preimage_tinyint_boundaries.test
 test/sql/optimizer/multiple_column_stats_pruning.test
 test/sql/optimizer/narrowing_cast_not_invertible.test
 test/sql/optimizer/not_conjunction_simplification.test
+test/sql/optimizer/null_check_statistics_propagation.test
 test/sql/optimizer/nullable_row_group_pruning.test
 test/sql/optimizer/or_null_simplification.test
 test/sql/optimizer/plan/dense_or_filter_pushdown.test
@@ -3181,6 +3195,7 @@ test/sql/optimizer/plan/test_except_empty_rhs.test
 test/sql/optimizer/plan/test_filter_pushdown.test
 test/sql/optimizer/plan/test_filter_pushdown_duplicate.test
 test/sql/optimizer/plan/test_filter_pushdown_large.test
+test/sql/optimizer/plan/test_recursive_build_side_probe_side.test
 test/sql/optimizer/plan/test_table_filter_pushdown.test
 test/sql/optimizer/plan/test_unused_column_after_join.test
 test/sql/optimizer/power_zonemap_pruning.test
@@ -3193,6 +3208,7 @@ test/sql/optimizer/scalar_aggregate_merge.test
 test/sql/optimizer/scalar_aggregate_merge_files.test
 test/sql/optimizer/scalar_aggregate_merge_files_plan.test
 test/sql/optimizer/scalar_aggregate_merge_plan.test
+test/sql/optimizer/secure_view_explain.test
 test/sql/optimizer/secure_view_fallible_functions.test
 test/sql/optimizer/secure_view_join_order.test
 test/sql/optimizer/secure_view_pushdown.test
@@ -3230,6 +3246,7 @@ test/sql/optimizer/test_not_comparison_simplification.test
 test/sql/optimizer/test_rollup_column_pruning.test
 test/sql/optimizer/test_rowid_pruning.test
 test/sql/optimizer/test_rowid_pushdown_deletes.test
+test/sql/optimizer/test_rowid_pushdown_plan.test
 test/sql/optimizer/test_rowid_vector_pruning.test
 test/sql/optimizer/test_rowid_vector_pruning_results.test
 test/sql/optimizer/test_window_join_pushdown.test
@@ -3439,6 +3456,7 @@ test/sql/pivot/unpivot_types.test
 test/sql/pivot/unpivot_unnamed_subquery.test
 test/sql/pivot/unpivot_view.test
 test/sql/pragma/pragma_database_size_readonly.test
+test/sql/pragma/profiling/call_enable_profiling_function.test
 test/sql/pragma/profiling/profiling_output_not_allowed.test
 test/sql/pragma/profiling/test_all_profiling_settings.test
 test/sql/pragma/profiling/test_attach_and_checkpoint_latency.test
@@ -3462,10 +3480,13 @@ test/sql/pragma/profiling/test_no_reset_setting.test
 test/sql/pragma/profiling/test_operator_info_suppression.test
 test/sql/pragma/profiling/test_profiling_all.test
 test/sql/pragma/profiling/test_profiling_fs.test
+test/sql/pragma/profiling/test_profiling_operator_name.test
+test/sql/pragma/profiling/test_profiling_output_file_overwrite.test
 test/sql/pragma/test_disabled_compression.test
 test/sql/pragma/test_enable_profile.test
 test/sql/pragma/test_force_compression.test
 test/sql/pragma/test_memory_limit.test
+test/sql/pragma/test_pragma_database_list.test
 test/sql/pragma/test_pragma_database_size.test
 test/sql/pragma/test_pragma_functions.test
 test/sql/pragma/test_pragma_parsing.test
