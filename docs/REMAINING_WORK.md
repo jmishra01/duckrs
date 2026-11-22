@@ -184,6 +184,12 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [ ] `vector_type` (~20 files) reports engine internals duckrs does not model
   - [x] `duckdb_memory()`: C++'s columns and a row per `MemoryTag`, volatile so common subplans do not share it;
     duckrs does not account memory by tag, so every row reports 0 bytes in memory and in temporary storage
+  - [ ] memory accounting by `MemoryTag`: until it exists, the tests that check `memory_usage_bytes` stays below a
+    bound pass without measuring anything, so they are left out of `known_passing.txt`
+    (`bulk_delete_version_info_memory`, `partial_delete_version_info_memory`, `test_art_mem_limit`,
+    `partial_delete_checkpoint_mask`, `partial_delete_pending_compress`, `noop_string_update_memory`,
+    `duckdb_memory_convert_to_persistent`, `compact_update_allocation`, `test_update_string_heap_compaction`,
+    `materialized_cte_prepared`)
 - [ ] 10. `ATTACH`/`DETACH` and multi-database features (`sql/attach`: 47 failing, 52.5%)
   - [x] the search path (`CatalogSearchPath`): `SET schema`, `SET search_path`, `USE`, RESET; unqualified names
     looked up along it and created in its default schema; `current_schema(s)`, `current_query()`, SHOW SCHEMAS
