@@ -224,7 +224,11 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [ ] the rest of C++'s analyzed plan: the `QUERY` / `EXPLAIN_ANALYZE` nodes, `Total Time`, operator timings
   - [x] the order of a join's conditions where an inequality comes before IS DISTINCT FROM (`issue_17042`)
   - [ ] filters through the row numbers of EXCEPT ALL / INTERSECT ALL on a collation key
-    (`pushdown_window_partition_expression`); dynamic filters of blockwise NL joins (`join_filter_pushdown_any_join`)
+    (`pushdown_window_partition_expression`)
+  - [x] join filters into `read_parquet` scans, through inner blockwise NL joins too, and their
+    `Dynamic Filters` (`join_filter_pushdown_any_join` up to its Top-N checks)
+  - [ ] Top-N dynamic filters pushed into scans (`join_filter_pushdown_any_join`, `topn_dynamic_filter_cast`):
+    the Top-N keeps its boundary to itself
   - [ ] the operator log and profiler output a few tests read (`join_filter_pushdown_integer_chain`,
     `cte_domain_join_filter`); `read_csv`'s `schema`; `COLUMNS(json_keys(getvariable(...)))` (`issue_16671`);
     a filter on the right of a SEMI join through

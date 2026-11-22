@@ -1019,9 +1019,13 @@ pub(super) fn physical_tree(
 
 /// `Dynamic Filters` of the table scans, from a run of the statement, in the order of the scans.
 pub(super) fn add_dynamic_filters(node: &mut ExplainNode, recorded: &mut impl Iterator<Item = Option<String>>) {
-    // of the scans of tables, not of table functions, which are TABLE_SCANs too once the plan ran
-    if matches!(node.name.as_str(), "SEQ_SCAN" | "TABLE_SCAN")
-        && node.info.iter().any(|(key, _)| key == "Table")
+    // of the scans of tables and Parquet files, not of other table functions, which are TABLE_SCANs too once
+    // the plan ran
+    let scan = node.info.iter().any(|(key, value)| {
+        key == "Table" || (key == "Function" && matches!(value.as_str(), "READ_PARQUET" | "PARQUET_SCAN"))
+    });
+    if (matches!(node.name.as_str(), "SEQ_SCAN" | "TABLE_SCAN") || scan)
+        && scan
         && let Some(Some(filters)) = recorded.next()
     {
         let at = node

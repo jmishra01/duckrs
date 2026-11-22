@@ -318,7 +318,14 @@ fn create_physical(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
         LogicalOperatorKind::ParquetScan { scan, .. } => {
             // an optional filter only skips row groups (`OptionalFilter`): the rows are filtered elsewhere
             let filter = (!scan.filters.is_empty()).then(|| crate::optimizer::conjunction_of(scan.filters.clone()));
-            let all: Vec<_> = scan.filters.iter().chain(&scan.optional_filters).cloned().collect();
+            // the join filters, which have no values yet, skip no row groups here
+            let all: Vec<_> = scan
+                .filters
+                .iter()
+                .filter(|f| !matches!(f.kind, crate::planner::expression::BoundExprKind::JoinFilter { .. }))
+                .chain(&scan.optional_filters)
+                .cloned()
+                .collect();
             let prune = (!all.is_empty()).then(|| crate::optimizer::conjunction_of(all));
             Box::new(parquet::PhysicalParquetScan {
                 types,

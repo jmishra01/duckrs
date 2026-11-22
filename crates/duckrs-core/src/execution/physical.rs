@@ -860,36 +860,7 @@ impl PhysicalOperator for PhysicalTableScan {
         })
     }
     fn dynamic_filters(&self) -> Option<String> {
-        let mut found: Vec<(String, Vec<String>)> = Vec::new();
-        let mut visit = |expr: &BoundExpr| {
-            if let BoundExprKind::JoinFilter {
-                child,
-                filter,
-                keep_null,
-            } = &expr.kind
-                && let Some(text) = filter.describe(child, *keep_null)
-            {
-                let name = child.to_string();
-                match found.iter_mut().find(|(n, _)| *n == name) {
-                    Some((_, texts)) => texts.push(text),
-                    None => found.push((name, vec![text])),
-                }
-            }
-        };
-        match self.filter.as_ref().map(|f| &f.kind) {
-            Some(BoundExprKind::Conjunction { and: true, children }) => children.iter().for_each(&mut visit),
-            Some(_) => visit(self.filter.as_ref().expect("matched")),
-            None => {}
-        }
-        // `TableFilterSet::PushFilter`: the filters of one column are one AND
-        let lines: Vec<String> = found
-            .into_iter()
-            .map(|(_, texts)| match texts.as_slice() {
-                [one] => one.clone(),
-                _ => format!("({})", texts.join(" AND ")),
-            })
-            .collect();
-        (!lines.is_empty()).then(|| lines.join("\n"))
+        dynamic_filters_of(self.filter.as_ref())
     }
     fn row_groups_scanned(&self) -> Option<(usize, usize)> {
         if self.index_rows.is_some() {
@@ -4636,4 +4607,38 @@ impl PhysicalOperator for PhysicalResultCollector {
         }
         Ok(())
     }
+}
+
+/// `Dynamic Filters` of a scan: the join filters among the conjuncts of its filter, once their joins gave them.
+pub(crate) fn dynamic_filters_of(filter: Option<&BoundExpr>) -> Option<String> {
+    let mut found: Vec<(String, Vec<String>)> = Vec::new();
+    let mut visit = |expr: &BoundExpr| {
+        if let BoundExprKind::JoinFilter {
+            child,
+            filter,
+            keep_null,
+        } = &expr.kind
+            && let Some(text) = filter.describe(child, *keep_null)
+        {
+            let name = child.to_string();
+            match found.iter_mut().find(|(n, _)| *n == name) {
+                Some((_, texts)) => texts.push(text),
+                None => found.push((name, vec![text])),
+            }
+        }
+    };
+    match filter.map(|f| &f.kind) {
+        Some(BoundExprKind::Conjunction { and: true, children }) => children.iter().for_each(&mut visit),
+        Some(_) => visit(filter.expect("matched")),
+        None => {}
+    }
+    // `TableFilterSet::PushFilter`: the filters of one column are one AND
+    let lines: Vec<String> = found
+        .into_iter()
+        .map(|(_, texts)| match texts.as_slice() {
+            [one] => one.clone(),
+            _ => format!("({})", texts.join(" AND ")),
+        })
+        .collect();
+    (!lines.is_empty()).then(|| lines.join("\n"))
 }
