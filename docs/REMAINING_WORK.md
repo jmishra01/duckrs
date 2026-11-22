@@ -302,7 +302,9 @@ Each item gives the number of failing files in `test/` that it should fix, where
     unnested back into rows
   - [x] its late-materialization variant: a payload of several columns of one table fetched by rowid, through
     projections, filters and joins on equal columns
-  - [ ] projections between the filter and the window that compute something
+  - [x] projections between the filter and the window that compute something: not ported. C++'s
+    `TraverseProjectionBindings` follows each expression to its one column and drops what it computes
+    (1.5.6 gives 256 for `x + 100` of 0 with `filter_pushdown` disabled); duckrs keeps the window there
   - [x] self-join aggregate (TPC-DS q95's `ws_wh` as `GROUP BY keys HAVING min(x) <> max(x)`); volatile
     uncorrelated IN subqueries are MARK joins too
   - [ ] `duckdb_types()` and the other system functions as `LogicalGet`s in EXPLAIN (`self_join_aggregate`)
