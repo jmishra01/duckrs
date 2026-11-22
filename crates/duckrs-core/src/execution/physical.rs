@@ -217,6 +217,11 @@ pub trait PhysicalOperator: fmt::Debug + Send + Sync {
         None
     }
 
+    /// `ReportsBytesScanned`: a scan of files that counts the bytes it reads of them.
+    fn reports_bytes_scanned(&self) -> bool {
+        false
+    }
+
     /// The filters a scan got when the plan was made physical that are not in its logical plan: those of a
     /// Top-N above it, as `Filters` shows them.
     fn planned_filters(&self) -> Vec<String> {
@@ -1199,9 +1204,19 @@ impl PhysicalOperator for PhysicalCsvScan {
     fn source_state(&self) -> SourceState {
         Box::new(super::csv::CsvScanState::default())
     }
+    fn reports_bytes_scanned(&self) -> bool {
+        true
+    }
     fn get_data(&self, state: &mut SourceState) -> Result<Option<DataChunk>> {
         let state = state.downcast_mut().expect("csv scan state");
-        super::csv::scan_chunk(&self.scan, state)
+        let chunk = super::csv::scan_chunk(&self.scan, state);
+        let bytes = super::csv::take_bytes_scanned(state);
+        if bytes > 0
+            && let Some(profiler) = super::profiler::current()
+        {
+            profiler.add_bytes_scanned(self, bytes);
+        }
+        chunk
     }
 }
 

@@ -1434,7 +1434,12 @@ impl Binder<'_> {
             )));
         }
         let format = if info.format.is_empty() {
+            // `ExtractFormat`: the extension before that of the compression
             let lower = path.to_lowercase();
+            let lower = lower
+                .strip_suffix(".gz")
+                .or_else(|| lower.strip_suffix(".zst"))
+                .unwrap_or(&lower);
             ["parquet", "json", "ndjson", "jsonl"]
                 .into_iter()
                 .find(|extension| lower.ends_with(&format!(".{extension}")))

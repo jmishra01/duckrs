@@ -571,15 +571,17 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [ ] the text of C++ where tests match it (`AS r(column0, ...)` table aliases, its formatter,
     result-type casts); the `*_plan` tests compare C++ plans
 - [ ] 40. Logging and error messages (`sql/logging` 8, `sql/error` 13, `test/logging` 2)
-- [ ] 40a. The query profiler (`sql/pragma/profiling`: 26 of 36 pass)
+- [ ] 40a. The query profiler (`sql/pragma/profiling`: 29 of 36 pass)
   - [x] `enable_profiling = 'json'`, `profiling_output`, `tracked_metrics` (globs), `profiling_coverage`,
     `legacy_metrics_format`; the grouped JSON of `ToResultTree` with the operator tree
   - [x] measured: query time, CPU time, intermediate rows and size bytes, rows scanned, planner, optimizer
     (per pass) and physical planner times, I/O bytes and operations (WAL writes left out, as in C++),
     checkpoint, attach, WAL write, commit and replay latencies, WAL replay entry count
   - [x] `wal_autocheckpoint_entries`; `disable_checkpoint_on_shutdown` also covers attached databases
-  - [ ] exact `query.total_bytes_scanned` and `operator.bytes_scanned` (Parquet chunk sizes, CSV and JSON file
-    bytes; `test_profiling_bytes_scanned*`), row groups of local storage, memory metrics, secure views
+  - [x] `operator.bytes_scanned` and `query.total_bytes_scanned`: the compressed column chunks of the Parquet row
+    groups read, the CSV buffers read (of `buffer_size`), JSON files; the total is left out when a scan doesn't
+    count them, and leaves out what is inside secure views; COPY TO `x.json.gz` writes JSON (`ExtractFormat`)
+  - [ ] row groups of local storage, memory metrics, secure views
   - [ ] the `query_tree` text output, `duckdb_available_metrics()`, `enable_profiling()` / `disable_profiling()`
     as table functions, the profiler log entries
 - [ ] 41. **C API** (`duckrs-capi`): implement `duckdb.h`, then pass `test/api/capi/*`. There is no code for this yet.
