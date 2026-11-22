@@ -676,7 +676,7 @@ fn larger(a: Option<Value>, b: Option<Value>) -> Option<Value> {
 }
 
 /// `BaseStatistics::Merge`: of values that are one or the other.
-fn union(a: Stats, b: Stats) -> Stats {
+pub(crate) fn union(a: Stats, b: Stats) -> Stats {
     let (a_valid, b_valid) = (a.can_be_valid, b.can_be_valid);
     let (min, max) = match (a_valid, b_valid) {
         (true, false) => (a.min, a.max),

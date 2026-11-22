@@ -190,10 +190,30 @@ pub(super) fn cast_from_variant(stats: &Stats, target: &LogicalType) -> Option<S
     let Some(VariantStatistics::Shredded(ty, shredded)) = stats.variant.as_deref() else {
         return None;
     };
-    if !fully_shredded(ty, shredded) || structured_type(ty) != *target {
+    if !fully_shredded(ty, shredded) {
         return None;
     }
+    let typed_type = structured_type(ty);
     let (_, mut result) = typed(ty, shredded);
+    // `CastStatistics::TryPropagate` of typed values of another integer type: their bounds, cast
+    if typed_type != *target {
+        if !typed_type.is_integral() || !target.is_integral() {
+            return None;
+        }
+        let convert = |value: Option<Value>| {
+            let cast = crate::planner::expression::BoundExpr::constant(value?).cast_to(target, false);
+            let converted = crate::execution::expression_executor::try_evaluate_scalar(&cast)?;
+            (converted.logical_type() == target).then_some(converted)
+        };
+        let (min, max) = (convert(result.min.take())?, convert(result.max.take())?);
+        result = Stats {
+            min: Some(min),
+            max: Some(max),
+            can_be_null: result.can_be_null,
+            can_be_valid: result.can_be_valid,
+            ..Stats::unknown()
+        };
+    }
     if stats.can_be_null {
         result.can_be_null = true;
     }
