@@ -987,7 +987,9 @@ impl DiskTable {
 /// A bound of a column of type `ty`, from the bytes the file has of it.
 fn bound(ty: &LogicalType, bytes: Option<&[u8; 16]>) -> Result<Option<Value>> {
     let width = fixed_width(ty.physical_type());
-    let (Some(bytes), Some(width)) = (bytes, width.filter(|_| has_ordered_statistics(ty))) else {
+    // UUIDs and ENUMs keep the statistics of the integers they are stored as
+    let ordered = has_ordered_statistics(ty) || matches!(ty.id(), LogicalTypeId::Uuid | LogicalTypeId::Enum);
+    let (Some(bytes), Some(width)) = (bytes, width.filter(|_| ordered)) else {
         return Ok(None);
     };
     let mut vector = Vector::new(ty.clone(), 1);
