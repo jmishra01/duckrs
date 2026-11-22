@@ -279,7 +279,9 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] DETACH of the default database: it is gone by name and keeps what is attached; RESET of the search path
     then goes to a database that remains; SHOW DATABASES lists them all (`PragmaShowDatabases`)
   - [x] `RECOVERY_MODE` (`NO_WAL_WRITES` keeps commits out of the log until a checkpoint)
-  - [ ] `ENCRYPTION_KEY`, `COMPRESS`, `IO_MODE` and the other ATTACH options
+  - [x] `ENCRYPTION_KEY`, `COMPRESS`, `IO_MODE` and the other ATTACH options: `DEFAULT_TABLE`, `HIDDEN`, `COMPRESS`,
+    `IO_MODE` and `MMAP_RESERVE_SIZE` (part 74); encrypted files, GCM and CTR, readable and writable both ways with
+    DuckDB 1.4 and 2.0, their logs and temporary files (part 75)
 - [x] 11. Files that C++ DuckDB v69 can read and write (`sql/storage_version`: all pass)
 - [ ] 12. `VACUUM` (`sql/vacuum`: 1 failing)
 - [ ] 13. Crash-recovery fuzzing: kill the process during writes, then reopen and verify
