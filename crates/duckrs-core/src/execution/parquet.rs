@@ -1095,6 +1095,9 @@ fn row_groups_to_scan(
     let leaves: Vec<Option<usize>> = (0..scan.names.len())
         .map(|column| statistics_leaf(scan, metadata, column, path))
         .collect();
+    let element_leaves: Vec<Option<(usize, LogicalType)>> = (0..scan.names.len())
+        .map(|column| element_leaf(scan, metadata, column, path))
+        .collect();
     let normalized = normalized_interval_blooms(metadata);
     let mut file = None;
     let selected = metadata
@@ -1103,8 +1106,17 @@ fn row_groups_to_scan(
         .enumerate()
         .filter(|(_, group)| {
             let zone = |at: usize| -> Option<crate::catalog::ColumnZone> {
+                if let Some((leaf, element)) = element_leaves.get(at).and_then(Option::as_ref) {
+                    // `TransformColumnStatistics` of a LIST or MAP: unknown validity, the elements' statistics
+                    let elements = group_zone(scan, metadata, group, *leaf, element)?;
+                    return (!elements.unknown).then(|| crate::catalog::ColumnZone {
+                        has_null: true,
+                        elements: Some(Box::new(elements)),
+                        ..Default::default()
+                    });
+                }
                 if let Some(leaf) = leaves.get(at) {
-                    let zone = group_zone(scan, metadata, group, (*leaf)?, at)?;
+                    let zone = group_zone(scan, metadata, group, (*leaf)?, &scan.types[at])?;
                     return (!zone.unknown).then_some(zone);
                 }
                 let value = scan.known_value(at, path)?;
@@ -1117,7 +1129,7 @@ fn row_groups_to_scan(
                 })
             };
             !crate::execution::zone_map::never_true(&zone, filter)
-                && !bloom_rules_out(scan, &leaves, group, filter, &mut file, path, normalized)
+                && !bloom_rules_out(scan, &leaves, &element_leaves, group, filter, &mut file, path, normalized)
         })
         .map(|(at, _)| at)
         .collect();
@@ -1129,6 +1141,7 @@ fn row_groups_to_scan(
 fn bloom_rules_out(
     scan: &ParquetScanData,
     leaves: &[Option<usize>],
+    elements: &[Option<(usize, LogicalType)>],
     group: &parquet::file::metadata::RowGroupMetaData,
     expr: &crate::planner::expression::BoundExpr,
     file: &mut Option<File>,
@@ -1140,7 +1153,7 @@ fn bloom_rules_out(
         E::Conjunction { and: true, children } => {
             if children
                 .iter()
-                .any(|child| bloom_rules_out(scan, leaves, group, child, file, path, normalized))
+                .any(|child| bloom_rules_out(scan, leaves, elements, group, child, file, path, normalized))
             {
                 return true;
             }
@@ -1172,12 +1185,12 @@ fn bloom_rules_out(
                         },
                         LogicalType::BOOLEAN,
                     );
-                    matched && bloom_rules_out(scan, leaves, group, &equal, file, path, normalized)
+                    matched && bloom_rules_out(scan, leaves, elements, group, &equal, file, path, normalized)
                 })
         }
         E::Conjunction { and: false, children } => children
             .iter()
-            .all(|child| bloom_rules_out(scan, leaves, group, child, file, path, normalized)),
+            .all(|child| bloom_rules_out(scan, leaves, elements, group, child, file, path, normalized)),
         // `x BETWEEN c AND c` is `x = c`
         E::Between { input, lower, upper } => match (&input.kind, &lower.kind, &upper.kind) {
             (E::Reference(_), E::Constant(low), E::Constant(high)) if low == high => {
@@ -1189,7 +1202,7 @@ fn bloom_rules_out(
                     },
                     LogicalType::BOOLEAN,
                 );
-                bloom_rules_out(scan, leaves, group, &equal, file, path, normalized)
+                bloom_rules_out(scan, leaves, elements, group, &equal, file, path, normalized)
             }
             _ => false,
         },
@@ -1199,16 +1212,34 @@ fn bloom_rules_out(
             left,
             right,
         } => {
-            let (column, value) = match (&left.kind, &right.kind) {
-                (E::Reference(column), E::Constant(value)) | (E::Constant(value), E::Reference(column)) => {
-                    (*column, value)
+            let (target, value) = match (&left.kind, &right.kind) {
+                (_, E::Constant(value)) => (left.as_ref(), value),
+                (E::Constant(value), _) => (right.as_ref(), value),
+                _ => return false,
+            };
+            // `TryGetNestedBloomFilterLeaf`: a column, an element of a LIST column or a value of a MAP column
+            let (leaf, ty) = match &target.kind {
+                E::Reference(column) => match leaves.get(*column) {
+                    Some(Some(leaf)) => (*leaf, &scan.types[*column]),
+                    _ => return false,
+                },
+                E::Function { function, children, .. } if children.len() == 2 => {
+                    let E::Reference(column) = children[0].kind else {
+                        return false;
+                    };
+                    let extract = match scan.types[column].id() {
+                        LogicalTypeId::List => matches!(function.name.as_str(), "list_extract" | "array_extract"),
+                        LogicalTypeId::Map => matches!(function.name.as_str(), "map_extract_value" | "array_extract"),
+                        _ => false,
+                    };
+                    match elements.get(column) {
+                        Some(Some((leaf, element))) if extract => (*leaf, element),
+                        _ => return false,
+                    }
                 }
                 _ => return false,
             };
-            let Some(Some(leaf)) = leaves.get(column) else {
-                return false;
-            };
-            let ty = &scan.types[column];
+            let leaf = &leaf;
             let Some(value) = try_cast_value(value, ty).filter(|v| !v.is_null()) else {
                 return false;
             };
@@ -2554,7 +2585,7 @@ pub fn partition_statistics(scan: &ParquetScanData) -> Option<Vec<(u64, Vec<Opti
             let zones = leaves
                 .iter()
                 .enumerate()
-                .map(|(at, leaf)| group_zone(scan, &metadata, group, (*leaf)?, at).filter(|z| !z.unknown))
+                .map(|(at, leaf)| group_zone(scan, &metadata, group, (*leaf)?, &scan.types[at]).filter(|z| !z.unknown))
                 .collect();
             let exact = leaves.iter().all(|leaf| {
                 leaf.and_then(|leaf| group.column(leaf).statistics())
@@ -2656,7 +2687,7 @@ pub fn scan_statistics(scan: &ParquetScanData) -> Vec<Option<crate::catalog::Col
             let string_column = matches!(scan.types[column].id(), LogicalTypeId::Varchar | LogicalTypeId::Blob);
             let mut strings: Option<crate::catalog::StringStatistics> = None;
             for group in metadata.row_groups() {
-                let Some(zone) = group_zone(scan, &metadata, group, leaf, column) else {
+                let Some(zone) = group_zone(scan, &metadata, group, leaf, &scan.types[column]) else {
                     usable = false;
                     break;
                 };
@@ -2825,6 +2856,49 @@ fn statistics_leaf(scan: &ParquetScanData, metadata: &ParquetMetaData, column: u
     Some(leaf)
 }
 
+/// The leaf that holds the elements of the LIST column `column`, or the values of the MAP column, with their type:
+/// `None` for other columns, or elements that are nested themselves.
+fn element_leaf(
+    scan: &ParquetScanData,
+    metadata: &ParquetMetaData,
+    column: usize,
+    path: &str,
+) -> Option<(usize, LogicalType)> {
+    let ty = scan.types.get(column)?;
+    let element = match ty.id() {
+        LogicalTypeId::List => ty.child_type()?.clone(),
+        LogicalTypeId::Map => ty.child_type()?.struct_children().get(1)?.1.clone(),
+        _ => return None,
+    };
+    if scan.schema.is_some() || element.is_nested() {
+        return None;
+    }
+    let name = scan.names.get(column)?;
+    if scan.hive_overrides.iter().any(|(_, key)| key.eq_ignore_ascii_case(name)) {
+        return None;
+    }
+    if stored_type(scan, path, name).as_ref() != Some(ty) {
+        return None;
+    }
+    let descriptor = metadata.file_metadata().schema_descr();
+    let leaves: Vec<usize> = (0..descriptor.num_columns())
+        .filter(|&i| {
+            let column = descriptor.column(i);
+            let parts = column.path().parts();
+            parts.len() == 3 && parts[0].eq_ignore_ascii_case(name)
+        })
+        .collect();
+    // a list has one leaf, a map its keys and then its values
+    let leaf = match (ty.id(), leaves.as_slice()) {
+        (LogicalTypeId::List, [leaf]) | (LogicalTypeId::Map, [_, leaf]) => *leaf,
+        _ => return None,
+    };
+    if scan.utf8_validation.repairs() && element.id() == LogicalTypeId::Varchar {
+        return None;
+    }
+    Some((leaf, element))
+}
+
 /// The DuckDB type the file at `path` stores its top-level column `name` as.
 fn stored_type(scan: &ParquetScanData, path: &str, name: &str) -> Option<LogicalType> {
     let builder = open_builder(path).ok()?;
@@ -2841,10 +2915,9 @@ fn group_zone(
     metadata: &ParquetMetaData,
     group: &parquet::file::metadata::RowGroupMetaData,
     leaf: usize,
-    column: usize,
+    ty: &LogicalType,
 ) -> Option<crate::catalog::ColumnZone> {
     use parquet::basic::Type as Physical;
-    let ty = &scan.types[column];
     let descriptor = metadata.file_metadata().schema_descr().column(leaf);
     let statistics = group.column(leaf).statistics()?;
     let rows = group.num_rows() as u64;

@@ -104,7 +104,9 @@ fn add_nested_statistics(
     positions: Option<Vec<usize>>,
     statistics: &mut [Stats],
 ) -> Option<()> {
-    let nested = |ty: &LogicalType| matches!(ty.id(), LogicalTypeId::List | LogicalTypeId::Array | LogicalTypeId::Struct);
+    let nested = |ty: &LogicalType| {
+        matches!(ty.id(), LogicalTypeId::List | LogicalTypeId::Array | LogicalTypeId::Map | LogicalTypeId::Struct)
+    };
     let columns: Vec<usize> = (0..table.columns.len())
         .filter(|&c| nested(&table.columns[c].ty) && statistics[c].children.is_empty())
         .collect();
@@ -542,6 +544,39 @@ fn string_stats_bounds(stats: &Stats) -> Stats {
     }
 }
 
+/// `ListSearchNeverMatches` of `list_position`, which also finds a NULL element for a NULL needle: whether the
+/// statistics prove that no element of the list matches the needle.
+fn list_search_never_matches(
+    list: &Stats,
+    needle: &Stats,
+    element_type: Option<&LogicalType>,
+    needle_type: &LogicalType,
+) -> bool {
+    if !list.can_be_valid {
+        // the list is always NULL, so there is nothing to search
+        return true;
+    }
+    let Some(child) = list.children.first() else {
+        return false;
+    };
+    // a NULL needle finds a NULL element
+    let null_needle_matches = child.can_be_null;
+    if !needle.can_be_valid {
+        return !null_needle_matches;
+    }
+    if null_needle_matches && needle.can_be_null {
+        return false;
+    }
+    if !child.can_be_valid {
+        // every element is NULL, and the needle is not
+        return true;
+    }
+    if element_type != Some(needle_type) {
+        return false;
+    }
+    decide(ComparisonOp::Equal, &string_stats_bounds(child), &string_stats_bounds(needle)) == Some(false)
+}
+
 /// A comparison of an expression of each side of a join: a `JoinCondition` in C++.
 fn is_side_comparison(expr: &BoundExpr, sides: &[Vec<ColumnBinding>; 2]) -> bool {
     let BoundExprKind::Comparison { left, right, .. } = &expr.kind else {
@@ -701,7 +736,7 @@ fn value_stats(value: &Value, ty: &LogicalType) -> Stats {
             ..unknown()
         };
         match ty.id() {
-            LogicalTypeId::List | LogicalTypeId::Array => ty.child_type().map(none).into_iter().collect(),
+            LogicalTypeId::List | LogicalTypeId::Array | LogicalTypeId::Map => ty.child_type().map(none).into_iter().collect(),
             LogicalTypeId::Struct => ty.struct_children().iter().map(|(_, child)| none(child)).collect(),
             _ => Vec::new(),
         }
@@ -716,7 +751,7 @@ fn value_stats(value: &Value, ty: &LogicalType) -> Stats {
         };
     }
     match (ty.id(), value.data()) {
-        (LogicalTypeId::List | LogicalTypeId::Array, ValueData::List(items)) => {
+        (LogicalTypeId::List | LogicalTypeId::Array | LogicalTypeId::Map, ValueData::List(items)) => {
             let child = ty.child_type().cloned().unwrap_or(LogicalType::SQLNULL);
             let merged = items
                 .iter()
@@ -1690,11 +1725,38 @@ impl StatisticsPropagator {
                     ..unknown()
                 };
             }
-            // `StructConcatStats`, `StructInsertStats`, `StructUpdateStats`: a struct, also of NULL inputs
+            // `StructConcatStats`, `StructInsertStats`, `StructUpdateStats`: a struct, also of NULL inputs, with the
+            // fields of its arguments (a field of a NULL struct is NULL)
             "struct_concat" | "struct_insert" | "struct_update" if return_type.id() == LogicalTypeId::Struct => {
+                let field = |stats: &Stats, at: usize| -> Stats {
+                    let mut child = stats.children.get(at).cloned().unwrap_or_else(unknown);
+                    child.can_be_null |= stats.can_be_null;
+                    child
+                };
+                let mut fields = Vec::new();
+                if function.name == "struct_concat" {
+                    for (child, stats) in children.iter().zip(&stats) {
+                        let count = child.return_type.struct_children().len();
+                        fields.extend((0..count).map(|at| field(stats, at)));
+                    }
+                } else if children.len() == 2 {
+                    // the named arguments are packed into the second; each replaces the field of its name
+                    let named = |ty: &LogicalType, name: &str| {
+                        ty.struct_children().iter().position(|(n, _)| n.eq_ignore_ascii_case(name))
+                    };
+                    for (name, _) in return_type.struct_children() {
+                        let child = match named(&children[1].return_type, name) {
+                            Some(at) => field(&stats[1], at),
+                            None => named(&children[0].return_type, name).map_or_else(unknown, |at| field(&stats[0], at)),
+                        };
+                        fields.push(child);
+                    }
+                }
+                let complete = fields.len() == return_type.struct_children().len();
                 return Stats {
                     can_be_null: false,
                     can_be_valid: true,
+                    children: if complete { fields } else { Vec::new() },
                     ..unknown()
                 };
             }
@@ -1745,11 +1807,53 @@ impl StatisticsPropagator {
                 if children.len() == 2
                     && matches!(children[0].return_type.id(), LogicalTypeId::List | LogicalTypeId::Array) =>
             {
-                // an index past the end is NULL
+                // an index past the end is NULL, and so is the element of a NULL list or at a NULL index
                 if let Some(child) = stats[0].children.first() {
                     let mut child = child.clone();
                     child.can_be_null = true;
+                    if !stats[0].can_be_valid || !stats[1].can_be_valid {
+                        child.can_be_valid = false;
+                    }
                     return child;
+                }
+                return unknown();
+            }
+            // `ListPositionPropagateStats`: only NULL where the statistics prove that no element matches
+            "list_position" | "list_indexof" | "array_position" | "array_indexof"
+                if children.len() == 2
+                    && has_ordered_statistics(&return_type)
+                    && list_search_never_matches(&stats[0], &stats[1], children[0].return_type.child_type(), &children[1].return_type) =>
+            {
+                return Stats {
+                    can_be_null: true,
+                    can_be_valid: false,
+                    ..unknown()
+                };
+            }
+            // `MapExtractValueStats`: the statistics of the values, and NULL for a missing key (`m[k]` too)
+            "map_extract_value" | "array_extract" | "element_at"
+                if children.len() == 2 && children[0].return_type.id() == LogicalTypeId::Map =>
+            {
+                if let Some(value) = stats[0].children.first().and_then(|entry| entry.children.get(1)) {
+                    let mut value = value.clone();
+                    value.can_be_null = true;
+                    if !stats[0].can_be_valid || !stats[1].can_be_valid {
+                        value.can_be_valid = false;
+                    }
+                    return value;
+                }
+                return unknown();
+            }
+            // `MapValuesStats`: the map's validity and lengths, with the statistics of its values as elements
+            "map_values" if children.len() == 1 && children[0].return_type.id() == LogicalTypeId::Map => {
+                if let Some(value) = stats[0].children.first().and_then(|entry| entry.children.get(1)) {
+                    return Stats {
+                        can_be_null: stats[0].can_be_null,
+                        can_be_valid: stats[0].can_be_valid,
+                        children: vec![value.clone()],
+                        lists: stats[0].lists.clone(),
+                        ..unknown()
+                    };
                 }
                 return unknown();
             }
@@ -3360,7 +3464,7 @@ pub(super) fn stats_fields(stats: &Stats, ty: &LogicalType) -> Option<Value> {
         }
     }
     match ty.id() {
-        LogicalTypeId::List | LogicalTypeId::Array => {
+        LogicalTypeId::List | LogicalTypeId::Array | LogicalTypeId::Map => {
             fields.push(("child_stats".to_string(), child(0, ty.child_type()?)?));
         }
         LogicalTypeId::Struct => {
