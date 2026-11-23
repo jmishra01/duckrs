@@ -500,10 +500,16 @@ impl Sniffer<'_> {
                       comply with the CSV standard.\n";
         }
         if let (Some(names), Some(types)) = (self.set_names, self.set_types) {
-            let set: Vec<String> = names.iter().zip(types).map(|(n, t)| format!("'{n}': '{t}'")).collect();
+            // `SetColumns::ToString`: each name and type as `SQLString::ToString` quotes it
+            let quoted = |text: &str| format!("'{}'", text.replace('\'', "''"));
+            let set: Vec<String> = names
+                .iter()
+                .zip(types)
+                .map(|(n, t)| format!("{} : {}", quoted(n), quoted(&t.to_string())))
+                .collect();
             error += &format!(
-                "* Columns are set as: \"{}\", and they contain: {} columns. It does not match the number of columns \
-                 found by the sniffer: {columns}. Verify the columns parameter is correctly set.\n",
+                "* Columns are set as: \"columns = {{ {}}}\", and they contain: {} columns. It does not match the \
+                 number of columns found by the sniffer: {columns}. Verify the columns parameter is correctly set.\n",
                 set.join(", "),
                 types.len()
             );

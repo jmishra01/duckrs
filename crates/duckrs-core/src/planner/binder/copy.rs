@@ -1686,6 +1686,20 @@ impl Binder<'_> {
         let mut arguments = vec![string_literal(path), format!("columns := {{{}}}", fields.join(", "))];
         let options = self.copy_options(info)?;
         Self::check_copy_options(&options, true)?;
+        // `CSVReaderOptions::SetReadOption`: FORCE_NOT_NULL names columns of the COPY (`ParseColumnList`),
+        // before the file is sniffed
+        if !self.copy_json
+            && let Some((_, value)) = options.iter().find(|(name, _)| name == "force_not_null")
+            && matches!(value.data(), ValueData::List(_) | ValueData::Struct(_))
+        {
+            for column in strings(value)? {
+                if !columns.iter().any(|c| c.eq_ignore_ascii_case(&column)) {
+                    return Err(binder_error(format!(
+                        "\"force_not_null\" expected to find {column}, but it was not found in the table"
+                    )));
+                }
+            }
+        }
         if !options.iter().any(|(name, _)| name == "auto_detect") {
             arguments.push("auto_detect := true".to_string());
         }

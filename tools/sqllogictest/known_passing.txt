@@ -1623,6 +1623,7 @@ test/sql/copy/csv/csv_dtypes_union_by_name.test
 test/sql/copy/csv/csv_duck_fuzz.test
 test/sql/copy/csv/csv_enum.test
 test/sql/copy/csv/csv_enum_storage.test
+test/sql/copy/csv/csv_error_message.test
 test/sql/copy/csv/csv_external_access.test
 test/sql/copy/csv/csv_glob_fallback.test
 test/sql/copy/csv/csv_hive.test
@@ -1732,9 +1733,11 @@ test/sql/copy/csv/test_export_force_quotes.test
 test/sql/copy/csv/test_export_not_null.test
 test/sql/copy/csv/test_extra_delimiters_rfc.test
 test/sql/copy/csv/test_filename_filter.test
+test/sql/copy/csv/test_force_not_null.test
 test/sql/copy/csv/test_force_quote.test
 test/sql/copy/csv/test_glob_reorder_null.test
 test/sql/copy/csv/test_greek_utf8.test
+test/sql/copy/csv/test_gzip_large_member_header.test
 test/sql/copy/csv/test_header_only.test
 test/sql/copy/csv/test_headers_12089.test
 test/sql/copy/csv/test_hits_problematic.test
