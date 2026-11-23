@@ -491,6 +491,12 @@ Each item gives the number of failing files in `test/` that it should fix, where
     COUNT(*) of its own (`catalog_function_binding`)
   - [ ] named table function arguments (`materialized_cte_column_count`)
 - [ ] 18. Optimizer-dependent SQL tests (`sql/optimizer`: 62 failing, 63.7% pass)
+  - [x] common subplans: a `sum` statistics made a `sum_no_overflow` can't throw, and combines with other
+    aggregates as C++, which shares subplans before statistics, has it (`test_common_subplan_matching_plan`);
+    `pragma_table_info` / `pragma_show` of a view or of what isn't a table of the catalog is volatile and not
+    shared (`test_common_subplan_repeatability_system`)
+  - [ ] the hash build of a recursive CTE's invariant side kept across its iterations, and its log
+    (`test_common_subplan_repeatability_logging`)
   - [x] uncorrelated scalar subqueries planned as cross products (`PlanUncorrelatedSubquery`), with first() and
     the multiple-rows check where they may not return one row
   - [x] window self-join, window join pushdown (with `GetUniqueColumnCombinations`), filter pushdown through

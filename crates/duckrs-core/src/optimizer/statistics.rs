@@ -3051,6 +3051,7 @@ impl StatisticsPropagator {
                             && bound.return_type == aggregate.return_type
                         {
                             aggregate.function = bound.function;
+                            aggregate.proven_no_overflow = true;
                         }
                     }
                 }
