@@ -12,7 +12,7 @@ use crate::execution::parquet::{
     ParquetScanData, ParquetWriteOptions, file_metadata_row, file_schema, key_value_rows, metadata_rows,
     parse_compression, schema_table_rows,
 };
-use crate::execution::parquet_writer::{FieldIds, MAX_UNCOMPRESSED_DICT_PAGE_SIZE, MAX_UNCOMPRESSED_PAGE_SIZE};
+use crate::execution::parquet_writer::{Codec, FieldIds, MAX_UNCOMPRESSED_DICT_PAGE_SIZE, MAX_UNCOMPRESSED_PAGE_SIZE};
 use crate::function::combine_types::force_max_logical_type;
 use crate::planner::logical::{LogicalOperator, LogicalOperatorKind};
 use duckrs_common::types::{LogicalType, LogicalTypeId};
@@ -656,7 +656,19 @@ impl Binder<'_> {
                     }
                     compression = Some((name.clone(), value.try_to_string()?));
                 }
-                "compression_level" => level = Some(number()? as i32),
+                "compression_level" => {
+                    // `ZStdFileSystem::MinimumCompressionLevel` / `MaximumCompressionLevel` (ZSTD_minCLevel,
+                    // ZSTD_maxCLevel)
+                    const MIN_LEVEL: i64 = -(1 << 17);
+                    const MAX_LEVEL: i64 = 22;
+                    let n = number()?;
+                    if !(MIN_LEVEL..=MAX_LEVEL).contains(&n) {
+                        return Err(binder_error(format!(
+                            "Compression level must be between {MIN_LEVEL} and {MAX_LEVEL}"
+                        )));
+                    }
+                    level = Some(n as i32);
+                }
                 "row_group_size" | "chunk_size" => {
                     if value.as_i128().is_some_and(|n| n >= i128::from(u64::MAX)) {
                         return Err(binder_error(format!(
@@ -784,6 +796,11 @@ impl Binder<'_> {
                      zstd]"
                 ))
             })?;
+        }
+        if level.is_some() && !matches!(writer.codec, Codec::Zstd(_)) {
+            return Err(binder_error(
+                "Compression level is only supported for the ZSTD compression codec",
+            ));
         }
         // `DEFAULT_DATA_PAGE_SIZE_LIMIT`: with the page index, pages of 1 MiB; without, one per column chunk
         writer.data_page_size_limit = page_size_limit.unwrap_or(if writer.write_page_index {

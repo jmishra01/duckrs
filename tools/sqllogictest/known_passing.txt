@@ -1869,10 +1869,12 @@ test/sql/copy/parquet/parquet_all_null_column.test
 test/sql/copy/parquet/parquet_arrow_timestamp.test
 test/sql/copy/parquet/parquet_blob.test
 test/sql/copy/parquet/parquet_bloom_filter_corruption.test
+test/sql/copy/parquet/parquet_column_metadata_corruption.test
 test/sql/copy/parquet/parquet_copy_failure_cleans_up.test
 test/sql/copy/parquet/parquet_copy_type_mismatch.test
 test/sql/copy/parquet/parquet_corrupt_stats.test
 test/sql/copy/parquet/parquet_count_star.test
+test/sql/copy/parquet/parquet_deep_schema.test
 test/sql/copy/parquet/parquet_deeply_nested_list.test
 test/sql/copy/parquet/parquet_dictionary_zero_sum_aggregate.test
 test/sql/copy/parquet/parquet_empty_enum.test
@@ -1911,6 +1913,7 @@ test/sql/copy/parquet/parquet_nullbyte.test
 test/sql/copy/parquet/parquet_pandas_date.test
 test/sql/copy/parquet/parquet_prefetch_overlapping_ranges.test
 test/sql/copy/parquet/parquet_pruned_first_file_cardinality.test
+test/sql/copy/parquet/parquet_row_group_row_count.test
 test/sql/copy/parquet/parquet_schema_hive_partitioning.test
 test/sql/copy/parquet/parquet_schema_lossy_filter_pushdown.test
 test/sql/copy/parquet/parquet_schema_num_children_fix.test
@@ -1974,6 +1977,7 @@ test/sql/copy/parquet/writer/parquet_timetz_metadata.test
 test/sql/copy/parquet/writer/parquet_timetz_roundtrip.test
 test/sql/copy/parquet/writer/parquet_write_booleans.test
 test/sql/copy/parquet/writer/parquet_write_compact_vectors.test
+test/sql/copy/parquet/writer/parquet_write_compression_level.test
 test/sql/copy/parquet/writer/parquet_write_data_page_size.test
 test/sql/copy/parquet/writer/parquet_write_date.test
 test/sql/copy/parquet/writer/parquet_write_decimals.test

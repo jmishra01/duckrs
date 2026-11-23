@@ -337,8 +337,30 @@ fn open_builder(path: &str) -> Result<ParquetRecordBatchReaderBuilder<File>> {
     let builder = guarded(path, || {
         ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| read_error(path, "Invalid Parquet file", e))
     })?;
+    check_schema_depth(builder.parquet_schema().root_schema(), path)?;
     check_variant_groups(builder.parquet_schema().root_schema(), path)?;
     Ok(builder)
+}
+
+/// `MAX_PARQUET_SCHEMA_DEPTH`: deeper schemas would overflow the stack while being read.
+const MAX_PARQUET_SCHEMA_DEPTH: usize = 500;
+
+/// The depth check of `ParquetReader::ParseSchemaRecursive`, the root at depth 0, walked without
+/// recursion so that the check itself can't overflow the stack.
+fn check_schema_depth(root: &parquet::schema::types::Type, path: &str) -> Result<()> {
+    let mut pending = vec![(root, 0usize)];
+    while let Some((ty, depth)) = pending.pop() {
+        if depth > MAX_PARQUET_SCHEMA_DEPTH {
+            return Err(invalid(format!(
+                "Malformed Parquet schema in file \"{path}\": the schema is nested more than \
+                 {MAX_PARQUET_SCHEMA_DEPTH} levels deep"
+            )));
+        }
+        if ty.is_group() {
+            pending.extend(ty.get_fields().iter().map(|field| (field.as_ref(), depth + 1)));
+        }
+    }
+    Ok(())
 }
 
 /// A FIXED_LEN_BYTE_ARRAY(12) annotated INTERVAL.
@@ -1287,6 +1309,42 @@ fn bloom_rules_out(
     }
 }
 
+/// `ParquetColumnSchema::ValidateColumnMetadata` with `validate_row_count`, for the top-level columns
+/// `reads` says the scan reads: a column outside lists has one value per row of its row group.
+fn validate_column_metadata(path: &str, metadata: &ParquetMetaData, reads: impl Fn(usize) -> bool) -> Result<()> {
+    let descr = metadata.file_metadata().schema_descr();
+    for group in metadata.row_groups() {
+        for (leaf, chunk) in group.columns().iter().enumerate() {
+            let column = descr.column(leaf);
+            if !reads(descr.get_column_root_idx(leaf)) {
+                continue;
+            }
+            let values = chunk.num_values();
+            if values < 0 {
+                return Err(Error::new(
+                    ErrorKind::DataCorruption,
+                    format!(
+                        "Failed to read file \"{path}\": metadata is corrupt. Column has invalid number of values \
+                         ({values})"
+                    ),
+                ));
+            }
+            let top_level = column.path().parts().len() == 1 && column.max_rep_level() == 0;
+            if top_level && values != group.num_rows() {
+                return Err(Error::new(
+                    ErrorKind::DataCorruption,
+                    format!(
+                        "Failed to read file \"{path}\": metadata is corrupt. Column has {values} values but row \
+                         group has {} rows",
+                        group.num_rows()
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn open_file(
     scan: &ParquetScanData,
     filter: Option<&crate::planner::expression::BoundExpr>,
@@ -1352,6 +1410,7 @@ fn open_file(
         mapping.push(found);
         transforms.push(None);
     }
+    validate_column_metadata(path, builder.metadata(), |root| mapping.contains(&Some(root)))?;
     // only the columns the query reads are decoded; a batch holds them in the order of the file
     let mut read_roots: Option<Vec<usize>> = None;
     let builder = match &scan.read {
