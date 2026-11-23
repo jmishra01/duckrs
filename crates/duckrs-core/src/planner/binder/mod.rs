@@ -13,21 +13,21 @@ mod index_key;
 mod join;
 mod json;
 mod lambda;
-pub(crate) use lambda::is_lambda_function;
+pub use lambda::is_lambda_function;
 mod macros;
 mod match_recognize;
 mod merge;
 mod on_conflict;
 mod parquet;
 mod pivot;
-pub(crate) use pivot::has_subquery;
+pub use pivot::has_subquery;
 pub mod read_duckdb;
 mod show;
 mod star;
 mod statements;
 mod table_constraints;
 mod table_functions;
-pub(crate) use table_functions::named_argument;
+pub use table_functions::named_argument;
 mod window;
 
 use crate::optimizer::OptimizerOptions;
@@ -746,7 +746,21 @@ pub type OpenDatabase = Arc<dyn Fn(&str) -> Result<(Arc<Catalog>, Arc<dyn std::a
 pub type SettingLookup = Box<dyn Fn(&str) -> Result<Value> + Send + Sync>;
 
 /// `duckdb_settings()`.
-pub type SettingList = Box<dyn Fn() -> Vec<crate::client::settings::SettingRow> + Send + Sync>;
+/// A row of `duckdb_settings()`.
+#[derive(Debug, Clone)]
+pub struct SettingRow {
+    pub name: &'static str,
+    pub value: Option<Value>,
+    pub description: &'static str,
+    pub input_type: &'static str,
+    /// `GLOBAL` or `LOCAL`
+    pub scope: &'static str,
+    pub aliases: &'static [&'static str],
+    pub is_debug: bool,
+    pub is_deprecated: bool,
+}
+
+pub type SettingList = Box<dyn Fn() -> Vec<SettingRow> + Send + Sync>;
 
 impl std::fmt::Debug for SessionValues {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

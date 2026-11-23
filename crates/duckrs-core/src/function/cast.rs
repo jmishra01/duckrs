@@ -1503,3 +1503,12 @@ mod tests {
         }
     }
 }
+/// `Value::CastAs`.
+pub fn cast_value(value: &Value, target: &LogicalType) -> Result<Value> {
+    if value.logical_type() == target {
+        return Ok(value.clone());
+    }
+    let mut result = Vector::new(target.clone(), 1);
+    cast_vector(&Vector::constant(value), &mut result, 1, CastMode::Strict)?;
+    Ok(result.get_value(0))
+}

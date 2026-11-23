@@ -13,13 +13,13 @@
 //! expression depth limit) or listed in [`UNHONORED`]: setting one of those to anything but
 //! its default fails as not yet ported, so a test never sees a silently different result.
 
+pub(crate) use duckrs_core::function::cast::cast_value;
+pub use duckrs_core::planner::binder::SettingRow;
 use super::settings_table::SETTINGS;
-use crate::execution::file_system::{FileAccess, sanitize_allowed_path};
-use crate::function::cast::{CastMode, cast_vector};
+use duckrs_core::execution::file_system::{FileAccess, sanitize_allowed_path};
 use duckrs_common::string_util::{candidates_error_message, candidates_message, similarity_rating, top_n_strings};
 use duckrs_common::types::LogicalType;
 use duckrs_common::value::Value;
-use duckrs_common::vector::Vector;
 use duckrs_common::{Error, ErrorKind, Result};
 use duckrs_parser::ast::SetScope;
 use std::collections::HashMap;
@@ -170,18 +170,8 @@ fn input_type(setting: &SettingDefinition) -> Result<LogicalType> {
         "DOUBLE" => LogicalType::DOUBLE,
         "VARCHAR[]" => LogicalType::list(LogicalType::VARCHAR),
         "MAP(VARCHAR, VARCHAR)" => LogicalType::map(LogicalType::VARCHAR, LogicalType::VARCHAR),
-        other => return Err(crate::unported(format!("settings of type {other}"))),
+        other => return Err(duckrs_core::unported(format!("settings of type {other}"))),
     })
-}
-
-/// `Value::CastAs`.
-pub(crate) fn cast_value(value: &Value, target: &LogicalType) -> Result<Value> {
-    if value.logical_type() == target {
-        return Ok(value.clone());
-    }
-    let mut result = Vector::new(target.clone(), 1);
-    cast_vector(&Vector::constant(value), &mut result, 1, CastMode::Strict)?;
-    Ok(result.get_value(0))
 }
 
 /// `EXTENSION_SETTINGS` of `extension_entries.hpp`: the settings of the extensions.
@@ -722,7 +712,7 @@ fn on_set(setting: &SettingDefinition, value: Value) -> Result<Value> {
         }
         // `DefaultCollationSetting::OnSet`: the collation has to exist
         "default_collation" => {
-            crate::planner::collation::test_collation(&value.try_to_string()?)?;
+            duckrs_core::planner::collation::test_collation(&value.try_to_string()?)?;
             value
         }
         "default_null_order" => {
@@ -760,7 +750,7 @@ fn on_set(setting: &SettingDefinition, value: Value) -> Result<Value> {
         }
         // `MaxMemorySetting::SetGlobal` and `GetSetting`: a size, shown as one
         "max_memory" => {
-            use crate::execution::temporary::{format_bytes, parse_memory_limit, physical_memory};
+            use duckrs_core::execution::temporary::{format_bytes, parse_memory_limit, physical_memory};
             let input = value.try_to_string()?;
             let bytes = match input.strip_suffix('%') {
                 Some(percentage) => {
@@ -785,7 +775,7 @@ fn on_set(setting: &SettingDefinition, value: Value) -> Result<Value> {
         }
         // `MaxTempDirectorySizeSetting::SetGlobal`
         "max_temp_directory_size" => {
-            use crate::execution::temporary::{format_bytes, parse_memory_limit};
+            use duckrs_core::execution::temporary::{format_bytes, parse_memory_limit};
             if value.is_null() {
                 return Err(Error::new(
                     ErrorKind::InvalidInput,
@@ -793,7 +783,7 @@ fn on_set(setting: &SettingDefinition, value: Value) -> Result<Value> {
                 ));
             }
             let input = value.try_to_string()?;
-            if input == crate::execution::temporary::DEFAULT_TEMP_DIRECTORY_SIZE {
+            if input == duckrs_core::execution::temporary::DEFAULT_TEMP_DIRECTORY_SIZE {
                 value
             } else {
                 Value::varchar(format_bytes(parse_memory_limit(&input)?.unwrap_or(u64::MAX)))
@@ -900,7 +890,7 @@ fn resolve_scope_of(setting: &SettingDefinition, scope: SetScope, reset: bool) -
             setting.name
         )),
         SetScope::Global => Ok(true),
-        SetScope::Variable => Err(crate::unported("SET VARIABLE")),
+        SetScope::Variable => Err(duckrs_core::unported("SET VARIABLE")),
     }
 }
 
@@ -914,7 +904,7 @@ pub fn set_variable(
     session: &mut SettingValues,
 ) -> Result<()> {
     if scope == SetScope::Variable {
-        return Err(crate::unported("SET VARIABLE"));
+        return Err(duckrs_core::unported("SET VARIABLE"));
     }
     check_lock(name, global, session)?;
     let (index, setting) = find_setting(name).ok_or_else(|| unrecognized(name))?;
@@ -955,7 +945,7 @@ pub fn set_variable(
     let value = on_set(setting, value)?;
     let value = file_access_on_set(setting.name, value, global, session)?;
     if UNHONORED.contains(&setting.name) && Some(&value) != default_value(setting).as_ref() {
-        return Err(crate::unported(format!("the {} setting", setting.name)));
+        return Err(duckrs_core::unported(format!("the {} setting", setting.name)));
     }
     let target = if is_global { global } else { session };
     target.0.insert(index, value);
@@ -1006,7 +996,7 @@ pub fn reset_variable(
     session: &mut SettingValues,
 ) -> Result<()> {
     if scope == SetScope::Variable {
-        return Err(crate::unported("RESET VARIABLE"));
+        return Err(duckrs_core::unported("RESET VARIABLE"));
     }
     check_lock(name, global, session)?;
     let (index, setting) = find_setting(name).ok_or_else(|| unrecognized(name))?;
@@ -1205,19 +1195,6 @@ pub fn current_value(name: &str, global: &SettingValues, session: &SettingValues
         .or_else(|| default_value(setting))
 }
 
-/// A row of `duckdb_settings()`.
-#[derive(Debug, Clone)]
-pub struct SettingRow {
-    pub name: &'static str,
-    pub value: Option<Value>,
-    pub description: &'static str,
-    pub input_type: &'static str,
-    /// `GLOBAL` or `LOCAL`
-    pub scope: &'static str,
-    pub aliases: &'static [&'static str],
-    pub is_debug: bool,
-    pub is_deprecated: bool,
-}
 
 /// `DuckDBSettingsInit`: every setting with its current value, each alias as a row of its
 /// own, sorted by name.

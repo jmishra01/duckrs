@@ -312,7 +312,7 @@ pub(crate) fn check_all_keys(table: &TableCatalogEntry, rows: &ColumnDataCollect
 
 /// That the DEFERRED keys of `table` hold among `rows`, as a commit checks them, or among those
 /// whose position `among` takes.
-pub(crate) fn check_deferred_keys(
+pub fn check_deferred_keys(
     table: &TableCatalogEntry,
     rows: &ColumnDataCollection,
     among: impl Fn(usize) -> bool,

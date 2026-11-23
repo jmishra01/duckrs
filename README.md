@@ -37,6 +37,8 @@ and SELECT (joins, WHERE, GROUP BY, aggregates, ORDER BY, LIMIT, DISTINCT) in me
   later phases. Expression depth is limited like DuckDB (`max_expression_depth`). Parsing a
   corpus statement into the AST takes about 82 µs (`bench` example), with packrat memoization of
   the rules DuckDB memoizes and a pool of reused parser threads. Phase 2 is complete.
+- `crates/duckrs-main`: the client (`ClientContext`, `DatabaseInstance`, settings, EXPLAIN, triggers),
+  split out of `duckrs-core` as the first step of the crate split (see `../CLAUDE.md`).
 - `crates/duckrs-core`: the engine, one module per DuckDB `src/` directory until the boundaries
   settle: an in-memory catalog (`catalog`); scalar functions, the implicit cast cost rules, type
   unification (`MaxLogicalType`), overload resolution and vector casts (`function`); the binder,
@@ -80,7 +82,8 @@ The full roadmap is in [`../RUST_PORT_PLAN.md`](../RUST_PORT_PLAN.md).
 duckrs/
 ├── crates/duckrs/          # public API (facade crate)
 ├── crates/duckrs-common/   # types, vectors, executors, values
-├── crates/duckrs-core/     # catalog, functions, binder/planner, execution, storage, client context
+├── crates/duckrs-core/     # catalog, functions, binder/planner, optimizer, execution, storage
+├── crates/duckrs-main/     # Database, Connection and ClientContext, settings, EXPLAIN (DuckDB's src/main)
 ├── crates/duckrs-parser/   # tokenizer, PEG grammar engine (+ vendored grammar), AST, transformer
 ├── tools/sqllogictest/     # test runner + known_passing.txt
 └── docs/                   # ARCHITECTURE, PORTING_GUIDE, UPSTREAM_SYNC

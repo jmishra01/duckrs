@@ -6,11 +6,12 @@
 //! `TextTreeRenderer` (in [`text_tree_renderer`]) or as JSON. A physical plan takes its details from the logical plan it came from, whose
 //! expressions still have their names.
 
-use crate::execution::physical::PhysicalOperator;
-use crate::optimizer::join_order::PlanEstimate;
-use crate::planner::expression::{BoundAggregate, BoundExpr, BoundWindow};
-use crate::optimizer::range_joins::{range_order, reorder_conditions};
-use crate::planner::logical::{
+use duckrs_core::planner::expression::filter_text;
+use duckrs_core::execution::physical::PhysicalOperator;
+use duckrs_core::optimizer::join_order::PlanEstimate;
+use duckrs_core::planner::expression::{BoundAggregate, BoundExpr, BoundWindow};
+use duckrs_core::optimizer::range_joins::{range_order, reorder_conditions};
+use duckrs_core::planner::logical::{
     BoundOrderByNode, JoinAlgorithm, JoinCondition, LogicalOperator, LogicalOperatorKind as K,
 };
 use duckrs_common::sort_key::OrderType;
@@ -115,9 +116,9 @@ fn conditions_text(conditions: &[JoinCondition], predicate: Option<String>) -> S
 fn aggregate_text(aggregate: &BoundAggregate) -> String {
     // the arguments of an aggregate duckrs computes from its rows are packed into one (`a0`, `a1`, ...)
     let children = match aggregate.children.as_slice() {
-        [only] if matches!(aggregate.function.kind, crate::function::aggregates::AggregateKind::Holistic(_)) => {
+        [only] if matches!(aggregate.function.kind, duckrs_core::function::aggregates::AggregateKind::Holistic(_)) => {
             match &only.kind {
-                crate::planner::expression::BoundExprKind::Function { function, children, .. }
+                duckrs_core::planner::expression::BoundExprKind::Function { function, children, .. }
                     if function.name == "struct_pack"
                         && children.len() > 1
                         && only.return_type.id() == duckrs_common::types::LogicalTypeId::Struct
@@ -155,7 +156,7 @@ fn scan_filter_lines(filters: &[BoundExpr]) -> String {
 
 /// [`scan_filter_lines`] of filters some of which are optional (`OptionalFilterScalarFun::ToString`).
 fn scan_filter_lines_marked(filters: &[(BoundExpr, bool)]) -> String {
-    use crate::planner::expression::BoundExprKind as E;
+    use duckrs_core::planner::expression::BoundExprKind as E;
     let text = |filter: &BoundExpr| match &filter.kind {
         E::Between { input, lower, upper } if matches!(input.kind, E::ColumnRef { .. }) => {
             format!("({input} >= {lower}) AND ({input} <= {upper})")
@@ -185,7 +186,7 @@ fn scan_filter_lines_marked(filters: &[(BoundExpr, bool)]) -> String {
         (E::Conjunction { and: false, .. }, false) => format!("({})", text(filter)),
         _ => text(filter),
     };
-    let mut groups: Vec<(Option<crate::planner::expression::ColumnBinding>, Vec<&(BoundExpr, bool)>)> = Vec::new();
+    let mut groups: Vec<(Option<duckrs_core::planner::expression::ColumnBinding>, Vec<&(BoundExpr, bool)>)> = Vec::new();
     for filter in filters {
         let key = column(&filter.0);
         match groups.iter_mut().find(|(k, _)| key.is_some() && *k == key) {
@@ -206,9 +207,9 @@ fn scan_filter_lines_marked(filters: &[(BoundExpr, bool)]) -> String {
 /// The fields of STRUCT columns a filter reads, as C++ shows them: of a column whose field the scan reads in its
 /// place (`IsPushdownExtract`), the filter is one on that field, named by its path (`s.a`); otherwise the key is the
 /// field's name (`struct_extract(s, 'a')`).
-fn with_field_names(filter: &BoundExpr, extracted: &dyn Fn(&crate::planner::expression::ColumnBinding) -> bool) -> BoundExpr {
-    use crate::planner::expression::BoundExprKind as E;
-    fn path(expr: &BoundExpr) -> Option<(crate::planner::expression::ColumnBinding, String)> {
+fn with_field_names(filter: &BoundExpr, extracted: &dyn Fn(&duckrs_core::planner::expression::ColumnBinding) -> bool) -> BoundExpr {
+    use duckrs_core::planner::expression::BoundExprKind as E;
+    fn path(expr: &BoundExpr) -> Option<(duckrs_core::planner::expression::ColumnBinding, String)> {
         match &expr.kind {
             E::ColumnRef { binding, depth: 0 } => Some((*binding, expr.alias.clone())),
             E::Function { function, children, .. } if function.name == "struct_extract" && children.len() == 2 => {
@@ -251,26 +252,6 @@ fn with_field_names(filter: &BoundExpr, extracted: &dyn Fn(&crate::planner::expr
     copy
 }
 
-pub(crate) fn filter_text(filter: &BoundExpr) -> String {
-    let text = filter.to_string();
-    let Some(inner) = text.strip_prefix('(').and_then(|t| t.strip_suffix(')')) else {
-        return text;
-    };
-    // (a) OR (b) starts and ends with them too, but those are not one pair
-    let mut depth = 0i32;
-    for c in inner.chars() {
-        match c {
-            '(' => depth += 1,
-            ')' => depth -= 1,
-            _ => {}
-        }
-        if depth < 0 {
-            return text;
-        }
-    }
-    inner.to_string()
-}
-
 /// `BoundOrderByNode::ToString`.
 fn order_node_text(expr: &BoundExpr, modifiers: duckrs_common::sort_key::OrderModifiers) -> String {
     let order = match modifiers.order {
@@ -286,7 +267,7 @@ fn order_node_text(expr: &BoundExpr, modifiers: duckrs_common::sort_key::OrderMo
 
 /// `BoundWindowExpression::ToString` (`WindowExpression::ToString`).
 fn window_text(window: &BoundWindow) -> String {
-    use crate::planner::expression::WindowFunction as F;
+    use duckrs_core::planner::expression::WindowFunction as F;
     use duckrs_parser::ast::{WindowBoundary as B, WindowExclude};
     let name = match window.function {
         F::Aggregate => window.aggregate.as_ref().map_or("", |a| a.name.as_str()),
@@ -436,11 +417,11 @@ fn resolve_unnamed(op: &LogicalOperator) -> Option<LogicalOperator> {
     let mut changed = false;
     for expr in resolved.expressions_mut() {
         expr.walk_mut(&mut |e| {
-            if let crate::planner::expression::BoundExprKind::ColumnRef { binding, depth: 0 } = &e.kind
+            if let duckrs_core::planner::expression::BoundExprKind::ColumnRef { binding, depth: 0 } = &e.kind
                 && e.alias.is_empty()
                 && let Some(at) = bindings.iter().position(|b| b == binding)
             {
-                e.kind = crate::planner::expression::BoundExprKind::Reference(at);
+                e.kind = duckrs_core::planner::expression::BoundExprKind::Reference(at);
                 changed = true;
             }
         });
@@ -534,7 +515,7 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
             let rename = |filter: &BoundExpr| {
                 let mut filter = filter.clone();
                 filter.walk_mut(&mut |e| {
-                    if let crate::planner::expression::BoundExprKind::ColumnRef { binding, depth: 0 } = &e.kind
+                    if let duckrs_core::planner::expression::BoundExprKind::ColumnRef { binding, depth: 0 } = &e.kind
                         && binding.table_index == *table_index
                         && let Some(column) = column_ids.get(binding.column_index)
                         && let Some(definition) = table.columns.get(*column)
@@ -543,7 +524,7 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
                     }
                 });
                 // the scan reads fields of the column, not all of it
-                let extracted = |binding: &crate::planner::expression::ColumnBinding| {
+                let extracted = |binding: &duckrs_core::planner::expression::ColumnBinding| {
                     let Some(column) = column_ids.get(binding.column_index).filter(|_| binding.table_index == *table_index)
                     else {
                         return false;
@@ -579,7 +560,7 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
             let mut info = entry("Table", table.qualified_name());
             info.extend(entry("Type", "Sequential Scan".to_string()));
             let name = |&column: &usize| {
-                if column == crate::planner::logical::COLUMN_IDENTIFIER_ROW_NUMBER {
+                if column == duckrs_core::planner::logical::COLUMN_IDENTIFIER_ROW_NUMBER {
                     return "row_number".to_string();
                 }
                 let name = table.columns.get(column).map(|c| c.name.as_str());
@@ -597,7 +578,7 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
             };
             let projected: Vec<String> = positions
                 .into_iter()
-                .filter(|&p| column_ids[p] != crate::planner::logical::COLUMN_IDENTIFIER_ROW_ID)
+                .filter(|&p| column_ids[p] != duckrs_core::planner::logical::COLUMN_IDENTIFIER_ROW_ID)
                 .map(name_at)
                 .collect();
             if !projected.is_empty() {
@@ -823,7 +804,7 @@ thread_local! {
     /// indexes.
     static RECURSIVE_TABLES: std::cell::RefCell<Vec<(usize, usize, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
     /// What the operators of the plan being rendered did when EXPLAIN ANALYZE ran it.
-    static ANALYZED: std::cell::RefCell<Option<std::sync::Arc<crate::execution::profiler::OperatorProfiler>>> =
+    static ANALYZED: std::cell::RefCell<Option<std::sync::Arc<duckrs_core::execution::profiler::OperatorProfiler>>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -832,7 +813,7 @@ pub(super) fn analyzed_tree(
     op: &dyn PhysicalOperator,
     logical: Option<&LogicalOperator>,
     estimate: Option<&PlanEstimate>,
-    profiler: std::sync::Arc<crate::execution::profiler::OperatorProfiler>,
+    profiler: std::sync::Arc<duckrs_core::execution::profiler::OperatorProfiler>,
 ) -> ExplainNode {
     let previous = ANALYZED.with(|a| a.borrow_mut().replace(profiler));
     let tree = physical_tree(op, logical, estimate, true);
@@ -845,7 +826,7 @@ pub(super) fn analyzed_tree_with_infos(
     op: &dyn PhysicalOperator,
     logical: Option<&LogicalOperator>,
     estimate: Option<&PlanEstimate>,
-    profiler: std::sync::Arc<crate::execution::profiler::OperatorProfiler>,
+    profiler: std::sync::Arc<duckrs_core::execution::profiler::OperatorProfiler>,
 ) -> (ExplainNode, std::collections::HashMap<usize, Vec<(String, String)>>) {
     INFOS.with(|i| *i.borrow_mut() = Some(std::collections::HashMap::new()));
     let tree = analyzed_tree(op, logical, estimate, profiler);
@@ -914,7 +895,7 @@ pub(super) fn physical_tree(
         let anchor = physical_tree(children[0].as_ref(), Some(&logical_children[0]), child_estimate(0), analyze);
         let pointer = |table: &std::sync::Arc<_>| std::sync::Arc::as_ptr(table) as *const () as usize;
         RECURSIVE_TABLES.with(|t| t.borrow_mut().push((pointer(working), pointer(recurring), *table_index)));
-        let plan = crate::execution::create_plan((**recursive).clone());
+        let plan = duckrs_core::execution::create_plan((**recursive).clone());
         let rounds = physical_tree(plan.as_ref(), Some(unresolved), child_estimate(1), analyze);
         RECURSIVE_TABLES.with(|t| t.borrow_mut().pop());
         return ExplainNode {
@@ -967,7 +948,7 @@ pub(super) fn physical_tree(
         && children.len() == 1
         && children[0].name() == op.name()
         && children[0].children().len() == 1
-        && crate::execution::distinct_in_two_steps(groups, aggregates, grouping_sets, grouping_functions).is_some()
+        && duckrs_core::execution::distinct_in_two_steps(groups, aggregates, grouping_sets, grouping_functions).is_some()
     {
         let estimate = estimate.filter(|e| e.children.len() == 1);
         return ExplainNode {
@@ -1062,7 +1043,7 @@ pub(super) fn physical_tree(
             | K::CsvScan { .. }
             | K::ExpressionGet { function: Some(_), .. },
         ) if ran => "TABLE_SCAN".to_string(),
-        _ if ran && crate::execution::profiler::operator_type(op) == "TABLE_SCAN" => "TABLE_SCAN".to_string(),
+        _ if ran && duckrs_core::execution::profiler::operator_type(op) == "TABLE_SCAN" => "TABLE_SCAN".to_string(),
         Some(K::Get { .. }) => "SEQ_SCAN".to_string(),
         // `PhysicalTableScan::GetName`
         Some(K::ParquetScan { scan, .. }) => scan.function_name.to_uppercase(),
@@ -1116,7 +1097,7 @@ pub(super) fn physical_tree(
             if let Some(estimate) = estimate {
                 details.push(("Estimated Cardinality".to_string(), estimate.cardinality.to_string()));
             }
-            infos.insert(crate::execution::profiler::key(op), details);
+            infos.insert(duckrs_core::execution::profiler::key(op), details);
         }
     });
     ExplainNode {
@@ -1330,8 +1311,8 @@ pub(super) fn summary_box(time: std::time::Duration) -> String {
 }
 
 /// `RenderTree::CreateNode(ProfilingNode)` over the profile of an EXPLAIN ANALYZE run, under its `QUERY` root.
-pub(super) fn profile_tree(root: Option<crate::execution::profiler::ProfileNode>) -> ExplainNode {
-    fn node(profile: &crate::execution::profiler::ProfileNode) -> ExplainNode {
+pub(super) fn profile_tree(root: Option<duckrs_core::execution::profiler::ProfileNode>) -> ExplainNode {
+    fn node(profile: &duckrs_core::execution::profiler::ProfileNode) -> ExplainNode {
         let mut info: Vec<(String, String)> = profile
             .extra_info
             .iter()

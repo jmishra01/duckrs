@@ -7,7 +7,7 @@
 //! (and the later CTEs) read its rows as a table of that name.
 
 use super::*;
-use crate::planner::trigger_scope::{self, TransitionTable, TriggerScope};
+use duckrs_core::planner::trigger_scope::{self, TransitionTable, TriggerScope};
 use duckrs_parser::ast::{CteInfo, CteMap, QueryNode, QueryNodeKind};
 
 /// Whether a CTE body writes or copies, rather than reads.

@@ -11,17 +11,18 @@
 //! of the statement as transition tables the bodies bind to.
 
 use super::*;
-use crate::catalog::{
+use duckrs_core::catalog::{
     DEFAULT_SCHEMA, TableCatalogEntry, TriggerCatalogEntry, TriggerEvent, TriggerForEach, TriggerTiming,
 };
-use crate::planner::trigger_scope::{self, RowScope, TransitionTable, TriggerScope};
+use duckrs_core::planner::statement_names::{body_statement, referenced_names};
+use duckrs_core::planner::trigger_scope::{self, RowScope, TransitionTable, TriggerScope};
 use duckrs_common::types::sql_identifier;
 use duckrs_parser::ast::{QueryNode, QueryNodeKind, TableRef, TableRefKind};
 use std::sync::atomic::Ordering as AtomicOrdering2;
 
 /// The table an INSERT, UPDATE or DELETE writes, and what it does to it.
 pub(super) struct TriggerTarget {
-    pub schema: Arc<crate::catalog::SchemaCatalogEntry>,
+    pub schema: Arc<duckrs_core::catalog::SchemaCatalogEntry>,
     pub table: Arc<TableCatalogEntry>,
     pub event: TriggerEvent,
     /// UPDATE: the columns it sets
@@ -36,39 +37,6 @@ fn not_implemented(message: impl Into<String>) -> Error {
 
 fn binder_error(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::Binder, message)
-}
-
-/// The statement a trigger body is.
-fn body_statement(action: &QueryNode) -> Result<Statement> {
-    Ok(match &action.kind {
-        QueryNodeKind::Insert(insert) => {
-            let mut insert = insert.clone();
-            if !action.cte_map.0.is_empty() {
-                insert.cte_map = action.cte_map.clone();
-            }
-            Statement::Insert(insert)
-        }
-        QueryNodeKind::Update(update) => {
-            let mut update = update.clone();
-            if !action.cte_map.0.is_empty() {
-                update.cte_map = action.cte_map.clone();
-            }
-            Statement::Update(update)
-        }
-        QueryNodeKind::Delete(delete) => {
-            let mut delete = delete.clone();
-            if !action.cte_map.0.is_empty() {
-                delete.cte_map = action.cte_map.clone();
-            }
-            Statement::Delete(delete)
-        }
-        QueryNodeKind::Merge(merge) => Statement::Merge(merge.clone()),
-        _ => {
-            return Err(binder_error(
-                "Trigger body must be an INSERT, UPDATE, or DELETE statement",
-            ));
-        }
-    })
 }
 
 /// The table a body writes and the events it causes there: (qualification, name, events).
@@ -94,47 +62,6 @@ fn body_target(action: &QueryNode) -> Option<(Vec<String>, String, Vec<TriggerEv
         }),
         _ => None,
     }
-}
-
-/// The names of the tables and views a statement refers to: its target, its FROM and USING
-/// clauses, and those of its subqueries.
-fn referenced_names(statement: &mut Statement) -> Vec<duckrs_parser::ast::QualifiedName> {
-    use duckrs_parser::ast::{SelectNode, SelectStatement};
-    let mut names = Vec::new();
-    let mut add = |statement: &mut Statement| {
-        super::for_each_table_name(statement, &mut |name| names.push(name.clone()));
-    };
-    // a SELECT of a FROM clause and of expressions, for their names
-    let select_of = |from: TableRef, exprs: Vec<Expr>| {
-        let node = SelectNode {
-            select_list: if exprs.is_empty() { vec![Expr::star()] } else { exprs },
-            from_table: from,
-            ..Default::default()
-        };
-        Statement::Select(SelectStatement { node: node.into() })
-    };
-    add(statement);
-    match statement {
-        Statement::Update(update) => {
-            let mut exprs = update.set_info.expressions.clone();
-            exprs.extend(update.set_info.condition.iter().map(|c| (**c).clone()));
-            let from = update.from_table.clone().unwrap_or_else(TableRef::empty);
-            add(&mut select_of(from, exprs));
-        }
-        Statement::Delete(delete) => {
-            for using in delete.using.clone() {
-                add(&mut select_of(using, Vec::new()));
-            }
-            let exprs: Vec<Expr> = delete.condition.iter().map(|c| (**c).clone()).collect();
-            add(&mut select_of(TableRef::empty(), exprs));
-        }
-        Statement::Merge(merge) => {
-            add(&mut select_of((*merge.target).clone(), Vec::new()));
-            add(&mut select_of((*merge.source).clone(), Vec::new()));
-        }
-        _ => {}
-    }
-    names
 }
 
 /// The columns `columns` of `result`, named `names`.
@@ -187,10 +114,10 @@ fn rows_of(new_rows: &Option<MaterializedQueryResult>, old_rows: &Option<Materia
 /// The schema with the entry `name`: the one it is qualified with, or the first of the search path
 /// that has it.
 fn table_schema(
-    catalog: &crate::catalog::Catalog,
+    catalog: &duckrs_core::catalog::Catalog,
     qualification: &[String],
     name: &str,
-) -> Option<Arc<crate::catalog::SchemaCatalogEntry>> {
+) -> Option<Arc<duckrs_core::catalog::SchemaCatalogEntry>> {
     match qualification.last() {
         Some(schema) => catalog.get_schema(schema).filter(|s| s.get_entry(name).is_some()),
         None => [TEMP_SCHEMA, DEFAULT_SCHEMA]
@@ -198,27 +125,6 @@ fn table_schema(
             .filter_map(|schema| catalog.get_schema(schema))
             .find(|schema| schema.get_entry(name).is_some()),
     }
-}
-
-/// The tables and views a trigger body names, other than its transition tables and its own CTEs:
-/// what it depends on.
-pub(crate) fn body_dependencies(action: &QueryNode, referencing: &[&str]) -> Vec<String> {
-    let Ok(mut statement) = body_statement(action) else {
-        return Vec::new();
-    };
-    let cte_names: Vec<String> = action.cte_map.0.iter().map(|(n, _)| n.to_lowercase()).collect();
-    let mut dependencies: Vec<String> = Vec::new();
-    for name in referenced_names(&mut statement) {
-        let shadowed = name.qualification.is_empty()
-            && (referencing
-                .iter()
-                .any(|t| !t.is_empty() && t.eq_ignore_ascii_case(&name.name))
-                || cte_names.contains(&name.name.to_lowercase()));
-        if !shadowed && !dependencies.iter().any(|d| d.eq_ignore_ascii_case(&name.name)) {
-            dependencies.push(name.name.clone());
-        }
-    }
-    dependencies
 }
 
 impl ClientContext {
@@ -822,7 +728,7 @@ impl ClientContext {
             &table_name.name,
         )?;
         let schema = table_schema(&catalog, &table_name.qualification, &table_name.name)
-            .ok_or_else(|| crate::catalog::missing_entry("Table", &table_name.name))?;
+            .ok_or_else(|| duckrs_core::catalog::missing_entry("Table", &table_name.name))?;
         let base = match schema.get_entry(&table_name.name) {
             Some(TableOrView::Table(table)) => table,
             Some(TableOrView::View(_)) => {
@@ -830,7 +736,7 @@ impl ClientContext {
                     "CREATE TRIGGER requires a base table, not a view or subquery",
                 ));
             }
-            None => return Err(crate::catalog::missing_entry("Table", &table_name.name)),
+            None => return Err(duckrs_core::catalog::missing_entry("Table", &table_name.name)),
         };
         let timing = TriggerTiming::from_name(timing);
         let event = TriggerEvent::from_name(event);
@@ -1035,10 +941,10 @@ impl ClientContext {
     /// The table `name` is, from a body in `schema`.
     fn resolve_table(
         &self,
-        schema: &Arc<crate::catalog::SchemaCatalogEntry>,
+        schema: &Arc<duckrs_core::catalog::SchemaCatalogEntry>,
         qualification: &[String],
         name: &str,
-    ) -> Option<(Arc<crate::catalog::SchemaCatalogEntry>, Arc<TableCatalogEntry>)> {
+    ) -> Option<(Arc<duckrs_core::catalog::SchemaCatalogEntry>, Arc<TableCatalogEntry>)> {
         let catalog = self.catalog();
         let schema = match qualification.last() {
             None if schema.get_entry(name).is_some() => schema.clone(),
@@ -1054,7 +960,7 @@ impl ClientContext {
     /// (`trigger_creation_table`).
     fn reaches_table(
         &self,
-        schema: &Arc<crate::catalog::SchemaCatalogEntry>,
+        schema: &Arc<duckrs_core::catalog::SchemaCatalogEntry>,
         qualification: &[String],
         name: &str,
         events: &[TriggerEvent],
@@ -1090,7 +996,7 @@ impl ClientContext {
     /// it from being dropped, unless CASCADE drops them too.
     pub(super) fn drop_trigger_dependents(
         &mut self,
-        catalog: &crate::catalog::Catalog,
+        catalog: &duckrs_core::catalog::Catalog,
         name: &str,
         kind: &str,
         cascade: bool,
@@ -1207,9 +1113,9 @@ impl ClientContext {
             &table_name.name,
         )?;
         let schema = table_schema(&catalog, &table_name.qualification, &table_name.name)
-            .ok_or_else(|| crate::catalog::missing_entry("Table", &table_name.name))?;
+            .ok_or_else(|| duckrs_core::catalog::missing_entry("Table", &table_name.name))?;
         let Some(TableOrView::Table(base)) = schema.get_entry(&table_name.name) else {
-            return Err(crate::catalog::missing_entry("Table", &table_name.name));
+            return Err(duckrs_core::catalog::missing_entry("Table", &table_name.name));
         };
         let exists = schema.get_trigger(&base.name, &info.name.name).is_some();
         if !exists {

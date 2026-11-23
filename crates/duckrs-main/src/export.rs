@@ -6,7 +6,7 @@
 //! again and `load.sql` to read the tables back; and `IMPORT DATABASE`, which runs the two.
 
 use super::{ClientContext, MaterializedQueryResult};
-use crate::catalog::{Catalog, DEFAULT_SCHEMA, SchemaCatalogEntry, TEMP_SCHEMA, TableCatalogEntry, TableConstraint};
+use duckrs_core::catalog::{Catalog, DEFAULT_SCHEMA, SchemaCatalogEntry, TEMP_SCHEMA, TableCatalogEntry, TableConstraint};
 use duckrs_common::{Error, ErrorKind, Result};
 use duckrs_parser::ast::{
     self, CopyInfo, CreateInfo, CreateKind, Literal, OnCreateConflict, QualifiedName, Statement, sql_identifier,
@@ -265,8 +265,8 @@ fn schema_statements(
         }
         for entry in schema.tables_and_views() {
             match entry {
-                crate::catalog::TableOrView::View(view) => views.push(view.to_sql()),
-                crate::catalog::TableOrView::Table(table) => {
+                duckrs_core::catalog::TableOrView::View(view) => views.push(view.to_sql()),
+                duckrs_core::catalog::TableOrView::Table(table) => {
                     for index in table.indexes.read().iter() {
                         let sql = index.sql.trim_end().trim_end_matches(';');
                         indexes.push(format!("{sql};"));
@@ -281,7 +281,7 @@ fn schema_statements(
     statements.extend(types);
     statements.extend(macros);
     for (schema, table) in tables {
-        statements.push(crate::storage::table_create_sql(schema, table)?);
+        statements.push(duckrs_core::storage::table_create_sql(schema, table)?);
     }
     statements.extend(views);
     statements.extend(indexes);
@@ -352,7 +352,7 @@ impl ClientContext {
                 continue;
             }
             for entry in schema.tables_and_views() {
-                if let crate::catalog::TableOrView::Table(table) = entry {
+                if let duckrs_core::catalog::TableOrView::Table(table) = entry {
                     tables.push((schema.clone(), table));
                 }
             }
@@ -492,7 +492,7 @@ impl ClientContext {
                 continue;
             }
             for entry in schema.tables_and_views() {
-                if let crate::catalog::TableOrView::Table(table) = entry {
+                if let duckrs_core::catalog::TableOrView::Table(table) = entry {
                     tables.push((schema.clone(), table));
                 }
             }

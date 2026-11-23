@@ -759,6 +759,7 @@ dependencies = [
  "criterion",
  "duckrs-common",
  "duckrs-core",
+ "duckrs-main",
  "libc",
 ]
 
@@ -810,6 +811,16 @@ dependencies = [
  "unicode-normalization",
  "unicode-segmentation",
  "zstd",
+]
+
+[[package]]
+name = "duckrs-main"
+version = "0.0.1"
+dependencies = [
+ "duckrs-common",
+ "duckrs-core",
+ "duckrs-parser",
+ "parking_lot",
 ]
 
 [[package]]

@@ -94,7 +94,7 @@ pub fn time_metric<T>(name: &'static str, body: impl FnOnce() -> T) -> T {
     result
 }
 
-pub(crate) fn key(op: &dyn PhysicalOperator) -> usize {
+pub fn key(op: &dyn PhysicalOperator) -> usize {
     std::ptr::from_ref(op).cast::<()>() as usize
 }
 

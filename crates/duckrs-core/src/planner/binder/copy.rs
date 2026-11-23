@@ -178,7 +178,7 @@ struct CsvArguments {
 
 impl Binder<'_> {
     /// The type that `name` spells (`UnboundType::TryParseAndDefaultBind`).
-    pub(crate) fn type_from_name(&mut self, name: &str) -> Result<LogicalType> {
+    pub fn type_from_name(&mut self, name: &str) -> Result<LogicalType> {
         self.csv_type(name)
     }
 

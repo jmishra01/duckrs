@@ -7,11 +7,11 @@
 
 use super::ClientContext;
 use super::settings::{self, SettingValues};
-use crate::execution::expression_executor::evaluate_scalar;
-use crate::logging::{
+use duckrs_core::execution::expression_executor::evaluate_scalar;
+use duckrs_core::logging::{
     FILE_STORAGE, LogConfig, LogLevel, LogManager, LogMode, LogScope, LogTarget, LoggingContext, lookup_log_type,
 };
-use crate::planner::binder::bind_constant_expression;
+use duckrs_core::planner::binder::bind_constant_expression;
 use duckrs_common::types::LogicalType;
 use duckrs_common::value::{Value, ValueData};
 use duckrs_common::{Error, ErrorKind, Result};
@@ -198,7 +198,7 @@ impl ClientContext {
                 "enable_logging" => manager.set_enabled(false),
                 "logging_level" => manager.set_level(LogLevel::Info),
                 "logging_mode" => manager.set_mode(LogMode::LevelOnly),
-                "logging_storage" => manager.set_storage(crate::logging::MEMORY_STORAGE)?,
+                "logging_storage" => manager.set_storage(duckrs_core::logging::MEMORY_STORAGE)?,
                 "enabled_log_types" => manager.set_enabled_log_types(BTreeSet::new()),
                 "disabled_log_types" => manager.set_disabled_log_types(BTreeSet::new()),
                 _ => unreachable!("a logging setting"),
@@ -247,7 +247,7 @@ impl ClientContext {
             ExprKind::ColumnRef(names) if names.len() == 1 => Ok(Value::varchar(names[0].clone())),
             _ => evaluate_scalar(&bind_constant_expression(&catalog, expr)?),
         };
-        let arguments: Vec<_> = call.args.iter().map(crate::planner::binder::named_argument).collect();
+        let arguments: Vec<_> = call.args.iter().map(duckrs_core::planner::binder::named_argument).collect();
         let positional: Vec<&Expr> = arguments
             .iter()
             .filter(|a| a.name.is_empty())

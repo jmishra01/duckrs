@@ -943,7 +943,7 @@ fn gone_table(table: &str, how: &str) -> Error {
     )
 }
 
-pub(crate) fn failed_commit(error: Error) -> Error {
+pub fn failed_commit(error: Error) -> Error {
     if error.kind == ErrorKind::Constraint {
         Error::new(ErrorKind::Transaction, format!("Failed to commit: {}", error.message))
     } else {

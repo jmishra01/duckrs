@@ -785,7 +785,7 @@ fn prune_files(scan: &mut impl FileList, bindings: &[ColumnBinding], conjuncts: 
         }
         // `ExtraOperatorInfo::file_filters`: the filters' texts, one after the other
         if applied {
-            file_filters.push_str(&crate::client::explain::filter_text(conjunct));
+            file_filters.push_str(&crate::planner::expression::filter_text(conjunct));
         }
         preserved
     });
