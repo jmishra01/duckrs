@@ -85,9 +85,19 @@ duckrs/
 ├── crates/duckrs-core/     # catalog, functions, binder/planner, optimizer, execution, storage
 ├── crates/duckrs-main/     # Database, Connection and ClientContext, settings, EXPLAIN (DuckDB's src/main)
 ├── crates/duckrs-parser/   # tokenizer, PEG grammar engine (+ vendored grammar), AST, transformer
+├── crates/duckrs-cli/      # the duckrs shell binary
 ├── tools/sqllogictest/     # test runner + known_passing.txt
 └── docs/                   # ARCHITECTURE, PORTING_GUIDE, UPSTREAM_SYNC
 ```
+
+Each crate has a README with its modules, main types, how it works, what is missing and how to
+test it, from the bottom of the stack up:
+[`duckrs-common`](crates/duckrs-common/README.md),
+[`duckrs-parser`](crates/duckrs-parser/README.md),
+[`duckrs-core`](crates/duckrs-core/README.md),
+[`duckrs-main`](crates/duckrs-main/README.md),
+[`duckrs`](crates/duckrs/README.md) and
+[`duckrs-cli`](crates/duckrs-cli/README.md).
 
 The runner expects the DuckDB checkout at `../duckdb` (override with `--duckdb-root`). The port
 is pinned to the `rust-port-baseline` branch of that checkout.

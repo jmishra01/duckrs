@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generates crates/duckrs-core/src/client/settings_table.rs from the DuckDB checkout.
+"""Generates crates/duckrs-main/src/settings_table.rs from the DuckDB checkout.
 
 The settings come from duckdb/src/common/settings.json, which DuckDB's own
 scripts/generate_settings.py turns into C++; the extra aliases are the
@@ -15,7 +15,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 DUCKDB = Path(sys.argv[1] if len(sys.argv) > 1 else ROOT.parent / "duckdb")
-OUTPUT = ROOT / "crates/duckrs-core/src/client/settings_table.rs"
+OUTPUT = ROOT / "crates/duckrs-main/src/settings_table.rs"
 
 
 def struct_name(setting):
