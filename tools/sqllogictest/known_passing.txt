@@ -731,6 +731,7 @@ test/optimizer/unused_columns/deliver_child_columns.test
 test/optimizer/unused_columns/distinct_on_projection_pushdown.test
 test/optimizer/unused_window_columns.test
 test/optimizer/using_optimizer.test
+test/optimizer/zonemaps.test
 test/parquet/concatenated_gzip_members.test
 test/parquet/constant_dictionary_vector_parquet.test
 test/parquet/corrupt/brotli_short_output.test
@@ -3241,6 +3242,7 @@ test/sql/optimizer/test_no_pushdown_cast_into_cte.test
 test/sql/optimizer/test_not_comparison_simplification.test
 test/sql/optimizer/test_rollup_column_pruning.test
 test/sql/optimizer/test_rowid_pruning.test
+test/sql/optimizer/test_rowid_pushdown.test
 test/sql/optimizer/test_rowid_pushdown_deletes.test
 test/sql/optimizer/test_rowid_vector_pruning.test
 test/sql/optimizer/test_rowid_vector_pruning_results.test

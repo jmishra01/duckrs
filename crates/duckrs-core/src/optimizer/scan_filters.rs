@@ -478,6 +478,19 @@ fn push_into(op: &mut LogicalOperator, before_statistics: bool) {
     if !matches!(op.children[0].kind, K::Get { .. } | K::ParquetScan { .. }) {
         return;
     }
+    // `PushdownGet`: a scan that has its table filters takes no more; what comes later (the ranges the joins'
+    // statistics derive) stays above it
+    if !before_statistics
+        && let K::Get {
+            filters,
+            zone_filters,
+            optional_filters,
+            ..
+        } = &op.children[0].kind
+        && !(filters.is_empty() && zone_filters.is_empty() && optional_filters.is_empty())
+    {
+        return;
+    }
     let scan = op.children[0].column_bindings();
     let mut conjuncts = Vec::new();
     for expr in std::mem::take(expressions) {

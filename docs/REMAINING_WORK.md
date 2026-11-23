@@ -213,6 +213,11 @@ Each item gives the number of failing files in `test/` that it should fix, where
     sides as a filter of `l` and of `r`; `GenerateEquivalentFilters`: `expr = constant` again for the other
     columns of its equivalence set; an inner join's conditions go through the filter combiner with the filters
     above it (`PushdownInnerJoin`'s `GenerateFilters`)
+  - [x] `PushdownGet`: a scan that has table filters takes no more, so the ranges the joins' statistics derive
+    stay above it (`zonemaps`); a filter on a field of a STRUCT column the scan reads only fields of is shown by
+    the field's path (`s.a = 3`), otherwise with the field's name as key (`struct_extract(s, 'a')`)
+  - [ ] `struct_extract(i, 'A')` keeps the key as written; the segments of nested validity as C++ sizes them
+    (`nested_null_segment_pruning`); bytes read of late materialization's prefetch (`test_rowid_vector_pruning_prefetch`)
   - [ ] table filters are put into scans after the projection pullup (`push_into_table_scans`), so a filter that
     can throw, which stays above a projection, goes into the scan once the projection is pulled up
     (`tuple_cast_pushdown`, `pushdown_safe_decimal_cast`); C++ sets them in `PushdownGet` only
