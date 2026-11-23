@@ -107,7 +107,9 @@ fn joins_below(op: &LogicalOperator) -> usize {
 
 /// `BuildProbeSideOptimizer::TryFlipJoinChildren` for inner, LEFT and RIGHT joins, to run when the
 /// plan has the columns it will have.
-pub fn choose_by_width(plan: &mut LogicalOperator) {
+/// `in_recursive_cte`: the plan is the recursive part of a recursive CTE, optimized on its own before its bindings
+/// are resolved, whose reads of the CTE are active (`active_recursive_cte_indexes`).
+pub fn choose_by_width(plan: &mut LogicalOperator, in_recursive_cte: bool) {
     fn has_flippable_join(op: &LogicalOperator) -> bool {
         let own = matches!(
             op.kind,
@@ -118,16 +120,86 @@ pub fn choose_by_width(plan: &mut LogicalOperator) {
         );
         own || op.children.iter().any(has_flippable_join)
     }
-    if !has_flippable_join(plan) {
+    fn has_semi_or_anti(op: &LogicalOperator) -> bool {
+        matches!(
+            op.kind,
+            K::Join {
+                join_type: JoinType::Semi | JoinType::Anti | JoinType::RightSemi | JoinType::RightAnti | JoinType::Outer,
+                ..
+            }
+        ) || op.children.iter().any(has_semi_or_anti)
+    }
+    if !has_flippable_join(plan) && !(in_recursive_cte && has_semi_or_anti(plan)) {
         return;
     }
     let estimate = estimate_plan(plan);
-    flip_by_width(plan, &estimate, true);
+    flip_by_width(plan, &estimate, true, in_recursive_cte);
+}
+
+/// `ContainsActiveRecursiveReference`: whether `op` reads the recursive CTE whose recursive part this is.
+fn reads_active_cte(op: &LogicalOperator) -> bool {
+    matches!(op.kind, K::WorkingTable { .. }) || op.children.iter().any(reads_active_cte)
+}
+
+/// `ContainsCorrelationSensitiveOperators`.
+fn correlation_sensitive(op: &LogicalOperator) -> bool {
+    matches!(op.kind, K::DelimGet { .. } | K::DelimJoin { .. } | K::LateralJoin { .. })
+        || op.children.iter().any(correlation_sensitive)
+}
+
+/// `PropagatesBuildSide`: the join gives on rows of its build side, which a hash table kept across rounds would not.
+fn propagates_build_side(join_type: JoinType) -> bool {
+    matches!(join_type, JoinType::Outer | JoinType::Right | JoinType::RightAnti | JoinType::RightSemi)
+}
+
+/// `InverseJoinType`, of the joins that have one.
+fn inverse_join_type(join_type: JoinType) -> Option<JoinType> {
+    Some(match join_type {
+        JoinType::Left => JoinType::Right,
+        JoinType::Right => JoinType::Left,
+        JoinType::Inner => JoinType::Inner,
+        JoinType::Outer => JoinType::Outer,
+        JoinType::Semi => JoinType::RightSemi,
+        JoinType::Anti => JoinType::RightAnti,
+        JoinType::RightSemi => JoinType::Semi,
+        JoinType::RightAnti => JoinType::Anti,
+        _ => return None,
+    })
+}
+
+/// `GetRecursiveProbeSidePreference`: inside the recursive part of a recursive CTE, a join with one side that reads
+/// the CTE probes with that side, so that the hash table of the other can be kept from round to round. Some(true) to
+/// swap the sides, Some(false) to keep them, None where it does not apply.
+fn recursive_preference(op: &LogicalOperator, active: bool) -> Option<bool> {
+    let K::Join {
+        join_type, conditions, ..
+    } = &op.kind
+    else {
+        return None;
+    };
+    if !active
+        || !conditions
+            .iter()
+            .any(|c| matches!(c.comparison, ComparisonOp::Equal | ComparisonOp::NotDistinctFrom))
+    {
+        return None;
+    }
+    let left = reads_active_cte(&op.children[0]);
+    let right = reads_active_cte(&op.children[1]);
+    if left == right {
+        return None;
+    }
+    if left && !propagates_build_side(*join_type) && !correlation_sensitive(&op.children[1]) {
+        return Some(false);
+    }
+    let inverse = inverse_join_type(*join_type)?;
+    (right && !propagates_build_side(inverse) && !correlation_sensitive(&op.children[0])).then_some(true)
 }
 
 /// `by_position`: whether something above reads the columns of `op` by where they are, and not by
-/// what they are, so that its sides have to stay where they are.
-fn flip_by_width(op: &mut LogicalOperator, estimate: &PlanEstimate, by_position: bool) {
+/// what they are, so that its sides have to stay where they are. `active`: `op` is in the recursive part of a
+/// recursive CTE (whose plan duckrs optimizes on its own, before it resolves its bindings).
+fn flip_by_width(op: &mut LogicalOperator, estimate: &PlanEstimate, by_position: bool, active: bool) {
     let below = match &op.kind {
         K::Projection { .. } | K::Aggregate { .. } | K::ColumnSelect { .. } => false,
         K::Join { .. } | K::CrossProduct | K::Filter { .. } | K::Order { .. } | K::TopN { .. } | K::Limit { .. } => {
@@ -136,7 +208,27 @@ fn flip_by_width(op: &mut LogicalOperator, estimate: &PlanEstimate, by_position:
         _ => true,
     };
     for (child, estimate) in op.children.iter_mut().zip(&estimate.children) {
-        flip_by_width(child, estimate, below);
+        flip_by_width(child, estimate, below, active);
+    }
+    match recursive_preference(op, active) {
+        Some(false) => return,
+        Some(true) if !by_position => {
+            let K::Join {
+                join_type, conditions, ..
+            } = &mut op.kind
+            else {
+                unreachable!()
+            };
+            *join_type = inverse_join_type(*join_type).expect("checked");
+            for condition in conditions {
+                std::mem::swap(&mut condition.left, &mut condition.right);
+                condition.comparison = super::range_joins::flip(condition.comparison);
+            }
+            op.children.swap(0, 1);
+            return;
+        }
+        Some(true) => return,
+        None => {}
     }
     let K::Join {
         join_type: join_type @ (JoinType::Inner | JoinType::Left | JoinType::Right),

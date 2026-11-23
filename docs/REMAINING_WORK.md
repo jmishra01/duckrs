@@ -462,6 +462,18 @@ Each item gives the number of failing files in `test/` that it should fix, where
     filter of those leaves (`TryGetNestedBloomFilterLeaf`)
   - [ ] EXPLAIN ANALYZE metrics of other operators (EXPLAIN-shape files under `test/optimizer`, `sql/optimizer`)
 - [ ] 16. Join order and cardinality estimation (`optimizer/joins`: 1 failing)
+  - [x] NOT LIKE of a column without NULLs keeps 80% of the rows (`test_negated_filter_cardinality`)
+  - [x] the filter statistics pass runs only for filters across tables, not for the conditions of inner joins
+    (`HasMultiBindingFilter`); a filter across both sides with an IN the rewriter makes a join stays above the
+    join (`join_condition_verification_stats`, `statistics_filter_context`)
+  - [x] recursive CTEs: a read of the CTE is reordered only right under an equality join
+    (`RecursiveCTERefCanReorder`; `test_recursive_join_order_guard`); a join that reads the CTE on one side
+    probes with it, so the other side's hash table can be kept (`GetRecursiveProbeSidePreference`;
+    `test_recursive_build_side_probe_side`); logical EXPLAIN shows the recursive part
+  - [ ] the columns of a recursive CTE nothing reads are not pruned (`recursive_cte_column_pruning`, which passed
+    only while EXPLAIN did not show the recursive part); LEFT joins reordered in the join graph
+    (`left_join_cardinality_estimation`); join enumeration of a CTE under a cross product
+    (`recursive_cte_projection_join_order`); semi joins' estimates (`current_domain_semi_anti`)
   - [x] LEFT join equality groups, `debug_force_no_cross_product`, `approximate_join_order_threshold`
   - [ ] LEFT joins reordered inside the join graph (C++'s CD-C conflict detector, `left_join_cardinality_estimation`)
 - [ ] 17. Column lifetime, unused columns, TopN, expression rewriter (small dirs under `test/optimizer`)

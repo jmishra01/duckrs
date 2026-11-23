@@ -214,7 +214,8 @@ fn is_indexed_column_in(expr: &BoundExpr, scan: &LogicalOperator) -> bool {
 }
 
 /// An IN that becomes a join: of enough values, all constants.
-fn has_rewritable_in(expr: &BoundExpr) -> bool {
+/// `InClauseRewriter::HasRewritableInClause`: an IN of enough constants for the rewriter to make it a join.
+pub(super) fn has_rewritable_in(expr: &BoundExpr) -> bool {
     let own = matches!(&expr.kind, BoundExprKind::Operator { op, children }
         if op.is_in()
             && children.len() >= IN_CLAUSE_REWRITE_THRESHOLD

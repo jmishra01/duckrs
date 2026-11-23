@@ -599,7 +599,12 @@ impl FilterPushdown {
                     if let Some(filter) = side_of_disjunction(&f.filter, &right_tables) {
                         right.add_filter(filter);
                     }
-                    join_expressions.push(f.filter);
+                    // an IN the rewriter makes a join of stays a filter above the join, not one of its conditions
+                    if super::in_clause_rewriter::has_rewritable_in(&f.filter) {
+                        above.push(f.filter);
+                    } else {
+                        join_expressions.push(f.filter);
+                    }
                 }
                 JoinSide::None => above.push(f.filter),
             }
