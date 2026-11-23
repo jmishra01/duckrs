@@ -3010,24 +3010,23 @@ impl Binder<'_> {
                 ("system".to_string(), "pg_catalog".to_string()),
             ])
             .collect();
-        // `CatalogSearchPath::SchemaInSearchPath`
-        let in_path = move |database: &str, schema: &str| {
+        // `CatalogSearchPath::SchemaInSearchPath`, on the bytes of the arguments
+        let in_path = move |database: &[u8], schema: &[u8]| {
             paths.iter().any(|(catalog, path_schema)| {
-                path_schema.eq_ignore_ascii_case(schema)
-                    && (catalog.eq_ignore_ascii_case(database)
-                        || (catalog.is_empty() && default_database.eq_ignore_ascii_case(database)))
+                path_schema.as_bytes().eq_ignore_ascii_case(schema)
+                    && (catalog.as_bytes().eq_ignore_ascii_case(database)
+                        || (catalog.is_empty() && default_database.as_bytes().eq_ignore_ascii_case(database)))
             })
         };
+        // `BinaryExecutor::Execute<string_t, string_t, bool>`: NULL where either argument is
         let bound: crate::function::BoundCallback = std::sync::Arc::new(move |args, result| {
-            for row in 0..args.len() {
-                let (database, schema) = (args.column(0).get_value(row), args.column(1).get_value(row));
-                let value = if database.is_null() || schema.is_null() {
-                    Value::null(LogicalType::BOOLEAN)
-                } else {
-                    Value::boolean(in_path(&database.try_to_string()?, &schema.try_to_string()?))
-                };
-                result.set_value(row, &value)?;
-            }
+            duckrs_common::executor::binary_str::<bool>(
+                args.column(0),
+                args.column(1),
+                result,
+                args.len(),
+                |database, schema| in_path(database, schema),
+            );
             Ok(())
         });
         let mut scalar = crate::function::ScalarFunction::new(
