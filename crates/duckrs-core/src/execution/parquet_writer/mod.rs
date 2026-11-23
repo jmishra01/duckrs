@@ -1,5 +1,7 @@
 // Ported from duckdb/extension/parquet/parquet_writer.cpp, column_writer.cpp, writer/*.cpp and
 // include/writer/{templated_column_writer,parquet_write_stats,parquet_write_operators}.hpp @ rust-port-baseline
+// The GEOMETRY columns and GeoParquet metadata: ported from duckdb/extension/parquet/parquet_geometry.cpp and
+// include/parquet_geometry.hpp @ rust-port-baseline
 //
 //! DuckDB's own Parquet writer (`ParquetWriter`), so that files come out as C++ writes them: its choice of encodings,
 //! dictionaries, pages, statistics and bloom filters, and its footer. A row group is written in the passes of
@@ -9,12 +11,16 @@
 //! `ColumnDataCollection` hands them out, because where pages end depends on that.
 
 mod encoding;
+pub(crate) mod geoparquet;
 mod written_stats;
 
 pub use encoding::BloomFilter;
+pub use geoparquet::GeoParquetVersion;
+use geoparquet::{GeoParquetFileMetadata, geometry_crs_annotation};
 use written_stats::StatsAccumulator;
 pub use written_stats::WrittenFileStats;
 
+use duckrs_common::geometry::GeometryStats;
 use duckrs_common::types::{LogicalType, LogicalTypeId, TimeTz};
 use duckrs_common::value::{Value, ValueData};
 use duckrs_common::{Error, ErrorKind, Result, STANDARD_VECTOR_SIZE};
@@ -170,6 +176,10 @@ pub struct WriterOptions {
     pub return_stats: bool,
     /// `SHREDDING`: the types to shred VARIANT columns on, by lowercase name (VARIANT: not at all)
     pub shredding: HashMap<String, LogicalType>,
+    /// `GEOPARQUET_VERSION`
+    pub geoparquet_version: GeoParquetVersion,
+    /// `enable_geoparquet_conversion`: whether the footer gets the GeoParquet metadata
+    pub geoparquet_conversion: bool,
 }
 
 /// `ChildFieldIDs`: the field ids of columns by name, each with those of the columns in it.
@@ -202,6 +212,8 @@ impl Default for WriterOptions {
             field_ids: FieldIds::default(),
             return_stats: false,
             shredding: HashMap::new(),
+            geoparquet_version: GeoParquetVersion::V1,
+            geoparquet_conversion: true,
         }
     }
 }
@@ -454,6 +466,8 @@ enum StatsKind {
         blob: bool,
     },
     Uuid,
+    /// `GeoStatisticsState`: no bounds, but the types and extent of GEOMETRYs
+    Geo,
 }
 
 /// The statistics of a column chunk, or of a page (`ColumnWriterStatistics`).
@@ -482,6 +496,11 @@ enum Stats {
     Decimal {
         min: Option<i128>,
         max: Option<i128>,
+    },
+    /// `GeoStatisticsState`
+    Geo {
+        has_stats: bool,
+        stats: GeometryStats,
     },
 }
 
@@ -593,6 +612,10 @@ impl Stats {
             },
             StatsKind::String { blob } => Stats::String(StringStats::new(blob, false)),
             StatsKind::Uuid => Stats::Uuid { min: None, max: None },
+            StatsKind::Geo => Stats::Geo {
+                has_stats: false,
+                stats: GeometryStats::empty(),
+            },
         })
     }
 
@@ -627,6 +650,13 @@ impl Stats {
                     stats.update(bytes);
                 }
             }
+            Stats::Geo { has_stats, stats } => {
+                // `GeometryStatsData::Update`: the values are GEOMETRYs already, so they are valid WKB
+                if let Target::Bytes(bytes) = value {
+                    let _ = stats.update(bytes);
+                    *has_stats = true;
+                }
+            }
             Stats::Uuid { min, max } => {
                 let bytes = value.raw();
                 if min.as_ref().is_none_or(|m| bytes < *m) {
@@ -647,6 +677,16 @@ impl Stats {
             Stats::Uuid { min, .. } => min.is_some(),
             Stats::Bool { min, max } => !*min || *max,
             Stats::Decimal { min, .. } => min.is_some(),
+            // `ColumnWriterStatistics::HasStats`: no bounds
+            Stats::Geo { .. } => false,
+        }
+    }
+
+    /// `HasGeoStats` and `GetGeoStats`.
+    fn geo_stats(&self) -> Option<&GeometryStats> {
+        match self {
+            Stats::Geo { has_stats: true, stats } => Some(stats),
+            _ => None,
         }
     }
 
@@ -660,7 +700,7 @@ impl Stats {
             Stats::Uuid { min, .. } => min.clone().unwrap_or_default(),
             Stats::Bool { min, .. } => vec![u8::from(*min)],
             Stats::Decimal { min, .. } => min.map(|v| v.to_be_bytes().to_vec()).unwrap_or_default(),
-            Stats::Empty => Vec::new(),
+            Stats::Empty | Stats::Geo { .. } => Vec::new(),
         }
     }
 
@@ -674,14 +714,14 @@ impl Stats {
             Stats::Uuid { max, .. } => max.clone().unwrap_or_default(),
             Stats::Bool { max, .. } => vec![u8::from(*max)],
             Stats::Decimal { max, .. } => max.map(|v| v.to_be_bytes().to_vec()).unwrap_or_default(),
-            Stats::Empty => Vec::new(),
+            Stats::Empty | Stats::Geo { .. } => Vec::new(),
         }
     }
 
     /// `GetMin`: the deprecated statistic, which unsigned integers leave out.
     fn deprecated_min_max(&self) -> (Vec<u8>, Vec<u8>) {
         match self {
-            Stats::Numeric { signed: false, .. } | Stats::Empty => (Vec::new(), Vec::new()),
+            Stats::Numeric { signed: false, .. } | Stats::Empty | Stats::Geo { .. } => (Vec::new(), Vec::new()),
             _ => (self.min_value(), self.max_value()),
         }
     }
@@ -775,6 +815,16 @@ impl Stats {
                 }
                 *min = *min && *omin;
                 *max = *max || *omax;
+            }
+            (
+                Stats::Geo { has_stats, stats },
+                Stats::Geo {
+                    has_stats: true,
+                    stats: other,
+                },
+            ) => {
+                stats.merge(other);
+                *has_stats = true;
             }
             (Stats::Decimal { min, max }, Stats::Decimal { min: omin, max: omax }) => {
                 for value in [omin, omax].into_iter().flatten() {
@@ -1059,6 +1109,7 @@ fn has_parquet_type(ty: &LogicalType) -> bool {
             | T::Uuid
             | T::SqlNull
             | T::Decimal
+            | T::Geometry
     )
 }
 
@@ -1353,7 +1404,7 @@ fn create_node(
                 can_have_nulls,
             });
         }
-        T::Union | T::Geometry => {
+        T::Union => {
             return Err(crate::unported(format!("writing {ty} to a Parquet file")));
         }
         _ => {}
@@ -1442,6 +1493,11 @@ fn create_node(
             convert: Convert::Bytes,
             stats: StatsKind::String { blob: true },
         },
+        // `ParquetGeometryOperator`: the WKB of the GEOMETRYs, with `GeoStatisticsState`
+        T::Geometry => LeafKind::Standard {
+            convert: Convert::Bytes,
+            stats: StatsKind::Geo,
+        },
         T::Varchar => LeafKind::Standard {
             convert: Convert::Bytes,
             stats: StatsKind::String { blob: false },
@@ -1482,7 +1538,7 @@ struct SchemaElement {
 }
 
 /// `duckdb_parquet::LogicalType`, of what the writer sets.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum LogicalAnnotation {
     Json,
     /// `TIME` with whether it is in UTC, and its unit (1 millis, 2 micros, 3 nanos)
@@ -1496,6 +1552,8 @@ enum LogicalAnnotation {
     Unknown,
     /// `VARIANT` of specification version 1
     Variant,
+    /// `GEOMETRY`, with its CRS if it has one
+    Geometry(Option<String>),
 }
 
 impl SchemaElement {
@@ -1525,24 +1583,30 @@ impl SchemaElement {
         if let Some(v) = self.field_id {
             t.i32(9, v);
         }
-        if let Some(logical) = self.logical {
+        if let Some(logical) = &self.logical {
             t.structure(10, |t| match logical {
                 LogicalAnnotation::Json => t.empty(12),
                 LogicalAnnotation::Time(utc, unit) => t.structure(7, |t| {
-                    t.bool(1, utc);
-                    t.structure(2, |t| t.empty(unit));
+                    t.bool(1, *utc);
+                    t.structure(2, |t| t.empty(*unit));
                 }),
                 LogicalAnnotation::Timestamp(utc, unit) => t.structure(8, |t| {
-                    t.bool(1, utc);
-                    t.structure(2, |t| t.empty(unit));
+                    t.bool(1, *utc);
+                    t.structure(2, |t| t.empty(*unit));
                 }),
                 LogicalAnnotation::Uuid => t.empty(14),
                 LogicalAnnotation::Decimal { scale, precision } => t.structure(5, |t| {
-                    t.i32(1, scale);
-                    t.i32(2, precision);
+                    t.i32(1, *scale);
+                    t.i32(2, *precision);
                 }),
                 LogicalAnnotation::Unknown => t.empty(11),
                 LogicalAnnotation::Variant => t.structure(16, |t| t.i8(1, 1)),
+                // `GeometryType`: 1 is the CRS
+                LogicalAnnotation::Geometry(crs) => t.structure(17, |t| {
+                    if let Some(crs) = crs {
+                        t.binary(1, crs.as_bytes());
+                    }
+                }),
             });
         }
     }
@@ -1613,6 +1677,10 @@ fn leaf_schema_element(leaf: &Leaf, options: &WriterOptions) -> SchemaElement {
             });
         }
         T::SqlNull => element.logical = Some(LogicalAnnotation::Unknown),
+        // `allow_geometry`: GeoParquet V1 stores geometries as blobs, without the logical type
+        T::Geometry if options.geoparquet_version != GeoParquetVersion::V1 => {
+            element.logical = Some(LogicalAnnotation::Geometry(geometry_crs_annotation(ty)));
+        }
         _ => {}
     }
     element
@@ -2014,6 +2082,8 @@ struct ChunkMeta {
     bloom_filter: Option<(i64, i32)>,
     column_index: Option<(i64, i32)>,
     offset_index: Option<(i64, i32)>,
+    /// `geospatial_statistics`
+    geospatial_statistics: Option<GeometryStats>,
 }
 
 struct RowGroupMeta {
@@ -2044,6 +2114,8 @@ pub struct ParquetFileWriter {
     stats: Option<StatsAccumulator>,
     /// of each column, if it is a VARIANT
     variants: Vec<Option<VariantColumn>>,
+    /// `geoparquet_data`: the GeoParquet metadata of the GEOMETRY columns written
+    geoparquet: Option<GeoParquetFileMetadata>,
 }
 
 /// A VARIANT column (`VariantColumnWriter`): what it is shredded on, once that is known.
@@ -2112,14 +2184,17 @@ impl ParquetFileWriter {
             page_indexes: Vec::new(),
             num_rows: 0,
             stats: None,
+            geoparquet: None,
         };
         if writer.options.return_stats {
             writer.stats = Some(StatsAccumulator::new(&writer.nodes));
         }
         if writer.options.bloom_filters {
             for node in &mut writer.nodes {
+                // `SupportsBloomFilterFallback`: not of INT96, nor of GEOMETRY
                 if let Node::Leaf(leaf) = node
-                    && matches!(leaf.kind, LeafKind::Standard { convert, .. } if !matches!(convert, Convert::Int96 { .. }))
+                    && matches!(leaf.kind, LeafKind::Standard { convert, stats }
+                        if !matches!(convert, Convert::Int96 { .. }) && stats != StatsKind::Geo)
                 {
                     leaf.bloom_fallback = true;
                 }
@@ -2458,6 +2533,7 @@ impl ParquetFileWriter {
             bloom_filter: None,
             column_index: None,
             offset_index: None,
+            geospatial_statistics: None,
         };
         // `SetParquetStatistics`
         for page in &state.pages {
@@ -2506,6 +2582,26 @@ impl ParquetFileWriter {
                 footer.distinct_count = Some(dictionary_size(leaf, &state) as i64);
             }
             meta.statistics = Some(footer);
+            if let Some(geo_stats) = stats.geo_stats() {
+                let version = self.options.geoparquet_version;
+                // the native statistics, and those of the GeoParquet metadata
+                let has_real_stats = matches!(
+                    version,
+                    GeoParquetVersion::None | GeoParquetVersion::Both | GeoParquetVersion::V2
+                );
+                let has_json_stats = matches!(
+                    version,
+                    GeoParquetVersion::V1 | GeoParquetVersion::Both | GeoParquetVersion::V2
+                );
+                if has_real_stats {
+                    meta.geospatial_statistics = Some(*geo_stats);
+                }
+                if has_json_stats {
+                    self.geoparquet
+                        .get_or_insert_with(|| GeoParquetFileMetadata::new(version))
+                        .add_stats(&leaf.schema.name, &leaf.schema.ty, geo_stats, version)?;
+                }
+            }
         }
         let mut total_uncompressed = 0usize;
         let mut index = PageIndexEntry {
@@ -2649,6 +2745,14 @@ impl ParquetFileWriter {
                 meta.offset_index = Some(at);
             }
         }
+        // `GeoParquetFileMetadata::Write`: the `geo` key of the footer
+        if self.options.geoparquet_conversion
+            && self.options.geoparquet_version != GeoParquetVersion::None
+            && let Some(geoparquet) = self.geoparquet.take()
+            && let Some(json) = geoparquet.write()?
+        {
+            self.options.key_values.push(("geo".to_string(), json.into_bytes()));
+        }
         let footer = self.footer();
         self.write_bytes(&footer)?;
         self.write_bytes(&(footer.len() as u32).to_le_bytes())?;
@@ -2767,6 +2871,9 @@ fn write_column_meta(t: &mut Thrift, column: &ChunkMeta, codec: i32) {
     if let Some((offset, length)) = column.bloom_filter {
         t.i64(14, offset);
         t.i32(15, length);
+    }
+    if let Some(stats) = &column.geospatial_statistics {
+        t.structure(17, |t| geoparquet::write_geospatial_statistics(t, stats));
     }
 }
 

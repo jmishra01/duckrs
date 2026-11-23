@@ -1002,6 +1002,21 @@ impl Extent {
         }
     }
 
+    /// `GeometryExtent::HasXY`: whether the X and Y ranges are neither empty nor unknown.
+    pub fn has_xy(&self) -> bool {
+        self.x_min.is_finite() && self.x_max.is_finite() && self.y_min.is_finite() && self.y_max.is_finite()
+    }
+
+    /// `GeometryExtent::HasZ`.
+    pub fn has_z(&self) -> bool {
+        self.z_min.is_finite() && self.z_max.is_finite()
+    }
+
+    /// `GeometryExtent::HasM`.
+    pub fn has_m(&self) -> bool {
+        self.m_min.is_finite() && self.m_max.is_finite()
+    }
+
     /// `GeometryExtent::IntersectsXY`.
     pub fn intersects_xy(&self, other: &Extent) -> bool {
         !(self.x_min > other.x_max || self.x_max < other.x_min || self.y_min > other.y_max || self.y_max < other.y_min)
@@ -1161,6 +1176,64 @@ impl GeometryStats {
         self.flags |= if any_empty { HAS_EMPTY_PART } else { HAS_NON_EMPTY_PART };
         self.flags |= if count == 0 { HAS_EMPTY_GEOM } else { HAS_NON_EMPTY_GEOM };
         Ok(())
+    }
+
+    /// `GeometryTypeSet::IsEmpty`.
+    pub fn types_empty(&self) -> bool {
+        self.types.iter().all(|set| *set == 0)
+    }
+
+    /// `GeometryTypeSet::ToString`: `Point`, `LineString Z`, ... or, `snake_case`, `point`,
+    /// `linestring_z`, ..., by vertex type and then by geometry type.
+    pub fn type_names(&self, snake_case: bool) -> Vec<String> {
+        const NAMES: [(&str, &str); 8] = [
+            ("Unknown", "unknown"),
+            ("Point", "point"),
+            ("LineString", "linestring"),
+            ("Polygon", "polygon"),
+            ("MultiPoint", "multipoint"),
+            ("MultiLineString", "multilinestring"),
+            ("MultiPolygon", "multipolygon"),
+            ("GeometryCollection", "geometrycollection"),
+        ];
+        const SUFFIXES: [(&str, &str); 4] = [("", ""), (" Z", "_z"), (" M", "_m"), (" ZM", "_zm")];
+        let mut result = Vec::new();
+        for (set, (suffix, snake_suffix)) in self.types.iter().zip(SUFFIXES) {
+            for (bit, (name, snake_name)) in NAMES.iter().enumerate() {
+                if set & (1 << bit) != 0 {
+                    result.push(if snake_case {
+                        format!("{snake_name}{snake_suffix}")
+                    } else {
+                        format!("{name}{suffix}")
+                    });
+                }
+            }
+        }
+        result
+    }
+
+    /// `GeometryTypeSet::ToWKBList`: the ISO WKB codes of the types (1 to 7, plus 1000 for Z, 2000
+    /// for M and 3000 for ZM).
+    pub fn wkb_types(&self) -> Vec<i32> {
+        let mut result = Vec::new();
+        for (vertex, set) in self.types.iter().enumerate() {
+            for geometry in 1..8 {
+                if set & (1 << geometry) != 0 {
+                    result.push(geometry + vertex as i32 * 1000);
+                }
+            }
+        }
+        result
+    }
+
+    /// `GeometryTypeSet::Add` of an ISO WKB type code; `false` for one that isn't a geometry type.
+    pub fn add_wkb_type(&mut self, code: i32) -> bool {
+        let (geometry, vertex) = (code % 1000, code / 1000);
+        if !(1..=7).contains(&geometry) || !(0..=3).contains(&vertex) {
+            return false;
+        }
+        self.types[vertex as usize] |= 1 << geometry;
+        true
     }
 
     /// `GeometryStatsData::Merge`.

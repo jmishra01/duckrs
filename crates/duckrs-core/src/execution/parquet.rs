@@ -44,6 +44,8 @@ pub struct ParquetScanData {
     pub binary_as_string: bool,
     /// `int96_as`
     pub int96_as: Int96As,
+    /// `enable_geoparquet_conversion`: the columns of the GeoParquet metadata are GEOMETRY
+    pub geoparquet_conversion: bool,
     /// `utf8_validation`
     pub utf8_validation: Utf8Validation,
     /// with COPY ... FROM, the columns of the table the columns of the files are loaded into
@@ -700,7 +702,7 @@ fn time_value(micros: i64, ty: &LogicalType) -> Value {
 }
 
 /// What the crate leaves out of a top-level column's type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Special {
     None,
     /// INT96 (Impala timestamps), which the crate reads as nanoseconds
@@ -711,10 +713,26 @@ enum Special {
     Variant,
     /// annotated UNKNOWN: a column of NULLs, whatever its physical type
     Null,
+    /// WKB, annotated GEOMETRY or GEOGRAPHY or named in the GeoParquet metadata, with its CRS (empty for none)
+    Geometry(String),
 }
 
-fn special_columns(builder: &ParquetRecordBatchReaderBuilder<File>) -> Vec<Special> {
-    builder
+// Ported from duckdb/extension/parquet/parquet_reader.cpp (IsGeometryType) @ rust-port-baseline
+fn special_columns(builder: &ParquetRecordBatchReaderBuilder<File>, geoparquet: bool) -> Result<Vec<Special>> {
+    use parquet::basic::LogicalType as L;
+    // `GeoParquetFileMetadata::TryRead`
+    let geo_columns = match builder
+        .metadata()
+        .file_metadata()
+        .key_value_metadata()
+        .and_then(|kvs| kvs.iter().find(|kv| kv.key == "geo"))
+        .and_then(|kv| kv.value.as_deref())
+        .filter(|_| geoparquet)
+    {
+        Some(geo) => crate::execution::parquet_writer::geoparquet::try_read(geo)?,
+        None => None,
+    };
+    Ok(builder
         .parquet_schema()
         .root_schema()
         .get_fields()
@@ -722,20 +740,38 @@ fn special_columns(builder: &ParquetRecordBatchReaderBuilder<File>) -> Vec<Speci
         .map(|field| {
             if !field.is_primitive() {
                 return match field.get_basic_info().logical_type_ref() {
-                    Some(parquet::basic::LogicalType::Variant(_)) => Special::Variant,
+                    Some(L::Variant(_)) => Special::Variant,
                     _ => Special::None,
                 };
+            }
+            if field.get_physical_type() == parquet::basic::Type::BYTE_ARRAY {
+                match field.get_basic_info().logical_type_ref() {
+                    Some(L::Geometry(geometry)) => {
+                        return Special::Geometry(geometry.crs.clone().unwrap_or_default());
+                    }
+                    Some(L::Geography(geography)) => {
+                        return Special::Geometry(geography.crs.clone().unwrap_or_default());
+                    }
+                    _ => {}
+                }
+                // a GeoParquet column is a leaf at the root, named in the metadata
+                if let Some((_, projjson)) = geo_columns
+                    .as_ref()
+                    .and_then(|columns| columns.iter().find(|(name, _)| name == field.name()))
+                {
+                    return Special::Geometry(projjson.clone());
+                }
             }
             if field.get_physical_type() == parquet::basic::Type::INT96 {
                 return Special::Int96;
             }
             match field.get_basic_info().logical_type_ref() {
-                Some(parquet::basic::LogicalType::Time(time)) if time.is_adjusted_to_u_t_c => Special::TimeUtc,
-                Some(parquet::basic::LogicalType::Unknown) => Special::Null,
+                Some(L::Time(time)) if time.is_adjusted_to_u_t_c => Special::TimeUtc,
+                Some(L::Unknown) => Special::Null,
                 _ => Special::None,
             }
         })
-        .collect()
+        .collect())
 }
 
 /// The DuckDB type of top-level column `index` of a file: INT96 by `int96_as`, the rest by [`logical_type`].
@@ -754,6 +790,11 @@ fn column_type(
     }
     if special.get(index) == Some(&Special::Null) {
         return Ok(LogicalType::SQLNULL);
+    }
+    if let Some(Special::Geometry(crs)) = special.get(index) {
+        // `CoordinateReferenceSystem::TryIdentify`: a CRS nothing can tell is none
+        let crs = duckrs_common::geometry_crs::try_identify(crs).ok().flatten();
+        return Ok(LogicalType::geometry(crs));
     }
     if special.get(index) == Some(&Special::Int96) {
         return Ok(match int96_as {
@@ -786,9 +827,14 @@ pub fn deduplicate_names<'a>(names: impl IntoIterator<Item = &'a String>) -> Vec
 }
 
 /// The names and types of a file's columns.
-pub fn file_schema(path: &str, binary_as_string: bool, int96_as: Int96As) -> Result<(Vec<String>, Vec<LogicalType>)> {
+pub fn file_schema(
+    path: &str,
+    binary_as_string: bool,
+    int96_as: Int96As,
+    geoparquet: bool,
+) -> Result<(Vec<String>, Vec<LogicalType>)> {
     let builder = open_builder(path)?;
-    let int96 = special_columns(&builder);
+    let int96 = special_columns(&builder, geoparquet)?;
     let schema = builder.schema();
     let names = deduplicate_names(schema.fields().iter().map(|f| f.name()));
     let types = schema
@@ -805,10 +851,11 @@ pub fn check_schema(
     path: &str,
     binary_as_string: bool,
     int96_as: Int96As,
+    geoparquet: bool,
     columns: &[crate::execution::parquet_schema::SchemaColumn],
 ) -> Result<()> {
     let builder = open_builder(path)?;
-    let int96 = special_columns(&builder);
+    let int96 = special_columns(&builder, geoparquet)?;
     let schema = builder.schema();
     let fields: Vec<&Field> = schema.fields().iter().map(|f| f.as_ref()).collect();
     for column in columns {
@@ -849,6 +896,11 @@ fn binary_value(bytes: &[u8], ty: &LogicalType) -> Result<Value> {
             let raw = <[u8; 16]>::try_from(bytes).map_err(|_| invalid("A UUID in a Parquet file is not 16 bytes"))?;
             Ok(Value::uuid((u128::from_be_bytes(raw) ^ (1 << 127)) as i128))
         }
+        // `ST_GeomFromWKB`: little endian ISO WKB, or the error that says why it isn't WKB
+        LogicalTypeId::Geometry => Ok(Value::new(
+            ty.clone(),
+            ValueData::Bytes(duckrs_common::geometry::from_wkb(bytes)?),
+        )?),
         _ => Ok(Value::blob(bytes)),
     }
 }
@@ -1358,7 +1410,7 @@ fn open_file(
     } else {
         open_builder(path)?
     };
-    let int96 = special_columns(&builder);
+    let int96 = special_columns(&builder, scan.geoparquet_conversion)?;
     let builder = with_schema_hints(path, builder, &int96, scan.int96_as)?.with_batch_size(STANDARD_VECTOR_SIZE);
     // the types of the columns are those of the file, whatever the reader is told to read strings as
     let schema = Arc::clone(typed.schema());
@@ -1527,10 +1579,17 @@ fn batch_chunk(
             columns.push(vector);
             continue;
         }
-        let mut vector = Vector::new(file_type.clone(), count);
-        for row in 0..count {
-            vector.set_value(row, &array_value(array, row, file_type)?)?;
-        }
+        let vector = match array.as_binary_opt::<i32>() {
+            Some(wkb) if file_type.id() == LogicalTypeId::Geometry => geometry_vector(wkb, file_type, count)?,
+            _ => {
+                let mut vector = Vector::new(file_type.clone(), count);
+                for row in 0..count {
+                    vector.set_value(row, &array_value(array, row, file_type)?)?;
+                }
+                vector
+            }
+        };
+        let mut vector = vector;
         if scan.byte_lengths.contains(&index) {
             let mut lengths = Vector::new(LogicalType::BIGINT, count);
             for row in 0..count {
@@ -1592,6 +1651,20 @@ fn batch_chunk(
         columns[*column] = constant_column(&scan.types[*column], &value, count)?;
     }
     Ok(DataChunk::from_columns(columns, count))
+}
+
+// Ported from duckdb/extension/parquet/parquet_geometry.cpp (GeometryColumnReader) @ rust-port-baseline
+/// `GeometryColumnReader`: the BLOBs of a GEOMETRY column through `ST_GeomFromWKB`, into a vector of `ty`.
+fn geometry_vector(wkb: &arrow::array::BinaryArray, ty: &LogicalType, count: usize) -> Result<Vector> {
+    let mut vector = Vector::new(ty.clone(), count);
+    for row in 0..count {
+        if wkb.is_null(row) {
+            vector.set_null(row, true);
+        } else {
+            vector.set_str(row, &duckrs_common::geometry::from_wkb(wkb.value(row))?);
+        }
+    }
+    Ok(vector)
 }
 
 /// `GetExtendedMultiFileError`: a value of a file that does not cast to the type the scan reads.
@@ -3082,7 +3155,7 @@ fn element_leaf(
 /// The DuckDB type the file at `path` stores its top-level column `name` as.
 fn stored_type(scan: &ParquetScanData, path: &str, name: &str) -> Option<LogicalType> {
     let builder = open_builder(path).ok()?;
-    let special = special_columns(&builder);
+    let special = special_columns(&builder, scan.geoparquet_conversion).ok()?;
     let schema = Arc::clone(builder.schema());
     let index = schema.fields().iter().position(|field| field.name().eq_ignore_ascii_case(name))?;
     column_type(schema.field(index), &special, index, scan.binary_as_string, scan.int96_as).ok()
@@ -3379,9 +3452,10 @@ pub fn metadata_rows(path: &str) -> Result<Vec<String>> {
                 None => format!("NULL::{ENCODING_STATS_TYPE}"),
             };
             let nan_count = chunk.statistics().and_then(Statistics::nan_count_opt).map(|n| n as i64);
+            let (geo_bbox, geo_types) = geo_statistics_text(chunk.geo_statistics())?;
             rows.push(format!(
                 "({}, {group}, {}, {}, {}, {column}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, NULL::BIGINT, {}, {}, \
-                 {}, {}, NULL::MAP(BLOB, BLOB), {}, {}, {}, {}, {}, NULL::{GEO_BBOX_TYPE}, NULL::VARCHAR[], {}, {}, {}, \
+                 {}, {}, NULL::MAP(BLOB, BLOB), {}, {}, {}, {}, {}, {geo_bbox}, {geo_types}, {}, {}, {}, \
                  {}, {}, {})",
                 sql_text(path),
                 row_group.num_rows(),
@@ -3418,6 +3492,51 @@ pub fn metadata_rows(path: &str) -> Result<Vec<String>> {
         }
     }
     Ok(rows)
+}
+
+// Ported from duckdb/extension/parquet/parquet_metadata.cpp (ConvertParquetGeoStatsBBOX and
+// ConvertParquetGeoStatsTypes) @ rust-port-baseline
+/// `geo_bbox` and `geo_types` of a column chunk, as SQL.
+fn geo_statistics_text(
+    stats: Option<&parquet::geospatial::statistics::GeospatialStatistics>,
+) -> Result<(String, String)> {
+    let double = |value: Option<f64>| match value {
+        Some(value) => format!("{}::DOUBLE", sql_text(&format!("{value:?}"))),
+        None => "NULL::DOUBLE".to_string(),
+    };
+    let bbox = match stats.and_then(|stats| stats.bounding_box()) {
+        Some(bbox) => format!(
+            "{{'xmin': {}, 'xmax': {}, 'ymin': {}, 'ymax': {}, 'zmin': {}, 'zmax': {}, 'mmin': {}, 'mmax': {}}}::\
+             {GEO_BBOX_TYPE}",
+            double(Some(bbox.get_xmin())),
+            double(Some(bbox.get_xmax())),
+            double(Some(bbox.get_ymin())),
+            double(Some(bbox.get_ymax())),
+            double(bbox.get_zmin()),
+            double(bbox.get_zmax()),
+            double(bbox.get_mmin()),
+            double(bbox.get_mmax()),
+        ),
+        None => format!("NULL::{GEO_BBOX_TYPE}"),
+    };
+    let types = match stats.and_then(|stats| stats.geospatial_types()) {
+        Some(codes) => {
+            let mut set = duckrs_common::geometry::GeometryStats::empty();
+            for &code in codes {
+                if !(1..=7).contains(&(code % 1000)) {
+                    return Err(invalid("Unsupported geometry type in Parquet geo metadata"));
+                }
+                if !(0..=3).contains(&(code / 1000)) {
+                    return Err(invalid("Unsupported geometry vertex type in Parquet geo metadata"));
+                }
+                set.add_wkb_type(code);
+            }
+            let names: Vec<String> = set.type_names(true).iter().map(|name| sql_text(name)).collect();
+            format!("[{}]::VARCHAR[]", names.join(", "))
+        }
+        None => "NULL::VARCHAR[]".to_string(),
+    };
+    Ok((bbox, types))
 }
 
 /// `ParquetLogicalTypeToString`: the Thrift `printTo` of the member of the union that is set.
@@ -3458,6 +3577,7 @@ fn logical_type_text(logical: &parquet::basic::LogicalType) -> Option<String> {
         L::Bson => "BsonType()".to_string(),
         L::Uuid => "UUIDType()".to_string(),
         L::Float16 => "Float16Type()".to_string(),
+        L::Geometry(geometry) => format!("GeometryType(crs={})", geometry.crs.as_deref().unwrap_or("<null>")),
         // C++ has no text for the others
         _ => return None,
     })
@@ -3575,7 +3695,7 @@ fn root_repetition(path: &str) -> Option<String> {
 
 /// `CollectElementTypes`: the DuckDB type of each element of the schema, in its order, a group collapsed into
 /// its only child having the type of that child.
-fn element_types(root: &Type, types: &[LogicalType]) -> Vec<Option<String>> {
+fn element_types(root: &Type, types: &[LogicalType], fields: &[Field]) -> Vec<Option<String>> {
     fn children(ty: &Type) -> &[parquet::schema::types::TypePtr] {
         if ty.is_group() { ty.get_fields() } else { &[] }
     }
@@ -3587,14 +3707,15 @@ fn element_types(root: &Type, types: &[LogicalType]) -> Vec<Option<String>> {
             out[at] = Some(ty.to_string());
         }
     }
-    /// `at` is the index of `node`, which has the type `ty`.
-    fn assign(node: &Type, at: usize, ty: &LogicalType, out: &mut [Option<String>]) {
+    /// `at` is the index of `node`, which has the type `ty` (and the Arrow field `arrow`, where known).
+    fn assign(node: &Type, at: usize, ty: &LogicalType, arrow: Option<&Field>, out: &mut [Option<String>]) {
         set(out, at, ty);
         let fields = children(node);
         if fields.is_empty() {
             return;
         }
         match ty.id() {
+            // `CollectElementTypes`: a LIST and its repeated group are one column schema, of the LIST
             LogicalTypeId::List | LogicalTypeId::Array => {
                 let Some(element) = ty.child_type() else { return };
                 let child = &fields[0];
@@ -3604,28 +3725,48 @@ fn element_types(root: &Type, types: &[LogicalType]) -> Vec<Option<String>> {
                     && grand.len() == 1
                     && child.name() != "array"
                     && !child.name().ends_with("_tuple");
+                set(out, at + 1, ty);
                 if collapsed {
-                    set(out, at + 1, element);
-                    assign(&grand[0], at + 2, element, out);
+                    assign(&grand[0], at + 2, element, None, out);
                 } else {
-                    assign(child, at + 1, element, out);
+                    assign(child, at + 1, element, None, out);
                 }
             }
+            // a MAP and its `key_value` group as well
             LogicalTypeId::Map => {
                 let Some(entry) = ty.child_type() else { return };
                 let entries = entry.struct_children();
                 let child = &fields[0];
+                set(out, at + 1, ty);
                 let mut next = at + 2;
                 for (field, (_, field_ty)) in children(child).iter().zip(entries) {
-                    set(out, at + 1, field_ty);
-                    assign(field, next, field_ty, out);
+                    assign(field, next, field_ty, None, out);
                     next += count(field);
                 }
             }
             LogicalTypeId::Struct => {
+                let arrow_children = match arrow.map(Field::data_type) {
+                    Some(DataType::Struct(arrow_children)) => Some(arrow_children),
+                    _ => None,
+                };
                 let mut next = at + 1;
-                for (field, (_, field_ty)) in fields.iter().zip(ty.struct_children()) {
-                    assign(field, next, field_ty, out);
+                for (i, (field, (_, field_ty))) in fields.iter().zip(ty.struct_children()).enumerate() {
+                    let arrow_child = arrow_children.and_then(|c| c.get(i)).map(|f| f.as_ref());
+                    assign(field, next, field_ty, arrow_child, out);
+                    next += count(field);
+                }
+            }
+            // the `metadata`, `value` and `typed_value` of a VARIANT are read as the columns they are
+            LogicalTypeId::Variant => {
+                let Some(DataType::Struct(arrow_children)) = arrow.map(Field::data_type) else {
+                    return;
+                };
+                let mut next = at + 1;
+                for field in fields {
+                    let arrow_child = arrow_children.iter().find(|f| f.name() == field.name());
+                    if let Some(child_ty) = arrow_child.and_then(|f| logical_type(f, false).ok()) {
+                        assign(field, next, &child_ty, arrow_child.map(|f| f.as_ref()), out);
+                    }
                     next += count(field);
                 }
             }
@@ -3634,8 +3775,8 @@ fn element_types(root: &Type, types: &[LogicalType]) -> Vec<Option<String>> {
     }
     let mut out = vec![None; count(root)];
     let mut next = 1;
-    for (field, ty) in root.get_fields().iter().zip(types) {
-        assign(field, next, ty, &mut out);
+    for (i, (field, ty)) in root.get_fields().iter().zip(types).enumerate() {
+        assign(field, next, ty, fields.get(i), &mut out);
         next += count(field);
     }
     out
@@ -3699,8 +3840,11 @@ pub fn schema_table_rows(path: &str) -> Result<Vec<String>> {
     let (metadata, _) = read_metadata(path)?;
     let mut rows = Vec::new();
     let root = metadata.file_metadata().schema();
-    let types = file_schema(path, false, Int96As::default())
-        .map(|(_, types)| element_types(root, &types))
+    let fields: Vec<Field> = open_builder(path)
+        .map(|builder| builder.schema().fields().iter().map(|f| f.as_ref().clone()).collect())
+        .unwrap_or_default();
+    let types = file_schema(path, false, Int96As::default(), true)
+        .map(|(_, types)| element_types(root, &types, &fields))
         .unwrap_or_default();
     schema_rows(root, path, &mut 0, &mut rows, &types);
     Ok(rows)
@@ -4019,7 +4163,7 @@ fn bloom_excludes(
 /// (`ParquetBloomProbeProcessor`), as rows of SQL.
 pub fn bloom_probe_rows(path: &str, column: &str, value: &Value) -> Result<Vec<String>> {
     let (metadata, _) = read_metadata(path)?;
-    let (names, types) = file_schema(path, false, Int96As::Timestamp)?;
+    let (names, types) = file_schema(path, false, Int96As::Timestamp, true)?;
     let Some(index) = names.iter().position(|n| n == column) else {
         return Err(invalid(format!("Column {column} not found in {path}")));
     };

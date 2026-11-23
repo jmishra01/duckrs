@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 
+use duckrs_common::geometry::GeometryStats;
 use duckrs_common::types::{LogicalType, LogicalTypeId, PhysicalType, Time, TimeTz, Timestamp};
 use duckrs_common::value::{Value, ValueData};
 
@@ -86,6 +87,8 @@ struct Unifier {
     nan_count: u64,
     column_size_bytes: u64,
     num_values: u64,
+    /// `GeoStatsUnifier`: the types and extent of a GEOMETRY column
+    geo_stats: Option<GeometryStats>,
 }
 
 impl Unifier {
@@ -108,6 +111,7 @@ impl Unifier {
             nan_count: 0,
             column_size_bytes: 0,
             num_values: 0,
+            geo_stats: None,
         }
     }
 
@@ -355,6 +359,13 @@ impl StatsAccumulator {
             Some(nulls) => unifier.null_count += nulls as u64,
             None => unifier.all_nulls_set = false,
         }
+        // `UnifyGeoStats`
+        if let Some(geo) = writer_stats.and_then(Stats::geo_stats) {
+            match &mut unifier.geo_stats {
+                Some(stats) => stats.merge(geo),
+                None => unifier.geo_stats = Some(*geo),
+            }
+        }
         unifier.column_size_bytes += compressed_size as u64;
         unifier.num_values += num_values as u64;
     }
@@ -394,6 +405,34 @@ impl StatsAccumulator {
             if unifier.can_have_nan {
                 stats.insert("has_nan".to_string(), Value::boolean(unifier.has_nan));
                 stats.insert("nan_count".to_string(), ubigint(unifier.nan_count));
+            }
+            // Ported from duckdb/extension/parquet/parquet_writer.cpp (GatherWrittenStatistics of the
+            // `GeoStatsUnifier`) @ rust-port-baseline
+            if let Some(geo) = &unifier.geo_stats {
+                let bbox = &geo.extent;
+                if bbox.has_xy() {
+                    let mut bounds = vec![
+                        ("bbox_xmin", bbox.x_min),
+                        ("bbox_xmax", bbox.x_max),
+                        ("bbox_ymin", bbox.y_min),
+                        ("bbox_ymax", bbox.y_max),
+                    ];
+                    if bbox.has_z() {
+                        bounds.extend([("bbox_zmin", bbox.z_min), ("bbox_zmax", bbox.z_max)]);
+                    }
+                    if bbox.has_m() {
+                        bounds.extend([("bbox_mmin", bbox.m_min), ("bbox_mmax", bbox.m_max)]);
+                    }
+                    for (name, value) in bounds {
+                        stats.insert(name.to_string(), Value::double(value));
+                    }
+                }
+                if !geo.types_empty() {
+                    let types = geo.type_names(true).into_iter().map(Value::varchar).collect();
+                    if let Ok(list) = Value::list(LogicalType::VARCHAR, types) {
+                        stats.insert("geo_types".to_string(), list);
+                    }
+                }
             }
             result.insert(unifier.column_name.clone(), stats);
         }
