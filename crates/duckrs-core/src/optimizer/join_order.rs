@@ -178,6 +178,37 @@ fn is_tree(op: &LogicalOperator) -> bool {
     }
 }
 
+/// `IsProjectedRecursiveCTERef`: a read of a recursive CTE in its recursive part, under the projections and filters
+/// of the relation it is.
+fn is_recursive_reference(op: &LogicalOperator) -> bool {
+    match (&op.kind, op.children.as_slice()) {
+        (K::WorkingTable { .. }, _) => true,
+        (K::Projection { .. } | K::Filter { .. }, [child]) => is_recursive_reference(child),
+        _ => false,
+    }
+}
+
+/// `RecursiveCTERefCanReorder`: a read of a recursive CTE takes part in reordering only right under a join with an
+/// equality, the join whose hash table of the other side can be kept from round to round. Elsewhere, the residual
+/// and range predicates would drive the tree into range joins, and the tree keeps its order.
+fn recursive_reference_blocks(op: &LogicalOperator) -> bool {
+    if is_movable_semi(op) {
+        return recursive_reference_blocks(&op.children[0]);
+    }
+    if !is_tree(op) {
+        return false;
+    }
+    let equality = matches!(&op.kind, K::Join { conditions, .. }
+        if conditions.iter().any(|c| matches!(c.comparison, ComparisonOp::Equal | ComparisonOp::NotDistinctFrom)));
+    op.children.iter().any(|child| {
+        if is_tree(child) || is_movable_semi(child) {
+            recursive_reference_blocks(child)
+        } else {
+            is_recursive_reference(child) && !equality
+        }
+    })
+}
+
 /// The relations of a tree, whose operators `is_tree` accepts.
 fn leaves<'a>(op: &'a LogicalOperator, result: &mut Vec<&'a LogicalOperator>) {
     if is_movable_semi(op) {
@@ -2055,7 +2086,10 @@ impl JoinOrderOptimizer {
             let columns = bindings.len();
             bindings.sort_by_key(|b| (b.table_index, b.column_index));
             bindings.dedup();
-            if (2..=MAX_RELATIONS).contains(&relations.len()) && bindings.len() == columns {
+            if (2..=MAX_RELATIONS).contains(&relations.len())
+                && bindings.len() == columns
+                && !recursive_reference_blocks(&op)
+            {
                 return self.reorder(op);
             }
         }
@@ -2583,6 +2617,13 @@ fn scan_conjunct_rows(
             FilterPropagate::AlwaysFalse => return (0.0, true),
             _ => {}
         }
+    }
+    // NOT LIKE of a column without NULLs keeps the rows LIKE's default leaves out
+    if let (Some((statistics, _)), BoundExprKind::Function { function, .. }) = (column, &conjunct.kind)
+        && function.name == "!~~"
+        && !statistics.can_be_null
+    {
+        return (filter_fraction(cardinality, 1.0 - DEFAULT_SELECTIVITY), true);
     }
     let BoundExprKind::Comparison { op, left, right } = &conjunct.kind else {
         return conjunct_rows(cardinality, conjunct, child);

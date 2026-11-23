@@ -2101,7 +2101,6 @@ test/sql/cte/materialized_compact_payloads.test
 test/sql/cte/materialized_compact_spill.test
 test/sql/cte/recursive_array_slice.test
 test/sql/cte/recursive_cte_batch_index.test
-test/sql/cte/recursive_cte_column_pruning.test
 test/sql/cte/recursive_cte_complex_pipelines.test
 test/sql/cte/recursive_cte_correlated_bindings.test
 test/sql/cte/recursive_cte_error.test
@@ -3197,6 +3196,7 @@ test/sql/optimizer/in_list_row_group_pruning.test
 test/sql/optimizer/instr_zonemap_pruning.test
 test/sql/optimizer/interval_column_stats_pruning.test
 test/sql/optimizer/interval_row_group_pruning.test
+test/sql/optimizer/join_condition_verification_stats.test
 test/sql/optimizer/joins/join_order_deep_setop_chain.test
 test/sql/optimizer/late_materialization_pushdown_extract.test
 test/sql/optimizer/late_materialization_table_filters.test
@@ -3224,6 +3224,8 @@ test/sql/optimizer/plan/test_except_empty_rhs.test
 test/sql/optimizer/plan/test_filter_pushdown.test
 test/sql/optimizer/plan/test_filter_pushdown_duplicate.test
 test/sql/optimizer/plan/test_filter_pushdown_large.test
+test/sql/optimizer/plan/test_recursive_build_side_probe_side.test
+test/sql/optimizer/plan/test_recursive_join_order_guard.test
 test/sql/optimizer/plan/test_table_filter_pushdown.test
 test/sql/optimizer/plan/test_unused_column_after_join.test
 test/sql/optimizer/power_zonemap_pruning.test
@@ -3273,6 +3275,7 @@ test/sql/optimizer/test_duplicate_groups_optimizer.test
 test/sql/optimizer/test_fd_derived_groups.test
 test/sql/optimizer/test_glob_row_group_pruning.test
 test/sql/optimizer/test_in_rewrite_rule.test
+test/sql/optimizer/test_negated_filter_cardinality.test
 test/sql/optimizer/test_no_pushdown_cast_into_cte.test
 test/sql/optimizer/test_not_comparison_simplification.test
 test/sql/optimizer/test_rollup_column_pruning.test

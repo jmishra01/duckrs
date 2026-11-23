@@ -570,7 +570,7 @@ pub fn optimize_timed(
         });
     }
     if options.join_order && options.unused_columns && options.build_side_probe_side {
-        build_side::choose_by_width(&mut plan);
+        build_side::choose_by_width(&mut plan, options.range_joins.in_recursive_cte);
     }
     // cheapest filters first
     if options.reorder_filter {
@@ -630,13 +630,10 @@ fn filter_statistics_applies(plan: &LogicalOperator) -> bool {
         matches!(op.kind, K::DelimJoin { .. }) || op.children.iter().any(has_delim)
     }
     fn has_multi(op: &LogicalOperator) -> bool {
+        // `HasMultiBindingFilter`: of filters only; what joins the two sides of an inner join is a condition of the
+        // join, which C++ leaves to the statistics after the join order
         let own = match &op.kind {
             K::Filter { expressions } => expressions.iter().any(multi),
-            K::Join {
-                join_type: duckrs_parser::ast::JoinType::Inner,
-                predicate: Some(predicate),
-                ..
-            } => multi(predicate),
             _ => false,
         };
         own || op.children.iter().any(has_multi)

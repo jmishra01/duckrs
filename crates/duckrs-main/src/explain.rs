@@ -780,18 +780,23 @@ pub(super) fn logical_tree(op: &LogicalOperator, estimate: Option<&PlanEstimate>
     }
     // `HidesChildren`: nothing of what is inside a secure view is shown
     let hidden = matches!(op.kind, K::SecureView { .. });
+    let mut children: Vec<ExplainNode> = op
+        .children
+        .iter()
+        .enumerate()
+        .filter(|_| !hidden)
+        .map(|(at, child)| logical_tree(child, aligned.map(|e| &e.children[at])))
+        .collect();
+    // `LogicalRecursiveCTE`: the recursive part is its second child, which duckrs keeps apart
+    if let K::RecursiveCte { recursive, .. } = &op.kind {
+        children.push(logical_tree(recursive, estimate.and_then(|e| e.children.get(1))));
+    }
     ExplainNode {
         name: logical_name(op).to_string(),
         info: operator_info(op, false),
         estimate: estimate.map(|e| e.cardinality),
         rows: None,
-        children: op
-            .children
-            .iter()
-            .enumerate()
-            .filter(|_| !hidden)
-            .map(|(at, child)| logical_tree(child, aligned.map(|e| &e.children[at])))
-            .collect(),
+        children,
     }
 }
 
