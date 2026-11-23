@@ -106,6 +106,7 @@ impl Binder<'_> {
         let mut filename = None;
         let mut hive_options = super::copy::HiveOptions::default();
         let mut int96_as = crate::execution::parquet::Int96As::Timestamp;
+        let geoparquet = self.geoparquet_conversion();
         let mut utf8_validation = crate::execution::parquet::Utf8Validation::Strict;
         let mut schema_value = None;
         let mut allow_empty = false;
@@ -221,7 +222,7 @@ impl Binder<'_> {
                     try_cast: &try_cast,
                 }
                 .parse(value)?;
-                crate::execution::parquet::check_schema(&files[0], binary_as_string, int96_as, &columns)?;
+                crate::execution::parquet::check_schema(&files[0], binary_as_string, int96_as, geoparquet, &columns)?;
                 Some(Arc::new(columns))
             }
             _ => None,
@@ -232,11 +233,11 @@ impl Binder<'_> {
                 columns.iter().map(|c| c.name.clone()).collect(),
                 columns.iter().map(|c| c.ty.clone()).collect(),
             ),
-            None => file_schema(&files[0], binary_as_string, int96_as)?,
+            None => file_schema(&files[0], binary_as_string, int96_as, geoparquet)?,
         };
         if union_by_name && !empty {
             for path in &files[1..] {
-                let (file_names, file_types) = file_schema(path, binary_as_string, int96_as)?;
+                let (file_names, file_types) = file_schema(path, binary_as_string, int96_as, geoparquet)?;
                 for (column, ty) in file_names.iter().zip(&file_types) {
                     match names.iter().position(|n| n.eq_ignore_ascii_case(column)) {
                         Some(i) => types[i] = force_max_logical_type(&types[i], ty),
@@ -361,6 +362,7 @@ impl Binder<'_> {
             types,
             binary_as_string,
             int96_as,
+            geoparquet_conversion: geoparquet,
             utf8_validation,
             table_columns,
             union_by_name,
@@ -602,6 +604,7 @@ impl Binder<'_> {
         let select = self.copy_to_select(info)?;
         let bound = self.bind_select_statement(&select)?;
         let mut options = ParquetWriteOptions::default();
+        options.writer.geoparquet_conversion = self.geoparquet_conversion();
         let writer = &mut options.writer;
         let mut compression = None;
         let mut level = None;
@@ -740,6 +743,10 @@ impl Binder<'_> {
                     writer.bloom_filter_fpp = ratio;
                 }
                 "write_timestamp_as_int96" => writer.timestamp_as_int96 = is_true(&value, &name)?,
+                "geoparquet_version" => {
+                    writer.geoparquet_version =
+                        crate::execution::parquet_writer::GeoParquetVersion::parse(&value.try_to_string()?)?;
+                }
                 "parquet_version" => {
                     // an option without a value is `true`, which is no VARCHAR
                     if value.logical_type().id() == LogicalTypeId::Boolean {
@@ -1112,6 +1119,20 @@ fn parse_field_ids(
         ids.0.insert(name, (field_id, children));
     }
     Ok(ids)
+}
+
+impl Binder<'_> {
+    /// `GeoParquetFileMetadata::IsGeoParquetConversionEnabled`: the `enable_geoparquet_conversion` setting.
+    fn geoparquet_conversion(&self) -> bool {
+        self.session
+            .as_ref()
+            .and_then(|session| (session.setting)("enable_geoparquet_conversion").ok())
+            .and_then(|value| match value.data() {
+                ValueData::Bool(enabled) => Some(*enabled),
+                _ => None,
+            })
+            .unwrap_or(true)
+    }
 }
 
 /// `ParquetCopyOptions`.

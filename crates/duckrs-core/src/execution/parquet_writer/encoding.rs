@@ -407,6 +407,7 @@ pub mod ttype {
     pub const BOOL_FALSE: u8 = 2;
     pub const I32: u8 = 5;
     pub const I64: u8 = 6;
+    pub const DOUBLE: u8 = 7;
     pub const BINARY: u8 = 8;
     pub const LIST: u8 = 9;
     pub const STRUCT: u8 = 12;
@@ -463,6 +464,12 @@ impl Thrift {
     pub fn i8(&mut self, id: i16, value: i8) {
         self.field(id, 3);
         self.out.push(value as u8);
+    }
+
+    /// A `double` field: its IEEE bits, little endian.
+    pub fn double(&mut self, id: i16, value: f64) {
+        self.field(id, ttype::DOUBLE);
+        self.out.extend_from_slice(&value.to_le_bytes());
     }
 
     pub fn bool(&mut self, id: i16, value: bool) {
