@@ -1183,7 +1183,7 @@ impl Binder<'_> {
                         "denormalized_table cannot be NULL",
                     ));
                 }
-                let value = crate::client::settings::cast_value(&value, &LogicalType::BOOLEAN)?;
+                let value = crate::function::cast::cast_value(&value, &LogicalType::BOOLEAN)?;
                 denormalized = value.try_to_string()? == "true";
             } else if argument.name.is_empty() {
                 return Err(binder_error(format!("{name} takes no positional arguments")));
@@ -1309,7 +1309,7 @@ impl Binder<'_> {
                     format!("Cannot use NULL as argument for {name}"),
                 ));
             }
-            let value = crate::client::settings::cast_value(&value, &LogicalType::BOOLEAN)?;
+            let value = crate::function::cast::cast_value(&value, &LogicalType::BOOLEAN)?;
             *target = Some(value.try_to_string()? == "true");
         }
         if include_all == Some(true) && (debug.is_some() || deprecated.is_some()) {
@@ -1334,8 +1334,8 @@ impl Binder<'_> {
             }
             let (value, typed_value) = match &setting.value {
                 Some(value) if !value.is_null() => (
-                    crate::client::settings::cast_value(value, &LogicalType::VARCHAR)?,
-                    crate::client::settings::cast_value(value, &variant)?,
+                    crate::function::cast::cast_value(value, &LogicalType::VARCHAR)?,
+                    crate::function::cast::cast_value(value, &variant)?,
                 ),
                 _ => (null_text(), Value::null(variant.clone())),
             };

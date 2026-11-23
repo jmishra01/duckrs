@@ -13,13 +13,13 @@
 //! expression depth limit) or listed in [`UNHONORED`]: setting one of those to anything but
 //! its default fails as not yet ported, so a test never sees a silently different result.
 
+pub(crate) use crate::function::cast::cast_value;
+pub use crate::planner::binder::SettingRow;
 use super::settings_table::SETTINGS;
 use crate::execution::file_system::{FileAccess, sanitize_allowed_path};
-use crate::function::cast::{CastMode, cast_vector};
 use duckrs_common::string_util::{candidates_error_message, candidates_message, similarity_rating, top_n_strings};
 use duckrs_common::types::LogicalType;
 use duckrs_common::value::Value;
-use duckrs_common::vector::Vector;
 use duckrs_common::{Error, ErrorKind, Result};
 use duckrs_parser::ast::SetScope;
 use std::collections::HashMap;
@@ -172,16 +172,6 @@ fn input_type(setting: &SettingDefinition) -> Result<LogicalType> {
         "MAP(VARCHAR, VARCHAR)" => LogicalType::map(LogicalType::VARCHAR, LogicalType::VARCHAR),
         other => return Err(crate::unported(format!("settings of type {other}"))),
     })
-}
-
-/// `Value::CastAs`.
-pub(crate) fn cast_value(value: &Value, target: &LogicalType) -> Result<Value> {
-    if value.logical_type() == target {
-        return Ok(value.clone());
-    }
-    let mut result = Vector::new(target.clone(), 1);
-    cast_vector(&Vector::constant(value), &mut result, 1, CastMode::Strict)?;
-    Ok(result.get_value(0))
 }
 
 /// `EXTENSION_SETTINGS` of `extension_entries.hpp`: the settings of the extensions.
@@ -1205,19 +1195,6 @@ pub fn current_value(name: &str, global: &SettingValues, session: &SettingValues
         .or_else(|| default_value(setting))
 }
 
-/// A row of `duckdb_settings()`.
-#[derive(Debug, Clone)]
-pub struct SettingRow {
-    pub name: &'static str,
-    pub value: Option<Value>,
-    pub description: &'static str,
-    pub input_type: &'static str,
-    /// `GLOBAL` or `LOCAL`
-    pub scope: &'static str,
-    pub aliases: &'static [&'static str],
-    pub is_debug: bool,
-    pub is_deprecated: bool,
-}
 
 /// `DuckDBSettingsInit`: every setting with its current value, each alias as a row of its
 /// own, sorted by name.

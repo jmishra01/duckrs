@@ -705,3 +705,23 @@ pub fn in_as_comparisons(negated: bool, children: &[BoundExpr]) -> BoundExpr {
         result
     }
 }
+/// The text of a filter as EXPLAIN shows it: without the one pair of parentheses around all of it.
+pub fn filter_text(filter: &BoundExpr) -> String {
+    let text = filter.to_string();
+    let Some(inner) = text.strip_prefix('(').and_then(|t| t.strip_suffix(')')) else {
+        return text;
+    };
+    // (a) OR (b) starts and ends with them too, but those are not one pair
+    let mut depth = 0i32;
+    for c in inner.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ => {}
+        }
+        if depth < 0 {
+            return text;
+        }
+    }
+    inner.to_string()
+}

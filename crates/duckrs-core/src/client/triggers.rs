@@ -14,6 +14,7 @@ use super::*;
 use crate::catalog::{
     DEFAULT_SCHEMA, TableCatalogEntry, TriggerCatalogEntry, TriggerEvent, TriggerForEach, TriggerTiming,
 };
+use crate::planner::statement_names::{body_statement, referenced_names};
 use crate::planner::trigger_scope::{self, RowScope, TransitionTable, TriggerScope};
 use duckrs_common::types::sql_identifier;
 use duckrs_parser::ast::{QueryNode, QueryNodeKind, TableRef, TableRefKind};
@@ -36,39 +37,6 @@ fn not_implemented(message: impl Into<String>) -> Error {
 
 fn binder_error(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::Binder, message)
-}
-
-/// The statement a trigger body is.
-fn body_statement(action: &QueryNode) -> Result<Statement> {
-    Ok(match &action.kind {
-        QueryNodeKind::Insert(insert) => {
-            let mut insert = insert.clone();
-            if !action.cte_map.0.is_empty() {
-                insert.cte_map = action.cte_map.clone();
-            }
-            Statement::Insert(insert)
-        }
-        QueryNodeKind::Update(update) => {
-            let mut update = update.clone();
-            if !action.cte_map.0.is_empty() {
-                update.cte_map = action.cte_map.clone();
-            }
-            Statement::Update(update)
-        }
-        QueryNodeKind::Delete(delete) => {
-            let mut delete = delete.clone();
-            if !action.cte_map.0.is_empty() {
-                delete.cte_map = action.cte_map.clone();
-            }
-            Statement::Delete(delete)
-        }
-        QueryNodeKind::Merge(merge) => Statement::Merge(merge.clone()),
-        _ => {
-            return Err(binder_error(
-                "Trigger body must be an INSERT, UPDATE, or DELETE statement",
-            ));
-        }
-    })
 }
 
 /// The table a body writes and the events it causes there: (qualification, name, events).
@@ -94,47 +62,6 @@ fn body_target(action: &QueryNode) -> Option<(Vec<String>, String, Vec<TriggerEv
         }),
         _ => None,
     }
-}
-
-/// The names of the tables and views a statement refers to: its target, its FROM and USING
-/// clauses, and those of its subqueries.
-fn referenced_names(statement: &mut Statement) -> Vec<duckrs_parser::ast::QualifiedName> {
-    use duckrs_parser::ast::{SelectNode, SelectStatement};
-    let mut names = Vec::new();
-    let mut add = |statement: &mut Statement| {
-        super::for_each_table_name(statement, &mut |name| names.push(name.clone()));
-    };
-    // a SELECT of a FROM clause and of expressions, for their names
-    let select_of = |from: TableRef, exprs: Vec<Expr>| {
-        let node = SelectNode {
-            select_list: if exprs.is_empty() { vec![Expr::star()] } else { exprs },
-            from_table: from,
-            ..Default::default()
-        };
-        Statement::Select(SelectStatement { node: node.into() })
-    };
-    add(statement);
-    match statement {
-        Statement::Update(update) => {
-            let mut exprs = update.set_info.expressions.clone();
-            exprs.extend(update.set_info.condition.iter().map(|c| (**c).clone()));
-            let from = update.from_table.clone().unwrap_or_else(TableRef::empty);
-            add(&mut select_of(from, exprs));
-        }
-        Statement::Delete(delete) => {
-            for using in delete.using.clone() {
-                add(&mut select_of(using, Vec::new()));
-            }
-            let exprs: Vec<Expr> = delete.condition.iter().map(|c| (**c).clone()).collect();
-            add(&mut select_of(TableRef::empty(), exprs));
-        }
-        Statement::Merge(merge) => {
-            add(&mut select_of((*merge.target).clone(), Vec::new()));
-            add(&mut select_of((*merge.source).clone(), Vec::new()));
-        }
-        _ => {}
-    }
-    names
 }
 
 /// The columns `columns` of `result`, named `names`.
@@ -198,27 +125,6 @@ fn table_schema(
             .filter_map(|schema| catalog.get_schema(schema))
             .find(|schema| schema.get_entry(name).is_some()),
     }
-}
-
-/// The tables and views a trigger body names, other than its transition tables and its own CTEs:
-/// what it depends on.
-pub(crate) fn body_dependencies(action: &QueryNode, referencing: &[&str]) -> Vec<String> {
-    let Ok(mut statement) = body_statement(action) else {
-        return Vec::new();
-    };
-    let cte_names: Vec<String> = action.cte_map.0.iter().map(|(n, _)| n.to_lowercase()).collect();
-    let mut dependencies: Vec<String> = Vec::new();
-    for name in referenced_names(&mut statement) {
-        let shadowed = name.qualification.is_empty()
-            && (referencing
-                .iter()
-                .any(|t| !t.is_empty() && t.eq_ignore_ascii_case(&name.name))
-                || cte_names.contains(&name.name.to_lowercase()));
-        if !shadowed && !dependencies.iter().any(|d| d.eq_ignore_ascii_case(&name.name)) {
-            dependencies.push(name.name.clone());
-        }
-    }
-    dependencies
 }
 
 impl ClientContext {

@@ -6,6 +6,7 @@
 //! `TextTreeRenderer` (in [`text_tree_renderer`]) or as JSON. A physical plan takes its details from the logical plan it came from, whose
 //! expressions still have their names.
 
+use crate::planner::expression::filter_text;
 use crate::execution::physical::PhysicalOperator;
 use crate::optimizer::join_order::PlanEstimate;
 use crate::planner::expression::{BoundAggregate, BoundExpr, BoundWindow};
@@ -249,26 +250,6 @@ fn with_field_names(filter: &BoundExpr, extracted: &dyn Fn(&crate::planner::expr
         }
     });
     copy
-}
-
-pub(crate) fn filter_text(filter: &BoundExpr) -> String {
-    let text = filter.to_string();
-    let Some(inner) = text.strip_prefix('(').and_then(|t| t.strip_suffix(')')) else {
-        return text;
-    };
-    // (a) OR (b) starts and ends with them too, but those are not one pair
-    let mut depth = 0i32;
-    for c in inner.chars() {
-        match c {
-            '(' => depth += 1,
-            ')' => depth -= 1,
-            _ => {}
-        }
-        if depth < 0 {
-            return text;
-        }
-    }
-    inner.to_string()
 }
 
 /// `BoundOrderByNode::ToString`.

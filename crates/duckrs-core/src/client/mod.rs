@@ -8,7 +8,7 @@ mod dml_cte;
 pub(crate) mod explain;
 mod text_tree_renderer;
 mod triggers;
-pub(crate) use triggers::body_dependencies as trigger_body_dependencies;
+
 mod export;
 mod logging;
 pub mod settings;
@@ -30,6 +30,7 @@ use crate::planner::binder::{
 };
 use crate::planner::binder::{SessionValues, ShowBehavior, enum_type_from, is_builtin_type};
 use crate::planner::column_binding_resolver::resolve_column_bindings;
+use crate::planner::statement_names::for_each_table_name;
 use crate::storage;
 use crate::storage::buffer_manager::BufferManager;
 use crate::storage::log_writer::WriteAheadLog;
@@ -978,95 +979,6 @@ fn macro_is_free(schema: &SchemaCatalogEntry, name: &str) -> Result<()> {
             ),
         )),
         None => Ok(()),
-    }
-}
-
-/// The names of the tables and other entries that a statement refers to directly, for routing it
-/// to the database they are in. Subqueries in expressions aren't looked at.
-fn for_each_table_name(statement: &mut Statement, f: &mut impl FnMut(&mut QualifiedName)) {
-    fn in_table(table: &mut duckrs_parser::ast::TableRef, f: &mut impl FnMut(&mut QualifiedName)) {
-        use duckrs_parser::ast::TableRefKind as K;
-        match &mut table.kind {
-            K::BaseTable { name, .. } => f(name),
-            K::Join(join) => {
-                in_table(&mut join.left, f);
-                in_table(&mut join.right, f);
-            }
-            K::Subquery(query) => in_query(&mut query.node, f),
-            // `pragma_table_info('db.t')`: the table is named by the text
-            K::TableFunction { function, .. } => {
-                if let ExprKind::Function(call) = &mut function.kind
-                    && call.name.qualification.is_empty()
-                    && matches!(
-                        call.name.name.to_lowercase().as_str(),
-                        "pragma_table_info" | "pragma_show"
-                    )
-                    && let [argument] = call.args.as_mut_slice()
-                    && let ExprKind::Constant(literal) = &mut argument.expr.kind
-                    && literal.kind == duckrs_parser::ast::LiteralKind::String
-                {
-                    let mut parts: Vec<String> = literal.text.split('.').map(str::to_string).collect();
-                    let mut name = QualifiedName {
-                        name: parts.pop().unwrap_or_default(),
-                        qualification: parts,
-                    };
-                    f(&mut name);
-                    let mut parts = name.qualification;
-                    parts.push(name.name);
-                    literal.text = parts.join(".");
-                }
-            }
-            _ => {}
-        }
-    }
-    fn in_query(node: &mut duckrs_parser::ast::QueryNode, f: &mut impl FnMut(&mut QualifiedName)) {
-        use duckrs_parser::ast::QueryNodeKind as K;
-        for (_, cte) in &mut node.cte_map.0 {
-            in_query(&mut cte.query, f);
-        }
-        match &mut node.kind {
-            K::Select(select) => in_table(&mut select.from_table, f),
-            K::SetOperation(set) => set.children.iter_mut().for_each(|child| in_query(child, f)),
-            _ => {}
-        }
-        duckrs_parser::transformer::visit_query_node_exprs_mut(node, &mut |e: &mut Expr| in_expression(e, f));
-    }
-    /// The subquery of `e`, whose parts go by anyway.
-    fn in_expression(e: &mut Expr, f: &mut impl FnMut(&mut QualifiedName)) {
-        if let ExprKind::Subquery { subquery, .. } = &mut e.kind {
-            in_query(&mut subquery.node, f);
-        }
-    }
-    use duckrs_parser::ast::InsertValues;
-    match statement {
-        Statement::Select(select) => in_query(&mut select.node, f),
-        Statement::Insert(insert) => {
-            f(&mut insert.table);
-            if let InsertValues::Select(query) = &mut insert.values {
-                in_query(&mut query.node, f);
-            }
-        }
-        Statement::Update(update) => in_table(&mut update.table, f),
-        Statement::Delete(delete) => in_table(&mut delete.table, f),
-        Statement::CreateTable(info) => {
-            f(&mut info.name);
-            if let Some(query) = &mut info.query {
-                in_query(&mut query.node, f);
-            }
-        }
-        // a trigger finds the database of its table itself, as it keeps the name as written
-        Statement::Create(info) if matches!(info.kind, CreateKind::Trigger { .. }) => {}
-        Statement::Create(info) => f(&mut info.name),
-        Statement::Drop(info) if info.trigger_table.is_some() => {}
-        Statement::Drop(info) => f(&mut info.name),
-        Statement::Alter(info) => f(&mut info.name),
-        Statement::Explain { statement, .. } => for_each_table_name(statement, f),
-        Statement::Vacuum { table: Some(table), .. } => in_table(table, f),
-        Statement::Copy(info) => match &mut info.select {
-            Some(query) => in_query(query, f),
-            None => f(&mut info.table),
-        },
-        _ => {}
     }
 }
 

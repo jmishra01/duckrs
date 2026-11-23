@@ -471,7 +471,7 @@ pub(super) fn convert_entry(info: g::CreateInfo) -> Result<Converted> {
             let mut written = table.qualification.clone();
             written.push(table.name.clone());
             let comment = comment.filter(|value| !value.is_null());
-            let dependencies = crate::client::trigger_body_dependencies(
+            let dependencies = crate::planner::statement_names::body_dependencies(
                 &action,
                 &[&stored.referencing_new_table, &stored.referencing_old_table],
             );

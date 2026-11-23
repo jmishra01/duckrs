@@ -746,7 +746,21 @@ pub type OpenDatabase = Arc<dyn Fn(&str) -> Result<(Arc<Catalog>, Arc<dyn std::a
 pub type SettingLookup = Box<dyn Fn(&str) -> Result<Value> + Send + Sync>;
 
 /// `duckdb_settings()`.
-pub type SettingList = Box<dyn Fn() -> Vec<crate::client::settings::SettingRow> + Send + Sync>;
+/// A row of `duckdb_settings()`.
+#[derive(Debug, Clone)]
+pub struct SettingRow {
+    pub name: &'static str,
+    pub value: Option<Value>,
+    pub description: &'static str,
+    pub input_type: &'static str,
+    /// `GLOBAL` or `LOCAL`
+    pub scope: &'static str,
+    pub aliases: &'static [&'static str],
+    pub is_debug: bool,
+    pub is_deprecated: bool,
+}
+
+pub type SettingList = Box<dyn Fn() -> Vec<SettingRow> + Send + Sync>;
 
 impl std::fmt::Debug for SessionValues {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
