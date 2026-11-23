@@ -218,9 +218,9 @@ Each item gives the number of failing files in `test/` that it should fix, where
     the field's path (`s.a = 3`), otherwise with the field's name as key (`struct_extract(s, 'a')`)
   - [ ] `struct_extract(i, 'A')` keeps the key as written; the segments of nested validity as C++ sizes them
     (`nested_null_segment_pruning`); bytes read of late materialization's prefetch (`test_rowid_vector_pruning_prefetch`)
-  - [ ] table filters are put into scans after the projection pullup (`push_into_table_scans`), so a filter that
-    can throw, which stays above a projection, goes into the scan once the projection is pulled up
-    (`tuple_cast_pushdown`, `pushdown_safe_decimal_cast`); C++ sets them in `PushdownGet` only
+  - [x] table filters go only into the scans the filter pushdown left filters on (C++ sets them in `PushdownGet`): a
+    filter that can throw, kept above a projection, stays above the scan once the projection is pulled up
+    (`tuple_cast_pushdown`, `pushdown_safe_decimal_cast`)
   - [ ] `RegexRangeFilter` (needs RE2's `PossibleMatchRange`); `invoke` of a lambda kept as a call
     (`or_range_merge`); a derived OR filter added again by each pushdown (`join_dependent_filter`)
   - [x] OR range merge, monotone preimage, filter reordering (`ExpressionHeuristics`), BETWEEN of a column as two comparisons

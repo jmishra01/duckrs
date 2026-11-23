@@ -3197,6 +3197,7 @@ test/sql/optimizer/plan/test_unused_column_after_join.test
 test/sql/optimizer/power_zonemap_pruning.test
 test/sql/optimizer/predicate_factoring.test
 test/sql/optimizer/prefix_zonemap_pruning.test
+test/sql/optimizer/pushdown/pushdown_safe_decimal_cast.test
 test/sql/optimizer/pushdown_extract_multiple_filters.test
 test/sql/optimizer/remove_unused_columns_nested_struct_cast.test
 test/sql/optimizer/rewrite_nan_null.test
@@ -3257,6 +3258,7 @@ test/sql/optimizer/topn_window_elimination_multiplicity.test
 test/sql/optimizer/topn_window_elimination_nullable_order.test
 test/sql/optimizer/topn_window_set_elimination.test
 test/sql/optimizer/try_struct_extract_cast.test
+test/sql/optimizer/tuple_cast_pushdown.test
 test/sql/optimizer/unsigned_divide_statistics.test
 test/sql/optimizer/upper_lower_zonemap_pruning.test
 test/sql/optimizer/variant_json_cast_pushdown.test

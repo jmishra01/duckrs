@@ -435,6 +435,10 @@ pub fn optimize_timed(
     if options.window_self_join {
         plan = run("window_self_join", plan, &mut window_self_join::optimize);
     }
+    // the scans the filter pushdown left filters on, which `PushdownGet` would have put into them: a filter that
+    // only reaches a scan later (a projection between them pulled up) stays above it
+    let filtered_scans = scan_filters::scans_with_filters(&plan);
+    let mut late_filtered_scans = std::collections::HashSet::new();
     if options.projection_pullup {
         plan = run("projection_pullup", plan, &mut projection_pullup::pull_up);
     }
@@ -474,7 +478,11 @@ pub fn optimize_timed(
     // `PushdownGet` has put the filters into the scans by the time statistics see them, as table filters that
     // statistics check while the copies of what went in partly stay above
     if options.filter_pushdown && options.statistics_propagation {
-        scan_filters::push_into_table_scans(&mut plan);
+        late_filtered_scans = scan_filters::scans_with_filters(&plan)
+            .difference(&filtered_scans)
+            .copied()
+            .collect();
+        scan_filters::push_into_table_scans(&mut plan, &filtered_scans);
     }
     let mut statistics_map = None;
     if options.statistics_propagation {
@@ -493,7 +501,7 @@ pub fn optimize_timed(
     });
     // a column only a scan's filter reads need not leave the scan
     if options.filter_pushdown {
-        scan_filters::push_into_scans(&mut plan);
+        scan_filters::push_into_scans(&mut plan, &late_filtered_scans);
     }
     if options.unused_columns {
         plan = run("unused_columns", plan, &mut |mut plan| {
