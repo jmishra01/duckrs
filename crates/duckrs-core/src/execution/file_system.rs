@@ -278,6 +278,27 @@ pub fn read_range(path: &str, start: u64, len: usize) -> Result<Vec<u8>> {
     Ok(data)
 }
 
+/// `GZIP_HEADER_MAXSIZE`: the largest member header the reader takes.
+const GZIP_HEADER_MAXSIZE: usize = 1 << 15;
+
+/// `GZipFile::ReadGZIPHeader`, state `EXTRA_LENGTH`: an extra field that makes a member's header
+/// larger than `GZIP_HEADER_MAXSIZE` is corruption, for the member that `data` starts with.
+fn check_gzip_extra_field(data: &[u8]) -> Result<()> {
+    const GZIP_HEADER_MINSIZE: usize = 10;
+    const GZIP_FLAG_EXTRA: u8 = 0x04;
+    let (Some(&flags), Some(length)) = (data.get(3), data.get(GZIP_HEADER_MINSIZE..GZIP_HEADER_MINSIZE + 2)) else {
+        return Ok(());
+    };
+    let extra = usize::from(u16::from_le_bytes([length[0], length[1]]));
+    if flags & GZIP_FLAG_EXTRA != 0 && GZIP_HEADER_MINSIZE + 2 + extra >= GZIP_HEADER_MAXSIZE {
+        return Err(Error::new(
+            ErrorKind::DataCorruption,
+            format!("Extra field resulting in GZIP header larger than defined maximum ({GZIP_HEADER_MAXSIZE})"),
+        ));
+    }
+    Ok(())
+}
+
 pub fn read_file(path: &str, compression: Compression) -> Result<Vec<u8>> {
     check_compression(path, compression)?;
     let expanded = expand_path(path);
@@ -292,9 +313,16 @@ pub fn read_file(path: &str, compression: Compression) -> Result<Vec<u8>> {
             if !data.starts_with(&[0x1f, 0x8b]) {
                 return Err(io_error(format!("Input is not a GZIP stream: {path}")));
             }
+            // member by member, as `GZipFile` reads them, so each member's header is checked
             let mut result = Vec::new();
-            std::io::Read::read_to_end(&mut flate2::read::MultiGzDecoder::new(data.as_slice()), &mut result)
-                .map_err(|e| io_error(format!("Failed to decompress GZIP file \"{path}\": {e}")))?;
+            let mut rest: &[u8] = &data;
+            while !rest.is_empty() {
+                check_gzip_extra_field(rest)?;
+                let mut member = flate2::bufread::GzDecoder::new(rest);
+                std::io::Read::read_to_end(&mut member, &mut result)
+                    .map_err(|e| io_error(format!("Failed to decompress GZIP file \"{path}\": {e}")))?;
+                rest = member.into_inner();
+            }
             Ok(result)
         }
         Compression::Zstd => zstd::stream::decode_all(data.as_slice())

@@ -135,6 +135,58 @@ pub(super) fn strings(value: &Value) -> Result<Vec<String>> {
     }
 }
 
+/// The named parameters of `read_csv` (`ReadCSVAddNamedParameters` and `MultiFileReader::AddParameters`),
+/// and the `force_match` of `sniff_csv`: an option outside them is not one of the function's.
+fn is_csv_named_parameter(function: &str, option: &str) -> bool {
+    const CSV: &[&str] = &[
+        "sep", "delim", "separator", "delimiter", "null", "date_format", "timestamp_format", "quote", "new_line",
+        "escape", "nullstr", "columns", "auto_type_candidates", "header", "auto_detect", "sample_size",
+        "all_varchar", "dateformat", "timestampformat", "normalize_names", "compression", "skip", "max_line_size",
+        "maximum_line_size", "ignore_errors", "store_rejects", "rejects_table", "rejects_scan", "rejects_limit",
+        "rejects_line_size_limit", "force_not_null", "buffer_size", "decimal_separator", "parallel",
+        "null_padding", "allow_quoted_nulls", "column_types", "dtypes", "types", "names", "column_names",
+        "comment", "encoding", "strict_mode", "thousands", "files_to_sniff",
+    ];
+    const MULTI_FILE: &[&str] = &[
+        "filename", "hive_partitioning", "union_by_name", "hive_types", "hive_types_autocast", "schema",
+        "file_row_number", "column_statistics", "allow_empty",
+    ];
+    CSV.contains(&option) || MULTI_FILE.contains(&option) || (function == "sniff_csv" && option == "force_match")
+}
+
+/// The `nullstr` of a COPY TO, as `CSVReaderOptions::SetBaseOption` takes it for a writer: a string, or a
+/// list of one (a COPY passes a list as a list of lists), with C++'s errors for an empty list, NULLs and
+/// more than one value.
+fn writer_null_str(value: &Value, option: &str) -> Result<String> {
+    let ValueData::List(items) = value.data() else {
+        return text(value);
+    };
+    let items = match items.as_slice() {
+        [inner] if matches!(inner.data(), ValueData::List(_)) => match inner.data() {
+            ValueData::List(inner) => inner.as_slice(),
+            _ => unreachable!(),
+        },
+        items => items,
+    };
+    if items.is_empty() {
+        return Err(binder_error(format!(
+            "CSV Reader function option \"{option}\" requires a non-empty list of possible null strings (varchar) \
+             as input"
+        )));
+    }
+    if items.iter().any(Value::is_null) {
+        return Err(binder_error(format!(
+            "CSV Reader function option \"{option}\" does not accept NULL values as a valid nullstr option"
+        )));
+    }
+    if items.len() > 1 {
+        return Err(binder_error(format!(
+            "CSV Writer function option \"{option}\" only accepts one nullstr value."
+        )));
+    }
+    text(&items[0])
+}
+
 /// A newline as C++'s `TransformNewLine` reads it.
 fn new_line(value: &str) -> Result<String> {
     match value.to_lowercase().as_str() {
@@ -374,12 +426,28 @@ impl Binder<'_> {
                 }
                 "nullstr" | "null" => {
                     let ty = value.logical_type().id();
-                    if !matches!(
-                        ty,
-                        LogicalTypeId::List | LogicalTypeId::Varchar | LogicalTypeId::SqlNull
-                    ) {
+                    if !matches!(ty, LogicalTypeId::List | LogicalTypeId::Varchar) {
                         return Err(binder_error(format!(
                             "CSV Reader function option \"{option}\" requires a string or a list as input"
+                        )));
+                    }
+                    if ty == LogicalTypeId::List
+                        && !matches!(
+                            value.logical_type().child_type().map(LogicalType::id),
+                            Some(LogicalTypeId::Varchar)
+                        )
+                    {
+                        return Err(binder_error(format!(
+                            "CSV Reader function option \"{option}\" requires a non-empty list of possible null \
+                             strings (varchar) as input"
+                        )));
+                    }
+                    if let ValueData::List(items) = value.data()
+                        && items.iter().any(Value::is_null)
+                    {
+                        return Err(binder_error(format!(
+                            "CSV Reader function option \"{option}\" does not accept NULL values as a valid nullstr \
+                             option"
                         )));
                     }
                     options.null_strs = strings(&value)?;
@@ -556,6 +624,13 @@ impl Binder<'_> {
                     if value.is_null() {
                         return Err(binder_error(format!("read_csv \"{option}\" cannot be NULL")));
                     }
+                    if let ValueData::List(items) = value.data()
+                        && items.iter().any(Value::is_null)
+                    {
+                        return Err(binder_error(format!(
+                            "read_csv \"{option}\" parameter cannot have a NULL value"
+                        )));
+                    }
                     let names = strings(&value)?;
                     let mut seen = std::collections::HashSet::new();
                     for name in &names {
@@ -654,6 +729,11 @@ impl Binder<'_> {
                         ));
                     }
                     result.rejects_limit = limit as usize;
+                }
+                _ if !is_csv_named_parameter(name, &option) => {
+                    return Err(binder_error(format!(
+                        "Invalid named parameter \"{option}\" for function {name}"
+                    )));
                 }
                 _ => return Err(crate::unported(format!("the {name} option {option}"))),
             }
@@ -1295,6 +1375,12 @@ impl Binder<'_> {
                 "sniff_csv function does not accept auto_detect variable set to false",
             ));
         }
+        if arguments.files.len() > 1 {
+            return Err(Error::new(
+                ErrorKind::NotImplemented,
+                "sniff_csv does not operate on more than one file yet",
+            ));
+        }
         let path = &arguments.files[0];
         let (mut sniffed, _) = Self::csv_sniff(&arguments, path)?;
         replace_null_with_varchar(&mut sniffed.types);
@@ -1686,6 +1772,20 @@ impl Binder<'_> {
         let mut arguments = vec![string_literal(path), format!("columns := {{{}}}", fields.join(", "))];
         let options = self.copy_options(info)?;
         Self::check_copy_options(&options, true)?;
+        // `CSVReaderOptions::SetReadOption`: FORCE_NOT_NULL names columns of the COPY (`ParseColumnList`),
+        // before the file is sniffed
+        if !self.copy_json
+            && let Some((_, value)) = options.iter().find(|(name, _)| name == "force_not_null")
+            && matches!(value.data(), ValueData::List(_) | ValueData::Struct(_))
+        {
+            for column in strings(value)? {
+                if !columns.iter().any(|c| c.eq_ignore_ascii_case(&column)) {
+                    return Err(binder_error(format!(
+                        "\"force_not_null\" expected to find {column}, but it was not found in the table"
+                    )));
+                }
+            }
+        }
         if !options.iter().any(|(name, _)| name == "auto_detect") {
             arguments.push("auto_detect := true".to_string());
         }
@@ -2080,7 +2180,7 @@ impl Binder<'_> {
                     options.header = is_true(&value, &name)?;
                     header_given = options.header;
                 }
-                "null" | "nullstr" => options.null_str = text(&value)?,
+                "null" | "nullstr" => options.null_str = writer_null_str(&value, &name)?,
                 "new_line" => options.new_line = new_line(&text(&value)?)?,
                 "prefix" => options.prefix = text(&value)?,
                 "suffix" => options.suffix = text(&value)?,
