@@ -380,6 +380,10 @@ fn cast_inner(value: &Value, target: &LogicalType, mode: CastMode) -> Result<Val
         let cast = cast_value(value, &target.struct_children()[member + 1].1, mode)?;
         return union_value(target, member, cast);
     }
+    // JSON is a VARCHAR with an alias: values become JSON through its cast, which checks them
+    if super::json::is_json_type(target) {
+        return cast_scalar(value, target, mode);
+    }
     if target.id() == L::Varchar {
         return Ok(Value::varchar(value.try_to_string()?));
     }

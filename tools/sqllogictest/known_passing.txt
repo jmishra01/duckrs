@@ -3055,6 +3055,7 @@ test/sql/json/table/read_json_ignore_errors_spanning.test
 test/sql/json/table/read_json_records_param_types.test
 test/sql/json/table/read_json_root_bignum.test
 test/sql/json/table/read_json_union.test
+test/sql/json/table/read_json_unnest_heterogeneous_struct.test
 test/sql/json/table/test_json_nested_struct_projection_pushdown.test
 test/sql/json/test_deserialize_at_clause.test
 test/sql/json/test_deserialize_function_validation.test
