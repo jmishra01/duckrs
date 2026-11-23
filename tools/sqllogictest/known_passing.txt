@@ -1633,11 +1633,13 @@ test/sql/copy/csv/csv_limit_copy.test
 test/sql/copy/csv/csv_multibyte_delimiter_escapes.test
 test/sql/copy/csv/csv_null_byte.test
 test/sql/copy/csv/csv_null_padding.test
+test/sql/copy/csv/csv_nullstr_list.test
 test/sql/copy/csv/csv_projection_pushdown.test
 test/sql/copy/csv/csv_quoted_buffer_boundary.test
 test/sql/copy/csv/csv_quoted_newline_after_boundary.test
 test/sql/copy/csv/csv_quoted_newline_incorrect.test
 test/sql/copy/csv/csv_roundtrip_single_null.test
+test/sql/copy/csv/duck_fuzz/test_internal_4048.test
 test/sql/copy/csv/empty_first_line.test
 test/sql/copy/csv/empty_string_quote.test
 test/sql/copy/csv/except.test
@@ -1774,6 +1776,7 @@ test/sql/copy/csv/test_segfault.test
 test/sql/copy/csv/test_skip_bom.test
 test/sql/copy/csv/test_skip_header.test
 test/sql/copy/csv/test_sniff_csv.test
+test/sql/copy/csv/test_sniff_csv_options.test
 test/sql/copy/csv/test_sniffer_hang.test
 test/sql/copy/csv/test_sniffer_tab_delimiter.test
 test/sql/copy/csv/test_soccer_kaggle.test
