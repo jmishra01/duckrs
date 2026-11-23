@@ -56,7 +56,8 @@ pub struct SettingDefinition {
 const UNHONORED: &[&str] = &[
     "access_mode",
     "active_grammar_extensions",
-    "allow_parser_override_extension",
+    // `allow_parser_override_extension` is honored: it picks between parser extensions that override
+    // the parser (`Parser::ParseQuery`), and duckrs has none, so every value parses alike
     "dialect_compatibility_mode",
     "disable_timestamptz_casts",
     "errors_as_json",

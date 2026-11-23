@@ -583,6 +583,25 @@ pub fn expand_foreach(tokens: &[String]) -> Vec<String> {
 }
 
 /// Executes one parsed file.
+/// `SQLLogicTestRunner::ConnectToDatabase`: every connection keeps its persistent secrets in the
+/// test's own directory, not in the user's.
+struct TestDatabase {
+    inner: Box<dyn Database>,
+    secret_directory: String,
+}
+
+impl Database for TestDatabase {
+    fn connect(&self) -> Result<Box<dyn Connection>, String> {
+        let mut con = self.inner.connect()?;
+        // as in C++, a connection made once the secret manager is in use cannot change it
+        let _ = con.query(&format!(
+            "SET secret_directory='{}'",
+            self.secret_directory.replace('\'', "''")
+        ));
+        Ok(con)
+    }
+}
+
 struct FileRunner<'a> {
     config: &'a RunConfig,
     engine: &'a dyn Engine,
@@ -613,6 +632,10 @@ impl<'a> FileRunner<'a> {
         let db =
             self.engine
                 .open_with_version(self.db_path.as_deref(), self.read_only, self.storage_version.as_deref())?;
+        let db: Box<dyn Database> = Box::new(TestDatabase {
+            inner: db,
+            secret_directory: self.shared.test_dir.join("test_secret_dir").to_string_lossy().into_owned(),
+        });
         self.con = Some(db.connect()?);
         self.db = Some(db);
         Ok(())

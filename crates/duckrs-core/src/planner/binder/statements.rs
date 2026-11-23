@@ -3018,6 +3018,14 @@ impl Binder<'_> {
         if name == "duckdb_settings" {
             return self.bind_duckdb_settings(call, table_ref).map(|op| table_function_rows(op, &name));
         }
+        if matches!(
+            name.as_str(),
+            "duckdb_secrets" | "duckdb_secret_types" | "duckdb_secret_type_parameters" | "which_secret"
+        ) {
+            return self
+                .bind_secret_function(&name, call, table_ref)
+                .map(|op| table_function_rows(op, &name));
+        }
         if name == "duckdb_logs" || name == "duckdb_log_contexts" {
             return self.bind_duckdb_logs(&name, call, table_ref).map(|op| table_function_rows(op, &name));
         }
