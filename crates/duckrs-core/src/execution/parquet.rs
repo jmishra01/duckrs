@@ -1131,7 +1131,7 @@ fn row_groups_to_scan(
             let zone = |at: usize| -> Option<crate::catalog::ColumnZone> {
                 if let Some((leaf, element)) = element_leaves.get(at).and_then(Option::as_ref) {
                     // `TransformColumnStatistics` of a LIST or MAP: unknown validity, the elements' statistics
-                    let elements = group_zone(scan, metadata, group, *leaf, element)?;
+                    let elements = group_zone(metadata, group, *leaf, element)?;
                     return (!elements.unknown).then(|| crate::catalog::ColumnZone {
                         has_null: true,
                         elements: Some(Box::new(elements)),
@@ -1139,7 +1139,7 @@ fn row_groups_to_scan(
                     });
                 }
                 if let Some(leaf) = leaves.get(at) {
-                    let zone = group_zone(scan, metadata, group, (*leaf)?, &scan.types[at])?;
+                    let zone = group_zone(metadata, group, (*leaf)?, &scan.types[at])?;
                     return (!zone.unknown).then_some(zone);
                 }
                 let value = scan.known_value(at, path)?;
@@ -1292,7 +1292,7 @@ fn open_file(
     filter: Option<&crate::planner::expression::BoundExpr>,
     state: &mut ParquetScanState,
     path: &str,
-) -> Result<()> {
+) -> Result<u64> {
     let typed = open_builder(path)?;
     let strip = scan.utf8_validation.repairs() || has_interval(typed.parquet_schema().root_schema());
     let builder = if strip {
@@ -1353,6 +1353,7 @@ fn open_file(
         transforms.push(None);
     }
     // only the columns the query reads are decoded; a batch holds them in the order of the file
+    let mut read_roots: Option<Vec<usize>> = None;
     let builder = match &scan.read {
         Some(read) => {
             let mut roots: Vec<usize> = mapping
@@ -1373,12 +1374,28 @@ fn open_file(
                     _ => None,
                 };
             }
+            read_roots = Some(roots.clone());
             let mask = parquet::arrow::ProjectionMask::roots(builder.parquet_schema(), roots);
             builder.with_projection(mask)
         }
         None => builder,
     };
-    let builder = match row_groups_to_scan(scan, filter, builder.metadata(), path) {
+    let selected = row_groups_to_scan(scan, filter, builder.metadata(), path);
+    // `operator.bytes_scanned`: the column chunks of the row groups read, as they are in the file
+    let metadata = Arc::clone(builder.metadata());
+    let descr = metadata.file_metadata().schema_descr();
+    let groups: Vec<usize> = selected.clone().unwrap_or_else(|| (0..metadata.num_row_groups()).collect());
+    let bytes = groups
+        .iter()
+        .map(|&group| {
+            let group = metadata.row_group(group);
+            (0..group.num_columns())
+                .filter(|&column| read_roots.as_ref().is_none_or(|roots| roots.contains(&descr.get_column_root_idx(column))))
+                .map(|column| group.column(column).compressed_size().max(0) as u64)
+                .sum::<u64>()
+        })
+        .sum();
+    let builder = match selected {
         Some(selected) => builder.with_row_groups(selected),
         None => builder,
     };
@@ -1389,7 +1406,7 @@ fn open_file(
     state.file_types = file_types;
     state.transforms = transforms;
     state.row = 0;
-    Ok(())
+    Ok(bytes)
 }
 
 /// A value cast to `ty`, as a cast of its column would.
@@ -1586,6 +1603,15 @@ impl PhysicalOperator for PhysicalParquetScan {
     fn source_state(&self) -> SourceState {
         Box::new(ParquetScanState::default())
     }
+    fn dynamic_filters(&self) -> Option<String> {
+        crate::execution::physical::dynamic_filters_of(self.filter.as_ref())
+    }
+    fn planned_filters(&self) -> Vec<String> {
+        crate::execution::physical::top_n_filters_of(self.filter.as_ref())
+    }
+    fn reports_bytes_scanned(&self) -> bool {
+        true
+    }
     fn row_groups_scanned(&self) -> Option<(usize, usize)> {
         self.prune.as_ref()?;
         let (mut scanned, mut total) = (0, 0);
@@ -1605,7 +1631,10 @@ impl PhysicalOperator for PhysicalParquetScan {
                 return Ok(None);
             };
             if state.reader.is_none() {
-                open_file(&self.scan, self.prune.as_ref(), state, path)?;
+                let bytes = open_file(&self.scan, self.prune.as_ref(), state, path)?;
+                if let Some(profiler) = crate::execution::profiler::current() {
+                    profiler.add_bytes_scanned(self, bytes);
+                }
             }
             let reader = state.reader.as_mut().expect("just opened");
             match guarded(path, || Ok(reader.next()))? {
@@ -2617,7 +2646,7 @@ pub fn partition_statistics(scan: &ParquetScanData) -> Option<Vec<(u64, Vec<Opti
             let zones = leaves
                 .iter()
                 .enumerate()
-                .map(|(at, leaf)| group_zone(scan, &metadata, group, (*leaf)?, &scan.types[at]).filter(|z| !z.unknown))
+                .map(|(at, leaf)| group_zone(&metadata, group, (*leaf)?, &scan.types[at]).filter(|z| !z.unknown))
                 .collect();
             let exact = leaves.iter().all(|leaf| {
                 leaf.and_then(|leaf| group.column(leaf).statistics())
@@ -2723,7 +2752,7 @@ pub fn scan_statistics(scan: &ParquetScanData) -> Vec<Option<crate::catalog::Col
             let string_column = matches!(scan.types[column].id(), LogicalTypeId::Varchar | LogicalTypeId::Blob);
             let mut strings: Option<crate::catalog::StringStatistics> = None;
             for group in metadata.row_groups() {
-                let Some(zone) = group_zone(scan, &metadata, group, leaf, &scan.types[column]) else {
+                let Some(zone) = group_zone(&metadata, group, leaf, &scan.types[column]) else {
                     usable = false;
                     break;
                 };
@@ -3003,7 +3032,6 @@ fn stored_type(scan: &ParquetScanData, path: &str, name: &str) -> Option<Logical
 /// What the statistics of row group `group` say of the scan's column `column`, stored in `leaf`: `None` where
 /// there are none, `unknown` where they have no bounds DuckDB can use.
 fn group_zone(
-    scan: &ParquetScanData,
     metadata: &ParquetMetaData,
     group: &parquet::file::metadata::RowGroupMetaData,
     leaf: usize,

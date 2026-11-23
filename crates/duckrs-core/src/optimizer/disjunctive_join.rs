@@ -507,6 +507,7 @@ fn join_condition(
     right: &HashMap<ColumnBinding, ColumnBinding>,
 ) -> JoinCondition {
     JoinCondition {
+        bound: None,
         left: replace(branch.left.clone(), left),
         right: replace(branch.right.clone(), right),
         comparison: branch.comparison,

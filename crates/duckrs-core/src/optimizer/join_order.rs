@@ -1116,6 +1116,7 @@ impl Tree {
                 {
                     let (a, b) = if subset(first, left_set) { (a, b) } else { (b, a) };
                     conditions.push(JoinCondition {
+                        bound: None,
                         left: *a,
                         right: *b,
                         comparison: op,
@@ -1445,6 +1446,12 @@ impl JoinOrderOptimizer {
                         apply_direct_filter_domain(column, expr, *binding);
                     }
                 }
+                stats
+            }
+            K::SecureView { estimate: Some(rows), .. } => {
+                let child = self.stats(&op.children[0]);
+                let mut stats = child.project(&op.column_bindings());
+                stats.apply_cardinality(*rows as f64);
                 stats
             }
             K::ColumnSelect { .. } | K::Order { .. } | K::SecureView { .. } => {

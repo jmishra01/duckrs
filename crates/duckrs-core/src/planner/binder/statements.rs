@@ -772,6 +772,7 @@ impl Binder<'_> {
         let mut conditions = Vec::with_capacity(compared.len());
         for (i, ty) in compared.iter().enumerate() {
             conditions.push(crate::planner::logical::JoinCondition {
+                bound: None,
                 left: collate(BoundExpr::column_ref(left_bindings[i], ty.clone(), ""), ty)?,
                 right: collate(BoundExpr::column_ref(right_bindings[i], ty.clone(), ""), ty)?,
                 comparison: duckrs_parser::ast::ComparisonOp::NotDistinctFrom,
@@ -1046,7 +1047,8 @@ impl Binder<'_> {
                 name,
             ))
         };
-        // DISTINCT ON keeps the first row of each group as ORDER BY sees them
+        // DISTINCT ON comes before the ORDER BY, which it takes over to keep the first row of each group as the ORDER
+        // BY sees them (`LogicalDistinct::order_by`)
         let mut prepared = prepared;
         if let Some(distinct) = prepared
             .iter()
@@ -1054,10 +1056,11 @@ impl Binder<'_> {
             && let Some(order) = prepared
                 .iter()
                 .position(|m| matches!(m, PreparedModifier::Order(_) | PreparedModifier::OrderAll(_)))
-            && order > distinct
+            && order < distinct
         {
             prepared.swap(distinct, order);
         }
+        let mut kinds = Vec::with_capacity(prepared.len());
         // ORDER BY and DISTINCT see the values as their collation does
         let default_collation = self.default_collation();
         let collated_column = |i: usize| -> Result<BoundExpr> {
@@ -1071,10 +1074,12 @@ impl Binder<'_> {
                 PreparedModifier::Distinct => LogicalOperatorKind::Distinct {
                     targets: (0..column_count).map(collated_column).collect::<Result<_>>()?,
                     on: false,
+                    orders: Vec::new(),
                 },
                 PreparedModifier::DistinctOn(indexes) => LogicalOperatorKind::Distinct {
                     targets: indexes.into_iter().map(collated_column).collect::<Result<_>>()?,
                     on: true,
+                    orders: Vec::new(),
                 },
                 PreparedModifier::LimitPercent { percent, offset } => {
                     LogicalOperatorKind::LimitPercent { percent, offset }
@@ -1117,6 +1122,21 @@ impl Binder<'_> {
                     LogicalOperatorKind::Limit { limit, offset, failure }
                 }
             };
+            kinds.push(kind);
+        }
+        if let Some(distinct) = kinds
+            .iter()
+            .position(|k| matches!(k, LogicalOperatorKind::Distinct { on: true, .. }))
+            && let Some(LogicalOperatorKind::Order { orders }) = kinds[distinct + 1..]
+                .iter()
+                .find(|k| matches!(k, LogicalOperatorKind::Order { .. }))
+        {
+            let orders = orders.clone();
+            if let LogicalOperatorKind::Distinct { orders: taken, .. } = &mut kinds[distinct] {
+                *taken = orders;
+            }
+        }
+        for kind in kinds {
             let children = if matches!(kind, LogicalOperatorKind::EmptyResult { .. }) {
                 vec![]
             } else {
@@ -2644,7 +2664,7 @@ impl Binder<'_> {
                     && Self::is_system_table(&name.name)
                     && crate::catalog::defaults::default_view(None, &name.name).is_none()
                 {
-                    return self.bind_system_table(table_ref, &name.name);
+                    return self.bind_system_table(table_ref, &name.name).map(|op| table_function_rows(op, &name.name));
                 }
                 // `BindBaseTableRef`: a file that is there, but that no reader is for
                 if entry.is_err()
@@ -2661,7 +2681,7 @@ impl Binder<'_> {
                 }
                 // the `duckdb_logs` view of `default_views.cpp`
                 if entry.is_err() && name.qualification.is_empty() && name.name.eq_ignore_ascii_case("duckdb_logs") {
-                    return self.bind_log_table("duckdb_logs", true, table_ref);
+                    return self.bind_log_table("duckdb_logs", true, table_ref).map(|op| table_function_rows(op, "duckdb_logs"));
                 }
                 // the other views of the system catalog (`DefaultViewGenerator`), by their query
                 if entry.is_err() {
@@ -2748,6 +2768,7 @@ impl Binder<'_> {
                 });
                 Ok(LogicalOperator::new(
                     LogicalOperatorKind::ExpressionGet {
+                        function: None,
                         table_index,
                         types,
                         expressions,
@@ -2895,14 +2916,16 @@ impl Binder<'_> {
                         name: parts.pop().unwrap_or_default(),
                         qualification: parts,
                     };
-                    return self.bind_pragma_table_info(table_ref, &call.name.name, &table);
+                    return self
+                        .bind_pragma_table_info(table_ref, &call.name.name, &table)
+                        .map(|op| table_function_rows(op, &call.name.name));
                 }
                 if let ExprKind::Function(call) = &function.kind
                     && call.name.qualification.is_empty()
                     && call.args.is_empty()
                     && Self::is_system_table(&call.name.name)
                 {
-                    return self.bind_system_table(table_ref, &call.name.name);
+                    return self.bind_system_table(table_ref, &call.name.name).map(|op| table_function_rows(op, &call.name.name));
                 }
                 self.bind_range(function, table_ref)
             }
@@ -2967,6 +2990,9 @@ impl Binder<'_> {
             bound.plan = LogicalOperator::new(
                 LogicalOperatorKind::SecureView {
                     view_name: view.name.clone(),
+                    pushed_filters: Vec::new(),
+                    propagate_statistics: false,
+                    estimate: None,
                 },
                 vec![plan],
             );
@@ -2989,13 +3015,44 @@ impl Binder<'_> {
         };
         let name = call.name.name.to_lowercase();
         if name == "duckdb_settings" {
-            return self.bind_duckdb_settings(call, table_ref);
+            return self.bind_duckdb_settings(call, table_ref).map(|op| table_function_rows(op, &name));
         }
         if name == "duckdb_logs" || name == "duckdb_log_contexts" {
-            return self.bind_duckdb_logs(&name, call, table_ref);
+            return self.bind_duckdb_logs(&name, call, table_ref).map(|op| table_function_rows(op, &name));
         }
         if name == "pragma_storage_info" {
-            return self.bind_storage_info(call, table_ref);
+            return self.bind_storage_info(call, table_ref).map(|op| table_function_rows(op, &name));
+        }
+        // `DuckDBMemoryFunction`: a row per `MemoryTag`. duckrs does not account memory by tag (as
+        // `pragma_database_size` reports no memory usage), so every tag shows no bytes.
+        if name == "duckdb_memory" && call.args.is_empty() && call.name.qualification.iter().all(String::is_empty) {
+            const MEMORY_TAGS: [&str; 16] = [
+                "BASE_TABLE",
+                "HASH_TABLE",
+                "PARQUET_READER",
+                "CSV_READER",
+                "ORDER_BY",
+                "ART_INDEX",
+                "COLUMN_DATA",
+                "METADATA",
+                "OVERFLOW_STRINGS",
+                "IN_MEMORY_TABLE",
+                "ALLOCATOR",
+                "EXTENSION",
+                "TRANSACTION",
+                "EXTERNAL_FILE_CACHE",
+                "WINDOW",
+                "OBJECT_CACHE",
+            ];
+            let rows = MEMORY_TAGS
+                .iter()
+                .map(|tag| vec![Value::varchar(*tag), Value::bigint(0), Value::bigint(0)])
+                .collect();
+            let names = ["tag", "memory_usage_bytes", "temporary_storage_bytes"].map(str::to_string).to_vec();
+            let types = vec![LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT];
+            return self
+                .bind_rows(table_ref, &name, names, types, rows)
+                .map(|op| table_function_rows(op, &name));
         }
         let generate_series = name == "generate_series";
         if !(generate_series || name == "range") || !call.name.qualification.is_empty() {
@@ -3620,6 +3677,7 @@ impl Binder<'_> {
                             table_index,
                             types,
                             expressions,
+                            function: None,
                         },
                         vec![],
                     )
@@ -4197,6 +4255,14 @@ const CPP_TABLE_FUNCTIONS: &[&str] = &[
     "unnest",
     "which_secret",
 ];
+
+/// Rows a table function computed while binding: EXPLAIN shows them as a scan of `name`.
+fn table_function_rows(mut op: LogicalOperator, name: &str) -> LogicalOperator {
+    if let LogicalOperatorKind::ExpressionGet { function, .. } = &mut op.kind {
+        *function = Some(name.to_lowercase());
+    }
+    op
+}
 
 impl Binder<'_> {
     /// `VerifyCompressionType`: the method `USING COMPRESSION` names for a column of a new table, if one, which the

@@ -699,6 +699,8 @@ pub struct SessionValues {
     pub settings: SettingList,
     /// `CatalogSearchPath::GetSetPaths`: the schemas of the search path that was set
     pub search_path: Vec<String>,
+    /// `CatalogSearchPath::GetSetPaths` as (catalog, schema), the catalog empty where it is not given
+    pub search_entries: Vec<(String, String)>,
     /// `current_query()`
     pub current_query: String,
     /// `read_duckdb`: a database file opened read-only for the statement (`AttachDatabase`, hidden)

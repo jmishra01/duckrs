@@ -163,6 +163,7 @@ fn create_condition(expr: &BoundExpr, left: &HashSet<usize>, right: &HashSet<usi
         ((**b).clone(), (**a).clone(), flip(*op))
     };
     Some(JoinCondition {
+        bound: None,
         left: l,
         right: r,
         comparison: op,

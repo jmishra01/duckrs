@@ -20,6 +20,8 @@ pub struct OperatorMetrics {
     pub rows_scanned: u64,
     /// `DataChunk::GetDataSize` of what it gave on
     pub size_bytes: u64,
+    /// the bytes of its files a scan read (`operator.bytes_scanned`)
+    pub bytes_scanned: u64,
 }
 
 /// `Vector::GetDataSize`, near enough: the width of each row's slot (16 for strings, the
@@ -92,7 +94,7 @@ pub fn time_metric<T>(name: &'static str, body: impl FnOnce() -> T) -> T {
     result
 }
 
-fn key(op: &dyn PhysicalOperator) -> usize {
+pub(crate) fn key(op: &dyn PhysicalOperator) -> usize {
     std::ptr::from_ref(op).cast::<()>() as usize
 }
 
@@ -115,6 +117,18 @@ impl OperatorProfiler {
         if scanned {
             metrics.rows_scanned += rows;
         }
+    }
+
+    /// The rows a scan that counts them read, in place of those it gave on (`TableScanState::rows_scanned`).
+    pub fn set_rows_scanned(&self, op: &dyn PhysicalOperator) {
+        if let Some(rows) = op.rows_read().filter(|_| is_scan(op)) {
+            self.operators.lock().entry(key(op)).or_default().rows_scanned = rows;
+        }
+    }
+
+    /// A scan read `bytes` of its files (`OperatorProfiler::AddBytesScanned`).
+    pub fn add_bytes_scanned(&self, op: &dyn PhysicalOperator, bytes: u64) {
+        self.operators.lock().entry(key(op)).or_default().bytes_scanned += bytes;
     }
 
     /// `op` took `time`, without giving on rows (a sink taking its input).
@@ -251,6 +265,8 @@ pub struct ProfileNode {
     pub metrics: OperatorMetrics,
     /// of a table scan: the row groups it scanned, of those it could have
     pub row_groups: (u64, u64),
+    /// of a scan that counts the bytes it reads, those it read (`bytes_scanned_reported`)
+    pub bytes_scanned: Option<u64>,
     pub children: Vec<ProfileNode>,
 }
 
@@ -258,24 +274,60 @@ impl ProfileNode {
     /// The tree of `op`, with what the profiler saw of each operator. With `select_coverage`, the
     /// operators C++ doesn't profile then are left out, their children taking their place.
     pub fn of(op: &dyn PhysicalOperator, profiler: &OperatorProfiler, select_coverage: bool) -> Vec<ProfileNode> {
+        Self::of_with(op, profiler, select_coverage, None)
+    }
+
+    /// [`ProfileNode::of`], with the details EXPLAIN shows of each operator, by its address, as its `extra_info`.
+    pub fn of_with(
+        op: &dyn PhysicalOperator,
+        profiler: &OperatorProfiler,
+        select_coverage: bool,
+        infos: Option<&std::collections::HashMap<usize, Vec<(String, String)>>>,
+    ) -> Vec<ProfileNode> {
+        let details = |op: &dyn PhysicalOperator| -> Vec<(String, String)> {
+            if let Some(info) = infos.and_then(|infos| infos.get(&key(op))) {
+                return info.iter().filter(|(_, value)| !value.is_empty()).cloned().collect();
+            }
+            op.explain_details()
+                .into_iter()
+                .enumerate()
+                .map(|(i, detail)| match detail.split_once(": ") {
+                    Some((key, value)) => (key.to_string(), value.to_string()),
+                    None => (format!("{i}"), detail),
+                })
+                .collect()
+        };
+        // `CollapseSecureViews`: of a secure view only the boundary is left, with the time of all that is inside it;
+        // the other metrics of what is inside describe the view's contents and are dropped
+        if op.name() == "SECURE_VIEW" {
+            fn subtree_time(op: &dyn PhysicalOperator, profiler: &OperatorProfiler) -> Duration {
+                op.children()
+                    .iter()
+                    .map(|child| profiler.metrics(child.as_ref()).time + subtree_time(child.as_ref(), profiler))
+                    .sum()
+            }
+            let mut metrics = profiler.metrics(op);
+            metrics.time += subtree_time(op, profiler);
+            return vec![ProfileNode {
+                op_type: operator_type(op).to_string(),
+                name: operator_name(op).to_string(),
+                extra_info: details(op),
+                metrics,
+                row_groups: (0, 0),
+                bytes_scanned: None,
+                children: Vec::new(),
+            }];
+        }
         let children: Vec<ProfileNode> = op
             .children()
             .iter()
-            .flat_map(|child| Self::of(child.as_ref(), profiler, select_coverage))
+            .flat_map(|child| Self::of_with(child.as_ref(), profiler, select_coverage, infos))
             .collect();
         let op_type = operator_type(op);
         if op.name() == "COLUMN_SELECT" || (select_coverage && !select_operator(op_type)) {
             return children;
         }
-        let extra_info = op
-            .explain_details()
-            .into_iter()
-            .enumerate()
-            .map(|(i, detail)| match detail.split_once(": ") {
-                Some((key, value)) => (key.to_string(), value.to_string()),
-                None => (format!("{i}"), detail),
-            })
-            .collect();
+        let extra_info = details(op);
         vec![ProfileNode {
             op_type: op_type.to_string(),
             name: operator_name(op).to_string(),
@@ -284,8 +336,22 @@ impl ProfileNode {
             row_groups: op
                 .row_groups_scanned()
                 .map_or((0, 0), |(scanned, total)| (scanned as u64, total as u64)),
+            bytes_scanned: op.reports_bytes_scanned().then(|| profiler.metrics(op).bytes_scanned),
             children,
         }]
+    }
+
+    /// `query.total_bytes_scanned`: the bytes the scans of the tree read, unless one of them doesn't count them
+    /// (`HasScanWithoutBytesScanned`).
+    pub fn total_bytes_scanned(&self) -> Option<u64> {
+        if self.op_type == "TABLE_SCAN" && self.bytes_scanned.is_none() {
+            return None;
+        }
+        let mut total = self.bytes_scanned.unwrap_or(0);
+        for child in &self.children {
+            total += child.total_bytes_scanned()?;
+        }
+        Some(total)
     }
 
     /// `MergeOperatorMeasurements`: the sums over the tree.
@@ -467,6 +533,9 @@ fn operator_json(node: &ProfileNode, tracked: &TrackedMetrics, legacy: bool) -> 
         ));
         metrics.push(("row_groups_scanned", Metric::UBigInt(node.row_groups.0), ""));
         metrics.push(("total_row_groups_to_scan", Metric::UBigInt(node.row_groups.1), ""));
+        if let Some(bytes) = node.bytes_scanned {
+            metrics.push(("bytes_scanned", Metric::UBigInt(bytes), ""));
+        }
     }
     metrics.push(("extra_info", Metric::Map(node.extra_info.clone()), "extra_info"));
     for (name, value, legacy_name) in metrics {
@@ -512,6 +581,12 @@ fn operator_json(node: &ProfileNode, tracked: &TrackedMetrics, legacy: bool) -> 
             JsonEntry::Value(format!("[{}]", children.join(", "))),
         ));
     }
+    // `QueryProfileResultToJSON`: the keys in order, the values before what nests
+    let nested = |(key, entry): &(String, JsonEntry)| match entry {
+        JsonEntry::Object(_) => true,
+        JsonEntry::Value(text) => key == "children" || text.starts_with('{') || text.starts_with('['),
+    };
+    object.entries.sort_by(|a, b| nested(a).cmp(&nested(b)).then_with(|| a.0.cmp(&b.0)));
     object
 }
 

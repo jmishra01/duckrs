@@ -1854,7 +1854,13 @@ impl Binder<'_> {
                 if builtin_qualification(&function.name.qualification)
                     && BuiltinFunctions::get().aggregate(&function.name.name).is_some() =>
             {
-                self.bind_aggregate(function)?
+                // `BindAggregate`: the column of the aggregate has the name of its alias
+                let bound = self.bind_aggregate(function)?;
+                if expr.alias.is_empty() {
+                    bound
+                } else {
+                    bound.with_alias(expr.alias.clone())
+                }
             }
             ExprKind::Function(function) => {
                 if !builtin_qualification(&function.name.qualification) {
@@ -2636,6 +2642,7 @@ pub(super) fn is_system_function(name: &str) -> bool {
                 | "current_database"
                 | "current_schema"
                 | "current_schemas"
+                | "in_search_path"
                 | "current_query"
                 | "txid_current"
                 | "current_transaction_id"
@@ -2980,6 +2987,66 @@ impl Binder<'_> {
         Ok(BoundExpr::column_ref(ColumnBinding::new(group_index, group), ty, name))
     }
 
+    /// `InSearchPathFun`: the paths of `CatalogSearchPath::SetPathsInternal`, read when the query runs.
+    fn bind_in_search_path(&mut self, function: &FunctionExpr) -> Result<BoundExpr> {
+        let mut children = Vec::with_capacity(2);
+        for argument in &function.args {
+            children.push(self.bind_expression(&argument.expr)?.cast_to(&LogicalType::VARCHAR, false));
+        }
+        let (default_database, set_paths) = match &self.session {
+            Some(session) => (session.database.clone(), session.search_entries.clone()),
+            None => (self.catalog.name.clone(), Vec::new()),
+        };
+        let set_paths = if set_paths.is_empty() {
+            vec![(String::new(), crate::catalog::DEFAULT_SCHEMA.to_string())]
+        } else {
+            set_paths
+        };
+        let paths: Vec<(String, String)> = std::iter::once(("temp".to_string(), "main".to_string()))
+            .chain(set_paths)
+            .chain([
+                (String::new(), "main".to_string()),
+                ("system".to_string(), "main".to_string()),
+                ("system".to_string(), "pg_catalog".to_string()),
+            ])
+            .collect();
+        // `CatalogSearchPath::SchemaInSearchPath`
+        let in_path = move |database: &str, schema: &str| {
+            paths.iter().any(|(catalog, path_schema)| {
+                path_schema.eq_ignore_ascii_case(schema)
+                    && (catalog.eq_ignore_ascii_case(database)
+                        || (catalog.is_empty() && default_database.eq_ignore_ascii_case(database)))
+            })
+        };
+        let bound: crate::function::BoundCallback = std::sync::Arc::new(move |args, result| {
+            for row in 0..args.len() {
+                let (database, schema) = (args.column(0).get_value(row), args.column(1).get_value(row));
+                let value = if database.is_null() || schema.is_null() {
+                    Value::null(LogicalType::BOOLEAN)
+                } else {
+                    Value::boolean(in_path(&database.try_to_string()?, &schema.try_to_string()?))
+                };
+                result.set_value(row, &value)?;
+            }
+            Ok(())
+        });
+        let mut scalar = crate::function::ScalarFunction::new(
+            "in_search_path",
+            vec![LogicalType::VARCHAR, LogicalType::VARCHAR],
+            LogicalType::BOOLEAN,
+            |_, _| Err(crate::unported("in_search_path without its search path")),
+        );
+        scalar.bound = Some(bound);
+        Ok(BoundExpr::new(
+            BoundExprKind::Function {
+                function: std::sync::Arc::new(scalar),
+                children,
+                is_operator: false,
+            },
+            LogicalType::BOOLEAN,
+        ))
+    }
+
     /// The functions that are constants of the session.
     fn bind_session_function(&mut self, function: &FunctionExpr) -> Result<Option<BoundExpr>> {
         let name = function.name.name.to_lowercase();
@@ -3010,6 +3077,13 @@ impl Binder<'_> {
                 "v{}",
                 env!("CARGO_PKG_VERSION")
             )))));
+        }
+        // `InSearchPathFunction`: whether the schema of the database is on the search path
+        if name == "in_search_path"
+            && function.args.len() == 2
+            && function.name.qualification.iter().all(String::is_empty)
+        {
+            return self.bind_in_search_path(function).map(Some);
         }
         if name == "current_query"
             && function.args.is_empty()

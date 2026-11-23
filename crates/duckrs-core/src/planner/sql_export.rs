@@ -912,7 +912,9 @@ impl Exporter<'_> {
                 let child = self.export_child(op, 0)?;
                 Body::Select(self.order(child, orders)?)
             }
-            Op::TopN { orders, limit, offset } => {
+            Op::TopN {
+                orders, limit, offset, ..
+            } => {
                 let child = self.export_child(op, 0)?;
                 let mut select = self.order(child, orders)?;
                 select.limit = Some(self.limit_values(Some(*limit), *offset, false)?);
@@ -952,9 +954,16 @@ impl Exporter<'_> {
                 select.sample = Some(options.clone());
                 Body::Select(select)
             }
-            Op::Distinct { targets, .. } => {
-                let child = self.export_child(op, 0)?;
+            Op::Distinct { targets, orders, .. } => {
+                let mut child = self.export_child(op, 0)?;
                 let child_fields = child.fields.clone();
+                // the ORDER BY of a DISTINCT ON picks the row it keeps, so it goes on the SELECT
+                if !orders.is_empty() {
+                    child = Relation {
+                        body: Body::Select(self.order(child, orders)?),
+                        fields: child_fields.clone(),
+                    };
+                }
                 let all_columns = targets.len() == child_fields.len()
                     && targets.iter().zip(&child_fields).all(|(t, f)| {
                         matches!(&t.kind, BoundExprKind::ColumnRef { binding, depth: 0 } if *binding == f.binding)
@@ -2407,7 +2416,9 @@ impl Exporter<'_> {
                 }
                 return Ok(expr);
             }
-            BoundExprKind::JoinFilter { .. } => return Err("A join filter has no SQL export".into()),
+            BoundExprKind::JoinFilter { .. } | BoundExprKind::TopNFilter { .. } => {
+                return Err("A dynamic filter has no SQL export".into());
+            }
             BoundExprKind::Reference(index) => {
                 let Some(expr) = self.lambdas.last().and_then(|l| l.get(*index)) else {
                     return Err("A bound reference has no SQL export".into());

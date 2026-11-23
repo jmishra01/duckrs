@@ -382,6 +382,11 @@ pub struct CsvScanState {
     stream: Option<Stream>,
     /// every file is read whole, for the error the scan of it finds first
     whole: bool,
+    /// the size of the file being read, and how much of it was counted as scanned
+    file_bytes: u64,
+    bytes_counted: u64,
+    /// the bytes scanned not yet given to the profiler
+    bytes_pending: u64,
 }
 
 /// A file read a buffer at a time (`CSVBufferManager`): the scan has the bytes of it from `base` on.
@@ -432,6 +437,37 @@ fn first_error(scan: &CsvScanData, error: Error) -> Error {
             Ok(None) => return error,
             Err(first) => return first,
         }
+    }
+}
+
+
+/// The bytes of its files the scan read since this was last asked (`CSVFileScan::CountBytesScanned`).
+pub fn take_bytes_scanned(state: &mut CsvScanState) -> u64 {
+    std::mem::take(&mut state.bytes_pending)
+}
+
+/// `CSVBufferManager`: what of the file the buffers read so far hold, the file being read in buffers of
+/// `buffer_size` up to where the scanner is.
+fn count_bytes(state: &mut CsvScanState, buffer_size: usize, done: bool) {
+    let read = match (&state.scanner, &state.data) {
+        _ if done => state.file_bytes,
+        // of a file read a buffer at a time, the buffers read so far
+        _ if state.stream.is_some() => {
+            let stream = state.stream.as_ref().expect("just checked");
+            let data = state.data.as_ref().map_or(0, |data| data.len() as u64);
+            (stream.base + data).min(state.file_bytes)
+        }
+        (Some(scanner), Some(data)) if !data.is_empty() => {
+            let at = (scanner.machine.position.min(data.len()) as f64 / data.len() as f64 * state.file_bytes as f64)
+                as u64;
+            let buffer = buffer_size.max(1) as u64;
+            (at / buffer + 1).saturating_mul(buffer).min(state.file_bytes)
+        }
+        _ => state.bytes_counted,
+    };
+    if read > state.bytes_counted {
+        state.bytes_pending += read - state.bytes_counted;
+        state.bytes_counted = read;
     }
 }
 
@@ -792,6 +828,14 @@ pub fn scan_morsel(
     }
 }
 
+/// The bytes of the file a scan in parts reads: all of them, which the first part counts.
+pub fn morsel_bytes(scan: &CsvScanData, morsels: &CsvMorsels, index: usize) -> u64 {
+    if index != 0 {
+        return 0;
+    }
+    std::fs::metadata(&scan.files[0].path).map_or(morsels.end as u64, |m| m.len())
+}
+
 /// The columns of `chunk` that the scan outputs: of a part of a file, none of them virtual.
 fn project(scan: &CsvScanData, chunk: DataChunk) -> DataChunk {
     match &scan.projection {
@@ -862,6 +906,8 @@ fn scan_file_chunk(scan: &CsvScanData, state: &mut CsvScanState) -> Result<Optio
             } else {
                 None
             };
+            state.file_bytes = std::fs::metadata(&file.path).map_or(data.len() as u64, |m| m.len());
+            state.bytes_counted = 0;
             let file = state.current.as_ref().unwrap_or(file);
             let machine = Machine::new(file.dialect.clone(), bom);
             let rows = usize::from(file.header) + file.skip;
@@ -904,6 +950,7 @@ fn scan_file_chunk(scan: &CsvScanData, state: &mut CsvScanState) -> Result<Optio
                 state.data = Some(data);
                 state.current = current;
                 state.stream = stream;
+                count_bytes(state, buffer_size(&scan.options), false);
                 return Ok(Some(chunk));
             }
             // the rest of the file, past the buffer
@@ -915,6 +962,7 @@ fn scan_file_chunk(scan: &CsvScanData, state: &mut CsvScanState) -> Result<Optio
                 state.stream = Some(stream);
             }
             None => {
+                count_bytes(state, 0, true);
                 state.file += 1;
                 state.stream = None;
             }

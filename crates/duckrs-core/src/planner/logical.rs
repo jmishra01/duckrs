@@ -116,6 +116,9 @@ pub enum LogicalOperatorKind {
         table_index: usize,
         types: Vec<LogicalType>,
         expressions: Vec<Vec<BoundExpr>>,
+        /// the table function whose rows these are, computed while binding (`duckdb_types()`), which
+        /// EXPLAIN names the scan after as C++'s `PhysicalTableScan` does
+        function: Option<String>,
     },
     /// `LogicalFilter`: keeps the rows for which all expressions are true.
     Filter { expressions: Vec<BoundExpr> },
@@ -155,6 +158,8 @@ pub enum LogicalOperatorKind {
         orders: Vec<BoundOrderByNode>,
         limit: u64,
         offset: u64,
+        /// `LogicalTopN::dynamic_filter`: the filter of its boundary it gave the scans below
+        dynamic: Option<Arc<crate::execution::join_filter::TopNFilter>>,
     },
     /// `LogicalLimit` with constant values: skips `offset` rows, then keeps `limit` rows (all
     /// of them with `None`).
@@ -169,11 +174,25 @@ pub enum LogicalOperatorKind {
     LimitPercent { percent: f64, offset: u64 },
     /// `LogicalSample`: a random part of the child's rows.
     Sample { options: SampleOptions },
-    /// `LogicalDistinct`: one row per distinct `targets`, the first one with DISTINCT ON (`on`).
-    Distinct { targets: Vec<BoundExpr>, on: bool },
+    /// `LogicalDistinct`: one row per distinct `targets`, the first one with DISTINCT ON (`on`), in the order of
+    /// `orders` where there are any (`order_by`, the ORDER BY of the statement).
+    Distinct {
+        targets: Vec<BoundExpr>,
+        on: bool,
+        orders: Vec<BoundOrderByNode>,
+    },
     /// `LogicalSecureView`: the plan of a SECURE VIEW, which it passes on. The optimizer pushes
     /// nothing into it, so that no expression of the query sees the rows the view hides.
-    SecureView { view_name: String },
+    SecureView {
+        view_name: String,
+        /// `LogicalSecureView::pushed_filters`: the filters pushed into the view, as text, which the boundary shows
+        /// in place of the operators inside it
+        pushed_filters: Vec<String>,
+        /// `propagate_statistics`: the view emits every row it reads, so the statistics of its columns may leave it
+        propagate_statistics: bool,
+        /// the estimate of its rows, frozen before filters were pushed into it
+        estimate: Option<u64>,
+    },
     /// `LogicalUnnest`: a row per element of the lists of `expressions`, next to the child's
     /// columns. A list that runs out gives NULL.
     Unnest {
@@ -425,6 +444,8 @@ pub struct JoinCondition {
     pub comparison: ComparisonOp,
     /// what the join tells a scan below its left side of its keys on the right
     pub filter: Option<std::sync::Arc<crate::execution::join_filter::JoinFilter>>,
+    /// of an inequality, the bound of the right side's keys the join gives that scan (`CreateDynamicMinMaxFilters`)
+    pub bound: Option<std::sync::Arc<crate::execution::join_filter::TopNFilter>>,
 }
 
 impl JoinCondition {
@@ -880,8 +901,10 @@ impl LogicalOperator {
             }
             LogicalOperatorKind::Filter { expressions }
             | LogicalOperatorKind::Projection { expressions, .. }
-            | LogicalOperatorKind::Unnest { expressions, .. }
-            | LogicalOperatorKind::Distinct { targets: expressions, .. } => expressions.iter_mut().collect(),
+            | LogicalOperatorKind::Unnest { expressions, .. } => expressions.iter_mut().collect(),
+            LogicalOperatorKind::Distinct { targets, orders, .. } => {
+                targets.iter_mut().chain(orders.iter_mut().map(|o| &mut o.expr)).collect()
+            }
             LogicalOperatorKind::LateralJoin {
                 correlated, predicate, ..
             } => correlated.iter_mut().chain(predicate.iter_mut()).collect(),

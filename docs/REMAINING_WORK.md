@@ -296,7 +296,15 @@ Each item gives the number of failing files in `test/` that it should fix, where
     back in the order of `CompressionType` (`RLE,Dictionary`)
   - [x] `read_duckdb` and the replacement scan of `.db` files; `enable_view_dependencies` (DROP ... CASCADE,
     refused DROP and ALTER, CREATE OR REPLACE of a view that reads itself)
-  - [ ] `vector_type` (~20 files) and `duckdb_memory` (~17) report engine internals duckrs does not model
+  - [ ] `vector_type` (~20 files) reports engine internals duckrs does not model
+  - [x] `duckdb_memory()`: C++'s columns and a row per `MemoryTag`, volatile so common subplans do not share it;
+    duckrs does not account memory by tag, so every row reports 0 bytes in memory and in temporary storage
+  - [ ] memory accounting by `MemoryTag`: until it exists, the tests that check `memory_usage_bytes` stays below a
+    bound pass without measuring anything, so they are left out of `known_passing.txt`
+    (`bulk_delete_version_info_memory`, `partial_delete_version_info_memory`, `test_art_mem_limit`,
+    `partial_delete_checkpoint_mask`, `partial_delete_pending_compress`, `noop_string_update_memory`,
+    `duckdb_memory_convert_to_persistent`, `compact_update_allocation`, `test_update_string_heap_compaction`,
+    `materialized_cte_prepared`)
 - [ ] 10. `ATTACH`/`DETACH` and multi-database features (`sql/attach`: 47 failing, 52.5%)
   - [x] the search path (`CatalogSearchPath`): `SET schema`, `SET search_path`, `USE`, RESET; unqualified names
     looked up along it and created in its default schema; `current_schema(s)`, `current_query()`, SHOW SCHEMAS
@@ -326,6 +334,20 @@ Each item gives the number of failing files in `test/` that it should fix, where
 ## Phase 7: Optimizer
 
 - [ ] 14. Filter pushdown and pullup (`optimizer/pushdown`: 19 failing, 55.8% pass)
+  - [x] `PushdownOuterJoin`: a filter of `coalesce(l, r)` over the keys of a FULL join's `l = r` goes to both
+    sides as a filter of `l` and of `r`; `GenerateEquivalentFilters`: `expr = constant` again for the other
+    columns of its equivalence set; an inner join's conditions go through the filter combiner with the filters
+    above it (`PushdownInnerJoin`'s `GenerateFilters`)
+  - [x] `PushdownGet`: a scan that has table filters takes no more, so the ranges the joins' statistics derive
+    stay above it (`zonemaps`); a filter on a field of a STRUCT column the scan reads only fields of is shown by
+    the field's path (`s.a = 3`), otherwise with the field's name as key (`struct_extract(s, 'a')`)
+  - [ ] `struct_extract(i, 'A')` keeps the key as written; the segments of nested validity as C++ sizes them
+    (`nested_null_segment_pruning`); bytes read of late materialization's prefetch (`test_rowid_vector_pruning_prefetch`)
+  - [x] table filters go only into the scans the filter pushdown left filters on (C++ sets them in `PushdownGet`): a
+    filter that can throw, kept above a projection, stays above the scan once the projection is pulled up
+    (`tuple_cast_pushdown`, `pushdown_safe_decimal_cast`)
+  - [ ] `RegexRangeFilter` (needs RE2's `PossibleMatchRange`); `invoke` of a lambda kept as a call
+    (`or_range_merge`); a derived OR filter added again by each pushdown (`join_dependent_filter`)
   - [x] OR range merge, monotone preimage, filter reordering (`ExpressionHeuristics`), BETWEEN of a column as two comparisons
   - [x] a filter that can throw stays above the projection of an inlined CTE: `position`/`instr`/`strpos` and a
     string `a[i]` with a constant index cannot throw, as in C++ (`test_no_pushdown_cast_into_cte`)
@@ -346,19 +368,38 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] EXPLAIN ANALYZE row counts: the plan it renders is the one that ran, under the profiler, with each
     operator's rows and scans as `TABLE_SCAN`; under an OR, what is never true but can be NULL stays
     `constant_or_null(false, ...)` (`table_or_pushdown`, `parquet_or_pushdown`)
-  - [ ] the rest of C++'s analyzed plan: the `QUERY` / `EXPLAIN_ANALYZE` nodes, `Total Time`, operator timings
-  - [ ] the order of a join's conditions where an inequality comes before IS DISTINCT FROM (`issue_17042`)
-  - [ ] filters through the row numbers of EXCEPT ALL / INTERSECT ALL on a collation key
-    (`pushdown_window_partition_expression`); dynamic filters of blockwise NL joins (`join_filter_pushdown_any_join`)
+  - [x] the `QUERY` / `EXPLAIN_ANALYZE` nodes and the `Summary` box with `Total Time` of C++'s analyzed plan
+  - [ ] operator timings in the text of EXPLAIN ANALYZE
+  - [x] the order of a join's conditions where an inequality comes before IS DISTINCT FROM (`issue_17042`)
+  - [x] filters through the row numbers of EXCEPT ALL / INTERSECT ALL on a collation key: filters on the
+    partitions of ranking windows pulled up through them (`PullupWindow`; `pushdown_window_partition_expression`)
+  - [x] join filters into `read_parquet` scans, through inner blockwise NL joins too, and their
+    `Dynamic Filters` (`join_filter_pushdown_any_join` up to its Top-N checks)
+  - [x] Top-N dynamic filters pushed into scans of tables and Parquet files, through order-keeping casts
+    that cannot fail (`TopN::PushdownDynamicFilters`; `join_filter_pushdown_any_join`, `topn_dynamic_filter_cast`)
   - [ ] the operator log and profiler output a few tests read (`join_filter_pushdown_integer_chain`,
-    `cte_domain_join_filter`); `read_csv`'s `schema`; `COLUMNS(json_keys(getvariable(...)))` (`issue_16671`);
-    a filter on the right of a SEMI join through
-    a subquery's projection
+    `cte_domain_join_filter`); a filter on the right of a SEMI join through a subquery's projection
+  - [x] `read_csv`'s `schema`, mapped by name with a projection over the scan, so casts above it are not pushed
+    into the reader (`csv_type_pushdown_schema`); `COLUMNS(expr)` evaluated with the client's variables
+    (`issue_16671`); `in_search_path`, consistent within a query, for zone-map pruning on constant inputs
+    (`constant_function_zonemap_pruning`); common subplans refuse scans with a pushed-down sample, which C++
+    pushes only after that optimizer (`test_common_subplan_repeatability`)
   - [x] `can_throw` as C++ has it: only the functions C++ marks `SetFallible` can fail, by overload where C++ decides
     it at bind time (extracts, substring, unary `+`/`-`, `list_value`, ICU date parts of TIMESTAMPTZ)
   - [x] `CanThrow` of aggregates and window functions: `sum`/`avg` of HUGEINT and wide DECIMAL, `string_agg`, the
     `n` variants of min/max/arg_min/arg_max, `ntile`, ... (common subplans, window pushdown)
 - [ ] 15. Statistics propagation (`optimizer/statistics`: 4 failing, 91.8% pass)
+  - [x] `PropagateInputValueStats`: first, last, any_value, arg_min/arg_max and their kin, mode, median and
+    the quantiles have the range of their input (cast to their type), as min and max had; the column of an
+    aggregate is named by its alias (`BindAggregate`)
+  - [x] `SimplifyDistinctComparison`: IS [NOT] DISTINCT FROM of two sides without NULLs is `=` / `!=`, in a
+    join with one side for NOT DISTINCT, not in a MARK join, in the predicate of a join too; IS [NOT] NULL is
+    not folded over a cast of variable-size values to VARIANT (`CanFoldNullCheck`)
+  - [x] multi-column filters skip row groups only if they can't throw (`CanPropagateExpressionStatistics`), and
+    through a TRY_CAST between numbers
+  - [ ] filters derived from joins have no selectivity in the estimate of the scan (`current_domain_semi_anti`);
+    JSON of table filters without the parentheses of `ExpressionFilter::ToString` (`statistics_early_join_range`);
+    `< ANY` planned as a filter on the scan, not an ANY join (`statistics_join`)
   - [x] row groups of the database's `ROW_GROUP_SIZE`; zone maps through CASE, COALESCE, greatest/least,
     arithmetic with constants, month/quarter, prefix, left, sign, two-column comparisons
   - [x] statistics of least/greatest, of sum (rows times the bounds), min and max; `constant_or_null` keeps both
@@ -378,11 +419,38 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] VARCHAR bounds of tables in a file: string statistics read (legacy 8-byte and current 12-byte forms) and
     written as `StatsWriter<string_t>` and `StringStats::Serialize` do, with unicode, lengths and totals
   - [ ] string comparisons that C++'s prefixes can't decide but exact bounds do (`a = b` prunes more here), an
-    OR of columns proven false is an empty result here where C++ scans no row groups, INTERVAL and TIMESTAMPTZ_NS
-    bounds, week, division by a column
+    OR of columns proven false is an empty result here where C++ scans no row groups, TIMESTAMPTZ_NS bounds, week,
+    division by a column
   - [x] the scalar aggregate merger (`scalar_aggregate_merge_threshold`), over tables, `read_parquet`, `read_csv`
     and `read_json`; predicate factoring of ORs in filters
-  - [ ] secure views (7 files), `json_serialize_plan`, gamma's errors without IEEE
+  - [ ] `json_serialize_plan`, gamma's errors without IEEE
+  - [x] secure views as C++ has them: a `SECURE_VIEW` operator at the boundary that EXPLAIN and EXPLAIN ANALYZE show
+    with the view's name and the filters pushed into it, and nothing below; statistics and distinct counts leave a
+    view only if it emits every row it reads (`EmitsAllRows`); its estimate is frozen before filters go into it
+  - [x] of secure views in the profile: the view's node keeps the time of what is below it, which is left out
+    (`CollapseSecureViews`); EXPLAIN ANALYZE in the profiler's JSON (`secure_view_explain`)
+  - [x] the prefix-range join filter of keys close together is exact: a bit per value between the smallest and the
+    largest key, so only keys pass where the Bloom filter let others through
+  - [x] dynamic filters of the build side's bounds through inequality joins (`CreateDynamicMinMaxFilters`): `>=` the
+    smallest key for `>`/`>=`, `<=` the largest for `<`/`<=`, set once the build side is done, through nested loop,
+    piecewise merge and IE joins; the prefix-range filter of VARCHAR keys, by their first four bytes (`table_filters`)
+  - [ ] join filters through an ANY join inside a secure view, on a key whose cast can fail
+    (`secure_view_join_filter_pushdown`)
+  - [x] temporal casts of a column compared with a constant give the scan an optional filter on the column, by
+    the cast's margin (`TryPushdownTemporalCastFilter`, also of filters that can throw); TIMESTAMPTZ_NS columns have
+    zone maps and `stats()` (`temporal_cast_zonemap`, `timestamp_unit_cast_zonemap_pruning`)
+  - [x] segment zone maps (`RowGroup::CheckZonemapSegments`): a scan skips the vectors that no row of can pass
+    its filters, by zones per vector of tables in memory, the segments' statistics of tables in files, the fields
+    of STRUCT columns, the row ids, and join filters on the row ids; `query.total_rows_scanned` counts the rows of
+    the vectors scans read, before their filters, as C++ does (`test_rowid_vector_pruning`)
+  - [ ] the segments of tables in memory as C++ sizes them: duckrs zones them per vector, finer than C++, so
+    `nested_null_segment_pruning` scans fewer rows than its exact count; the bytes late materialization reads
+    (`test_rowid_vector_pruning_prefetch`)
+  - [x] INTERVAL bounds of row groups in database files: written from v2.0.0 by the normalized intervals and
+    read into zone maps (`interval_row_group_pruning`, `interval_column_stats_pruning`)
+  - [x] statistics and zone maps of `%` (`PropagateModuloStats`: signed and unsigned, DECIMAL, FLOAT/DOUBLE, a
+    column divisor, and bounds with a NULL where `error_on_division_by_zero` is off), of `//` on UHUGEINT past the
+    range of an i128, and of `power` (`PropagatePowStats`)
   - [x] string statistics in `stats()`: bounds, unicode, lengths and totals of tables and constants; `approx_unique`
   - [x] string statistics through functions (contains, suffix, upper/lower, length)
   - [x] list lengths through `length` / `array_length` (a `constant_or_null` where all lists are as long),
@@ -397,6 +465,12 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] LEFT join equality groups, `debug_force_no_cross_product`, `approximate_join_order_threshold`
   - [ ] LEFT joins reordered inside the join graph (C++'s CD-C conflict detector, `left_join_cardinality_estimation`)
 - [ ] 17. Column lifetime, unused columns, TopN, expression rewriter (small dirs under `test/optimizer`)
+  - [x] `DUPLICATE_GROUPS` (`RemoveDuplicateGroups`): a group of the same column as an earlier one goes, and so does
+    one computed of a single column that is a group (not of floats or intervals), computed again in a projection
+    above the aggregate
+  - [ ] a BETWEEN with exclusive bounds, printed as two comparisons in one (`test_between_tostring`);
+    `RECURSIVE_KEY_JOIN` (`test_row_comparison_simplification`); LATERAL with grouping sets is not decorrelated
+    (`common_aggregate_positional_consumers`); `json_serialize_plan` (`materialized_cte_column_count`)
   - [x] `CastCanThrow` of nested, DECIMAL and timestamp casts; `x * 0` and `x // 0` (`ArithmeticSimplificationRule`);
     `prefix` decided by statistics only in a one-column filter on a scan; empty statistics fold no `constant_or_null`
   - [x] count/min/max from row group statistics (`TryExecuteAggregates`), of tables and single Parquet files, with
@@ -406,13 +480,16 @@ Each item gives the number of failing files in `test/` that it should fix, where
     (`ClearUnusedExpressions`); a LIMIT above fewer rows than it lets through (`PropagateStatistics(LogicalLimit)`,
     with the row bounds of `range` and Parquet row groups); `ArrayGenericFoldStats`; large INs of an inner
     join's predicate become MARK joins; `EXPLAIN (FORMAT yaml)`; scan filters of a column as one conjunction
-  - [ ] struct fields pushed into a scan through a view's projection (`unused_columns/deliver_child_columns`)
-  - [ ] the ORDER BY of DISTINCT ON inside the DISTINCT, so its keys can be dropped (`remove_redundant_order_keys`)
+  - [x] struct fields pushed into a scan through a view's projection (`unused_columns/deliver_child_columns`)
+  - [x] the ORDER BY of DISTINCT ON inside the DISTINCT (`LogicalDistinct::order_by`), so its keys can be dropped (`remove_redundant_order_keys`)
   - [x] the values aggregates keep for their rows count toward `memory_limit` with the bytes of their strings,
     BLOBs and BITs (`bitagg_memory_limit`)
   - [ ] EXPLAIN shapes: join-dependent filters, projection placement, filter pullup join order, recursive CTE join
     order, zone maps of ORs over joins, grouping sets of the common aggregate
-  - [ ] `duckdb_extensions()`, named table function arguments (`materialized_cte_column_count`)
+  - [x] `duckdb_extensions()`: the default extensions with their aliases, and parquet, json and core_functions as
+    statically linked and loaded; an ungrouped aggregate none of whose aggregates are read computes a
+    COUNT(*) of its own (`catalog_function_binding`)
+  - [ ] named table function arguments (`materialized_cte_column_count`)
 - [ ] 18. Optimizer-dependent SQL tests (`sql/optimizer`: 62 failing, 63.7% pass)
   - [x] uncorrelated scalar subqueries planned as cross products (`PlanUncorrelatedSubquery`), with first() and
     the multiple-rows check where they may not return one row
@@ -427,10 +504,12 @@ Each item gives the number of failing files in `test/` that it should fix, where
     unnested back into rows
   - [x] its late-materialization variant: a payload of several columns of one table fetched by rowid, through
     projections, filters and joins on equal columns
-  - [ ] projections between the filter and the window that compute something
+  - [x] projections between the filter and the window that compute something: not ported. C++'s
+    `TraverseProjectionBindings` follows each expression to its one column and drops what it computes
+    (1.5.6 gives 256 for `x + 100` of 0 with `filter_pushdown` disabled); duckrs keeps the window there
   - [x] self-join aggregate (TPC-DS q95's `ws_wh` as `GROUP BY keys HAVING min(x) <> max(x)`); volatile
     uncorrelated IN subqueries are MARK joins too
-  - [ ] `duckdb_types()` and the other system functions as `LogicalGet`s in EXPLAIN (`self_join_aggregate`)
+  - [x] `duckdb_types()` and the other system functions as scans of the function in EXPLAIN (`self_join_aggregate`)
   - [x] compressed materialization, stages 1-3: integral and VARCHAR columns of ORDER BY, DISTINCT, aggregate
     groups and the build side and single key pair of comparison joins (casts, `__internal_compress_integral_*`,
     `__internal_compress_string_*`); calling them is the binder error C++ gives
@@ -483,6 +562,13 @@ Each item gives the number of failing files in `test/` that it should fix, where
 - [ ] 26. Set operations, `SAMPLE`, `RETURNING`, `WITH ORDINALITY`, `UNNEST` (`setops` 8, `sample` 7, `returning` 2, `ordinality` 0, `unnest` 2)
 - [ ] 27. SQL variables: `SET VARIABLE`, `getvariable` (`sql/variables`: 3 failing)
 - [ ] 28. `EXPLAIN` / `EXPLAIN ANALYZE` and profiling (`explain` 7, `profiling` 3, `detailed_profiler` 1)
+  - [x] the `graphviz`, `mermaid`, `html` (the viewer page, `html_template.html`) and `compact` formats; EXPLAIN
+    ANALYZE in any format but text renders the profile (`QUERY`, `RESULT_COLLECTOR`, `EXPLAIN_ANALYZE` above the
+    plan, with estimates), in text with the `Summary` box of its total time; without a FORMAT it follows
+    `enable_profiling`, and leaves `profiling_output` alone; `no_output` renders nothing; unknown formats, the
+    values of `profiling_renderer_settings` and a `profiling_output` of another file type are errors
+  - [ ] profile files in `html`, `compact`, `graphviz`, `mermaid` and `yaml` (only `json` is written), the SQL
+    highlighting of the HTML page, and the bytes read and written of a query (`tree_renderer_branches`)
 - [ ] 29. Query progress bar (`sql/progress`: 1 failing)
 - [ ] 29a. The parser and errors (`sql/parser`: 23 failing, 66.7%; `sql/error`: 12 failing, 47.8%)
   - [x] `has_error` as the HAS_ERROR operator (a macro of its name shadows it, exported as `system.main.has_error`);
@@ -642,14 +728,17 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [ ] the text of C++ where tests match it (`AS r(column0, ...)` table aliases, its formatter,
     result-type casts); the `*_plan` tests compare C++ plans
 - [ ] 40. Logging and error messages (`sql/logging` 8, `sql/error` 13, `test/logging` 2)
-- [ ] 40a. The query profiler (`sql/pragma/profiling`: 21 of 36 pass)
+- [ ] 40a. The query profiler (`sql/pragma/profiling`: 29 of 36 pass)
   - [x] `enable_profiling = 'json'`, `profiling_output`, `tracked_metrics` (globs), `profiling_coverage`,
     `legacy_metrics_format`; the grouped JSON of `ToResultTree` with the operator tree
   - [x] measured: query time, CPU time, intermediate rows and size bytes, rows scanned, planner, optimizer
     (per pass) and physical planner times, I/O bytes and operations (WAL writes left out, as in C++),
     checkpoint, attach, WAL write, commit and replay latencies, WAL replay entry count
   - [x] `wal_autocheckpoint_entries`; `disable_checkpoint_on_shutdown` also covers attached databases
-  - [ ] exact `query.total_bytes_scanned`, row groups of local storage, memory metrics, secure views
+  - [x] `operator.bytes_scanned` and `query.total_bytes_scanned`: the compressed column chunks of the Parquet row
+    groups read, the CSV buffers read (of `buffer_size`), JSON files; the total is left out when a scan doesn't
+    count them, and leaves out what is inside secure views; COPY TO `x.json.gz` writes JSON (`ExtractFormat`)
+  - [ ] row groups of local storage, memory metrics, secure views
   - [ ] the `query_tree` text output, `duckdb_available_metrics()`, `enable_profiling()` / `disable_profiling()`
     as table functions, the profiler log entries
 - [ ] 41. **C API** (`duckrs-capi`): implement `duckdb.h`, then pass `test/api/capi/*`. There is no code for this yet.

@@ -206,7 +206,7 @@ fn visit(op: &mut LogicalOperator, by_position: bool, used: &mut HashSet<ColumnB
         }
     }
     // `ClearUnusedExpressions` of an aggregate: what nothing reads is not computed; an ungrouped
-    // aggregate keeps one, for its one row
+    // aggregate none of whose aggregates are read computes a COUNT(*) of its own, for its one row
     if let K::Aggregate {
         aggregate_index,
         aggregates,
@@ -220,8 +220,13 @@ fn visit(op: &mut LogicalOperator, by_position: bool, used: &mut HashSet<ColumnB
             !used.contains(&ColumnBinding::new(aggregate_index, index)) && !aggregate_is_volatile(aggregate)
         };
         let removable = aggregates.iter().enumerate().filter(|(i, a)| unused(*i, a)).count();
-        let keep_one = groups.is_empty() && removable == aggregates.len();
-        if removable > usize::from(keep_one) {
+        let ungrouped = groups.is_empty();
+        // a lone unread COUNT(*) is the one the ungrouped aggregate would compute in its place
+        let lone_count_star = ungrouped
+            && aggregates.len() == 1
+            && aggregates[0].function.name == "count_star"
+            && aggregates[0].filter.is_none();
+        if removable > 0 && !lone_count_star {
             WINDOW_RENUMBERING.with(|r| {
                 let mut r = r.borrow_mut();
                 let Some(renumbering) = r.as_mut() else {
@@ -229,8 +234,7 @@ fn visit(op: &mut LogicalOperator, by_position: bool, used: &mut HashSet<ColumnB
                 };
                 let mut kept = Vec::new();
                 for (index, aggregate) in std::mem::take(aggregates).into_iter().enumerate() {
-                    let last = keep_one && kept.is_empty() && index == removable - 1;
-                    if unused(index, &aggregate) && !last {
+                    if unused(index, &aggregate) {
                         continue;
                     }
                     if kept.len() != index {
@@ -240,6 +244,9 @@ fn visit(op: &mut LogicalOperator, by_position: bool, used: &mut HashSet<ColumnB
                         );
                     }
                     kept.push(aggregate);
+                }
+                if kept.is_empty() && ungrouped {
+                    kept.push(count_star());
                 }
                 *aggregates = kept;
             });
@@ -389,4 +396,12 @@ fn window_is_volatile(window: &BoundWindow) -> bool {
 fn aggregate_is_volatile(aggregate: &BoundAggregate) -> bool {
     aggregate.children.iter().chain(aggregate.filter.iter()).any(BoundExpr::is_volatile)
         || aggregate.order_by.iter().any(|(e, _)| e.is_volatile())
+}
+
+/// The `count_star()` an ungrouped aggregate computes when none of its own aggregates are read.
+fn count_star() -> BoundAggregate {
+    let function = crate::function::BuiltinFunctions::get()
+        .aggregate("count_star")
+        .expect("count_star is a builtin aggregate");
+    crate::function::binder::bind_aggregate_function(function, Vec::new(), None, false).expect("count_star() binds")
 }

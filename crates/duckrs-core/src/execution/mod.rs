@@ -134,6 +134,7 @@ fn order_plan(
     orders: Vec<crate::planner::logical::BoundOrderByNode>,
     top: Option<(u64, u64)>,
     child: Box<dyn PhysicalOperator>,
+    dynamic: Option<Arc<join_filter::TopNFilter>>,
 ) -> Box<dyn PhysicalOperator> {
     let modifiers: Vec<_> = orders.iter().map(|o| o.modifiers).collect();
     let (child, keys, columns) = computed_targets(child, orders.into_iter().map(|o| o.expr).collect());
@@ -142,7 +143,9 @@ fn order_plan(
         .zip(modifiers)
         .map(|(expr, modifiers)| crate::planner::logical::BoundOrderByNode { modifiers, expr })
         .collect();
-    drop_computed(Box::new(PhysicalOrder::new(orders, top, child)), columns)
+    let mut order = PhysicalOrder::new(orders, top, child);
+    order.dynamic = dynamic;
+    drop_computed(Box::new(order), columns)
 }
 
 /// `PhysicalPlanGenerator::CreatePlan`.
@@ -296,8 +299,10 @@ fn create_physical(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             extracts,
             ..
         } => {
+            // a Top-N's filter, whose boundary moves while the scan runs, skips no row groups here
             let all: Vec<_> = filters
                 .iter()
+                .filter(|f| !matches!(f.kind, crate::planner::expression::BoundExprKind::TopNFilter { .. }))
                 .chain(&zone_filters)
                 .chain(&optional_filters)
                 .cloned()
@@ -312,6 +317,8 @@ fn create_physical(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
                 index_rows,
                 sample,
                 extracts,
+                rows_read: std::sync::atomic::AtomicU64::new(0),
+                vector_prune: std::sync::OnceLock::new(),
             })
         }
         LogicalOperatorKind::CsvScan { scan, .. } => Box::new(PhysicalCsvScan { types, scan }),
@@ -319,7 +326,20 @@ fn create_physical(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
         LogicalOperatorKind::ParquetScan { scan, .. } => {
             // an optional filter only skips row groups (`OptionalFilter`): the rows are filtered elsewhere
             let filter = (!scan.filters.is_empty()).then(|| crate::optimizer::conjunction_of(scan.filters.clone()));
-            let all: Vec<_> = scan.filters.iter().chain(&scan.optional_filters).cloned().collect();
+            // the join filters, which have no values yet, skip no row groups here
+            let all: Vec<_> = scan
+                .filters
+                .iter()
+                .filter(|f| {
+                    !matches!(
+                        f.kind,
+                        crate::planner::expression::BoundExprKind::JoinFilter { .. }
+                            | crate::planner::expression::BoundExprKind::TopNFilter { .. }
+                    )
+                })
+                .chain(&scan.optional_filters)
+                .cloned()
+                .collect();
             let prune = (!all.is_empty()).then(|| crate::optimizer::conjunction_of(all));
             Box::new(parquet::PhysicalParquetScan {
                 types,
@@ -452,10 +472,13 @@ fn create_physical(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
         LogicalOperatorKind::MatchRecognize { data, .. } => {
             Box::new(match_recognize::PhysicalMatchRecognize::new(types, data, children))
         }
-        LogicalOperatorKind::Order { orders } => order_plan(orders, None, children.remove(0)),
-        LogicalOperatorKind::TopN { orders, limit, offset } => {
-            order_plan(orders, Some((limit, offset)), children.remove(0))
-        }
+        LogicalOperatorKind::Order { orders } => order_plan(orders, None, children.remove(0), None),
+        LogicalOperatorKind::TopN {
+            orders,
+            limit,
+            offset,
+            dynamic,
+        } => order_plan(orders, Some((limit, offset)), children.remove(0), dynamic),
         LogicalOperatorKind::Limit { limit, offset, failure } => Box::new(PhysicalLimit {
             types,
             children,
@@ -490,10 +513,28 @@ fn create_physical(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             Box::new(sample)
         }
         // only the optimizer sees the boundary
-        LogicalOperatorKind::SecureView { .. } => children.remove(0),
-        LogicalOperatorKind::Distinct { targets, .. } => {
-            let (child, keys, columns) = computed_targets(children.remove(0), targets);
-            drop_computed(Box::new(PhysicalDistinct::new(&keys, child)), columns)
+        LogicalOperatorKind::SecureView {
+            view_name,
+            pushed_filters,
+            ..
+        } => Box::new(physical::PhysicalSecureView {
+            types,
+            view_name,
+            pushed_filters,
+            children,
+        }),
+        LogicalOperatorKind::Distinct { targets, orders, .. } => {
+            let count = targets.len();
+            let modifiers: Vec<_> = orders.iter().map(|o| o.modifiers).collect();
+            let expressions = targets.into_iter().chain(orders.into_iter().map(|o| o.expr)).collect();
+            let (child, mut keys, columns) = computed_targets(children.remove(0), expressions);
+            let orders: Vec<_> = keys
+                .split_off(count)
+                .into_iter()
+                .zip(modifiers)
+                .map(|(expr, modifiers)| crate::planner::logical::BoundOrderByNode { modifiers, expr })
+                .collect();
+            drop_computed(Box::new(PhysicalDistinct::new(&keys, &orders, child)), columns)
         }
         LogicalOperatorKind::Delete { table, returning, .. } => {
             Box::new(PhysicalDelete::new(types, children, table, returning))
@@ -803,7 +844,7 @@ impl Pipeline<'_> {
             }
             self.sink.combine_local_input(self.input, local)
         };
-        std::thread::scope(|scope| {
+        let finished = std::thread::scope(|scope| {
             for _ in 0..threads.min(morsels) {
                 scope.spawn(|| {
                     let run = || temporary::with_memory(Arc::clone(&memory), worker);
@@ -814,6 +855,10 @@ impl Pipeline<'_> {
                 });
             }
         });
+        let () = finished;
+        if let Some(profiler) = &query_profiler {
+            profiler.set_rows_scanned(self.source);
+        }
         error.into_inner().map_or(Ok(()), Err)
     }
 
@@ -835,6 +880,9 @@ impl Pipeline<'_> {
                 if self.is_finished() {
                     break;
                 }
+            }
+            if let Some(profiler) = &profiler {
+                profiler.set_rows_scanned(self.source);
             }
             // `PipelineExecutor::FinishProcessing`: what the operators hold back goes on up
             for index in 0..self.operators.len() {

@@ -1044,13 +1044,20 @@ impl DiskTable {
         }
         Ok(result)
     }
+
+    /// A bound of a column as a value of its type.
+    fn bound(&self, column: usize, bytes: Option<&[u8; 16]>) -> Result<Option<Value>> {
+        bound(&self.table.columns[column].ty, bytes)
+    }
 }
 
 /// A bound of a column of type `ty`, from the bytes the file has of it.
 fn bound(ty: &LogicalType, bytes: Option<&[u8; 16]>) -> Result<Option<Value>> {
     let width = fixed_width(ty.physical_type());
-    // UUIDs and ENUMs keep the statistics of the integers they are stored as
-    let ordered = has_ordered_statistics(ty) || matches!(ty.id(), LogicalTypeId::Uuid | LogicalTypeId::Enum);
+    // UUIDs and ENUMs keep the statistics of the integers they are stored as; INTERVAL bounds are of the
+    // normalized intervals, as `interval_t` orders them
+    let ordered = has_ordered_statistics(ty)
+        || matches!(ty.id(), LogicalTypeId::Uuid | LogicalTypeId::Enum | LogicalTypeId::Interval);
     let (Some(bytes), Some(width)) = (bytes, width.filter(|_| ordered)) else {
         return Ok(None);
     };
@@ -1244,6 +1251,66 @@ impl DiskTable {
 impl TableSource for DiskTable {
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+    fn segment_zones(&self, column: usize, path: &[usize]) -> Result<Vec<(usize, usize, ColumnZone)>> {
+        let mut ty = self.table.columns[column].ty.clone();
+        for &field in path {
+            ty = match ty.struct_children().get(field) {
+                Some((_, child)) => child.clone(),
+                None => return Ok(Vec::new()),
+            };
+        }
+        let mut result = Vec::new();
+        let mut group_start = 0usize;
+        for group in 0..self.table.row_groups.len() {
+            let root = self.persistent_column(group, column)?;
+            let mut stored: &PersistentColumn = &root;
+            for &field in path {
+                match stored.children.get(field) {
+                    Some(child) => stored = child,
+                    None => return Ok(Vec::new()),
+                }
+            }
+            // the NULLs of each segment, from the validity segments over the same rows; without them, maybe
+            let validity: Vec<(usize, usize, bool)> = match &stored.validity {
+                Some(validity) => {
+                    let mut start = 0;
+                    validity
+                        .pointers
+                        .iter()
+                        .map(|p| {
+                            let range = (start, p.tuple_count, p.statistics.has_null);
+                            start += p.tuple_count;
+                            range
+                        })
+                        .collect()
+                }
+                None => Vec::new(),
+            };
+            let varchar = ty.id() == LogicalTypeId::Varchar;
+            let mut start = 0usize;
+            for pointer in &stored.pointers {
+                let rows = pointer.tuple_count;
+                let has_null = stored.validity.is_none()
+                    || validity.iter().any(|&(s, n, null)| null && s < start + rows && start < s + n);
+                let (min, max) = if varchar {
+                    string_bounds(pointer.statistics.strings.as_ref())
+                } else {
+                    (bound(&ty, pointer.statistics.min.as_ref())?, bound(&ty, pointer.statistics.max.as_ref())?)
+                };
+                let zone = ColumnZone {
+                    unknown: min.is_none() && pointer.statistics.has_no_null,
+                    min,
+                    max,
+                    has_null,
+                    ..ColumnZone::default()
+                };
+                result.push((group_start + start, rows, zone));
+                start += rows;
+            }
+            group_start += self.table.row_groups[group].tuple_count as usize;
+        }
+        Ok(result)
     }
     fn fetch_rows(&self, group: usize, column: usize, rows: &[u32]) -> Result<Vector> {
         // rows one by one only pay off when few are wanted; otherwise the column is decoded whole

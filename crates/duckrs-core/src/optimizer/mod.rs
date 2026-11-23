@@ -59,6 +59,7 @@ mod window_join_pushdown;
 mod window_self_join;
 pub mod unnest_rewriter;
 pub mod unused_columns;
+mod duplicate_groups;
 mod extract_pushdown;
 
 use crate::planner::expression::{BoundExpr, BoundExprKind};
@@ -75,6 +76,8 @@ pub struct OptimizerOptions {
     pub statistics_propagation: bool,
     pub empty_result_pullup: bool,
     pub unused_columns: bool,
+    /// `DUPLICATE_GROUPS`
+    pub duplicate_groups: bool,
     pub row_number_rewriter: bool,
     pub type_pushdown: bool,
     pub scalar_fn_pushdown: bool,
@@ -153,6 +156,7 @@ impl Default for OptimizerOptions {
             statistics_propagation: true,
             empty_result_pullup: true,
             unused_columns: true,
+            duplicate_groups: true,
             row_number_rewriter: true,
             type_pushdown: true,
             scalar_fn_pushdown: true,
@@ -216,6 +220,7 @@ impl OptimizerOptions {
             statistics_propagation: false,
             empty_result_pullup: false,
             unused_columns: false,
+            duplicate_groups: false,
             row_number_rewriter: false,
             type_pushdown: false,
             scalar_fn_pushdown: false,
@@ -278,6 +283,7 @@ impl OptimizerOptions {
             statistics_propagation: !off("statistics_propagation"),
             empty_result_pullup: !off("empty_result_pullup"),
             unused_columns: !off("unused_columns"),
+            duplicate_groups: !off("duplicate_groups"),
             row_number_rewriter: !off("window_rewriter"),
             type_pushdown: !off("type_pushdown"),
             scalar_fn_pushdown: !off("scalar_fn_pushdown"),
@@ -351,6 +357,9 @@ pub fn optimize_timed(
         };
     // a plan that has been through here before has its comparisons back in the predicates
     range_joins::restore_predicates(&mut plan);
+    // `LogicalSecureView::AnalyzeStatistics`, before the filters the optimizer pushes into a view are mistaken for
+    // the view restricting its own rows
+    analyze_secure_views(&mut plan);
     if options.expression_rewriter {
         plan = run("expression_rewriter", plan, &mut |mut plan| {
             rewriter::rewrite_plan(&mut plan);
@@ -431,6 +440,10 @@ pub fn optimize_timed(
     if options.window_self_join {
         plan = run("window_self_join", plan, &mut window_self_join::optimize);
     }
+    // the scans the filter pushdown left filters on, which `PushdownGet` would have put into them: a filter that
+    // only reaches a scan later (a projection between them pulled up) stays above it
+    let filtered_scans = scan_filters::scans_with_filters(&plan);
+    let mut late_filtered_scans = std::collections::HashSet::new();
     if options.projection_pullup {
         plan = run("projection_pullup", plan, &mut projection_pullup::pull_up);
     }
@@ -463,10 +476,18 @@ pub fn optimize_timed(
     if options.redundant_order_keys {
         plan = run("redundant_order_keys", plan, &mut redundant_order_keys::remove);
     }
+    // `DUPLICATE_GROUPS`, before statistics, which work out the groups as they are then
+    if options.duplicate_groups {
+        plan = run("duplicate_groups", plan, &mut duplicate_groups::remove);
+    }
     // `PushdownGet` has put the filters into the scans by the time statistics see them, as table filters that
     // statistics check while the copies of what went in partly stay above
     if options.filter_pushdown && options.statistics_propagation {
-        scan_filters::push_into_table_scans(&mut plan);
+        late_filtered_scans = scan_filters::scans_with_filters(&plan)
+            .difference(&filtered_scans)
+            .copied()
+            .collect();
+        scan_filters::push_into_table_scans(&mut plan, &filtered_scans);
     }
     let mut statistics_map = None;
     if options.statistics_propagation {
@@ -485,7 +506,7 @@ pub fn optimize_timed(
     });
     // a column only a scan's filter reads need not leave the scan
     if options.filter_pushdown {
-        scan_filters::push_into_scans(&mut plan);
+        scan_filters::push_into_scans(&mut plan, &late_filtered_scans);
     }
     if options.unused_columns {
         plan = run("unused_columns", plan, &mut |mut plan| {
@@ -641,4 +662,38 @@ pub(crate) fn conjunction_of(mut expressions: Vec<BoundExpr>) -> BoundExpr {
         },
         LogicalType::BOOLEAN,
     )
+}
+
+/// `LogicalSecureView::AnalyzeStatistics`: a secure view may expose the statistics of its contents only if it emits
+/// every row it reads.
+fn analyze_secure_views(op: &mut LogicalOperator) {
+    use crate::planner::logical::LogicalOperatorKind as K;
+    if matches!(op.kind, K::SecureView { .. }) {
+        let emits = emits_all_rows(&op.children[0]);
+        if let K::SecureView { propagate_statistics, .. } = &mut op.kind {
+            *propagate_statistics = emits;
+        }
+    }
+    for child in &mut op.children {
+        analyze_secure_views(child);
+    }
+}
+
+/// `EmitsAllRows`: whether `op` and what is below it emit every row they read.
+fn emits_all_rows(op: &LogicalOperator) -> bool {
+    use crate::planner::logical::LogicalOperatorKind as K;
+    let own = match &op.kind {
+        // a nested secure view applies the same rule to its own contents
+        K::SecureView { .. } => return true,
+        K::Projection { .. } | K::Order { .. } | K::ExpressionGet { .. } | K::DummyScan { .. } | K::ColumnSelect { .. } => true,
+        K::Get {
+            filters,
+            optional_filters,
+            zone_filters,
+            sample,
+            ..
+        } => filters.is_empty() && optional_filters.is_empty() && zone_filters.is_empty() && sample.is_none(),
+        _ => false,
+    };
+    own && op.children.iter().all(emits_all_rows)
 }

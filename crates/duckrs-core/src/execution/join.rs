@@ -174,6 +174,8 @@ pub struct PhysicalJoin {
     /// the comparisons a range join looks the build rows up by: one for a piecewise merge join,
     /// two for an IE join
     range: Vec<JoinCondition>,
+    /// the bounds of the build keys that the inequalities give the scans of the probe side, with the key each is of
+    bounds: Vec<(BoundExpr, std::sync::Arc<super::join_filter::TopNFilter>)>,
     /// the name of the operator, if it is not a hash join or a blockwise nested loop join
     operator_name: Option<&'static str>,
 }
@@ -701,6 +703,7 @@ impl PhysicalJoin {
             error_on_multiple_rows: false,
             spill,
             range: Vec::new(),
+            bounds: Vec::new(),
             operator_name: None,
         }
     }
@@ -708,6 +711,23 @@ impl PhysicalJoin {
     /// `PlanComparisonJoin` for the operator the optimizer picked: the comparisons each operator
     /// does not run itself are checked on the pairs, with the predicate.
     pub fn for_algorithm(
+        types: Vec<LogicalType>,
+        join_type: JoinType,
+        mut conditions: Vec<JoinCondition>,
+        predicate: Option<BoundExpr>,
+        algorithm: JoinAlgorithm,
+        children: Vec<Box<dyn PhysicalOperator>>,
+    ) -> Self {
+        let bounds: Vec<_> = conditions
+            .iter()
+            .filter_map(|c| c.bound.clone().map(|bound| (c.right.clone(), bound)))
+            .collect();
+        let mut join = Self::for_algorithm_unbounded(types, join_type, conditions, predicate, algorithm, children);
+        join.bounds = bounds;
+        join
+    }
+
+    fn for_algorithm_unbounded(
         types: Vec<LogicalType>,
         join_type: JoinType,
         mut conditions: Vec<JoinCondition>,
@@ -1652,6 +1672,37 @@ impl PhysicalOperator for PhysicalJoin {
         let mut finished = Self::finish_build(&mut build, threads, total_count, has_null_key);
         if !self.range.is_empty() {
             finished.range = Some(self.range_index(&finished.data, finished.count)?);
+        }
+        // `CreateDynamicMinMaxFilters`: the smallest or largest key of the build side, where it is all there
+        for (key, bound) in &self.bounds {
+            if !complete || finished.count == 0 || key.is_volatile() {
+                continue;
+            }
+            let Ok(keys) = crate::execution::expression_executor::execute(key, &finished.data) else {
+                continue;
+            };
+            let lower = bound.comparison == duckrs_parser::ast::ComparisonOp::GreaterThanOrEqual;
+            let mut extreme: Option<Value> = None;
+            for row in 0..finished.count {
+                let value = keys.get_value(row);
+                if value.is_null() {
+                    continue;
+                }
+                let op = if lower {
+                    duckrs_parser::ast::ComparisonOp::LessThan
+                } else {
+                    duckrs_parser::ast::ComparisonOp::GreaterThan
+                };
+                if extreme
+                    .as_ref()
+                    .is_none_or(|e| crate::optimizer::statistics::compare_values(op, &value, e) == Some(true))
+                {
+                    extreme = Some(value);
+                }
+            }
+            if let Some(extreme) = extreme {
+                bound.set(extreme);
+            }
         }
         for condition in &self.conditions {
             if let Some(filter) = &condition.filter {

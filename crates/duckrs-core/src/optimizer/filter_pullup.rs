@@ -98,8 +98,36 @@ impl FilterPullup {
                 op.children.push(self.rewrite(child));
                 op
             }
+            K::Window { .. } => self.pullup_window(op),
             _ => self.finish_pullup(op),
         }
+    }
+
+    /// `PullupWindow`: a filter that compares a partition of every window with constants keeps or removes whole
+    /// partitions, so it can go above windows that only rank rows. The others stay below.
+    fn pullup_window(&mut self, mut op: LogicalOperator) -> LogicalOperator {
+        if !self.can_pullup {
+            return self.finish_pullup(op);
+        }
+        // above the window, the window expressions also run for the partitions the filters remove
+        let K::Window { windows, .. } = &op.kind else { unreachable!() };
+        if !super::filter_pushdown::only_ranks_without_arguments(windows) {
+            return self.finish_pullup(op);
+        }
+        let pulled_before_child = self.filters.len();
+        let child = op.children.pop().expect("a window has a child");
+        let child = self.rewrite(child);
+        let K::Window { windows, .. } = &op.kind else { unreachable!() };
+        let compares = |f: &BoundExpr| super::filter_pushdown::compares_window_partitions(windows, f);
+        // a filter that stays below the window and can throw keeps the filters that guard it there
+        let keep_all = self.filters[pulled_before_child..]
+            .iter()
+            .any(|f| super::rewriter::can_throw(f) && !compares(f));
+        let pulled = self.filters.split_off(pulled_before_child);
+        let (up, kept): (Vec<_>, Vec<_>) = pulled.into_iter().partition(|f| !keep_all && compares(f));
+        self.filters.extend(up);
+        op.children.push(if kept.is_empty() { child } else { filter(child, kept) });
+        op
     }
 
     /// `FinishPullup`: the children start over, and what was pulled up stays here.

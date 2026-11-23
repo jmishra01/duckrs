@@ -322,6 +322,7 @@ fn try_late_materialization(op: &mut LogicalOperator, next: &mut usize, root: bo
         .iter()
         .zip(&rhs_row_ids)
         .map(|((left, _), (right, ty, name))| JoinCondition {
+            bound: None,
             left: left.clone(),
             right: BoundExpr::column_ref(ColumnBinding::new(rhs_index, right.column_index), ty.clone(), name.clone()),
             comparison: ComparisonOp::Equal,

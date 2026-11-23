@@ -350,6 +350,7 @@ fn flatten_in(expr: &BoundExpr, left: &mut LogicalOperator, next_table_index: &m
         Some(predicate) => (Vec::new(), Some(predicate)),
         None => (
             vec![JoinCondition {
+                bound: None,
                 left: (**child).clone(),
                 right,
                 comparison: ComparisonOp::Equal,
@@ -513,6 +514,7 @@ fn flatten_subquery(expr: &BoundExpr, left: &mut LogicalOperator, next_table_ind
         .iter()
         .zip(&state)
         .map(|(value, binding)| JoinCondition {
+            bound: None,
             left: value.clone(),
             right: BoundExpr::column_ref(*binding, value.return_type.clone(), value.alias.clone()),
             comparison: ComparisonOp::NotDistinctFrom,
@@ -957,6 +959,7 @@ impl Flatten<'_> {
             .into_iter()
             .zip(self.state_refs(right))
             .map(|(left, right)| JoinCondition {
+                bound: None,
                 left,
                 right,
                 comparison: ComparisonOp::NotDistinctFrom,
