@@ -1,8 +1,9 @@
 // Ported from duckdb/src/planner/binder/tableref/bind_showref.cpp,
 // duckdb/src/planner/binder/statement/bind_summarize.cpp, the column information of
 // duckdb/src/function/table/system/pragma_table_info.cpp and the catalog listings of
-// duckdb/src/function/table/system/duckdb_{tables,views,columns,schemas,databases,settings}.cpp
-// @ rust-port-baseline
+// duckdb/src/function/table/system/duckdb_{tables,views,columns,schemas,databases,settings}.cpp,
+// the binds of duckdb/src/function/table/system/duckdb_{secrets,secret_types,secret_type_parameters,
+// which_secret}.cpp @ rust-port-baseline
 //
 //! SHOW, DESCRIBE, SUMMARIZE and the `duckdb_*` listings of the catalog. They are rows computed
 //! while binding, as `LogicalColumnDataGet` holds in C++.
@@ -1382,6 +1383,104 @@ impl Binder<'_> {
         self.bind_rows(table_ref, "duckdb_settings", names, types, rows)
     }
 
+    /// `duckdb_secrets()`, `duckdb_secret_types()`, `duckdb_secret_type_parameters()` and
+    /// `which_secret(path, type)`: the rows the client's secret manager gives.
+    pub(super) fn bind_secret_function(
+        &mut self,
+        name: &str,
+        call: &duckrs_parser::ast::FunctionExpr,
+        table_ref: &TableRef,
+    ) -> Result<LogicalOperator> {
+        let arguments: Vec<_> = call.args.iter().map(super::table_functions::named_argument).collect();
+        let positional = arguments.iter().filter(|argument| argument.name.is_empty()).count();
+        let expected = if name == "which_secret" { 2 } else { 0 };
+        if positional != expected {
+            return Err(binder_error(format!(
+                "Function \"{name}\" expects {expected} positional argument{}, got {positional}",
+                if expected == 1 { "" } else { "s" }
+            )));
+        }
+        // `DuckDBSecretsBind`: `redact` is its only named parameter
+        let mut redact = true;
+        let mut values = Vec::new();
+        for argument in &arguments {
+            let parameter = argument.name.to_lowercase();
+            let known = parameter.is_empty() || (name == "duckdb_secrets" && parameter == "redact");
+            if !known {
+                return Err(binder_error(format!(
+                    "Invalid named parameter \"{}\" for function {name}",
+                    argument.name
+                )));
+            }
+            let value = self.constant_argument(&argument.expr)?;
+            if parameter == "redact" {
+                if value.is_null() {
+                    return Err(duckrs_common::Error::new(
+                        ErrorKind::InvalidInput,
+                        "Cannot use NULL as argument for redact",
+                    ));
+                }
+                let value = crate::function::cast::cast_value(&value, &LogicalType::BOOLEAN)?;
+                redact = value.try_to_string()? == "true";
+            } else {
+                values.push(crate::function::cast::cast_value(&value, &LogicalType::VARCHAR)?);
+            }
+        }
+        let Some(secrets) = self.session.as_ref().and_then(|session| session.secrets.clone()) else {
+            return Err(crate::unported(format!("{name} here")));
+        };
+        let varchar = LogicalType::VARCHAR;
+        let (columns, rows) = match name {
+            "duckdb_secrets" => (
+                vec![
+                    ("name", varchar.clone()),
+                    ("type", varchar.clone()),
+                    ("provider", varchar.clone()),
+                    ("persistent", LogicalType::BOOLEAN),
+                    ("storage", varchar.clone()),
+                    ("scope", LogicalType::list(varchar.clone())),
+                    ("secret_string", varchar.clone()),
+                ],
+                secrets.secrets(redact)?,
+            ),
+            "duckdb_secret_types" => (
+                vec![
+                    ("type", varchar.clone()),
+                    ("default_provider", varchar.clone()),
+                    ("extension", varchar.clone()),
+                ],
+                secrets.secret_types()?,
+            ),
+            "duckdb_secret_type_parameters" => (
+                vec![
+                    ("type", varchar.clone()),
+                    ("provider", varchar.clone()),
+                    ("name", varchar.clone()),
+                    ("parameter_type", varchar.clone()),
+                    ("description", varchar.clone()),
+                ],
+                secrets.secret_type_parameters()?,
+            ),
+            _ => {
+                // `DuckDBWhichSecretFunction`: `Value::ToString` of the inputs
+                let text_of = |value: &Value| -> Result<String> {
+                    if value.is_null() { Ok("NULL".to_string()) } else { value.try_to_string() }
+                };
+                let (path, secret_type) = (text_of(&values[0])?, text_of(&values[1])?);
+                (
+                    vec![
+                        ("name", varchar.clone()),
+                        ("persistent", varchar.clone()),
+                        ("storage", varchar.clone()),
+                    ],
+                    secrets.which_secret(&path, &secret_type)?.into_iter().collect(),
+                )
+            }
+        };
+        let (names, types) = columns.into_iter().map(|(n, t)| (n.to_string(), t)).unzip();
+        self.bind_rows(table_ref, name, names, types, rows)
+    }
+
     /// `pragma_storage_info`: the segments of a table in its file. Rows in memory have none.
     pub(super) fn bind_storage_info(
         &mut self,
@@ -2098,6 +2197,22 @@ impl Binder<'_> {
             // `DuckDBExtensionsInit`: the default extensions, installed or not, and those linked into duckrs,
             // which are loaded; duckrs installs no others, so there is no directory of them to list
             "duckdb_extensions" => {
+                // `fs.ListFiles` of the extension directory, which the file system can refuse
+                if self.options.local_file_system_disabled {
+                    return Err(duckrs_common::Error::new(
+                        ErrorKind::Permission,
+                        "File system LocalFileSystem has been disabled by configuration",
+                    ));
+                }
+                if let Some(access) = &self.options.file_access {
+                    let directory = format!(
+                        "{}/.duckdb/extensions/v{}/{}",
+                        crate::execution::file_system::home_directory(),
+                        env!("CARGO_PKG_VERSION"),
+                        platform()
+                    );
+                    access.check(&directory, true)?;
+                }
                 let list = LogicalType::list(varchar.clone());
                 let version = format!("v{}", env!("CARGO_PKG_VERSION"));
                 let mut entries: std::collections::BTreeMap<&str, (&str, bool)> = DEFAULT_EXTENSIONS

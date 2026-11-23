@@ -11,6 +11,7 @@ mod triggers;
 
 mod export;
 mod logging;
+mod secret;
 pub mod settings;
 mod settings_table;
 
@@ -86,6 +87,8 @@ pub struct DatabaseInstance {
     detached: AtomicBool,
     /// `DatabaseInstance::GetLogManager`
     log_manager: duckrs_core::logging::SharedLogManager,
+    /// `DBConfig::secret_manager`: the secrets and their storages
+    secrets: secret::SecretManager,
     /// `DatabaseManager::GetNewQueryNumber`: the queries so far
     query_number: AtomicU64,
     /// `global_transaction_id`: the transactions so far, an auto-commit statement being one
@@ -305,6 +308,7 @@ impl DatabaseInstance {
             attached: RwLock::default(),
             detached: AtomicBool::new(false),
             log_manager: Arc::default(),
+            secrets: secret::SecretManager::default(),
             query_number: AtomicU64::new(0),
             transaction_number: AtomicU64::new(0),
             hidden: false,
@@ -1167,6 +1171,9 @@ pub struct ClientContext {
     appended: Option<duckrs_core::planner::binder::AppendedRows>,
     /// `DBConfig::replacement_scans` of this connection
     replacement_scans: duckrs_core::planner::binder::ReplacementScans,
+    /// `ConnectionSecretStorage`: the secrets `CREATE SECRET ... IN connection` made, which only
+    /// this connection sees
+    connection_secrets: secret::ConnectionSecrets,
     /// its temporary objects, which the `temp` catalog holds in C++
     temp: Arc<SchemaCatalogEntry>,
     /// the connection's logger (`ClientContext::logger`), which `write_log` finds by its id
@@ -1251,6 +1258,8 @@ struct ActiveTransaction {
     modified: Option<Arc<DatabaseInstance>>,
     /// `MetaTransaction::start_timestamp`, in microseconds since the epoch: what `now()` says
     started: i64,
+    /// what it changed of the secrets in memory and of the connection, which a rollback undoes
+    secret_undo: Vec<secret::SecretUndo>,
 }
 
 impl ActiveTransaction {
@@ -1424,6 +1433,7 @@ impl ClientContext {
             current_query: String::new(),
             appended: None,
             replacement_scans: Default::default(),
+            connection_secrets: Arc::default(),
             temp: SessionTemp::new_schema(),
             log_target,
             log_target_id,
@@ -1561,6 +1571,7 @@ impl ClientContext {
                 })
             },
             settings: Box::new(move || settings::list_settings(&list_db.settings.read(), &list_session)),
+            secrets: Some(self.secret_view()),
             database_files: Box::new(move || {
                 let mut databases = vec![files_db.clone()];
                 databases.extend(files_db.attached.read().values().cloned());
@@ -1943,6 +1954,7 @@ impl ClientContext {
                     attached: Vec::new(),
                     modified: None,
                     started: duckrs_core::execution::temporary::now_micros(),
+                    secret_undo: Vec::new(),
                 });
                 if self
                     .setting_text("immediate_transaction_mode")
@@ -1952,7 +1964,7 @@ impl ClientContext {
                 }
             }
             TransactionType::Commit => {
-                let Some(transaction) = self.transaction.take() else {
+                let Some(mut transaction) = self.transaction.take() else {
                     return Err(error("cannot commit - no transaction is active"));
                 };
                 // COMMIT of an invalidated transaction rolls it back
@@ -1975,6 +1987,10 @@ impl ClientContext {
                     }
                 }
                 let databases: Vec<_> = transaction.forks.iter().map(|(database, _)| database.clone()).collect();
+                if !rollback {
+                    // the secrets it changed stay as they are
+                    transaction.secret_undo.clear();
+                }
                 self.end_transaction(transaction);
                 if !rollback {
                     let current = self.db.clone();
@@ -2101,7 +2117,9 @@ impl ClientContext {
         Ok(())
     }
 
-    fn end_transaction(&self, transaction: ActiveTransaction) {
+    fn end_transaction(&self, mut transaction: ActiveTransaction) {
+        // what a committed transaction changed of the secrets was cleared; anything else rolls back
+        self.undo_secret_changes(std::mem::take(&mut transaction.secret_undo));
         for (database, _) in &transaction.forks {
             database.transactions.lock().open.remove(&self.id);
         }
@@ -2176,6 +2194,21 @@ impl ClientContext {
         // `FileSystem::GetHomeDirectory` of this connection
         duckrs_core::execution::file_system::set_home_directory(Some(self.setting_text("home_directory")));
         duckrs_core::execution::file_system::set_file_search_path(&self.setting_text("file_search_path"));
+        // secrets live in the secret manager of the database, not in a catalog
+        match statement {
+            Statement::Create(info) if matches!(info.kind, CreateKind::Secret { .. }) => {
+                if self.transaction.as_ref().is_some_and(|t| t.invalidated) {
+                    return Err(Error::new(ErrorKind::Transaction, INVALIDATED_TRANSACTION));
+                }
+                return self.create_secret(info);
+            }
+            // `requires_valid_transaction = false`: a secret can always be dropped
+            Statement::Drop(info) if info.entry_type == "SECRET" => {
+                self.drop_secret(info)?;
+                return Ok(Self::success());
+            }
+            _ => {}
+        }
         // `Binder::BindCreateSchema`: the system catalog (and its pg_catalog and information_schema)
         // takes no entries
         let created = match statement {
@@ -3870,6 +3903,12 @@ impl ClientContext {
                 }
                 let turning_off_access = name.eq_ignore_ascii_case("enable_external_access")
                     && settings::external_access_enabled(&global, &self.settings);
+                // what the secret manager read when it started stays, once the value is known to be valid
+                if let Err(error) = self.check_secret_setting_change(name) {
+                    let (mut checked, mut session) = (global.clone(), self.settings.clone());
+                    settings::set_variable(name, *scope, &value, &mut checked, &mut session)?;
+                    return Err(error);
+                }
                 settings::set_variable(name, *scope, &value, &mut global, &mut self.settings)?;
                 // `EnableExternalAccessSetting::OnSet`: the databases attached so far stay reachable
                 if turning_off_access && !settings::external_access_enabled(&global, &self.settings) {
@@ -3905,6 +3944,7 @@ impl ClientContext {
                     self.reset_logging_setting(setting)?;
                     return Ok(Self::success());
                 }
+                self.check_secret_setting_change(name)?;
                 settings::reset_variable(name, *scope, &mut global, &mut self.settings)?;
                 return Ok(Self::success());
             }

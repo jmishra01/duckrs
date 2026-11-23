@@ -2208,7 +2208,8 @@ fn read_value_body(d: &mut BinaryDeserializer<'_>, ty: LogicalType) -> Result<Va
                     .into_iter()
                     .map(|t| {
                         d.read_object_value(|d| {
-                            let t = if d.is_json() && d.has_named_property(100, "type")? {
+                            // binary files written before v1.2 have the types of the children too
+                            let t = if d.has_named_property(100, "type")? {
                                 let own: LogicalType = d.read_property(100, "type")?;
                                 if own.id() == LogicalTypeId::Invalid { t } else { own }
                             } else {

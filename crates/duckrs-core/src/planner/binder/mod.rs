@@ -697,6 +697,9 @@ pub struct SessionValues {
     pub default_collation: String,
     /// `duckdb_settings()`
     pub settings: SettingList,
+    /// the secret manager of the database, for `duckdb_secrets()` and the other secret table
+    /// functions (`SecretManager::Get(context)`); `None` where the client has none
+    pub secrets: Option<Arc<dyn SecretTables>>,
     /// `CatalogSearchPath::GetSetPaths`: the schemas of the search path that was set
     pub search_path: Vec<String>,
     /// `CatalogSearchPath::GetSetPaths` as (catalog, schema), the catalog empty where it is not given
@@ -761,6 +764,24 @@ pub struct SettingRow {
 }
 
 pub type SettingList = Box<dyn Fn() -> Vec<SettingRow> + Send + Sync>;
+
+/// What the secret table functions read of the client's `SecretManager`: the rows of each, in the
+/// order of their columns. The secret manager belongs to the database instance, which the engine
+/// does not know, so the client passes this in.
+pub trait SecretTables: Send + Sync {
+    /// `duckdb_secrets()`: name, type, provider, persistent, storage, scope and secret_string of each
+    /// secret, the secret string redacted unless `redact` is false (`DuckDBSecretsBind` +
+    /// `DuckDBSecretsFunction`).
+    fn secrets(&self, redact: bool) -> Result<Vec<Vec<Value>>>;
+    /// `duckdb_secret_types()`: type, default_provider and extension of each secret type.
+    fn secret_types(&self) -> Result<Vec<Vec<Value>>>;
+    /// `duckdb_secret_type_parameters()`: type, provider, name, parameter_type and description of
+    /// each parameter of each provider.
+    fn secret_type_parameters(&self) -> Result<Vec<Vec<Value>>>;
+    /// `which_secret(path, type)`: name, persistent and storage of the secret a lookup of `path`
+    /// finds, if one.
+    fn which_secret(&self, path: &str, secret_type: &str) -> Result<Option<Vec<Value>>>;
+}
 
 impl std::fmt::Debug for SessionValues {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
