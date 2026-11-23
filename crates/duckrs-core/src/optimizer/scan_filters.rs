@@ -426,29 +426,66 @@ pub(super) fn table_pushdown(expr: &BoundExpr) -> TablePushdown {
 }
 
 /// Moves the filters directly on scans into them.
-pub fn push_into_scans(op: &mut LogicalOperator) {
-    push_into(op, false);
+pub fn push_into_scans(op: &mut LogicalOperator, late: &std::collections::HashSet<usize>) {
+    push_into(op, None, late);
 }
 
 /// [`push_into_scans`] of the filters on scans of tables and Parquet files only, whose table filters statistics
 /// then check (`PushdownGet` runs before statistics for any `LogicalGet` with `filter_pushdown`).
-pub fn push_into_table_scans(op: &mut LogicalOperator) {
-    push_into(op, true);
+pub fn push_into_table_scans(op: &mut LogicalOperator, filtered: &std::collections::HashSet<usize>) {
+    push_into(op, Some(filtered), &std::collections::HashSet::new());
 }
 
-fn push_into(op: &mut LogicalOperator, before_statistics: bool) {
+/// The table indexes of the scans with a filter right above them.
+pub fn scans_with_filters(op: &LogicalOperator) -> std::collections::HashSet<usize> {
+    fn visit(op: &LogicalOperator, found: &mut std::collections::HashSet<usize>) {
+        for child in &op.children {
+            visit(child, found);
+        }
+        if let K::LateralJoin { right, .. } = &op.kind {
+            visit(right, found);
+        }
+        if let K::Filter { .. } = &op.kind
+            && let Some(K::Get { table_index, .. } | K::ParquetScan { table_index, .. }) =
+                op.children.first().map(|child| &child.kind)
+        {
+            found.insert(*table_index);
+        }
+    }
+    let mut found = std::collections::HashSet::new();
+    visit(op, &mut found);
+    found
+}
+
+/// `before_statistics`: the scans whose filters go in now, those the filter pushdown left filters on. `late`: the
+/// scans a filter only reached after the filter pushdown, which keep it above them.
+fn push_into(
+    op: &mut LogicalOperator,
+    before_statistics: Option<&std::collections::HashSet<usize>>,
+    late: &std::collections::HashSet<usize>,
+) {
     for child in &mut op.children {
-        push_into(child, before_statistics);
+        push_into(child, before_statistics, late);
     }
     if let K::LateralJoin { right, .. } = &mut op.kind {
-        push_into(right, before_statistics);
+        push_into(right, before_statistics, late);
     }
     let K::Filter { expressions } = &mut op.kind else {
         return;
     };
-    if before_statistics && !matches!(op.children[0].kind, K::Get { .. } | K::ParquetScan { .. }) {
+    if let Some(K::Get { table_index, .. } | K::ParquetScan { table_index, .. }) =
+        op.children.first().map(|child| &child.kind)
+        && late.contains(table_index)
+    {
         return;
     }
+    if let Some(filtered) = before_statistics {
+        match &op.children[0].kind {
+            K::Get { table_index, .. } | K::ParquetScan { table_index, .. } if filtered.contains(table_index) => {}
+            _ => return,
+        }
+    }
+    let before_statistics = before_statistics.is_some();
     // `MultiFileFunction` has no `filter_pushdown` for CSV and JSON, only `pushdown_complex_filter`, which
     // leaves out files
     if matches!(op.children[0].kind, K::CsvScan { .. } | K::JsonScan { .. }) {
