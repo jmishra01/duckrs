@@ -11,14 +11,14 @@ pub use duckrs_common::types::{LogicalType, LogicalTypeId};
 pub use duckrs_common::value::Value;
 pub use duckrs_common::vector::DataChunk;
 pub use duckrs_common::{Error, ErrorKind, Result};
-pub use duckrs_core::client::MaterializedQueryResult as QueryResult;
+pub use duckrs_main::MaterializedQueryResult as QueryResult;
 
 mod arrow_export;
 pub use arrow_export::{arrow_schema, arrow_type, record_batches};
 mod relation;
 pub use relation::{JoinKind, Relation};
 
-use duckrs_core::client::{ClientContext, DatabaseInstance, PreparedStatementData};
+use duckrs_main::{ClientContext, DatabaseInstance, PreparedStatementData};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 

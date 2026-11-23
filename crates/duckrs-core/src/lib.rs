@@ -3,7 +3,6 @@
 //! directory; the modules split into crates once their boundaries settle.
 
 pub mod catalog;
-pub mod client;
 pub mod execution;
 pub mod function;
 pub mod logging;

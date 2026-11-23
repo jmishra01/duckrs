@@ -14,26 +14,26 @@ mod logging;
 pub mod settings;
 mod settings_table;
 
-use crate::catalog::{
+use duckrs_core::catalog::{
     Catalog, DEFAULT_CATALOG, Fork, IndexCatalogEntry, OnCreateConflict, SchemaCatalogEntry, SequenceData, SessionTemp,
     TEMP_SCHEMA, TableOrView, macro_type_name, missing_entry,
 };
-use crate::catalog::{DatabaseList, DatabaseListing};
-use crate::execution::alter::{execute_alter, execute_create_index};
-use crate::execution::expression_executor::evaluate_scalar;
-use crate::execution::physical::PhysicalResultCollector;
-use crate::execution::{create_plan, execute_plan_with};
-use crate::optimizer::join_order::estimate_plan;
-use crate::optimizer::{OptimizerOptions, optimize};
-use crate::planner::binder::{
+use duckrs_core::catalog::{DatabaseList, DatabaseListing};
+use duckrs_core::execution::alter::{execute_alter, execute_create_index};
+use duckrs_core::execution::expression_executor::evaluate_scalar;
+use duckrs_core::execution::physical::PhysicalResultCollector;
+use duckrs_core::execution::{create_plan, execute_plan_with};
+use duckrs_core::optimizer::join_order::estimate_plan;
+use duckrs_core::optimizer::{OptimizerOptions, optimize};
+use duckrs_core::planner::binder::{
     BindOptions, Binder, DefaultNullOrder, ParameterValues, bind_constant_expression, schema_of,
 };
-use crate::planner::binder::{SessionValues, ShowBehavior, enum_type_from, is_builtin_type};
-use crate::planner::column_binding_resolver::resolve_column_bindings;
-use crate::planner::statement_names::for_each_table_name;
-use crate::storage;
-use crate::storage::buffer_manager::BufferManager;
-use crate::storage::log_writer::WriteAheadLog;
+use duckrs_core::planner::binder::{SessionValues, ShowBehavior, enum_type_from, is_builtin_type};
+use duckrs_core::planner::column_binding_resolver::resolve_column_bindings;
+use duckrs_core::planner::statement_names::for_each_table_name;
+use duckrs_core::storage;
+use duckrs_core::storage::buffer_manager::BufferManager;
+use duckrs_core::storage::log_writer::WriteAheadLog;
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::serializer::StorageVersion;
 use duckrs_common::sort_key::OrderType;
@@ -85,7 +85,7 @@ pub struct DatabaseInstance {
     /// default one): it is gone by name, and only keeps what is attached
     detached: AtomicBool,
     /// `DatabaseInstance::GetLogManager`
-    log_manager: crate::logging::SharedLogManager,
+    log_manager: duckrs_core::logging::SharedLogManager,
     /// `DatabaseManager::GetNewQueryNumber`: the queries so far
     query_number: AtomicU64,
     /// `global_transaction_id`: the transactions so far, an auto-commit statement being one
@@ -161,7 +161,7 @@ fn attach_bool(value: &duckrs_parser::ast::Literal) -> Result<bool> {
     if value.text.is_empty() {
         return Ok(true);
     }
-    crate::function::cast::try_cast_string_to_bool(value.text.as_bytes()).ok_or_else(|| {
+    duckrs_core::function::cast::try_cast_string_to_bool(value.text.as_bytes()).ok_or_else(|| {
         Error::new(
             ErrorKind::Conversion,
             format!("Could not convert string '{}' to BOOL", value.text),
@@ -175,10 +175,10 @@ struct FileAheadWriter {
     db: std::sync::Weak<DatabaseInstance>,
 }
 
-impl crate::catalog::AheadWriter for FileAheadWriter {
+impl duckrs_core::catalog::AheadWriter for FileAheadWriter {
     fn write(
         &self,
-        table: &crate::catalog::TableCatalogEntry,
+        table: &duckrs_core::catalog::TableCatalogEntry,
         rows: &duckrs_common::column_data::ColumnDataCollection,
         first: usize,
         first_id: u64,
@@ -192,7 +192,7 @@ impl crate::catalog::AheadWriter for FileAheadWriter {
 
     fn encode(
         &self,
-        table: &crate::catalog::TableCatalogEntry,
+        table: &duckrs_core::catalog::TableCatalogEntry,
         rows: &duckrs_common::column_data::ColumnDataCollection,
     ) -> Result<Option<storage::writer::EncodedAhead>> {
         let Some(db) = self.db.upgrade() else {
@@ -203,7 +203,7 @@ impl crate::catalog::AheadWriter for FileAheadWriter {
 
     fn place(
         &self,
-        table: &crate::catalog::TableCatalogEntry,
+        table: &duckrs_core::catalog::TableCatalogEntry,
         encoded: storage::writer::EncodedAhead,
         first_id: u64,
     ) -> Result<Vec<storage::writer::WrittenGroup>> {
@@ -313,7 +313,7 @@ impl DatabaseInstance {
     }
 
     pub fn new() -> Arc<Self> {
-        crate::function::json::register_projjson_parser();
+        duckrs_core::function::json::register_projjson_parser();
         Arc::new(Self::with_file_access(None))
     }
 
@@ -373,7 +373,7 @@ impl DatabaseInstance {
         }
         let schema = db
             .catalog
-            .get_schema(crate::catalog::DEFAULT_SCHEMA)
+            .get_schema(duckrs_core::catalog::DEFAULT_SCHEMA)
             .ok_or_else(|| Error::new(ErrorKind::Internal, "an in-memory database has a main schema"))?;
         let file = path.to_string_lossy().replace('\'', "''");
         let Some(Statement::Select(query)) = duckrs_parser::parse_ast(&format!("SELECT * FROM '{file}'"))?.pop() else {
@@ -391,7 +391,7 @@ impl DatabaseInstance {
 
     /// `open_file` with what `ATTACH` can ask for.
     pub fn open_with(path: &Path, options: &AttachOptions) -> Result<Arc<Self>> {
-        crate::function::json::register_projjson_parser();
+        duckrs_core::function::json::register_projjson_parser();
         let read_only = options.read_only;
         if storage::is_open_file(path) {
             return Self::open_data_file(path, options);
@@ -467,7 +467,7 @@ impl DatabaseInstance {
         // `ROW_GROUP_SIZE`: the row groups the tables get from now on; those in the file keep the size they have
         let group_rows = options
             .row_group_size
-            .unwrap_or(crate::execution::zone_map::ROW_GROUP_SIZE as u64) as usize;
+            .unwrap_or(duckrs_core::execution::zone_map::ROW_GROUP_SIZE as u64) as usize;
         db.catalog.set_row_group_rows(group_rows);
         for schema in db.catalog.schemas() {
             for entry in schema.tables_and_views() {
@@ -493,7 +493,7 @@ impl DatabaseInstance {
             log,
             row_group_size: options
                 .row_group_size
-                .unwrap_or(crate::execution::zone_map::ROW_GROUP_SIZE as u64),
+                .unwrap_or(duckrs_core::execution::zone_map::ROW_GROUP_SIZE as u64),
             storage_version,
             no_wal_writes: options.no_wal_writes,
             vacuum_rebuild_indexes: options.vacuum_rebuild_indexes,
@@ -562,7 +562,7 @@ impl DatabaseInstance {
         }
         // `OptimisticDataWriter`: large appends go to blocks of their own ahead of a checkpoint
         let write_ahead =
-            |table: &crate::catalog::TableCatalogEntry,
+            |table: &duckrs_core::catalog::TableCatalogEntry,
              rows: &duckrs_common::column_data::ColumnDataCollection,
              first: usize,
              first_id: u64| self.write_ahead(table, rows, first, first_id, true);
@@ -647,7 +647,7 @@ impl DatabaseInstance {
     /// blocks of their own; nothing where `enable_optimistic_write` is off or the database can't be written.
     fn write_ahead(
         &self,
-        table: &crate::catalog::TableCatalogEntry,
+        table: &duckrs_core::catalog::TableCatalogEntry,
         rows: &duckrs_common::column_data::ColumnDataCollection,
         first: usize,
         first_id: u64,
@@ -681,7 +681,7 @@ impl DatabaseInstance {
     /// The encoding of [`Self::write_ahead`] of all of `rows`, with no lock held: `None` where nothing is written.
     fn encode_ahead(
         &self,
-        table: &crate::catalog::TableCatalogEntry,
+        table: &duckrs_core::catalog::TableCatalogEntry,
         rows: &duckrs_common::column_data::ColumnDataCollection,
     ) -> Result<Option<storage::writer::EncodedAhead>> {
         let Some(file) = self
@@ -703,7 +703,7 @@ impl DatabaseInstance {
     /// The placing of [`Self::write_ahead`], of what [`Self::encode_ahead`] encoded.
     fn place_ahead(
         &self,
-        table: &crate::catalog::TableCatalogEntry,
+        table: &duckrs_core::catalog::TableCatalogEntry,
         encoded: storage::writer::EncodedAhead,
         first_id: u64,
     ) -> Result<Vec<storage::writer::WrittenGroup>> {
@@ -778,7 +778,7 @@ impl DatabaseInstance {
         .filter(|text| !text.is_empty());
         let force_variant_shredding = match force_variant_shredding {
             Some(text) => {
-                let ty = crate::planner::binder::Binder::new(&self.catalog).type_from_name(&text)?;
+                let ty = duckrs_core::planner::binder::Binder::new(&self.catalog).type_from_name(&text)?;
                 Some(duckrs_common::variant::shredding::forced_shredded_type(&ty))
             }
             None => None,
@@ -825,7 +825,7 @@ impl DatabaseInstance {
 
     /// `abort` is `debug_checkpoint_abort`, which belongs to the session that asked.
     fn write_checkpoint_with(&self, abort: &str) -> Result<()> {
-        crate::execution::profiler::time_metric("storage.checkpoint_latency", || self.write_checkpoint_timed(abort))
+        duckrs_core::execution::profiler::time_metric("storage.checkpoint_latency", || self.write_checkpoint_timed(abort))
     }
 
     fn write_checkpoint_timed(&self, abort: &str) -> Result<()> {
@@ -1164,13 +1164,13 @@ pub struct ClientContext {
     /// `ClientContext::GetCurrentQuery`: the text of the query that runs
     current_query: String,
     /// the rows of an `Appender` that is flushing
-    appended: Option<crate::planner::binder::AppendedRows>,
+    appended: Option<duckrs_core::planner::binder::AppendedRows>,
     /// `DBConfig::replacement_scans` of this connection
-    replacement_scans: crate::planner::binder::ReplacementScans,
+    replacement_scans: duckrs_core::planner::binder::ReplacementScans,
     /// its temporary objects, which the `temp` catalog holds in C++
     temp: Arc<SchemaCatalogEntry>,
     /// the connection's logger (`ClientContext::logger`), which `write_log` finds by its id
-    log_target: Arc<crate::logging::LogTarget>,
+    log_target: Arc<duckrs_core::logging::LogTarget>,
     log_target_id: u64,
     /// the query running now (`TransactionContext::GetActiveQuery`)
     query_id: u64,
@@ -1184,8 +1184,8 @@ pub struct ClientContext {
     pending_profile: Option<PendingProfile>,
     /// of the statement EXPLAIN ANALYZE ran: its profile tree, what the profiler saw, and how long it took
     analyzed_profile: Option<(
-        Option<crate::execution::profiler::ProfileNode>,
-        Arc<crate::execution::profiler::OperatorProfiler>,
+        Option<duckrs_core::execution::profiler::ProfileNode>,
+        Arc<duckrs_core::execution::profiler::OperatorProfiler>,
         std::time::Duration,
     )>,
     /// EXPLAIN ANALYZE asks the statement it runs to keep the tree of its plan, with what each operator did
@@ -1229,7 +1229,7 @@ fn check_print_format(given: &str) -> Result<()> {
 /// The phases (with their times) and the operator tree of a profiled statement.
 type PendingProfile = (
     Vec<(String, std::time::Duration)>,
-    Option<crate::execution::profiler::ProfileNode>,
+    Option<duckrs_core::execution::profiler::ProfileNode>,
 );
 
 /// A transaction started with BEGIN.
@@ -1406,7 +1406,7 @@ impl ClientContext {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let log_target = Self::new_log_target(&db, id);
-        let log_target_id = crate::logging::register_target(&log_target);
+        let log_target_id = duckrs_core::logging::register_target(&log_target);
         let context = Self {
             home: db.clone(),
             routed_from: None,
@@ -1447,8 +1447,8 @@ impl ClientContext {
 
     /// What spilling operators may hold, from `memory_limit`, and where they spill to, from
     /// `temp_directory` (by default `.tmp`, or next to the database file) and `max_temp_directory_size`.
-    fn query_memory(&self) -> Result<Arc<crate::execution::temporary::QueryMemory>> {
-        use crate::execution::temporary::{QueryMemory, default_memory_limit, parse_setting_bytes};
+    fn query_memory(&self) -> Result<Arc<duckrs_core::execution::temporary::QueryMemory>> {
+        use duckrs_core::execution::temporary::{QueryMemory, default_memory_limit, parse_setting_bytes};
         let text = |name: &str| {
             self.setting(name)
                 .filter(|v| !v.is_null())
@@ -1600,9 +1600,9 @@ impl ClientContext {
         if let Ok(threshold) = self.setting_text("dynamic_or_filter_threshold").parse() {
             options.dynamic_or_filter_threshold = threshold;
         }
-        crate::execution::join_filter::set_in_filter_threshold(options.dynamic_or_filter_threshold);
-        crate::execution::join_filter::set_enabled(options.join_filter_pushdown);
-        crate::execution::set_streaming_windows(self.setting_text("enable_optimizer") != "false");
+        duckrs_core::execution::join_filter::set_in_filter_threshold(options.dynamic_or_filter_threshold);
+        duckrs_core::execution::join_filter::set_enabled(options.join_filter_pushdown);
+        duckrs_core::execution::set_streaming_windows(self.setting_text("enable_optimizer") != "false");
         if let Ok(threshold) = self.setting_text("approximate_join_order_threshold").parse() {
             options.approximate_join_order_threshold = threshold;
         }
@@ -1669,7 +1669,7 @@ impl ClientContext {
     }
 
     /// What files can be read and written, with `enable_external_access` off.
-    pub(crate) fn file_access(&self) -> Option<crate::execution::file_system::FileAccess> {
+    pub(crate) fn file_access(&self) -> Option<duckrs_core::execution::file_system::FileAccess> {
         settings::file_access(&self.home.settings.read(), &self.settings)
     }
 
@@ -1695,7 +1695,7 @@ impl ClientContext {
     /// `ClientContext::TableInfo`: the name and type of each column of a table, for an `Appender`.
     pub fn table_columns(&self, schema: Option<&str>, table: &str) -> Result<Vec<(String, LogicalType)>> {
         let catalog = self.catalog();
-        let _search_path = crate::catalog::SearchPathGuard::set(self.search_path_for(&self.db.name.clone()));
+        let _search_path = duckrs_core::catalog::SearchPathGuard::set(self.search_path_for(&self.db.name.clone()));
         let entry = catalog.get_table(schema, table).map_err(|_| {
             Error::new(
                 ErrorKind::Catalog,
@@ -1713,7 +1713,7 @@ impl ClientContext {
     }
 
     /// Adds a replacement scan: tables the catalog does not have that `scan` gives rows for.
-    pub fn add_replacement_scan(&mut self, scan: crate::planner::binder::ReplacementScan) {
+    pub fn add_replacement_scan(&mut self, scan: duckrs_core::planner::binder::ReplacementScan) {
         self.replacement_scans.0.push(scan);
     }
 
@@ -1767,10 +1767,10 @@ impl ClientContext {
             // `QueryProfiler::StartQuery`: a statement that starts with profiling on is profiled
             let profiled = self.profiling.then(std::time::Instant::now);
             self.pending_profile = None;
-            let profiler = profiled.map(|_| Arc::new(crate::execution::profiler::OperatorProfiler::default()));
-            let outcome = crate::execution::profiler::with_profiler(profiler.clone(), || {
-                crate::logging::with_file_logging(&target, || {
-                    let old_casting = crate::function::cast_rules::set_old_implicit_casting(
+            let profiler = profiled.map(|_| Arc::new(duckrs_core::execution::profiler::OperatorProfiler::default()));
+            let outcome = duckrs_core::execution::profiler::with_profiler(profiler.clone(), || {
+                duckrs_core::logging::with_file_logging(&target, || {
+                    let old_casting = duckrs_core::function::cast_rules::set_old_implicit_casting(
                         self.setting_text("old_implicit_casting") == "true",
                     );
                     let result = match self.verification_statement(statement) {
@@ -1778,7 +1778,7 @@ impl ClientContext {
                         Ok(None) => self.run_statement(statement),
                         Err(error) => Err(error),
                     };
-                    crate::function::cast_rules::set_old_implicit_casting(old_casting);
+                    duckrs_core::function::cast_rules::set_old_implicit_casting(old_casting);
                     result
                 })
             });
@@ -1942,7 +1942,7 @@ impl ClientContext {
                     forks: Vec::new(),
                     attached: Vec::new(),
                     modified: None,
-                    started: crate::execution::temporary::now_micros(),
+                    started: duckrs_core::execution::temporary::now_micros(),
                 });
                 if self
                     .setting_text("immediate_transaction_mode")
@@ -2174,8 +2174,8 @@ impl ClientContext {
     /// (`ClientContext::PendingStatementOrPreparedStatementInternal` + `CleanupInternal`).
     fn run_statement(&mut self, statement: &Statement) -> Result<MaterializedQueryResult> {
         // `FileSystem::GetHomeDirectory` of this connection
-        crate::execution::file_system::set_home_directory(Some(self.setting_text("home_directory")));
-        crate::execution::file_system::set_file_search_path(&self.setting_text("file_search_path"));
+        duckrs_core::execution::file_system::set_home_directory(Some(self.setting_text("home_directory")));
+        duckrs_core::execution::file_system::set_file_search_path(&self.setting_text("file_search_path"));
         // `Binder::BindCreateSchema`: the system catalog (and its pg_catalog and information_schema)
         // takes no entries
         let created = match statement {
@@ -2207,7 +2207,7 @@ impl ClientContext {
             self.db = previous;
             return result;
         }
-        let _search_path = crate::catalog::SearchPathGuard::set(self.search_path_for(&self.db.name.clone()));
+        let _search_path = duckrs_core::catalog::SearchPathGuard::set(self.search_path_for(&self.db.name.clone()));
         // the default database can be gone, as when its ATTACH was rolled back
         if (!Arc::ptr_eq(&self.db, &self.home) || self.home.is_detached())
             && !self
@@ -2449,10 +2449,10 @@ impl ClientContext {
                         .deferred_tables()
                         .iter()
                         .try_for_each(|table| {
-                            crate::execution::constraints::check_deferred_keys(table, &*table.rows()?, |_| true)
+                            duckrs_core::execution::constraints::check_deferred_keys(table, &*table.rows()?, |_| true)
                         })
                         .err()
-                        .map(crate::catalog::failed_commit)
+                        .map(duckrs_core::catalog::failed_commit)
                 } else {
                     None
                 };
@@ -2587,7 +2587,7 @@ impl ClientContext {
                 entries.push(SearchEntry {
                     catalog: internal.to_string(),
                     database: internal.to_string(),
-                    schema: crate::catalog::DEFAULT_SCHEMA.to_string(),
+                    schema: duckrs_core::catalog::DEFAULT_SCHEMA.to_string(),
                 });
                 continue;
             }
@@ -2623,7 +2623,7 @@ impl ClientContext {
                     entries.push(SearchEntry {
                         catalog: database.name.clone(),
                         database: database.name.clone(),
-                        schema: crate::catalog::DEFAULT_SCHEMA.to_string(),
+                        schema: duckrs_core::catalog::DEFAULT_SCHEMA.to_string(),
                     });
                     continue;
                 }
@@ -2641,7 +2641,7 @@ impl ClientContext {
             if !catalog.is_empty()
                 && self
                     .catalog()
-                    .get_schema(&crate::catalog::schema_key(&[catalog.as_str(), schema.as_str()]))
+                    .get_schema(&duckrs_core::catalog::schema_key(&[catalog.as_str(), schema.as_str()]))
                     .is_some()
             {
                 return Err(Error::new(
@@ -2676,13 +2676,13 @@ impl ClientContext {
     /// `SchemaSetting::GetSetting`: the schema of the default entry.
     fn default_schema_setting(&self) -> String {
         self.search_path.first().map_or_else(
-            || crate::catalog::DEFAULT_SCHEMA.to_string(),
+            || duckrs_core::catalog::DEFAULT_SCHEMA.to_string(),
             |entry| entry.schema.clone(),
         )
     }
 
     /// The search path of the database `database`, for the catalog's lookups.
-    fn search_path_for(&self, database: &str) -> crate::catalog::SearchPath {
+    fn search_path_for(&self, database: &str) -> duckrs_core::catalog::SearchPath {
         let mut schemas: Vec<String> = self
             .search_path
             .iter()
@@ -2691,20 +2691,20 @@ impl ClientContext {
             .collect();
         let default = match self.search_path.first() {
             Some(entry) if entry.database.eq_ignore_ascii_case(database) => entry.schema.clone(),
-            _ => crate::catalog::DEFAULT_SCHEMA.to_string(),
+            _ => duckrs_core::catalog::DEFAULT_SCHEMA.to_string(),
         };
-        schemas.push(crate::catalog::DEFAULT_SCHEMA.to_string());
-        crate::catalog::SearchPath { default, schemas }
+        schemas.push(duckrs_core::catalog::DEFAULT_SCHEMA.to_string());
+        duckrs_core::catalog::SearchPath { default, schemas }
     }
 
     /// `PhysicalAttach`.
     fn attach(&mut self, info: &duckrs_parser::ast::AttachInfo) -> Result<()> {
         use duckrs_parser::ast::OnCreateConflict as Conflict;
         if info.external_resource.is_some() {
-            return Err(crate::unported("ATTACH TO EXTERNAL RESOURCE"));
+            return Err(duckrs_core::unported("ATTACH TO EXTERNAL RESOURCE"));
         }
         let path = evaluate_scalar(&bind_constant_expression(&self.catalog(), &info.path)?)?.try_to_string()?;
-        let path = crate::execution::file_system::expand_path(&path);
+        let path = duckrs_core::execution::file_system::expand_path(&path);
         let mut options = AttachOptions::default();
         let mut mode_given = false;
         let mut compress_given = false;
@@ -2809,12 +2809,12 @@ impl ClientContext {
                 "recovery_mode" => {
                     // `RecoveryMode`
                     let modes = [(false, "DEFAULT"), (true, "NO_WAL_WRITES")];
-                    options.no_wal_writes = crate::logging::enum_from(&modes, "RecoveryMode", &value.text)?;
+                    options.no_wal_writes = duckrs_core::logging::enum_from(&modes, "RecoveryMode", &value.text)?;
                 }
                 // `QualifiedName::Parse`
                 "default_table" => {
                     // `QualifiedName::FromPath`: the last part is the name and the one before the schema
-                    let parts = crate::catalog::parse_qualified_name(&value.text)?;
+                    let parts = duckrs_core::catalog::parse_qualified_name(&value.text)?;
                     options.default_table = match parts.as_slice() {
                         [] => None,
                         [name] => Some((None, name.clone())),
@@ -2842,7 +2842,7 @@ impl ClientContext {
                 }
                 // `DBConfig::ParseMemoryLimitOrMaximum`
                 "mmap_reserve_size" => {
-                    let size = crate::execution::temporary::parse_memory_limit(&value.text)?;
+                    let size = duckrs_core::execution::temporary::parse_memory_limit(&value.text)?;
                     if size.is_none_or(|size| size > i64::MAX as u64) {
                         return Err(Error::new(
                             ErrorKind::Binder,
@@ -2898,7 +2898,7 @@ impl ClientContext {
         }
         // `MetricStorageWaitingToAttachLatency`: one instance attaches at a time, so there is no wait.
         if !in_memory {
-            crate::execution::profiler::add_timing("storage.waiting_to_attach_latency", std::time::Duration::ZERO);
+            duckrs_core::execution::profiler::add_timing("storage.waiting_to_attach_latency", std::time::Duration::ZERO);
         }
         let stem = Path::new(&path)
             .file_stem()
@@ -3220,7 +3220,7 @@ impl ClientContext {
                     "VIEW" => {
                         let view = match catalog.get_entry(schema_name.as_deref(), None, name) {
                             Ok(TableOrView::View(view)) => view,
-                            _ if crate::catalog::defaults::default_view(schema_name.as_deref(), name).is_some() => {
+                            _ if duckrs_core::catalog::defaults::default_view(schema_name.as_deref(), name).is_some() => {
                                 return Err(system());
                             }
                             _ => return Err(missing_entry("View", name)),
@@ -3244,10 +3244,10 @@ impl ClientContext {
                         let table_macro = *entry_type == "MACRO TABLE";
                         let schema = catalog.schema_for(schema_name.as_deref())?;
                         if !schema.set_macro_comment(name, table_macro, comment) {
-                            let builtin = crate::function::BuiltinFunctions::get();
+                            let builtin = duckrs_core::function::BuiltinFunctions::get();
                             if builtin.scalar(name).is_some()
                                 || builtin.aggregate(name).is_some()
-                                || crate::catalog::defaults::default_macro(schema_name.as_deref(), name, table_macro)
+                                || duckrs_core::catalog::defaults::default_macro(schema_name.as_deref(), name, table_macro)
                                     .is_some()
                             {
                                 return Err(system());
@@ -3268,7 +3268,7 @@ impl ClientContext {
     }
 
     /// The names of the columns of a view, as binding its query gives them.
-    fn view_column_names(&self, view: &crate::catalog::ViewCatalogEntry) -> Result<Vec<String>> {
+    fn view_column_names(&self, view: &duckrs_core::catalog::ViewCatalogEntry) -> Result<Vec<String>> {
         let catalog = self.catalog();
         let mut binder = Binder::with_options(&catalog, self.bind_options());
         binder.session = Some(self.session_values());
@@ -3330,8 +3330,8 @@ impl ClientContext {
         let bound = binder.bind(statement)?;
         let modifies = !matches!(statement, Statement::Select(_));
         let plan = optimize(bound.plan, self.optimizer_options());
-        crate::optimizer::join_order::take_error()?;
-        let databases: Vec<(String, Arc<crate::catalog::Catalog>)> = std::iter::once(self.db.clone())
+        duckrs_core::optimizer::join_order::take_error()?;
+        let databases: Vec<(String, Arc<duckrs_core::catalog::Catalog>)> = std::iter::once(self.db.clone())
             .chain(std::iter::once(self.home.clone()))
             .chain(self.home.attached.read().values().cloned())
             .map(|db| {
@@ -3345,7 +3345,7 @@ impl ClientContext {
                 )
             })
             .collect();
-        let database_of = |table: &crate::catalog::TableCatalogEntry| -> Option<String> {
+        let database_of = |table: &duckrs_core::catalog::TableCatalogEntry| -> Option<String> {
             let found = |exact: bool| {
                 databases.iter().find_map(|(name, catalog)| {
                     let entry = catalog.get_table(Some(&table.schema), &table.name).ok()?;
@@ -3358,7 +3358,7 @@ impl ClientContext {
         let exported = match statement {
             // the statement as written, with the query its plan exports to
             Statement::Copy(_) | Statement::CreateTable(_) => self.export_write(statement, &plan, &database_of),
-            _ => crate::planner::sql_export::export_plan(
+            _ => duckrs_core::planner::sql_export::export_plan(
                 &plan,
                 (!modifies || !names.is_empty()).then_some(names),
                 &database_of,
@@ -3379,10 +3379,10 @@ impl ClientContext {
     fn export_write(
         &self,
         statement: &Statement,
-        plan: &crate::planner::logical::LogicalOperator,
-        database_of: crate::planner::sql_export::DatabaseOf,
+        plan: &duckrs_core::planner::logical::LogicalOperator,
+        database_of: duckrs_core::planner::sql_export::DatabaseOf,
     ) -> std::result::Result<String, String> {
-        use crate::planner::logical::LogicalOperatorKind as K;
+        use duckrs_core::planner::logical::LogicalOperatorKind as K;
         let (names, source) = match (&plan.kind, plan.children.first()) {
             (K::CopyToFile { names, .. } | K::CopyToParquet { names, .. }, Some(child)) => (names.clone(), child),
             (K::CreateTableAs { columns, .. }, Some(child)) => {
@@ -3390,7 +3390,7 @@ impl ClientContext {
             }
             _ => return Err("The write has no SQL export".into()),
         };
-        let query = crate::planner::sql_export::export_query(source, &names, database_of)?;
+        let query = duckrs_core::planner::sql_export::export_query(source, &names, database_of)?;
         let sql = match statement {
             Statement::Copy(copy) => {
                 let mut copy = copy.clone();
@@ -3407,7 +3407,7 @@ impl ClientContext {
             }
             _ => unreachable!("checked by the caller"),
         };
-        crate::planner::sql_export::finish_sql(&sql)
+        duckrs_core::planner::sql_export::finish_sql(&sql)
     }
 
     /// `StatementVerification` with `debug_verify_statement` set to `explain_sql` or
@@ -3452,11 +3452,11 @@ impl ClientContext {
         let (names, types) = (bound.names.clone(), bound.types.clone());
         let logical = explain::logical_tree(&bound.plan, None);
         let mut plan = optimize(bound.plan, self.optimizer_options());
-        crate::optimizer::join_order::take_error()?;
+        duckrs_core::optimizer::join_order::take_error()?;
         let optimized = plan.clone();
         let estimate = estimate_plan(&plan);
         let logical_optimized = explain::logical_tree(&plan, Some(&estimate));
-        crate::execution::join_filter::note_probe_estimates(&plan);
+        duckrs_core::execution::join_filter::note_probe_estimates(&plan);
         resolve_column_bindings(&mut plan)?;
         let physical_plan = create_plan(plan);
         let physical = explain::physical_tree(physical_plan.as_ref(), Some(&optimized), Some(&estimate), analyze);
@@ -3484,12 +3484,12 @@ impl ClientContext {
         let logical_optimized = explain::render(&logical_optimized, format, upper);
         let physical = if explain_type == ExplainType::Analyze {
             // what the joins gave the scans is known once the statement ran
-            crate::execution::join_filter::start_recording();
+            duckrs_core::execution::join_filter::start_recording();
             self.capture_analyzed = true;
             self.analyzed = None;
             let ran = self.execute_statement(statement);
             self.capture_analyzed = false;
-            let recorded = crate::execution::join_filter::take_recorded();
+            let recorded = duckrs_core::execution::join_filter::take_recorded();
             ran?;
             // the plan that ran, where the statement planned one; else the one planned to show
             let mut physical = self.analyzed.take().unwrap_or(physical);
@@ -3639,12 +3639,12 @@ impl ClientContext {
                 if let Some(table) = table
                     && let duckrs_parser::ast::TableRefKind::BaseTable { name, .. } = &table.kind
                 {
-                    let schema = crate::planner::binder::schema_of(name)?;
+                    let schema = duckrs_core::planner::binder::schema_of(name)?;
                     let table = match self.catalog().get_entry(schema.as_deref(), None, &name.name)? {
-                        crate::catalog::TableOrView::View(_) => {
+                        duckrs_core::catalog::TableOrView::View(_) => {
                             return Err(Error::new(ErrorKind::Binder, "Can only vacuum or analyze base tables"));
                         }
-                        crate::catalog::TableOrView::Table(table) => table,
+                        duckrs_core::catalog::TableOrView::Table(table) => table,
                     };
                     // `Binder::BindVacuumTable`
                     let mut seen = std::collections::HashSet::new();
@@ -3727,7 +3727,7 @@ impl ClientContext {
             Statement::SetVariable { name, value, scope } => {
                 // `Binder::Bind(SetVariableStatement)` + `PhysicalSet`; the value binds with a
                 // `ConstantBinder`, where a name that is no SQL value function is refused
-                if crate::planner::binder::has_subquery(value) {
+                if duckrs_core::planner::binder::has_subquery(value) {
                     return Err(Error::new(ErrorKind::Binder, "SET value cannot contain subqueries"));
                 }
                 let bound = bind_constant_expression(&self.catalog(), value).map_err(|error| {
@@ -3764,7 +3764,7 @@ impl ClientContext {
                     || name.eq_ignore_ascii_case("debug_force_variant_shredding"))
                     && let Some(text) = (!value.is_null()).then(|| value.try_to_string()).transpose()?
                     && !text.is_empty()
-                    && crate::planner::binder::Binder::new(&self.catalog())
+                    && duckrs_core::planner::binder::Binder::new(&self.catalog())
                         .type_from_name(&text)
                         .is_err()
                 {
@@ -3961,7 +3961,7 @@ impl ClientContext {
                         }
                         _ => duckrs_common::value::Value::varchar(serialized.to_string()),
                     };
-                    let select = crate::function::json_serialize::execute_serialized_statement(&value, true)?;
+                    let select = duckrs_core::function::json_serialize::execute_serialized_statement(&value, true)?;
                     return self.execute_statement(&Statement::Select(select));
                 }
                 if parameters.is_empty() && lower.ends_with("_checkpoint_on_shutdown") {
@@ -4046,7 +4046,7 @@ impl ClientContext {
                         format!("No function matches the given name and argument types '{lower}'"),
                     ));
                 }
-                return Err(crate::unported(format!("PRAGMA {name}")));
+                return Err(duckrs_core::unported(format!("PRAGMA {name}")));
             }
             Statement::Explain {
                 statement,
@@ -4088,7 +4088,7 @@ impl ClientContext {
                     if info.if_exists {
                         return Ok(Self::success());
                     }
-                    return Err(crate::catalog::missing_entry("Sequence", &info.name.name));
+                    return Err(duckrs_core::catalog::missing_entry("Sequence", &info.name.name));
                 }
                 schema.alter_ownership(&info.name.name, owner_name)?;
                 return Ok(Self::success());
@@ -4163,8 +4163,8 @@ impl ClientContext {
                     directory if directory.is_empty() => "~/.duckdb/extensions".to_string(),
                     directory => directory,
                 };
-                access.check(&crate::execution::file_system::expand_path(&directory), true)?;
-                return Err(crate::unported("INSTALL statements"));
+                access.check(&duckrs_core::execution::file_system::expand_path(&directory), true)?;
+                return Err(duckrs_core::unported("INSTALL statements"));
             }
             Statement::CopyDatabase { from, to, schema_only } => {
                 return self.copy_database(from, to, *schema_only);
@@ -4203,7 +4203,7 @@ impl ClientContext {
             }
             Statement::Create(info) => {
                 let CreateKind::Schema { options } = &info.kind else {
-                    return Err(crate::unported(create_kind_name(&info.kind)));
+                    return Err(duckrs_core::unported(create_kind_name(&info.kind)));
                 };
                 if info.temporary {
                     return Err(Error::new(ErrorKind::Binder, "Temporary schemas are not supported"));
@@ -4277,8 +4277,8 @@ impl ClientContext {
         let bound = binder.bind(statement)?;
         let planned = profiling.map(|_| std::time::Instant::now());
         let mut optimizers = Vec::new();
-        let mut plan = crate::optimizer::optimize_timed(bound.plan, self.optimizer_options(), &mut optimizers);
-        crate::optimizer::join_order::take_error()?;
+        let mut plan = duckrs_core::optimizer::optimize_timed(bound.plan, self.optimizer_options(), &mut optimizers);
+        duckrs_core::optimizer::join_order::take_error()?;
         let optimized = profiling.map(|_| std::time::Instant::now());
         // EXPLAIN ANALYZE renders this plan once it ran: the optimized plan, its estimates, and what the
         // profiler saw of each operator
@@ -4286,16 +4286,16 @@ impl ClientContext {
             let estimate = estimate_plan(&plan);
             (plan.clone(), estimate)
         });
-        crate::execution::join_filter::note_probe_estimates(&plan);
+        duckrs_core::execution::join_filter::note_probe_estimates(&plan);
         resolve_column_bindings(&mut plan)?;
         let plan = create_plan(plan);
         let physical = profiling.map(|_| std::time::Instant::now());
         let collector = PhysicalResultCollector::new(plan);
         let threads = self.thread_count();
         let analyze_start = std::time::Instant::now();
-        let mut operator_profiler = profiling.and_then(|_| crate::execution::profiler::current());
+        let mut operator_profiler = profiling.and_then(|_| duckrs_core::execution::profiler::current());
         if analyzed.is_some() && operator_profiler.is_none() {
-            operator_profiler = Some(Arc::new(crate::execution::profiler::OperatorProfiler::default()));
+            operator_profiler = Some(Arc::new(duckrs_core::execution::profiler::OperatorProfiler::default()));
         }
         if let Some(profiler) = &operator_profiler {
             profiler.clear_operators();
@@ -4308,12 +4308,12 @@ impl ClientContext {
         memory.set_transaction_start(
             self.transaction
                 .as_ref()
-                .map_or_else(crate::execution::temporary::now_micros, |t| t.started),
+                .map_or_else(duckrs_core::execution::temporary::now_micros, |t| t.started),
         );
-        crate::execution::profiler::with_profiler(operator_profiler.clone(), || {
-            crate::execution::temporary::with_memory(memory, || execute_plan_with(&collector, threads))
+        duckrs_core::execution::profiler::with_profiler(operator_profiler.clone(), || {
+            duckrs_core::execution::temporary::with_memory(memory, || execute_plan_with(&collector, threads))
         })?;
-        crate::execution::join_filter::record(&collector);
+        duckrs_core::execution::join_filter::record(&collector);
         if let (Some((logical, estimate)), Some(profiler)) = (&analyzed, &operator_profiler) {
             let (tree, infos) = explain::analyzed_tree_with_infos(
                 collector.children[0].as_ref(),
@@ -4324,7 +4324,7 @@ impl ClientContext {
             self.analyzed = Some(tree);
             // `EXPLAIN (ANALYZE, FORMAT JSON)` is the profile of the run
             let select_coverage = !self.setting_text("profiling_coverage").eq_ignore_ascii_case("all");
-            let root = crate::execution::profiler::ProfileNode::of_with(
+            let root = duckrs_core::execution::profiler::ProfileNode::of_with(
                 collector.children[0].as_ref(),
                 profiler,
                 select_coverage,
@@ -4333,8 +4333,8 @@ impl ClientContext {
             .into_iter()
             .next();
             // the statement runs under a materializing collector and EXPLAIN ANALYZE, which the profile shows above it
-            let wrap = |name: &str, child: Option<crate::execution::profiler::ProfileNode>| {
-                crate::execution::profiler::ProfileNode {
+            let wrap = |name: &str, child: Option<duckrs_core::execution::profiler::ProfileNode>| {
+                duckrs_core::execution::profiler::ProfileNode {
                     op_type: name.to_string(),
                     name: name.to_string(),
                     extra_info: Vec::new(),
@@ -4362,7 +4362,7 @@ impl ClientContext {
             );
             let select_coverage = !self.setting_text("profiling_coverage").eq_ignore_ascii_case("all");
             let root =
-                crate::execution::profiler::ProfileNode::of(collector.children[0].as_ref(), operators, select_coverage)
+                duckrs_core::execution::profiler::ProfileNode::of(collector.children[0].as_ref(), operators, select_coverage)
                     .into_iter()
                     .next();
             self.pending_profile = Some((phases, root));
@@ -4390,9 +4390,9 @@ impl ClientContext {
         &mut self,
         sql: &str,
         total: std::time::Duration,
-        profiler: &crate::execution::profiler::OperatorProfiler,
+        profiler: &duckrs_core::execution::profiler::OperatorProfiler,
     ) -> Result<()> {
-        use crate::execution::profiler::{Metric, QueryProfile, TrackedMetrics};
+        use duckrs_core::execution::profiler::{Metric, QueryProfile, TrackedMetrics};
         let format = self.setting_text("enable_profiling");
         let output = self.setting_text("profiling_output");
         let (phases, root) = self.pending_profile.take().unwrap_or_default();
@@ -4414,11 +4414,11 @@ impl ClientContext {
         &self,
         sql: &str,
         total: std::time::Duration,
-        profiler: &crate::execution::profiler::OperatorProfiler,
+        profiler: &duckrs_core::execution::profiler::OperatorProfiler,
         phases: Vec<(String, std::time::Duration)>,
-        root: Option<crate::execution::profiler::ProfileNode>,
+        root: Option<duckrs_core::execution::profiler::ProfileNode>,
     ) -> String {
-        use crate::execution::profiler::{Metric, QueryProfile, TrackedMetrics};
+        use duckrs_core::execution::profiler::{Metric, QueryProfile, TrackedMetrics};
         // `QueryMetrics::FinalizeMetrics`: the live counters and the system peaks are always there,
         // the timings and counters only when something recorded them
         let mut metrics = std::collections::BTreeMap::new();
@@ -4488,7 +4488,7 @@ impl ClientContext {
 }
 
 /// The row groups the scans of a profile scanned, of those they could have.
-fn row_group_totals(node: &crate::execution::profiler::ProfileNode) -> (u64, u64) {
+fn row_group_totals(node: &duckrs_core::execution::profiler::ProfileNode) -> (u64, u64) {
     node.children
         .iter()
         .map(row_group_totals)
@@ -4543,7 +4543,7 @@ impl DatabaseInstance {
 }
 
 impl DatabaseList for DatabaseInstance {
-    fn with_catalog(&self, name: &str, use_it: &mut dyn FnMut(&crate::catalog::Catalog)) {
+    fn with_catalog(&self, name: &str, use_it: &mut dyn FnMut(&duckrs_core::catalog::Catalog)) {
         if name.eq_ignore_ascii_case(&self.name) && !self.is_detached() {
             use_it(&self.catalog);
         } else if let Some(database) = self.attached.read().get(&name.to_lowercase()) {
@@ -4677,7 +4677,7 @@ impl ClientContext {
             unreachable!("checked by the caller");
         };
         if self.setting_text("enable_macro_dependencies") == "true" {
-            return Err(crate::unported("macro dependencies"));
+            return Err(duckrs_core::unported("macro dependencies"));
         }
         let catalog = self.catalog();
         let schema = catalog.schema_for(create_schema_of(info)?.as_deref())?;
@@ -4716,7 +4716,7 @@ impl ClientContext {
             duckrs_parser::transformer::visit_expr_mut(e, &mut |e: &mut Expr| {
                 // only the lambda of a function that takes one: another arrow is JSON's `->`
                 if let ExprKind::Function(function) = &mut e.kind
-                    && crate::planner::binder::is_lambda_function(&function.name.name)
+                    && duckrs_core::planner::binder::is_lambda_function(&function.name.name)
                 {
                     for argument in &mut function.args {
                         if let ExprKind::Lambda { syntax, .. } = &mut argument.expr.kind {
@@ -4851,7 +4851,7 @@ impl ClientContext {
         match info.entry_type {
             kind @ ("TABLE" | "VIEW") => {
                 let type_name = if kind == "TABLE" { "Table" } else { "View" };
-                let schema = schema_of(&info.name).map_err(|_| crate::unported(format!("this form of DROP {kind}")))?;
+                let schema = schema_of(&info.name).map_err(|_| duckrs_core::unported(format!("this form of DROP {kind}")))?;
                 let dropped = match catalog.schema_for(schema.as_deref()) {
                     Ok(schema) => {
                         if schema.get_entry(&info.name.name).is_some() {
@@ -4871,7 +4871,7 @@ impl ClientContext {
                 // `Binder::Bind(DropStatement)`: the views of the system catalog are internal
                 if !dropped
                     && kind == "VIEW"
-                    && crate::catalog::defaults::default_view(schema.as_deref(), &info.name.name).is_some()
+                    && duckrs_core::catalog::defaults::default_view(schema.as_deref(), &info.name.name).is_some()
                 {
                     return Err(internal_entry(&info.name.name));
                 }
@@ -4882,7 +4882,7 @@ impl ClientContext {
             }
             kind @ ("MACRO" | "MACRO TABLE") => {
                 let table_macro = kind == "MACRO TABLE";
-                let schema = schema_of(&info.name).map_err(|_| crate::unported("this form of DROP MACRO"))?;
+                let schema = schema_of(&info.name).map_err(|_| duckrs_core::unported("this form of DROP MACRO"))?;
                 let dropped = match catalog.schema_for(schema.as_deref()) {
                     // DROP MACRO also drops a table macro, if there is no scalar one
                     Ok(schema) => {
@@ -4894,7 +4894,7 @@ impl ClientContext {
                     Err(error) => return Err(missing_schema(error, macro_type_name(table_macro), &info.name)),
                 };
                 // a function of the system catalog is an internal entry
-                let functions = crate::function::BuiltinFunctions::get();
+                let functions = duckrs_core::function::BuiltinFunctions::get();
                 if !dropped
                     && schema.is_none()
                     && (functions.scalar(&info.name.name).is_some() || functions.aggregate(&info.name.name).is_some())
@@ -4907,7 +4907,7 @@ impl ClientContext {
                 Ok(())
             }
             "INDEX" => {
-                let schema = schema_of(&info.name).map_err(|_| crate::unported("this form of DROP INDEX"))?;
+                let schema = schema_of(&info.name).map_err(|_| duckrs_core::unported("this form of DROP INDEX"))?;
                 let dropped = match catalog.schema_for(schema.as_deref()) {
                     Ok(schema) => schema.drop_index(&info.name.name),
                     Err(_) if info.if_exists => false,
@@ -4919,7 +4919,7 @@ impl ClientContext {
                 Ok(())
             }
             "SEQUENCE" => {
-                let schema = schema_of(&info.name).map_err(|_| crate::unported("this form of DROP SEQUENCE"))?;
+                let schema = schema_of(&info.name).map_err(|_| duckrs_core::unported("this form of DROP SEQUENCE"))?;
                 let dropped = match catalog.schema_for(schema.as_deref()) {
                     Ok(schema) => schema.drop_sequence_checked(&info.name.name, info.cascade)?,
                     Err(_) if info.if_exists => false,
@@ -4931,7 +4931,7 @@ impl ClientContext {
                 Ok(())
             }
             "TYPE" => {
-                let schema = schema_of(&info.name).map_err(|_| crate::unported("this form of DROP TYPE"))?;
+                let schema = schema_of(&info.name).map_err(|_| duckrs_core::unported("this form of DROP TYPE"))?;
                 let dropped = match catalog.schema_for(schema.as_deref()) {
                     Ok(schema) => schema.drop_type_checked(&info.name.name, info.cascade)?,
                     Err(_) if info.if_exists => false,
@@ -4955,21 +4955,21 @@ impl ClientContext {
                     if catalog_qualifier_only(&path[..1]) {
                         path.remove(0);
                     } else if !first.eq_ignore_ascii_case(&self.db.name) && self.find_database(first).is_some() {
-                        return Err(crate::unported("DROP SCHEMA of another catalog"));
+                        return Err(duckrs_core::unported("DROP SCHEMA of another catalog"));
                     }
                 }
                 path.push(info.name.name.clone());
-                catalog.drop_schema(&crate::catalog::schema_key(&path), info.if_exists, info.cascade)?;
+                catalog.drop_schema(&duckrs_core::catalog::schema_key(&path), info.if_exists, info.cascade)?;
                 // a dropped schema leaves the search path (`CatalogSearchPath::RefreshSetPaths`)
                 let database = self.db.name.clone();
-                let dropped = crate::catalog::schema_key(&path);
+                let dropped = duckrs_core::catalog::schema_key(&path);
                 self.search_path.retain(|entry| {
                     !(entry.database.eq_ignore_ascii_case(&database)
-                        && crate::catalog::schema_key(&[entry.schema.as_str()]) == dropped)
+                        && duckrs_core::catalog::schema_key(&[entry.schema.as_str()]) == dropped)
                 });
                 Ok(())
             }
-            other => Err(crate::unported(format!("DROP {other}"))),
+            other => Err(duckrs_core::unported(format!("DROP {other}"))),
         }
     }
 
@@ -9341,8 +9341,8 @@ fn view_dependents(
     catalog: &Catalog,
     schema: &str,
     name: &str,
-) -> Vec<(Arc<crate::catalog::SchemaCatalogEntry>, String)> {
-    let mut found: Vec<(Arc<crate::catalog::SchemaCatalogEntry>, String)> = Vec::new();
+) -> Vec<(Arc<duckrs_core::catalog::SchemaCatalogEntry>, String)> {
+    let mut found: Vec<(Arc<duckrs_core::catalog::SchemaCatalogEntry>, String)> = Vec::new();
     let mut pending = vec![(schema.to_string(), name.to_string())];
     while let Some((schema, name)) = pending.pop() {
         for entry_schema in catalog.schemas() {
@@ -9395,7 +9395,7 @@ fn check_alter_dependents(catalog: &Catalog, schema: &str, name: &str) -> Result
 }
 
 /// The rows of the row groups of a table in a file, if all but the last have the same number.
-fn stored_group_rows(source: &dyn crate::catalog::TableSource) -> Option<usize> {
+fn stored_group_rows(source: &dyn duckrs_core::catalog::TableSource) -> Option<usize> {
     let groups = source.group_count();
     if groups < 2 {
         return None;

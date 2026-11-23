@@ -1,0 +1,16 @@
+[package]
+name = "duckrs-main"
+description = "The duckrs client: Database, Connection and ClientContext, settings, EXPLAIN, triggers (DuckDB's src/main)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+duckrs-common.workspace = true
+duckrs-parser.workspace = true
+duckrs-core.workspace = true
+parking_lot.workspace = true
+
+[lints]
+workspace = true

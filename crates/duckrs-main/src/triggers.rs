@@ -11,18 +11,18 @@
 //! of the statement as transition tables the bodies bind to.
 
 use super::*;
-use crate::catalog::{
+use duckrs_core::catalog::{
     DEFAULT_SCHEMA, TableCatalogEntry, TriggerCatalogEntry, TriggerEvent, TriggerForEach, TriggerTiming,
 };
-use crate::planner::statement_names::{body_statement, referenced_names};
-use crate::planner::trigger_scope::{self, RowScope, TransitionTable, TriggerScope};
+use duckrs_core::planner::statement_names::{body_statement, referenced_names};
+use duckrs_core::planner::trigger_scope::{self, RowScope, TransitionTable, TriggerScope};
 use duckrs_common::types::sql_identifier;
 use duckrs_parser::ast::{QueryNode, QueryNodeKind, TableRef, TableRefKind};
 use std::sync::atomic::Ordering as AtomicOrdering2;
 
 /// The table an INSERT, UPDATE or DELETE writes, and what it does to it.
 pub(super) struct TriggerTarget {
-    pub schema: Arc<crate::catalog::SchemaCatalogEntry>,
+    pub schema: Arc<duckrs_core::catalog::SchemaCatalogEntry>,
     pub table: Arc<TableCatalogEntry>,
     pub event: TriggerEvent,
     /// UPDATE: the columns it sets
@@ -114,10 +114,10 @@ fn rows_of(new_rows: &Option<MaterializedQueryResult>, old_rows: &Option<Materia
 /// The schema with the entry `name`: the one it is qualified with, or the first of the search path
 /// that has it.
 fn table_schema(
-    catalog: &crate::catalog::Catalog,
+    catalog: &duckrs_core::catalog::Catalog,
     qualification: &[String],
     name: &str,
-) -> Option<Arc<crate::catalog::SchemaCatalogEntry>> {
+) -> Option<Arc<duckrs_core::catalog::SchemaCatalogEntry>> {
     match qualification.last() {
         Some(schema) => catalog.get_schema(schema).filter(|s| s.get_entry(name).is_some()),
         None => [TEMP_SCHEMA, DEFAULT_SCHEMA]
@@ -728,7 +728,7 @@ impl ClientContext {
             &table_name.name,
         )?;
         let schema = table_schema(&catalog, &table_name.qualification, &table_name.name)
-            .ok_or_else(|| crate::catalog::missing_entry("Table", &table_name.name))?;
+            .ok_or_else(|| duckrs_core::catalog::missing_entry("Table", &table_name.name))?;
         let base = match schema.get_entry(&table_name.name) {
             Some(TableOrView::Table(table)) => table,
             Some(TableOrView::View(_)) => {
@@ -736,7 +736,7 @@ impl ClientContext {
                     "CREATE TRIGGER requires a base table, not a view or subquery",
                 ));
             }
-            None => return Err(crate::catalog::missing_entry("Table", &table_name.name)),
+            None => return Err(duckrs_core::catalog::missing_entry("Table", &table_name.name)),
         };
         let timing = TriggerTiming::from_name(timing);
         let event = TriggerEvent::from_name(event);
@@ -941,10 +941,10 @@ impl ClientContext {
     /// The table `name` is, from a body in `schema`.
     fn resolve_table(
         &self,
-        schema: &Arc<crate::catalog::SchemaCatalogEntry>,
+        schema: &Arc<duckrs_core::catalog::SchemaCatalogEntry>,
         qualification: &[String],
         name: &str,
-    ) -> Option<(Arc<crate::catalog::SchemaCatalogEntry>, Arc<TableCatalogEntry>)> {
+    ) -> Option<(Arc<duckrs_core::catalog::SchemaCatalogEntry>, Arc<TableCatalogEntry>)> {
         let catalog = self.catalog();
         let schema = match qualification.last() {
             None if schema.get_entry(name).is_some() => schema.clone(),
@@ -960,7 +960,7 @@ impl ClientContext {
     /// (`trigger_creation_table`).
     fn reaches_table(
         &self,
-        schema: &Arc<crate::catalog::SchemaCatalogEntry>,
+        schema: &Arc<duckrs_core::catalog::SchemaCatalogEntry>,
         qualification: &[String],
         name: &str,
         events: &[TriggerEvent],
@@ -996,7 +996,7 @@ impl ClientContext {
     /// it from being dropped, unless CASCADE drops them too.
     pub(super) fn drop_trigger_dependents(
         &mut self,
-        catalog: &crate::catalog::Catalog,
+        catalog: &duckrs_core::catalog::Catalog,
         name: &str,
         kind: &str,
         cascade: bool,
@@ -1113,9 +1113,9 @@ impl ClientContext {
             &table_name.name,
         )?;
         let schema = table_schema(&catalog, &table_name.qualification, &table_name.name)
-            .ok_or_else(|| crate::catalog::missing_entry("Table", &table_name.name))?;
+            .ok_or_else(|| duckrs_core::catalog::missing_entry("Table", &table_name.name))?;
         let Some(TableOrView::Table(base)) = schema.get_entry(&table_name.name) else {
-            return Err(crate::catalog::missing_entry("Table", &table_name.name));
+            return Err(duckrs_core::catalog::missing_entry("Table", &table_name.name));
         };
         let exists = schema.get_trigger(&base.name, &info.name.name).is_some();
         if !exists {

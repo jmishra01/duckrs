@@ -22,7 +22,7 @@ pub mod default_types;
 pub mod defaults;
 mod defaults_table;
 mod fork;
-pub(crate) use fork::failed_commit;
+pub use fork::failed_commit;
 mod row_ids;
 pub mod trigger;
 pub use fork::{CatalogVersions, Fork, RowVersions, TableOrigin, tick};
@@ -3197,7 +3197,7 @@ impl Catalog {
     }
 
     /// The tables with a DEFERRED key, which a commit checks.
-    pub(crate) fn deferred_tables(&self) -> Vec<Arc<TableCatalogEntry>> {
+    pub fn deferred_tables(&self) -> Vec<Arc<TableCatalogEntry>> {
         let mut found = Vec::new();
         for schema in self.schema_map().values() {
             for entry in schema.tables.read().values() {

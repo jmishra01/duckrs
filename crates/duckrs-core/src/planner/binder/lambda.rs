@@ -28,7 +28,7 @@ pub(super) struct LambdaScope {
 }
 
 /// Whether `name` is a function that takes a lambda.
-pub(crate) fn is_lambda_function(name: &str) -> bool {
+pub fn is_lambda_function(name: &str) -> bool {
     lambda_kind(name).is_some()
 }
 
