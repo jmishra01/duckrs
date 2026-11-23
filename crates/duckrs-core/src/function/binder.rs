@@ -626,6 +626,7 @@ pub fn bind_aggregate_function(
         order_by: Vec::new(),
         distinct_key: None,
         distinct_order: Vec::new(),
+        proven_no_overflow: false,
     })
 }
 

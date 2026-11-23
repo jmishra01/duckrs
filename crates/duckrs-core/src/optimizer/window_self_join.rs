@@ -168,6 +168,7 @@ fn translate_aggregate(window: &BoundWindow) -> BoundAggregate {
         order_by,
         distinct_key: None,
         distinct_order: Vec::new(),
+        proven_no_overflow: false,
     }
 }
 

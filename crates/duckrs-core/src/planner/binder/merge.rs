@@ -278,6 +278,7 @@ impl Binder<'_> {
             let row = LogicalOperator::new(
                 LogicalOperatorKind::ExpressionGet {
                     function: None,
+                    volatile: false,
                     table_index,
                     types: vec![LogicalType::INTEGER],
                     expressions: vec![vec![BoundExpr::constant(Value::integer(42))]],

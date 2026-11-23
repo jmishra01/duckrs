@@ -222,6 +222,9 @@ pub struct BoundAggregate {
     /// the `ORDER BY` keys (by position) that are not arguments: DISTINCT tells rows apart by
     /// them too (`MultiStageAggregateRewriter::GetOrderExpressions`)
     pub distinct_order: Vec<usize>,
+    /// a `sum` that statistics proved can't overflow and made a `sum_no_overflow` (`SumPropagateStats`), which
+    /// then can't throw either
+    pub proven_no_overflow: bool,
 }
 
 /// The functions that give something else on each call (`FunctionStability::VOLATILE`).

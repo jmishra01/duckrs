@@ -415,6 +415,7 @@ impl Binder<'_> {
         Ok(LogicalOperator::new(
             LogicalOperatorKind::ExpressionGet {
                 function: None,
+                volatile: false,
                 table_index,
                 types,
                 expressions,
@@ -836,9 +837,23 @@ impl Binder<'_> {
         function: &str,
         name: &QualifiedName,
     ) -> Result<LogicalOperator> {
+        // `PragmaTableInfoBind`: of a view, which is bound again when it runs, or a table that is not the catalog's
+        // own, the rows can differ between runs
+        let native_table = !(name.qualification.is_empty()
+            && self.ctes.iter().any(|(n, ..)| n.eq_ignore_ascii_case(&name.name)))
+            && matches!(
+                self.catalog.get_entry(super::schema_of(name)?.as_deref(), self.search_schema.as_deref(), &name.name),
+                Ok(TableOrView::Table(_))
+            );
         let described = self.describe_entry(name)?;
+        let mark = |mut op: LogicalOperator| {
+            if let LogicalOperatorKind::ExpressionGet { volatile, .. } = &mut op.kind {
+                *volatile = !native_table;
+            }
+            op
+        };
         if function.eq_ignore_ascii_case("pragma_show") {
-            return self.bind_describe_rows(table_ref, described);
+            return self.bind_describe_rows(table_ref, described).map(mark);
         }
         let mut rows = Vec::with_capacity(described.len());
         for (cid, row) in described.into_iter().enumerate() {
@@ -870,6 +885,7 @@ impl Binder<'_> {
             types,
             rows,
         )
+        .map(mark)
     }
 
     /// Everything in the catalog, with stable ids.

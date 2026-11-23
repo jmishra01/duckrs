@@ -2769,6 +2769,7 @@ impl Binder<'_> {
                 Ok(LogicalOperator::new(
                     LogicalOperatorKind::ExpressionGet {
                         function: None,
+                        volatile: false,
                         table_index,
                         types,
                         expressions,
@@ -3678,6 +3679,7 @@ impl Binder<'_> {
                             types,
                             expressions,
                             function: None,
+                            volatile: false,
                         },
                         vec![],
                     )

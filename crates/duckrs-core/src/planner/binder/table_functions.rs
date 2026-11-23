@@ -517,6 +517,7 @@ impl Binder<'_> {
         Ok(LogicalOperator::new(
             LogicalOperatorKind::ExpressionGet {
                 function: None,
+                volatile: false,
                 table_index,
                 types,
                 expressions,

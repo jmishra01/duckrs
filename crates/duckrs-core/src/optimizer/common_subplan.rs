@@ -659,9 +659,12 @@ impl Finder {
                 index_rows.is_none() && !rowid
             }
             // the rows of a volatile table function differ between its calls
-            K::ExpressionGet { function, .. } => function
-                .as_deref()
-                .is_none_or(|f| !crate::planner::expression::VOLATILE_TABLE_FUNCTIONS.contains(&f)),
+            K::ExpressionGet { function, volatile, .. } => {
+                !*volatile
+                    && function
+                        .as_deref()
+                        .is_none_or(|f| !crate::planner::expression::VOLATILE_TABLE_FUNCTIONS.contains(&f))
+            }
             // `LogicalColumnDataGet`: not too many rows to compare
             K::ChunkGet { chunks, .. } => chunks.iter().map(|c| c.len()).sum::<usize>() < 1000,
             _ => false,
@@ -676,8 +679,12 @@ impl Finder {
         };
         let shareable = outputs.into_iter().all(|mut output| {
             let combinable = match &output {
+                // C++ shares subplans before statistics propagation, which here has made a `sum` it proved can't
+                // overflow a `sum_no_overflow`: that can't throw either
                 Expandable::Aggregate(aggregate) => {
-                    can_combine_aggregate(aggregate) && !aggregate_can_throw(&aggregate.function, &aggregate.children)
+                    can_combine_aggregate(aggregate)
+                        && (aggregate.proven_no_overflow
+                            || !aggregate_can_throw(&aggregate.function, &aggregate.children))
                 }
                 Expandable::Expression(_) => true,
             };
