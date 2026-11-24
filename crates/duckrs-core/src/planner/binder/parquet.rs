@@ -429,6 +429,7 @@ impl Binder<'_> {
             files_for_stats,
             page_pruning: self.parquet_page_pruning(can_have_nan),
             explicit_cardinality,
+            metadata_cache: self.bool_setting("parquet_metadata_cache", false),
         };
         Ok(LogicalOperator::new(
             LogicalOperatorKind::ParquetScan {

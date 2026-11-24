@@ -3085,6 +3085,13 @@ impl StatisticsPropagator {
                 self.hidden.insert(base);
             }
         }
+        // `PropagateStatistics(LogicalProjection)`: a projection of nothing is nothing
+        if matches!(op.kind, K::Projection { .. })
+            && op.children.first().is_some_and(|child| matches!(child.kind, K::EmptyResult { .. }))
+        {
+            *op = empty_result(op);
+            return;
+        }
         self.count_valid_as_count_star(op);
         // `ParquetCopyToPropagateStatistics`: columns that can't be NULL are written REQUIRED
         if matches!(op.kind, K::CopyToParquet { .. }) {
@@ -3168,6 +3175,12 @@ impl StatisticsPropagator {
                 for (index, group) in groups.iter().enumerate() {
                     if let BoundExprKind::ColumnRef { binding, depth: 0 } = &group.kind {
                         self.aliases.insert(ColumnBinding::new(*group_index, index), *binding);
+                    }
+                }
+                // `PropagateStatistics(LogicalAggregate)`: the arguments of the aggregates are expressions too
+                for aggregate in aggregates.iter_mut() {
+                    for child in &mut aggregate.children {
+                        self.expression(child, false);
                     }
                 }
                 let (aggregate_index, aggregates) = (*aggregate_index, aggregates.clone());
