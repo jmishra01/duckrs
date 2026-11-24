@@ -68,7 +68,7 @@ pub(super) fn filename_option(value: &Value, option: &str) -> Result<Option<Stri
     Ok(is_true(value, option)?.then(|| "filename".to_string()))
 }
 
-fn text(value: &Value) -> Result<String> {
+pub(super) fn text(value: &Value) -> Result<String> {
     value.try_to_string()
 }
 

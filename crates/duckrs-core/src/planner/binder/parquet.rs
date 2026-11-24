@@ -123,7 +123,7 @@ impl Binder<'_> {
                 if value.is_null() {
                     return Err(binder_error(format!("{name} cannot take NULL list as parameter")));
                 }
-                paths = Some(strings(&value)?);
+                paths = Some(file_entries(&value)?);
                 continue;
             }
             let option = argument.name.to_lowercase();
@@ -194,7 +194,20 @@ impl Binder<'_> {
                 _ => return Err(crate::unported(format!("the {name} option {option}"))),
             }
         }
-        let patterns = paths.ok_or_else(|| binder_error(format!("{name} requires a file name")))?;
+        let entries = paths.ok_or_else(|| binder_error(format!("{name} requires a file name")))?;
+        // `ParquetReader::LoadMetadata`: a footer length given for a file must fit in it
+        for (path, footer_size) in &entries {
+            if let Some(length) = footer_size {
+                let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                if *length == 0 || *length > u64::from(u32::MAX) || size < 12 + *length {
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        format!("Invalid footer length provided for file '{path}'"),
+                    ));
+                }
+            }
+        }
+        let patterns: Vec<String> = entries.into_iter().map(|(path, _)| path).collect();
         let mut files = Vec::new();
         for pattern in &patterns {
             self.check_file_access(pattern)?;
@@ -1142,6 +1155,41 @@ fn parse_field_ids(
         ids.0.insert(name, (field_id, children));
     }
     Ok(ids)
+}
+
+/// The files of a Parquet scan: paths, or STRUCTs of a `filename` and the options of that file
+/// (`OpenFileInfo::extended_info`), of which `footer_size` is kept.
+fn file_entries(value: &Value) -> Result<Vec<(String, Option<u64>)>> {
+    let ValueData::List(items) = value.data() else {
+        return Ok(strings(value)?.into_iter().map(|path| (path, None)).collect());
+    };
+    items
+        .iter()
+        .map(|item| {
+            let ValueData::Struct(children) = item.data() else {
+                return Ok((super::copy::text(item)?, None));
+            };
+            let fields = item.logical_type().struct_children();
+            let field = |name: &str| {
+                fields
+                    .iter()
+                    .position(|(field, _)| field.eq_ignore_ascii_case(name))
+                    .map(|at| &children[at])
+            };
+            let path = field("filename")
+                .ok_or_else(|| binder_error("a file given as a STRUCT needs a 'filename'"))
+                .and_then(super::copy::text)?;
+            let footer_size = match field("footer_size") {
+                Some(size) if !size.is_null() => Some(
+                    size.try_to_string()?
+                        .parse::<u64>()
+                        .map_err(|_| binder_error("footer_size must be an unsigned integer"))?,
+                ),
+                _ => None,
+            };
+            Ok((path, footer_size))
+        })
+        .collect()
 }
 
 impl Binder<'_> {
