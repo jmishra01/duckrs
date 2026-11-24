@@ -146,15 +146,9 @@ fn aggregate_text(aggregate: &BoundAggregate) -> String {
     }
 }
 
-/// `ExpressionFilter::ToString`: without the parentheses around all of it, if there are any.
-/// The filters of a scan as `GetFilterInfo` shows them: a BETWEEN of a column is its two
-/// comparisons (`FilterCombiner::GenerateTableScanFilters`), in one conjunction.
-fn scan_filter_lines(filters: &[BoundExpr]) -> String {
-    let marked: Vec<(BoundExpr, bool)> = filters.iter().map(|f| (f.clone(), false)).collect();
-    scan_filter_lines_marked(&marked)
-}
-
-/// [`scan_filter_lines`] of filters some of which are optional (`OptionalFilterScalarFun::ToString`).
+/// The filters of a scan as `GetFilterInfo` shows them (`ExpressionFilter::ToString`, without the parentheses
+/// around all of it): a BETWEEN of a column is its two comparisons (`FilterCombiner::GenerateTableScanFilters`), in
+/// one conjunction, and some of the filters may be optional (`OptionalFilterScalarFun::ToString`).
 fn scan_filter_lines_marked(filters: &[(BoundExpr, bool)]) -> String {
     use duckrs_core::planner::expression::BoundExprKind as E;
     let text = |filter: &BoundExpr| match &filter.kind {
@@ -186,6 +180,7 @@ fn scan_filter_lines_marked(filters: &[(BoundExpr, bool)]) -> String {
         (E::Conjunction { and: false, .. }, false) => format!("({})", text(filter)),
         _ => text(filter),
     };
+    #[allow(clippy::type_complexity, reason = "per column, its filters")]
     let mut groups: Vec<(Option<duckrs_core::planner::expression::ColumnBinding>, Vec<&(BoundExpr, bool)>)> = Vec::new();
     for filter in filters {
         let key = column(&filter.0);
@@ -329,10 +324,8 @@ fn window_text(window: &BoundWindow) -> String {
             from = "CURRENT ROW".to_string();
             units = units_of(window.start);
         }
-        B::UnboundedPreceding => {
-            if window.end != B::CurrentRowRange {
-                from = "UNBOUNDED PRECEDING".to_string();
-            }
+        B::UnboundedPreceding if window.end != B::CurrentRowRange => {
+            from = "UNBOUNDED PRECEDING".to_string();
         }
         B::ExprPrecedingRows | B::ExprPrecedingRange | B::ExprPrecedingGroups => {
             from = format!("{} PRECEDING", expr_text(&window.start_expr));
@@ -803,6 +796,7 @@ pub(super) fn logical_tree(op: &LogicalOperator, estimate: Option<&PlanEstimate>
 thread_local! {
     /// The details of each operator of the plan being rendered, by its address, while a profile wants them as its
     /// `extra_info`.
+    #[allow(clippy::type_complexity, reason = "the extra info of each operator, by its id")]
     static INFOS: std::cell::RefCell<Option<std::collections::HashMap<usize, Vec<(String, String)>>>> =
         const { std::cell::RefCell::new(None) };
     /// The working and recurring tables of the recursive CTEs being rendered, and their table
@@ -1134,9 +1128,7 @@ pub(super) fn add_dynamic_filters(node: &mut ExplainNode, recorded: &mut impl It
     let scan = node.info.iter().any(|(key, value)| {
         key == "Table" || (key == "Function" && matches!(value.as_str(), "READ_PARQUET" | "PARQUET_SCAN"))
     });
-    if (matches!(node.name.as_str(), "SEQ_SCAN" | "TABLE_SCAN") || scan)
-        && scan
-        && let Some(Some(filters)) = recorded.next()
+    if scan && let Some(Some(filters)) = recorded.next()
     {
         let at = node
             .info

@@ -35,7 +35,7 @@ pub enum BoundAlter {
         view: Arc<ViewCatalogEntry>,
         new_name: String,
     },
-    Table(BoundTableAlter),
+    Table(Box<BoundTableAlter>),
 }
 
 pub struct BoundTableAlter {
@@ -507,7 +507,7 @@ impl Binder<'_> {
                 let renames_generated = table.is_generated(&path[0]);
                 rename_in_generated(&mut alter.generated, &path[0], new_name);
                 if renames_generated {
-                    return Ok(BoundAlter::Table(alter));
+                    return Ok(BoundAlter::Table(Box::new(alter)));
                 }
                 let index = column_index(&table, &path[0])?;
                 if table.column_index(new_name).is_some_and(|other| other != index) {
@@ -562,7 +562,7 @@ impl Binder<'_> {
                             .find(|c| c.position == position)
                             .expect("the new column is generated"),
                     );
-                    return Ok(BoundAlter::Table(alter));
+                    return Ok(BoundAlter::Table(Box::new(alter)));
                 }
                 let mut definition = self.bind_new_column(column, &alter.schema.name)?;
                 definition.not_null = *not_null;
@@ -609,7 +609,7 @@ impl Binder<'_> {
                 if table.is_generated(&path[0]) {
                     alter.generated.retain(|c| !c.name.eq_ignore_ascii_case(&path[0]));
                     reposition_generated(&mut alter.generated, &table, &path[0]);
-                    return Ok(BoundAlter::Table(alter));
+                    return Ok(BoundAlter::Table(Box::new(alter)));
                 }
                 let Some(index) = table.column_index(&path[0]) else {
                     if *if_exists {
@@ -736,7 +736,7 @@ impl Binder<'_> {
             }
             _ => return Err(crate::unported("this ALTER statement")),
         }
-        Ok(BoundAlter::Table(alter))
+        Ok(BoundAlter::Table(Box::new(alter)))
     }
 
     /// `DuckTableEntry::ChangeColumnType`.

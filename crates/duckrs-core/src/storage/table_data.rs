@@ -1045,10 +1045,6 @@ impl DiskTable {
         Ok(result)
     }
 
-    /// A bound of a column as a value of its type.
-    fn bound(&self, column: usize, bytes: Option<&[u8; 16]>) -> Result<Option<Value>> {
-        bound(&self.table.columns[column].ty, bytes)
-    }
 }
 
 /// A bound of a column of type `ty`, from the bytes the file has of it.
@@ -1478,8 +1474,8 @@ impl TableSource for DiskTable {
         let values = scan_column(&self.buffer, leaf, &leaf_type, rows)?;
         let variant = LogicalType::new(LogicalTypeId::Variant);
         let mut result = Vector::new(variant.clone(), rows.max(1));
-        for row in 0..rows {
-            if !present[row] {
+        for (row, &is_present) in present.iter().enumerate().take(rows) {
+            if !is_present {
                 result.set_null(row, true);
                 continue;
             }

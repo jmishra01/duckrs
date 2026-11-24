@@ -17,7 +17,7 @@ pub fn execute_alter(alter: BoundAlter) -> Result<()> {
     match alter {
         BoundAlter::Nothing => Ok(()),
         BoundAlter::RenameView { schema, view, new_name } => schema.rename_view(&view, &new_name),
-        BoundAlter::Table(alter) => execute_table_alter(alter),
+        BoundAlter::Table(alter) => execute_table_alter(*alter),
     }
 }
 

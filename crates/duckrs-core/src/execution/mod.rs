@@ -208,7 +208,7 @@ fn base_cardinality(op: &LogicalOperator) -> u64 {
         LogicalOperatorKind::ExpressionGet { expressions, .. } => expressions.len() as u64,
         LogicalOperatorKind::DummyScan { .. } => 1,
         LogicalOperatorKind::EmptyResult { .. } => 0,
-        LogicalOperatorKind::Range { count, .. } => (*count).max(0) as u64,
+        LogicalOperatorKind::Range { count, .. } => *count,
         LogicalOperatorKind::TopN { limit, .. } => (*limit).min(op.children.first().map_or(0, base_cardinality)),
         LogicalOperatorKind::Limit { limit: Some(limit), .. } => {
             (*limit).min(op.children.first().map_or(0, base_cardinality))
@@ -844,7 +844,7 @@ impl Pipeline<'_> {
             }
             self.sink.combine_local_input(self.input, local)
         };
-        let finished = std::thread::scope(|scope| {
+        std::thread::scope(|scope| {
             for _ in 0..threads.min(morsels) {
                 scope.spawn(|| {
                     let run = || temporary::with_memory(Arc::clone(&memory), worker);
@@ -855,7 +855,6 @@ impl Pipeline<'_> {
                 });
             }
         });
-        let () = finished;
         if let Some(profiler) = &query_profiler {
             profiler.set_rows_scanned(self.source);
         }

@@ -363,6 +363,7 @@ impl Placer<'_> {
     }
 
     /// `GetExpressionWidth`: the bytes of the columns an expression reads, with each one's.
+    #[allow(clippy::type_complexity, reason = "the width and the columns it is made of")]
     fn expression_width(&mut self, expr: &BoundExpr) -> Option<(u64, Vec<(ColumnBinding, LogicalType, u64)>)> {
         let bindings = read_bindings(expr)?;
         if bindings.is_empty() {
@@ -448,6 +449,7 @@ impl Placer<'_> {
         // beyond the first direct join, the source can be live for another path expression or join condition
         let mut can_credit_input_transport = true;
         // (steps, expression, evaluation, output transport, input transport savings)
+        #[allow(clippy::type_complexity, reason = "a candidate with its paths and costs")]
         let mut candidates: Vec<(Vec<(Path, usize)>, BoundExpr, f64, f64, f64)> = Vec::new();
         loop {
             let op = node(plan, &current);

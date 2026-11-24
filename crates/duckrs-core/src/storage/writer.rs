@@ -2069,9 +2069,9 @@ impl<'a> Writer<'a> {
         }
         stream.current = Some(next);
         stream.offset = SUB_BLOCK_HEADER_SIZE;
-        if self.written_pages.is_some() {
-            let pointer = self.disk_pointer(next);
-            self.written_pages.as_mut().expect("just checked").push(pointer);
+        let pointer = self.disk_pointer(next);
+        if let Some(pages) = &mut self.written_pages {
+            pages.push(pointer);
         }
     }
 
@@ -3042,6 +3042,7 @@ impl<'a> Writer<'a> {
     }
 
     /// `RowGroup::WriteToDisk`.
+    #[allow(clippy::too_many_arguments)]
     fn write_row_group(
         &mut self,
         table: &TableCatalogEntry,
@@ -3175,6 +3176,7 @@ impl<'a> Writer<'a> {
     /// blocks and statistics, and whether they are loaded. `columns` says, of each column now, the stored one it
     /// is if it stays; the others are written again. Of those that stay, where their metadata starts and the
     /// metadata blocks it goes on to.
+    #[allow(clippy::type_complexity, reason = "per column: its pointer and its blocks")]
     fn keep_columns(
         &mut self,
         stored_group: usize,
@@ -4015,6 +4017,7 @@ pub const WRITE_BUFFER_ROW_GROUP_COUNT: usize = 5;
 /// `OptimisticDataWriter::WriteNewRowGroup` and `WriteUnflushedRowGroups` of the rows of `table` from position
 /// `first` on, the first of which has id `first_id`: in row groups of the table's size, `WRITE_BUFFER_ROW_GROUP_COUNT`
 /// at a time, into blocks that get their ids as they fill (`PartialBlockType::APPEND_TO_TABLE`).
+#[allow(clippy::too_many_arguments)]
 pub fn write_ahead(
     buffer: &std::sync::Arc<BufferManager>,
     catalog: &Catalog,

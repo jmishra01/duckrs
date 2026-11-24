@@ -67,7 +67,7 @@ impl HyperLogLog {
     const P: u32 = 6;
     const Q: usize = 64 - Self::P as usize;
     const M: usize = 1 << Self::P;
-    const ALPHA: f64 = 0.721_347_520_444_481_703_680;
+    const ALPHA: f64 = 0.721_347_520_444_481_7;
 
     fn new() -> Self {
         Self {

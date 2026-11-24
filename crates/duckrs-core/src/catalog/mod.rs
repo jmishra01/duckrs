@@ -712,6 +712,7 @@ impl ListLengths {
 
 /// `VariantStatsShreddingState`, with the type of the typed part of a shredded VARIANT and its statistics.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant, reason = "always behind the `Box` of `ColumnStatistics::variant`")]
 pub enum VariantStatistics {
     /// what a checkpoint that shredded nothing leaves
     Uninitialized,
@@ -1277,6 +1278,7 @@ impl TableCatalogEntry {
     /// `OptimisticDataWriter::WriteNewRowGroup` during an append: once the rows appended to the table in memory have
     /// `count` row groups full and more rows after them, those row groups go to blocks and out of memory.
     /// `write` writes them, given the rows, the position of the first and its id.
+    #[allow(clippy::type_complexity, reason = "the callback that writes the row groups")]
     pub fn write_full_row_groups(
         &self,
         count: usize,

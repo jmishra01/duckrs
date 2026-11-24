@@ -630,7 +630,7 @@ impl Estimator {
         let mut estimate = if empty { 0.0 } else { self.numerator(set) * self.inner_selectivity(set) };
         // the product of many large relations leaves the range of a double before the selectivity
         // divides it down again: work in units of the largest relation, as the equalities scale with it
-        if !empty && !(estimate.is_finite() && estimate > 0.0) {
+        if !(empty || (estimate.is_finite() && estimate > 0.0)) {
             let scale = self.cardinalities.iter().copied().fold(1.0, f64::max);
             let scaled = Estimator {
                 cardinalities: self.cardinalities.iter().map(|c| c / scale).collect(),
@@ -1920,7 +1920,7 @@ impl JoinOrderOptimizer {
                     .map(|&at| {
                         let expr = expressions.get(at)?;
                         // through the compression of a column too
-                        let column = if keeps_values_apart(expr) { &expr.children()[0] } else { expr };
+                        let column = if keeps_values_apart(expr) { expr.children()[0] } else { expr };
                         match &column.kind {
                             BoundExprKind::ColumnRef { binding, depth: 0 } => bindings.iter().position(|b| b == binding),
                             _ => None,

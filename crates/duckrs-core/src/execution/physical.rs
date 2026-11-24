@@ -294,6 +294,7 @@ pub struct PhysicalTableScan {
     pub rows_read: std::sync::atomic::AtomicU64,
     /// `prune` with each STRUCT field it reads (`struct_extract` of a column) as a position past `column_ids`, and
     /// the column and field of each of those positions, worked out once
+    #[allow(clippy::type_complexity, reason = "computed once: the filter and the extracts it reads")]
     pub vector_prune: std::sync::OnceLock<Option<(BoundExpr, Vec<(usize, crate::planner::logical::PushedExtract)>)>>,
 }
 
@@ -538,21 +539,6 @@ impl PhysicalTableScan {
             }
         }
         Ok(None)
-    }
-
-    fn file_scan(&self, source: Arc<dyn TableSource>) -> FileScan {
-        let (read, types, columns) = self.file_columns();
-        FileScan {
-            cursor: TableCursor::new(source, read, types, self.table.row_group_size()),
-            columns,
-        }
-    }
-
-    /// The columns a scan of the file reads, their types, and per entry of `column_ids` where a
-    /// chunk of them has it (or a vector that nothing reads).
-    #[allow(clippy::type_complexity, reason = "the three parts of a FileScan")]
-    fn file_columns(&self) -> (Vec<usize>, Vec<LogicalType>, Vec<Result<usize, Vector>>) {
-        self.file_columns_without(&[])
     }
 
     /// [`Self::file_columns`], with the positions `skip` read some other way.
@@ -5330,6 +5316,7 @@ pub struct PhysicalCreateTableAs {
     pub data: Mutex<ColumnDataCollection>,
     /// The row groups of `data` written to blocks as they filled (`OptimisticDataWriter`), out of memory, with the
     /// table they were written for, which takes their blocks.
+    #[allow(clippy::type_complexity, reason = "the table, its written row groups and their rows, taken together")]
     pub written: Mutex<
         Option<(
             Arc<TableCatalogEntry>,

@@ -20,7 +20,7 @@ type Path = Vec<usize>;
 pub fn pull_up(mut plan: LogicalOperator) -> LogicalOperator {
     // each step removes a projection, or moves one above everything it can pass
     for _ in 0..100_000 {
-        let Some(step) = find(&plan, &plan, &mut Vec::new(), &mut Vec::new(), false) else {
+        let Some(step) = find(&plan, &plan, &mut Vec::new(), &[], false) else {
             break;
         };
         apply(&mut plan, step);
@@ -121,7 +121,7 @@ fn find(
     root: &LogicalOperator,
     op: &LogicalOperator,
     path: &mut Path,
-    chain: &mut Vec<Path>,
+    chain: &[Path],
     free: bool,
 ) -> Option<Step> {
     if free && let Some(step) = consider(root, op, path, chain) {
@@ -129,15 +129,15 @@ fn find(
     }
     // a projection that stays is a barrier, as is any operator a projection cannot pass
     for at in 0..op.children.len() {
-        let mut child_chain = if pull_through(op, at) {
-            let mut chain = chain.clone();
+        let child_chain = if pull_through(op, at) {
+            let mut chain = chain.to_vec();
             chain.push(path.clone());
             chain
         } else {
             Vec::new()
         };
         path.push(at);
-        let step = find(root, &op.children[at], path, &mut child_chain, child_layout_free(op, at, free));
+        let step = find(root, &op.children[at], path, &child_chain, child_layout_free(op, at, free));
         path.pop();
         if step.is_some() {
             return step;

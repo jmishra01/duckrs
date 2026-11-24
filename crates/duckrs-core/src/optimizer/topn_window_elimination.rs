@@ -131,7 +131,7 @@ fn can_optimize(op: &LogicalOperator) -> Option<i64> {
         ComparisonOp::LessThanOrEqual if value >= MIN_MAX_N_MAX_VALUE => return None,
         ComparisonOp::LessThanOrEqual => value,
         ComparisonOp::LessThan if value < 2 => 0,
-        ComparisonOp::LessThan if value - 1 >= MIN_MAX_N_MAX_VALUE => return None,
+        ComparisonOp::LessThan if value > MIN_MAX_N_MAX_VALUE => return None,
         ComparisonOp::LessThan => value - 1,
         ComparisonOp::Equal if value < 1 => 0,
         ComparisonOp::Equal if value != 1 => return None,

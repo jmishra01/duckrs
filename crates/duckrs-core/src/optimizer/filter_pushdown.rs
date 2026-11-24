@@ -1151,17 +1151,17 @@ fn compared_expression(filter: &BoundExpr) -> Option<&BoundExpr> {
         return None;
     }
     let (children, first_only): (Vec<&BoundExpr>, bool) = match &filter.kind {
-        BoundExprKind::Comparison { op, left, right }
-            if matches!(
-                op,
+        BoundExprKind::Comparison {
+            op:
                 ComparisonOp::Equal
-                    | ComparisonOp::NotEqual
-                    | ComparisonOp::LessThan
-                    | ComparisonOp::LessThanOrEqual
-                    | ComparisonOp::GreaterThan
-                    | ComparisonOp::GreaterThanOrEqual
-            ) =>
-        {
+                | ComparisonOp::NotEqual
+                | ComparisonOp::LessThan
+                | ComparisonOp::LessThanOrEqual
+                | ComparisonOp::GreaterThan
+                | ComparisonOp::GreaterThanOrEqual,
+            left,
+            right,
+        } => {
             (vec![&**left, &**right], false)
         }
         BoundExprKind::Between { input, lower, upper } => (vec![&**input, &**lower, &**upper], true),

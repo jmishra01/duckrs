@@ -290,8 +290,7 @@ fn try_late_materialization(op: &mut LogicalOperator, next: &mut usize, root: bo
             .collect()
     } else {
         let mut columns = projections[0].1.clone();
-        for level in 1..projections.len() {
-            let below = &projections[level].1;
+        for (_, below) in projections.iter().skip(1) {
             for expr in &mut columns {
                 replace_columns(expr, &|binding| below.get(binding.column_index).cloned());
             }

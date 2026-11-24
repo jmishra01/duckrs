@@ -844,7 +844,7 @@ fn date_trunc_simplification(expr: &mut BoundExpr) -> bool {
                 && matches!(children[0].kind, BoundExprKind::Constant(_)))
     };
     let column_is_left = is_trunc(left) && matches!(right.kind, BoundExprKind::Constant(_));
-    if !column_is_left && !(is_trunc(right) && matches!(left.kind, BoundExprKind::Constant(_))) {
+    if !(column_is_left || (is_trunc(right) && matches!(left.kind, BoundExprKind::Constant(_)))) {
         return false;
     }
     let (trunc, constant) = if column_is_left { (&**left, &**right) } else { (&**right, &**left) };
