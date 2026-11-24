@@ -1183,6 +1183,13 @@ fn strip_view_catalog(query: &mut duckrs_parser::ast::SelectStatement, database:
     });
 }
 
+/// The first schema along the search path that `has` what an unqualified DROP names.
+fn search_path_schema(catalog: &Catalog, has: impl Fn(&SchemaCatalogEntry) -> bool) -> Option<String> {
+    duckrs_core::catalog::search_schemas()
+        .into_iter()
+        .find(|schema| catalog.get_schema(schema).is_some_and(|schema| has(&schema)))
+}
+
 /// A fully materialized result (`MaterializedQueryResult`).
 #[derive(Debug)]
 pub struct MaterializedQueryResult {
@@ -5139,7 +5146,17 @@ impl ClientContext {
         match info.entry_type {
             kind @ ("TABLE" | "VIEW") => {
                 let type_name = if kind == "TABLE" { "Table" } else { "View" };
-                let schema = schema_of(&info.name).map_err(|_| duckrs_core::unported(format!("this form of DROP {kind}")))?;
+                let mut schema =
+                    schema_of(&info.name).map_err(|_| duckrs_core::unported(format!("this form of DROP {kind}")))?;
+                // an unqualified name is looked up along the search path, as in a query
+                if schema.is_none()
+                    && let Ok(found) = catalog.get_entry(None, None, &info.name.name)
+                {
+                    schema = Some(match found {
+                        TableOrView::Table(table) => table.schema.clone(),
+                        TableOrView::View(view) => view.schema.clone(),
+                    });
+                }
                 let dropped = match catalog.schema_for(schema.as_deref()) {
                     Ok(schema) => {
                         if schema.get_entry(&info.name.name).is_some() {
@@ -5171,7 +5188,14 @@ impl ClientContext {
             }
             kind @ ("MACRO" | "MACRO TABLE") => {
                 let table_macro = kind == "MACRO TABLE";
-                let schema = schema_of(&info.name).map_err(|_| duckrs_core::unported("this form of DROP MACRO"))?;
+                let mut schema =
+                    schema_of(&info.name).map_err(|_| duckrs_core::unported("this form of DROP MACRO"))?;
+                // an unqualified name is looked up along the search path, as in a call
+                if schema.is_none() {
+                    let found = |table_macro| catalog.get_macro_in(None, None, &info.name.name, table_macro).ok().flatten();
+                    let found = found(table_macro).or_else(|| if table_macro { None } else { found(true) });
+                    schema = found.map(|(schema, _)| schema);
+                }
                 let dropped = match catalog.schema_for(schema.as_deref()) {
                     // DROP MACRO also drops a table macro, if there is no scalar one
                     Ok(schema) => {
@@ -5223,7 +5247,11 @@ impl ClientContext {
                 Ok(())
             }
             "SEQUENCE" => {
-                let schema = schema_of(&info.name).map_err(|_| duckrs_core::unported("this form of DROP SEQUENCE"))?;
+                let mut schema =
+                    schema_of(&info.name).map_err(|_| duckrs_core::unported("this form of DROP SEQUENCE"))?;
+                if schema.is_none() {
+                    schema = search_path_schema(&catalog, |s| s.get_sequence(&info.name.name).is_some());
+                }
                 let dropped = match catalog.schema_for(schema.as_deref()) {
                     Ok(schema) => schema.drop_sequence_checked(&info.name.name, info.cascade)?,
                     Err(_) if info.if_exists => false,
