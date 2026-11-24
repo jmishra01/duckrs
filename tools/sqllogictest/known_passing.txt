@@ -106,6 +106,7 @@ test/fuzzer/pedro/concurrent_set_threads.test
 test/fuzzer/pedro/constraints_temp_table.test
 test/fuzzer/pedro/correlated_in_segv.test
 test/fuzzer/pedro/correlated_limit_rowid.test
+test/fuzzer/pedro/correlated_offset_subquery.test
 test/fuzzer/pedro/correlated_subquery_downcast_error.test
 test/fuzzer/pedro/create_replace_table_union.test
 test/fuzzer/pedro/currval_sequence_dependency.test
@@ -2989,6 +2990,7 @@ test/sql/join/nearest/nearest_errors.test
 test/sql/join/nearest/nearest_parser.test
 test/sql/join/non_inner_decorrelation_regressions.test
 test/sql/join/non_inner_join_subquery.test
+test/sql/join/non_inner_join_subquery_binding.test
 test/sql/join/pair_dependent_full_outer_join_subquery.test
 test/sql/join/pair_dependent_full_outer_join_subquery_bindings.test
 test/sql/join/pair_dependent_join_subquery.test
@@ -4389,6 +4391,7 @@ test/sql/storage_version/storage_version_bump.test
 test/sql/subquery/any_all/issue_2999.test
 test/sql/subquery/any_all/subquery_in.test
 test/sql/subquery/any_all/test_any_all.test
+test/sql/subquery/any_all/test_any_array_subquery.test
 test/sql/subquery/any_all/test_any_left_join_in_on_clause.test
 test/sql/subquery/any_all/test_correlated_any_all.test
 test/sql/subquery/any_all/test_correlated_cte_in.test
@@ -4426,6 +4429,8 @@ test/sql/subquery/lateral/lateral_empty_grouping_sets.test
 test/sql/subquery/lateral/lateral_fuzzer_1463.test
 test/sql/subquery/lateral/lateral_fuzzer_5984_23.test
 test/sql/subquery/lateral/lateral_grouping_sets.test
+test/sql/subquery/lateral/lateral_join_aggregate.test
+test/sql/subquery/lateral/lateral_join_chain.test
 test/sql/subquery/lateral/lateral_join_generated_columns.test
 test/sql/subquery/lateral/lateral_join_macro.test
 test/sql/subquery/lateral/lateral_join_typed_macro.test
@@ -4435,21 +4440,27 @@ test/sql/subquery/lateral/lateral_null_propagation_shortcut.test
 test/sql/subquery/lateral/lateral_qualify.test
 test/sql/subquery/lateral/lateral_recursive_filter_pushdown.test
 test/sql/subquery/lateral/lateral_values.test
+test/sql/subquery/lateral/pg_lateral.test
+test/sql/subquery/lateral/qualified_star.test
 test/sql/subquery/lateral/test_lateral_join.test
 test/sql/subquery/scalar/array_order_subquery.test
 test/sql/subquery/scalar/array_subquery.test
 test/sql/subquery/scalar/coalesce_subquery.test
 test/sql/subquery/scalar/correlated_cte_definition_subquery.test
+test/sql/subquery/scalar/correlated_grouped_expression.test
 test/sql/subquery/scalar/correlated_pivot.test
 test/sql/subquery/scalar/correlated_pivot_error.test
+test/sql/subquery/scalar/correlated_scope_resolution.test
 test/sql/subquery/scalar/correlated_subquery_in_list_null.test
 test/sql/subquery/scalar/correlated_unnest_join_null.test
 test/sql/subquery/scalar/in_multiple_columns.test
 test/sql/subquery/scalar/nested_subquery_window.test
 test/sql/subquery/scalar/order_by_correlated.test
+test/sql/subquery/scalar/pg_grouping_expression_references.test
 test/sql/subquery/scalar/subquery_row_in_any.test
 test/sql/subquery/scalar/test_complex_correlated_subquery.test
 test/sql/subquery/scalar/test_complex_nested_correlated_subquery.test
+test/sql/subquery/scalar/test_correlated_aggregate_correlation_key.test
 test/sql/subquery/scalar/test_correlated_count_nested_subquery.test
 test/sql/subquery/scalar/test_correlated_grouping_set.test
 test/sql/subquery/scalar/test_correlated_having.test
@@ -4458,8 +4469,10 @@ test/sql/subquery/scalar/test_correlated_side_effects.test
 test/sql/subquery/scalar/test_correlated_subquery.test
 test/sql/subquery/scalar/test_correlated_subquery_cte.test
 test/sql/subquery/scalar/test_correlated_subquery_where.test
+test/sql/subquery/scalar/test_correlated_window.test
 test/sql/subquery/scalar/test_count_star_subquery.test
 test/sql/subquery/scalar/test_delete_subquery.test
+test/sql/subquery/scalar/test_grouped_correlated_subquery.test
 test/sql/subquery/scalar/test_issue_4216.test
 test/sql/subquery/scalar/test_issue_6136.test
 test/sql/subquery/scalar/test_issue_6184.test
@@ -4482,6 +4495,7 @@ test/sql/subquery/table/test_subquery_union.test
 test/sql/subquery/table/test_table_subquery.test
 test/sql/subquery/table/test_unnamed_subquery.test
 test/sql/subquery/test_neumann.test
+test/sql/subquery/test_offset.test
 test/sql/table_function/database_oid.test
 test/sql/table_function/duckdb_constraints.test
 test/sql/table_function/duckdb_constraints_fk.test
@@ -4506,6 +4520,7 @@ test/sql/table_function/information_schema.test
 test/sql/table_function/information_schema_fkey_constraint_names.test
 test/sql/table_function/information_schema_issue12867.test
 test/sql/table_function/information_schema_types.test
+test/sql/table_function/lateral_table_function.test
 test/sql/table_function/postgres_setof_compatibility.test
 test/sql/table_function/range_cardinality_extremes.test
 test/sql/table_function/range_function_different_iterators.test
