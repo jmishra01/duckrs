@@ -2114,7 +2114,7 @@ pub(crate) fn contains_barrier(expr: &BoundExpr) -> bool {
         || expr.children().into_iter().any(contains_barrier)
 }
 
-pub(crate) fn can_throw(expr: &BoundExpr) -> bool {
+pub fn can_throw(expr: &BoundExpr) -> bool {
     let own = match &expr.kind {
         BoundExprKind::Subquery { .. } | BoundExprKind::ListLambda { .. } | BoundExprKind::Sequence { .. } => true,
         BoundExprKind::Cast { child, try_cast } => cast_can_throw_of(&child.return_type, &expr.return_type, *try_cast),

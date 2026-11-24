@@ -9,6 +9,7 @@ pub mod grammar;
 pub mod keywords;
 pub mod matcher;
 mod pool;
+pub mod sql_formatter;
 pub mod tokenizer;
 pub mod transformer;
 pub mod unicode;
