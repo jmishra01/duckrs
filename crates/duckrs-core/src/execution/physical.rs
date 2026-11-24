@@ -23,7 +23,7 @@ use crate::execution::run_plan;
 use crate::execution::temporary::{self, PartitionedSpill, SpillFile};
 use crate::function::aggregates::{AggregateState, combine_states, value_keys};
 use crate::planner::expression::{BoundAggregate, BoundExpr, BoundExprKind, ColumnBinding};
-use crate::planner::logical::{BoundOrderByNode, COLUMN_IDENTIFIER_ROW_ID, COLUMN_IDENTIFIER_ROW_NUMBER, CteKeyColumn, LogicalOperator, OnConflict};
+use crate::planner::logical::{BoundOrderByNode, COLUMN_IDENTIFIER_ROW_ID, COLUMN_IDENTIFIER_ROW_NUMBER, CteKey, LogicalOperator, OnConflict};
 use crate::storage::log_writer::can_serialize;
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::sort_key::{
@@ -32,7 +32,7 @@ use duckrs_common::sort_key::{
 };
 use duckrs_common::types::LogicalType;
 use duckrs_common::value::{Value, ValueData};
-use duckrs_common::vector::{DataChunk, SelectionVector, Vector};
+use duckrs_common::vector::{DataChunk, SelectionVector, StringCopy, Vector};
 use duckrs_common::{Error, ErrorKind, Result, STANDARD_VECTOR_SIZE};
 use duckrs_parser::ast::{JoinType, SampleMethod, SampleOptions, sql_identifier};
 use parking_lot::Mutex;
@@ -1993,7 +1993,7 @@ pub struct PhysicalRecursiveCte {
     union_all: bool,
     working: Arc<Mutex<ColumnDataCollection>>,
     recurring: Arc<Mutex<ColumnDataCollection>>,
-    key: Vec<CteKeyColumn>,
+    key: CteKey,
     recursive: LogicalOperator,
     /// the rows of the current round
     data: Mutex<ColumnDataCollection>,
@@ -2001,19 +2001,37 @@ pub struct PhysicalRecursiveCte {
     seen: Mutex<HashSet<Vec<u8>>>,
 }
 
-/// The rows of a USING KEY recursion, one per key.
-#[derive(Default)]
-struct KeyedRows {
-    positions: HashMap<Vec<u8>, usize>,
-    rows: Vec<Vec<Value>>,
+// The USING KEY recursion below is ported from
+// duckdb/src/execution/operator/set/physical_recursive_cte_keyed.cpp and
+// physical_recursive_cte_delta.cpp @ rust-port-baseline (`RecursiveCTEKeyedState`), without the
+// pre-aggregation, the direct probes of the state and the reuse of candidate rows, which are
+// ways of doing the same work faster.
+
+/// The state of a USING KEY recursion (`RecursiveCTEKeyedState::ht`): a group per key, with a
+/// state per aggregate, and what the states were finalized to by the last commit.
+struct KeyedState {
+    groups: HashMap<Vec<u8>, usize>,
+    count: usize,
+    /// per key column, the value of each group, by its id
+    keys: Vec<Vector>,
+    /// per aggregate, the state of each group
+    states: Vec<Vec<AggregateState>>,
+    /// per aggregate, the finalized state of each group as of the last commit
+    /// (`RecursiveCTEFinalizedValues`), which `recurring.name` and the result read
+    finalized: Vec<Vector>,
 }
 
-fn value_sort_key(value: &Value) -> Result<Vec<u8>> {
-    let mut vector = Vector::new(value.logical_type().clone(), 1);
-    vector.prepare_flat(1);
-    vector.set_value(0, value)?;
-    let mut keys = group_keys(&[&vector], 1)?;
-    Ok(keys.remove(0))
+impl KeyedState {
+    fn new(key: &CteKey) -> Self {
+        let vector = |ty: &LogicalType| Vector::new(ty.clone(), STANDARD_VECTOR_SIZE);
+        Self {
+            groups: HashMap::new(),
+            count: 0,
+            keys: key.keys.iter().map(|&c| vector(&key.internal_types[c])).collect(),
+            states: vec![Vec::new(); key.payload.len()],
+            finalized: key.payload.iter().map(|(_, a)| vector(&a.return_type)).collect(),
+        }
+    }
 }
 
 impl PhysicalRecursiveCte {
@@ -2023,10 +2041,16 @@ impl PhysicalRecursiveCte {
         union_all: bool,
         working: Arc<Mutex<ColumnDataCollection>>,
         recurring: Arc<Mutex<ColumnDataCollection>>,
-        key: Vec<CteKeyColumn>,
+        key: CteKey,
         recursive: LogicalOperator,
     ) -> Self {
-        let data = Mutex::new(ColumnDataCollection::new(types.clone()));
+        // the anchor's rows, which are of the types of the rows a USING KEY aggregates
+        let input_types = if key.is_empty() {
+            types.clone()
+        } else {
+            key.internal_types.clone()
+        };
+        let data = Mutex::new(ColumnDataCollection::new(input_types));
         Self {
             types,
             children,
@@ -2040,98 +2064,160 @@ impl PhysicalRecursiveCte {
         }
     }
 
-    fn collection_of(&self, rows: impl Iterator<Item = Vec<Value>>) -> Result<ColumnDataCollection> {
-        let mut result = ColumnDataCollection::new(self.types.clone());
-        let mut chunk = DataChunk::new(&self.types);
-        for row in rows {
-            chunk.append_row(&row)?;
-            if chunk.len() == STANDARD_VECTOR_SIZE {
-                result.append(&chunk);
-                chunk = DataChunk::new(&self.types);
-            }
-        }
-        if !chunk.is_empty() {
-            result.append(&chunk);
-        }
-        Ok(result)
-    }
-
-    /// Takes `rows` into `state`, and returns what the next round reads.
-    fn apply_keyed(&self, rows: &ColumnDataCollection, state: &mut KeyedRows) -> Result<ColumnDataCollection> {
-        let key_columns: Vec<usize> = (0..self.key.len())
-            .filter(|c| self.key[*c] == CteKeyColumn::Key)
-            .collect();
-        let mut changed: Vec<usize> = Vec::new();
-        let mut changed_set: HashSet<usize> = HashSet::new();
+    /// `CommitUsingKeyUpdates`: adds the candidate `rows` to the states of their keys, and
+    /// finalizes the states. Returns the groups whose finalized row changed and the first new group
+    /// (`FinalizeUsingKeyDelta`).
+    fn commit(&self, rows: &ColumnDataCollection, state: &mut KeyedState) -> Result<(Vec<usize>, usize)> {
+        let before = state.count;
+        // the groups there were before, in the order the rows first touched them
+        let mut touched = Vec::new();
+        let mut is_touched = vec![false; before];
         for chunk in rows.chunks() {
-            let vectors: Vec<&Vector> = key_columns.iter().map(|c| chunk.column(*c)).collect();
-            let keys = group_keys(&vectors, chunk.len())?;
-            for (row, key) in keys.into_iter().enumerate() {
-                let values: Vec<Value> = chunk.columns().iter().map(|c| c.get_value(row)).collect();
-                let position = match state.positions.get(&key) {
-                    Some(position) => {
-                        let existing = &mut state.rows[*position];
-                        let mut updated = false;
-                        for (column, mode) in self.key.iter().enumerate() {
-                            let new = &values[column];
-                            let old = &existing[column];
-                            let take = match mode {
-                                CteKeyColumn::Key | CteKeyColumn::First => false,
-                                CteKeyColumn::Last => value_sort_key(new)? != value_sort_key(old)?,
-                                CteKeyColumn::Min => {
-                                    !new.is_null() && (old.is_null() || value_sort_key(new)? < value_sort_key(old)?)
-                                }
-                                CteKeyColumn::Max => {
-                                    !new.is_null() && (old.is_null() || value_sort_key(new)? > value_sort_key(old)?)
-                                }
-                            };
-                            if take {
-                                existing[column] = new.clone();
-                                updated = true;
-                            }
-                        }
-                        if !updated {
-                            continue;
-                        }
-                        *position
-                    }
-                    None => {
-                        state.positions.insert(key, state.rows.len());
-                        state.rows.push(values);
-                        state.rows.len() - 1
-                    }
-                };
-                if changed_set.insert(position) {
-                    changed.push(position);
+            let count = chunk.len();
+            // the keys group by their collated values
+            let columns = self
+                .key
+                .keys
+                .iter()
+                .zip(&self.key.key_normalizers)
+                .map(|(&c, normalizer)| match normalizer {
+                    Some(normalizer) => execute(normalizer, chunk).map(Cow::Owned),
+                    None => Ok(Cow::Borrowed(chunk.column(c))),
+                })
+                .collect::<Result<Vec<Cow<Vector>>>>()?;
+            let columns: Vec<&Vector> = columns.iter().map(|c| c.as_ref()).collect();
+            let encoded = group_keys(&columns, count)?;
+            let first_new = state.count;
+            let mut new_rows = Vec::new();
+            let mut targets = Vec::with_capacity(count);
+            for (row, key) in encoded.into_iter().enumerate() {
+                let next = state.count;
+                let id = *state.groups.entry(key).or_insert(next);
+                if id == next {
+                    state.count += 1;
+                    new_rows.push(row as u32);
+                } else if id < before && !std::mem::replace(&mut is_touched[id], true) {
+                    touched.push(id);
+                }
+                targets.push((row, id));
+            }
+            if !new_rows.is_empty() {
+                let new_count = new_rows.len();
+                let sel = SelectionVector::from_vec(new_rows);
+                for (values, &column) in state.keys.iter_mut().zip(&self.key.keys) {
+                    values.copy_from(chunk.column(column), &sel, new_count, first_new, StringCopy::Deep);
+                }
+            }
+            for ((_, aggregate), states) in self.key.payload.iter().zip(state.states.iter_mut()) {
+                states.resize(state.count, aggregate.function.kind.initial_state());
+                let input = aggregate.children.first().map(|c| execute(c, chunk)).transpose()?;
+                aggregate.function.update(input.as_ref(), count, &targets, states)?;
+            }
+        }
+        let mut finalized = Vec::with_capacity(self.key.payload.len());
+        for ((_, aggregate), states) in self.key.payload.iter().zip(&state.states) {
+            let mut column = Vector::new(aggregate.return_type.clone(), state.count.max(1));
+            let input = aggregate.children.first().map(|c| &c.return_type);
+            aggregate.function.finalize_into(states, &aggregate.return_type, input, &mut column)?;
+            finalized.push(column);
+        }
+        // a group changed when one of its finalized values is distinct from what it was
+        let mut changed = vec![false; touched.len()];
+        if !touched.is_empty() {
+            let sel = SelectionVector::from_vec(touched.iter().map(|&id| id as u32).collect());
+            let count = touched.len();
+            let compared = |values: &Vector, comparison: &Option<BoundExpr>| -> Result<Vec<Vec<u8>>> {
+                let mut values = values.clone();
+                values.slice(&sel, count);
+                if let Some(comparison) = comparison {
+                    values = execute(comparison, &DataChunk::from_columns(vec![values], count))?;
+                }
+                group_keys(&[&values], count)
+            };
+            for ((old, new), comparison) in state.finalized.iter().zip(&finalized).zip(&self.key.payload_comparisons) {
+                let old_keys = compared(old, comparison)?;
+                let new_keys = compared(new, comparison)?;
+                for ((changed, old), new) in changed.iter_mut().zip(old_keys).zip(new_keys) {
+                    *changed |= old != new;
                 }
             }
         }
-        *self.recurring.lock() = self.collection_of(state.rows.iter().cloned())?;
-        if self.union_all {
-            let mut raw = ColumnDataCollection::new(self.types.clone());
-            if !changed.is_empty() {
-                for chunk in rows.chunks() {
-                    raw.append(chunk);
-                }
-            }
-            return Ok(raw);
-        }
-        self.collection_of(changed.iter().map(|p| state.rows[*p].clone()))
+        state.finalized = finalized;
+        let changed = touched
+            .into_iter()
+            .zip(changed)
+            .filter_map(|(id, changed)| changed.then_some(id))
+            .collect();
+        Ok((changed, before))
     }
 
-    /// USING KEY: runs all rounds, and leaves the rows of all keys in `data`.
+    /// The finalized rows of the groups `ids`, all of them for `None` (`AssembleStateRows`).
+    fn state_rows(&self, state: &KeyedState, ids: Option<&[usize]>) -> ColumnDataCollection {
+        let mut result = ColumnDataCollection::new(self.types.clone());
+        let total = ids.map_or(state.count, <[usize]>::len);
+        let sources = self
+            .key
+            .keys
+            .iter()
+            .zip(&state.keys)
+            .chain(self.key.payload.iter().map(|(c, _)| c).zip(&state.finalized));
+        let sources: Vec<(usize, &Vector)> = sources.map(|(&c, v)| (c, v)).collect();
+        for start in (0..total).step_by(STANDARD_VECTOR_SIZE) {
+            let count = (total - start).min(STANDARD_VECTOR_SIZE);
+            let sel = ids.map(|ids| {
+                SelectionVector::from_vec(ids[start..start + count].iter().map(|&id| id as u32).collect())
+            });
+            let mut columns: Vec<Option<Vector>> = vec![None; self.types.len()];
+            for &(column, source) in &sources {
+                let mut vector = Vector::new(self.types[column].clone(), count);
+                match &sel {
+                    Some(sel) => vector.copy_from(source, sel, count, 0, StringCopy::Reference),
+                    None => vector.copy_range_from(source, start, count, 0, StringCopy::Reference),
+                }
+                columns[column] = Some(vector);
+            }
+            let columns = columns.into_iter().map(|c| c.expect("a key or an aggregate")).collect();
+            result.append(&DataChunk::from_columns(columns, count));
+        }
+        result
+    }
+
+    /// USING KEY: runs all rounds, and leaves the rows of all keys in `data`. Every round commits
+    /// its rows to the states; the next one reads them all with UNION ALL, and with UNION the
+    /// finalized rows of the keys that are new or whose row changed (`GetUsingKeyDataInternal`).
     fn run_keyed(&self) -> Result<()> {
-        let mut state = KeyedRows::default();
-        let anchor = std::mem::replace(&mut *self.data.lock(), ColumnDataCollection::new(self.types.clone()));
-        let mut round = self.apply_keyed(&anchor, &mut state)?;
-        while !round.is_empty() {
-            *self.working.lock() = round;
+        let mut state = KeyedState::new(&self.key);
+        let mut rows = std::mem::replace(
+            &mut *self.data.lock(),
+            ColumnDataCollection::new(self.key.internal_types.clone()),
+        );
+        loop {
+            let (changed, first_new) = self.commit(&rows, &mut state)?;
+            *self.recurring.lock() = self.state_rows(&state, None);
+            if self.key.once {
+                // the recursive part does not recurse: its rows join the anchor's, once
+                let mut plan = self.recursive.clone();
+                plan.clear_subquery_results();
+                let rows = run_plan(plan)?;
+                self.commit(&rows, &mut state)?;
+                break;
+            }
+            let next = if self.union_all {
+                rows
+            } else {
+                let mut ids = changed;
+                ids.extend(first_new..state.count);
+                self.state_rows(&state, Some(&ids))
+            };
+            if next.is_empty() {
+                break;
+            }
+            *self.working.lock() = next;
             let mut plan = self.recursive.clone();
             plan.clear_subquery_results();
-            let rows = run_plan(plan)?;
-            round = self.apply_keyed(&rows, &mut state)?;
+            rows = run_plan(plan)?;
         }
-        *self.data.lock() = self.collection_of(state.rows.into_iter())?;
+        *self.data.lock() = self.state_rows(&state, None);
         Ok(())
     }
 

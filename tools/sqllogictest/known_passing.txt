@@ -2095,11 +2095,16 @@ test/sql/cte/insert_cte_bug_3417.test
 test/sql/cte/lazy_cte_bind.test
 test/sql/cte/lazy_cte_bind_correlated.test
 test/sql/cte/materialized/annotated_and_auto_materialized.test
+test/sql/cte/materialized/cte_gated_buffered_consumer.test
+test/sql/cte/materialized/cte_gated_buffered_consumer_27925.test
+test/sql/cte/materialized/cte_gated_buffered_consumer_runtime_filter.test
 test/sql/cte/materialized/cte_runtime_filter_effects.test
 test/sql/cte/materialized/cte_runtime_filters.test
+test/sql/cte/materialized/cte_streaming_over_materialization.test
 test/sql/cte/materialized/dml_materialized_cte.test
 test/sql/cte/materialized/incorrect_recursive_cte_materialized.test
 test/sql/cte/materialized/internal_3004.test
+test/sql/cte/materialized/materialized_cte_prepared.test
 test/sql/cte/materialized/recursive_array_slice_materialized.test
 test/sql/cte/materialized/recursive_cte_complex_pipelines.test
 test/sql/cte/materialized/recursive_cte_error_materialized.test
@@ -2126,7 +2131,12 @@ test/sql/cte/recursive_cte_error.test
 test/sql/cte/recursive_cte_event_schedule_reset.test
 test/sql/cte/recursive_cte_invariant_build.test
 test/sql/cte/recursive_cte_iteration_state_reuse.test
+test/sql/cte/recursive_cte_key_aggregate_subquery.test
+test/sql/cte/recursive_cte_key_aggregation.test
 test/sql/cte/recursive_cte_key_final_drain.test
+test/sql/cte/recursive_cte_key_finalize_reads.test
+test/sql/cte/recursive_cte_key_finalized_values.test
+test/sql/cte/recursive_cte_key_hll_aggregation.test
 test/sql/cte/recursive_cte_key_snapshot.test
 test/sql/cte/recursive_cte_large_payload.test
 test/sql/cte/recursive_cte_limit.test
@@ -2148,6 +2158,7 @@ test/sql/cte/test_recursive_cte_recurring.test
 test/sql/cte/test_recursive_cte_tutorial.test
 test/sql/cte/test_recursive_cte_union.test
 test/sql/cte/test_recursive_cte_union_all.test
+test/sql/cte/using_key_aggregate_qualification.test
 test/sql/delete/cleanup_delete_on_conflict.test
 test/sql/delete/delete_compression_after_restart.test
 test/sql/delete/delete_query_node.test
@@ -2927,6 +2938,7 @@ test/sql/join/mark/distinct_comparison.test
 test/sql/join/mark/explicit_conditions.test
 test/sql/join/mark/group_reconstruction_limits.test
 test/sql/join/mark/hash_nested_operator_semantics.test
+test/sql/join/mark/nested_operator_semantics.test
 test/sql/join/mark/residual_predicate.test
 test/sql/join/mark/residual_vector_reuse.test
 test/sql/join/mark/test_null_safe_semi_uncommitted_stats.test
@@ -4324,6 +4336,7 @@ test/sql/subquery/any_all/test_correlated_in_left_join_mark.test
 test/sql/subquery/any_all/test_correlated_mark_row_identity.test
 test/sql/subquery/any_all/test_correlated_tuple_in.test
 test/sql/subquery/any_all/test_row_comparison_any_all.test
+test/sql/subquery/any_all/test_row_not_equal_any_null_semantics.test
 test/sql/subquery/any_all/test_scalar_any_all.test
 test/sql/subquery/any_all/test_scalar_in.test
 test/sql/subquery/any_all/test_simple_not_in.test

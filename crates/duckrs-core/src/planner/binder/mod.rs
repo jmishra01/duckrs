@@ -1027,6 +1027,8 @@ struct WorkingTable {
     names: Vec<String>,
     types: Vec<LogicalType>,
     rows: Arc<Mutex<ColumnDataCollection>>,
+    /// the types of what `recurring.name` reads: those of a USING KEY's aggregates
+    recurring_types: Vec<LogicalType>,
     /// what `recurring.name` reads
     recurring: Arc<Mutex<ColumnDataCollection>>,
     /// whether the recursive part reads it
@@ -1116,6 +1118,7 @@ impl<'a> Binder<'a> {
                     name: table.name.clone(),
                     names: table.names.clone(),
                     types: table.types.clone(),
+                    recurring_types: table.types.clone(),
                     rows: table.rows.clone(),
                     recurring: table.rows.clone(),
                     used: Arc::new(AtomicBool::new(false)),

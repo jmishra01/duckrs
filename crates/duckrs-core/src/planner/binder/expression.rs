@@ -961,6 +961,19 @@ impl Binder<'_> {
                 let Some(child) = child else {
                     return Err(crate::unported("ANY without a value to compare"));
                 };
+                // `IsMultiColumnComparison`: other than `=`, a correlated comparison of rows of
+                // several fields is not planned (`<`, `>` and friends are rewritten to MIN/MAX first)
+                let multi_column_row = |ty: &LogicalType| {
+                    ty.id() == LogicalTypeId::Tuple && ty.struct_children().len() > 1
+                };
+                if !bindings.is_empty()
+                    && comparison == ComparisonOp::NotEqual
+                    && (multi_column_row(&child.return_type) || multi_column_row(&bound.types[0]))
+                {
+                    return Err(crate::error_not_implemented(
+                        "Correlated IN/ANY/ALL with multiple columns not yet supported",
+                    ));
+                }
                 let child_type = expression_return_type(&child);
                 let Some(compare_type) = try_max_logical_type(&child_type, &bound.types[0]) else {
                     return Err(binder_error(format!(
@@ -2651,6 +2664,23 @@ pub(super) fn is_system_function(name: &str) -> bool {
                 | "getvariable"
                 | "current_setting"
         )
+}
+
+/// `BindSchemaOrCatalog` and `GetCatalogEntry` of an `AGGREGATE_FUNCTION_ENTRY`: the built-in aggregate a
+/// qualified name names, if any. A lone qualification that is a catalog is the catalog's `main` schema.
+pub(super) fn qualified_aggregate(
+    name: &ast::QualifiedName,
+) -> Option<&'static crate::function::aggregates::AggregateFunctionSet> {
+    let parts: Vec<&String> = name.qualification.iter().filter(|q| !q.is_empty()).collect();
+    let catalog = |part: &String| part.eq_ignore_ascii_case("system") || part.eq_ignore_ascii_case(DEFAULT_CATALOG);
+    let builtin = match parts.as_slice() {
+        [only] => catalog(only) || builtin_qualification(&name.qualification),
+        _ => builtin_qualification(&name.qualification),
+    };
+    if !builtin {
+        return None;
+    }
+    BuiltinFunctions::get().aggregate(&name.name)
 }
 
 fn builtin_qualification(qualification: &[String]) -> bool {

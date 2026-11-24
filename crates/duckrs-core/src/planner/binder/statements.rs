@@ -26,7 +26,7 @@ use crate::optimizer::optimize;
 use crate::planner::column_binding_resolver::resolve_column_bindings;
 use crate::planner::expression::{BoundExpr, BoundExprKind, ColumnBinding};
 use crate::planner::logical::{
-    BoundOrderByNode, COLUMN_IDENTIFIER_ROW_ID, CteKeyColumn, LogicalOperator, LogicalOperatorKind,
+    BoundOrderByNode, COLUMN_IDENTIFIER_ROW_ID, CteKey, LogicalOperator, LogicalOperatorKind,
 };
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::sort_key::OrderModifiers;
@@ -528,15 +528,23 @@ impl Binder<'_> {
         for (column, alias) in names.iter_mut().zip(aliases) {
             column.clone_from(alias);
         }
-        let key = bind_cte_key(&node.key_targets, &names)?;
-        let working = Arc::new(Mutex::new(ColumnDataCollection::new(types.clone())));
-        let recurring = Arc::new(Mutex::new(ColumnDataCollection::new(types.clone())));
+        let (key, result_types) = self.bind_cte_key(name, &node.key_targets, &names, &types)?;
+        // with USING KEY and UNION, the recursive part reads the finalized rows of the keys that
+        // changed, and `recurring.name` reads those of all keys
+        let recursive_types = if !key.is_empty() && !node.union_all {
+            result_types.clone()
+        } else {
+            types.clone()
+        };
+        let working = Arc::new(Mutex::new(ColumnDataCollection::new(recursive_types.clone())));
+        let recurring = Arc::new(Mutex::new(ColumnDataCollection::new(result_types.clone())));
         let used = Arc::new(AtomicBool::new(false));
         let mut binder = self.child_binder();
         binder.working_tables.push(WorkingTable {
             name: name.to_string(),
             names: names.clone(),
-            types: types.clone(),
+            types: recursive_types,
+            recurring_types: result_types.clone(),
             rows: working.clone(),
             recurring: recurring.clone(),
             used: used.clone(),
@@ -551,6 +559,8 @@ impl Binder<'_> {
         }
         let columns = (0..types.len()).map(Some).collect();
         let recursive = self.cast_plan(recursive, &types, columns);
+        let mut key = key;
+        key.once = !key.is_empty() && !used.load(Ordering::Relaxed);
         let plan = if used.load(Ordering::Relaxed) || !key.is_empty() {
             // `recursive_cte_tables` has the CTE while its recursive part is planned
             let mut options = self.options.optimizer;
@@ -562,7 +572,7 @@ impl Binder<'_> {
                 LogicalOperatorKind::RecursiveCte {
                     name: name.to_string(),
                     table_index: self.generate_table_index(),
-                    types: types.clone(),
+                    types: result_types.clone(),
                     union_all: node.union_all,
                     working,
                     recurring,
@@ -593,10 +603,210 @@ impl Binder<'_> {
         Ok(BoundStatement {
             plan,
             names,
-            types,
+            types: result_types,
             column_aliases,
             return_type: StatementReturnType::QueryResult,
         })
+    }
+
+    /// `Binder::BindNode(RecursiveCTENode)`: the USING KEY clause. The columns it names are the
+    /// keys; each other column is given by an aggregate of the rows of its key, the one USING KEY
+    /// calls on it or else `last`. Returns the key, and the types of the CTE, which are those of
+    /// the aggregates.
+    fn bind_cte_key(
+        &mut self,
+        name: &str,
+        targets: &[Expr],
+        names: &[String],
+        types: &[LogicalType],
+    ) -> Result<(CteKey, Vec<LogicalType>)> {
+        if targets.is_empty() {
+            return Ok((CteKey::default(), types.to_vec()));
+        }
+        let cant_be_used = |target: &Expr| {
+            binder_error(format!(
+                "'{target}' can't be used in the USING KEY clause.\nIt has to be either a column name as a key or a \
+                 direct call to an aggregate function."
+            ))
+        };
+        let subquery_error = || binder_error("Subqueries are not yet supported for aggregates in USING KEY");
+        // the aggregates read the rows of the CTE, and nothing around it
+        let mut binder = self.child_binder();
+        binder.outer_contexts.clear();
+        binder.outer_aliases.clear();
+        binder.working_tables.clear();
+        binder.correlated = Arc::default();
+        let table_index = binder.generate_table_index();
+        binder.bind_context.add_binding(Binding {
+            alias: name.to_string(),
+            schema: None,
+            catalog: None,
+            table_index,
+            names: names.to_vec(),
+            types: types.to_vec(),
+            row_id: None,
+            virtual_columns: Vec::new(),
+            generated: Vec::new(),
+        });
+        let column_of = |bound: &BoundExpr| match &bound.kind {
+            BoundExprKind::ColumnRef { binding, .. } if binding.table_index == table_index => {
+                Some(binding.column_index)
+            }
+            _ => None,
+        };
+        let mut keys: Vec<usize> = Vec::new();
+        let mut payload: Vec<(usize, crate::planner::expression::BoundAggregate)> = Vec::new();
+        let mut return_types = types.to_vec();
+        for target in targets {
+            match &target.kind {
+                ExprKind::ColumnRef(_) => {
+                    if !target.alias.is_empty() {
+                        return Err(binder_error(
+                            "In USING KEY, only direct calls to an aggregate function can have an alias.",
+                        ));
+                    }
+                    let bound = binder.bind_expression(target)?;
+                    let column = column_of(&bound).ok_or_else(|| cant_be_used(target))?;
+                    if !keys.contains(&column) {
+                        keys.push(column);
+                    }
+                }
+                ExprKind::Function(call) => {
+                    if call.filter.is_some() {
+                        return Err(binder_error("FILTER clause is not yet supported for aggregates in USING KEY"));
+                    }
+                    if !call.order_by.is_empty() {
+                        return Err(binder_error("ORDER BY clause is not yet supported for aggregates in USING KEY"));
+                    }
+                    if call.distinct {
+                        return Err(binder_error("DISTINCT is not yet supported for aggregates in USING KEY"));
+                    }
+                    let set = super::expression::qualified_aggregate(&call.name).ok_or_else(|| cant_be_used(target))?;
+                    let mut children = Vec::with_capacity(call.args.len());
+                    for argument in &call.args {
+                        // nothing plans a subquery over the rows of the CTE: one written here is refused
+                        // before binding, and one that a macro expands to after it
+                        let mut subquery = false;
+                        visit_expr_mut(&mut argument.expr.clone(), &mut |e| {
+                            subquery |= matches!(e.kind, ExprKind::Subquery { .. });
+                        });
+                        if subquery {
+                            return Err(subquery_error());
+                        }
+                        let bound = binder.bind_expression(&argument.expr)?;
+                        let mut subquery = false;
+                        bound.clone().walk_mut(&mut |e| {
+                            subquery |= matches!(e.kind, BoundExprKind::Subquery { .. });
+                        });
+                        if subquery {
+                            return Err(subquery_error());
+                        }
+                        children.push(bound);
+                    }
+                    // the column the alias names, or else the column of the first argument
+                    let column = if !target.alias.is_empty() {
+                        names.iter().position(|n| *n == target.alias).ok_or_else(|| {
+                            binder_error(format!(
+                                "Could not find column with name {} to bind aggregate to.",
+                                target.alias
+                            ))
+                        })?
+                    } else {
+                        children.first().and_then(column_of).ok_or_else(|| {
+                            binder_error("In USING KEY, an aggregate must either have a column reference or an alias.")
+                        })?
+                    };
+                    let aggregate = crate::function::binder::bind_aggregate_function(set, children, None, false)
+                        .map_err(|error| {
+                            if error.message.starts_with("No function matches") {
+                                binder_error(format!("No matching aggregate function\n{}", error.message))
+                            } else {
+                                error
+                            }
+                        })?;
+                    if payload.iter().any(|(c, _)| *c == column) {
+                        return Err(binder_error(format!(
+                            "Column {} referenced multiple times in USING KEY clause.\nTry using an alias for one \
+                             of the aggregates.",
+                            names[column]
+                        )));
+                    }
+                    if keys.contains(&column) {
+                        return Err(binder_error(format!(
+                            "Column {} cannot be used as both key and aggregate in USING KEY clause.\nTry using an \
+                             alias for the aggregation.",
+                            names[column]
+                        )));
+                    }
+                    return_types[column] = aggregate.return_type.clone();
+                    payload.push((column, aggregate));
+                }
+                _ => return Err(cant_be_used(target)),
+            }
+        }
+        self.next_table_index = binder.next_table_index;
+        if keys.is_empty() {
+            return Err(binder_error("USING KEY clause requires at least one key column."));
+        }
+        // every column that is neither a key nor aggregated keeps the value of its last row
+        let last = crate::function::BuiltinFunctions::get()
+            .aggregate("last")
+            .expect("last is an aggregate");
+        let mut aggregates = Vec::new();
+        for (column, ty) in types.iter().enumerate() {
+            if keys.contains(&column) {
+                continue;
+            }
+            let aggregate = match payload.iter().position(|(c, _)| *c == column) {
+                Some(at) => payload.swap_remove(at).1,
+                None => {
+                    let reference = BoundExpr::column_ref(ColumnBinding::new(table_index, column), ty.clone(), "");
+                    crate::function::binder::bind_aggregate_function(last, vec![reference], None, false)?
+                }
+            };
+            aggregates.push((column, aggregate));
+        }
+        // the aggregates read the rows of the CTE by position
+        for (_, aggregate) in &mut aggregates {
+            for child in &mut aggregate.children {
+                child.walk_mut(&mut |e| {
+                    if let BoundExprKind::ColumnRef { binding, .. } = &e.kind
+                        && binding.table_index == table_index
+                    {
+                        e.kind = BoundExprKind::Reference(binding.column_index);
+                    }
+                });
+            }
+        }
+        // `PlanRecursiveCTE`: collated keys group by their collated values, and collated results
+        // compare by theirs
+        let collation = self.default_collation();
+        let collated = |source: BoundExpr, ty: &LogicalType| -> Result<Option<BoundExpr>> {
+            let (collated, pushed) = crate::planner::collation::push_collation(
+                source,
+                ty,
+                &collation,
+                crate::planner::collation::CollationType::AllCollations,
+            )?;
+            Ok(pushed.then_some(collated))
+        };
+        let key_normalizers = keys
+            .iter()
+            .map(|&c| collated(BoundExpr::new(BoundExprKind::Reference(c), types[c].clone()), &types[c]))
+            .collect::<Result<_>>()?;
+        let payload_comparisons = aggregates
+            .iter()
+            .map(|(_, a)| collated(BoundExpr::new(BoundExprKind::Reference(0), a.return_type.clone()), &a.return_type))
+            .collect::<Result<_>>()?;
+        let key = CteKey {
+            keys,
+            payload: aggregates,
+            internal_types: types.to_vec(),
+            key_normalizers,
+            payload_comparisons,
+            once: false,
+        };
+        Ok((key, return_types))
     }
 
     /// `Binder::BindNode(SetOperationNode)`.
@@ -2514,6 +2724,7 @@ impl Binder<'_> {
                     working.used.store(true, Ordering::Relaxed);
                     if recurring {
                         working.rows = working.recurring.clone();
+                        working.types = working.recurring_types.clone();
                     }
                     let alias = if table_ref.alias.is_empty() {
                         working.name.clone()
@@ -4043,61 +4254,6 @@ impl Binder<'_> {
 }
 
 /// Fails like DuckDB would for a cast that is not implemented here yet.
-/// The USING KEY clause: the columns it names are keys, or aggregates of what they get.
-fn bind_cte_key(targets: &[Expr], names: &[String]) -> Result<Vec<CteKeyColumn>> {
-    if targets.is_empty() {
-        return Ok(Vec::new());
-    }
-    let position = |name: &str| -> Result<usize> {
-        names
-            .iter()
-            .position(|n| n.eq_ignore_ascii_case(name))
-            .ok_or_else(|| binder_error(format!("Referenced column \"{name}\" not found in FROM clause!")))
-    };
-    let mut columns = vec![CteKeyColumn::Last; names.len()];
-    let mut seen = vec![false; names.len()];
-    let mut has_key = false;
-    for target in targets {
-        let (column, mode) = match &target.kind {
-            ExprKind::ColumnRef(parts) => {
-                has_key = true;
-                (position(parts.last().expect("a name"))?, CteKeyColumn::Key)
-            }
-            ExprKind::Function(call) if call.args.len() == 1 => {
-                let ExprKind::ColumnRef(parts) = &call.args[0].expr.kind else {
-                    return Err(binder_error(
-                        "In USING KEY, an aggregate must either have a column reference or an empty argument list",
-                    ));
-                };
-                let mode = match call.name.name.to_lowercase().as_str() {
-                    "min" => CteKeyColumn::Min,
-                    "max" => CteKeyColumn::Max,
-                    "first" | "arbitrary" | "any_value" => CteKeyColumn::First,
-                    "last" => CteKeyColumn::Last,
-                    other => return Err(not_implemented(&format!("the aggregate {other} in USING KEY"))),
-                };
-                (position(parts.last().expect("a name"))?, mode)
-            }
-            _ => {
-                return Err(binder_error(format!(
-                    "'{target}' can't be used in the USING KEY clause."
-                )));
-            }
-        };
-        if std::mem::replace(&mut seen[column], true) {
-            return Err(binder_error(format!(
-                "Column {} referenced multiple times in USING KEY clause",
-                names[column]
-            )));
-        }
-        columns[column] = mode;
-    }
-    if !has_key {
-        return Err(binder_error("USING KEY clause requires at least one key column."));
-    }
-    Ok(columns)
-}
-
 /// `LogicalSample`, with the check of `PlanSample`.
 fn bind_sample(options: &ast::SampleOptions, plan: LogicalOperator) -> Result<LogicalOperator> {
     if !options.is_percentage && options.method == ast::SampleMethod::Bernoulli {
