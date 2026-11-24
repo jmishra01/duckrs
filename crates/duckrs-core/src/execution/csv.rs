@@ -1137,6 +1137,12 @@ fn bad_line(
         end,
     };
     let text = span.text(data);
+    // `UNQUOTED VALUE`: at the value with the quote
+    let (column, field_start) = match kind {
+        "UNQUOTED VALUE" => unterminated_field(&data[before..end], &file.dialect)
+            .map_or((0, before), |(column, start)| (column, before + start)),
+        _ => (0, before),
+    };
     let scanner = state.scanner.as_mut().expect("a scan has a scanner");
     scanner.skip_line(data);
     let position = scanner.machine.position;
@@ -1148,15 +1154,58 @@ fn bad_line(
             file: state.file,
             line,
             row_position: before + 1,
-            position: Some(before + 1),
-            column: Some(1),
-            column_name: scan.names.first().cloned(),
+            position: Some(field_start + 1),
+            column: Some(column + 1),
+            column_name: scan.names.get(column).cloned(),
             kind,
             text,
             message,
         },
     );
     Ok(())
+}
+
+/// The value of a line that has a quote it does not end on (`"a"b`): its column, and where it starts.
+fn unterminated_field(line: &[u8], dialect: &Dialect) -> Option<(usize, usize)> {
+    let quote = dialect.quote?;
+    let delimiter = dialect.delimiter.as_slice();
+    if delimiter.is_empty() {
+        return None;
+    }
+    let (mut column, mut start, mut at) = (0, 0, 0);
+    while at <= line.len() {
+        if line.get(at) == Some(&quote) && at == start {
+            // a quoted value: to its closing quote, which must be followed by a delimiter or the end
+            let mut end = at + 1;
+            while end < line.len() {
+                if line[end] == quote {
+                    if line.get(end + 1) == Some(&quote) {
+                        end += 2;
+                        continue;
+                    }
+                    break;
+                }
+                end += 1;
+            }
+            let after = end + 1;
+            if end >= line.len() || (after < line.len() && !line[after..].starts_with(delimiter)) {
+                return Some((column, start));
+            }
+            at = after;
+            continue;
+        }
+        if at == line.len() {
+            break;
+        }
+        if line[at..].starts_with(delimiter) {
+            column += 1;
+            at += delimiter.len();
+            start = at;
+            continue;
+        }
+        at += 1;
+    }
+    None
 }
 
 /// The next rows of `data`, typed; `None` past its last. With a `margin`, a row starts only with that many bytes of
@@ -1625,7 +1674,8 @@ fn typed_chunk(
                     file: state.file,
                     line: spans[row].line,
                     row_position: spans[row].start + 1,
-                    position: fields[row].map(|field| field.offset + 1),
+                    // (a value read as text and cast after has no position of its own)
+                    position: fields[row].filter(|_| parsed_directly(ty)).map(|field| field.offset + 1),
                     column: Some(index + 1),
                     column_name: Some(scan.names[index].clone()),
                     kind: "CAST",

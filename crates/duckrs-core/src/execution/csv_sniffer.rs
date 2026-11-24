@@ -199,7 +199,8 @@ pub fn can_cast(text: &str, ty: &LogicalType, parsing: &Parsing) -> bool {
     };
     match ty.id() {
         LogicalTypeId::Varchar => true,
-        LogicalTypeId::Boolean => ["t", "f", "true", "false"]
+        // `TryCastStringBool` with `strict`: `yes` and `no` too, but not `y`, `n`, `1` or `0`
+        LogicalTypeId::Boolean => ["t", "f", "true", "false", "yes", "no"]
             .iter()
             .any(|word| word.eq_ignore_ascii_case(text)),
         LogicalTypeId::TinyInt => parse_int(i8::MIN.into(), i8::MAX.into()),
