@@ -494,6 +494,8 @@ impl Binder<'_> {
                 .collect();
             let mut binder = Binder::with_options(self.catalog, self.options.clone());
             binder.search_schema = Some(schema.to_string());
+            // a body that reads a setting reads that of the session (`current_setting`)
+            binder.session = self.session.clone();
             let parameters = parameter_names(function);
             match &function.body {
                 MacroBody::Scalar(body) => {

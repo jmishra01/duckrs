@@ -229,8 +229,8 @@ pub enum LogicalOperatorKind {
         working: Arc<Mutex<ColumnDataCollection>>,
         /// what `recurring.name` reads: all rows so far
         recurring: Arc<Mutex<ColumnDataCollection>>,
-        /// USING KEY: what each column is; empty without one
-        key: Vec<CteKeyColumn>,
+        /// USING KEY: the key columns and the aggregates of the others; empty without one
+        key: CteKey,
         recursive: Box<LogicalOperator>,
         /// `recursive` before its column bindings were resolved, for `EXPLAIN (SQL)`
         unresolved: Box<LogicalOperator>,
@@ -396,16 +396,33 @@ pub enum JoinAlgorithm {
     IeJoin,
 }
 
-/// What a column of a recursive CTE is to its USING KEY.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CteKeyColumn {
-    Key,
-    /// The value of the last row with the key.
-    Last,
-    /// The value of the first row with the key.
-    First,
-    Min,
-    Max,
+/// The USING KEY of a recursive CTE (`LogicalRecursiveCTE::key_targets` and `payload_aggregates`).
+#[derive(Debug, Clone, Default)]
+pub struct CteKey {
+    /// the key columns, by position, in the order USING KEY names them
+    pub keys: Vec<usize>,
+    /// every other column, in order, and the aggregate that gives it from the rows of the CTE; its
+    /// children read those rows by position ([`BoundExprKind::Reference`])
+    pub payload: Vec<(usize, BoundAggregate)>,
+    /// the types of the rows of the anchor and the recursive part (`internal_types`); the CTE's own
+    /// types are the results of the aggregates
+    pub internal_types: Vec<LogicalType>,
+    /// per key column, the collation its rows group by, over the rows of the CTE
+    /// (`key_normalizers`); a group's value is that of its first row
+    pub key_normalizers: Vec<Option<BoundExpr>>,
+    /// per aggregate, the collation its finalized values compare by, over `Reference(0)`
+    /// (`payload_comparisons`)
+    pub payload_comparisons: Vec<Option<BoundExpr>>,
+    /// the recursive part reads neither the CTE nor `recurring`: its rows are aggregated with the
+    /// anchor's once (`LogicalSetOperation` under a `LogicalAggregate`)
+    pub once: bool,
+}
+
+impl CteKey {
+    /// Whether the CTE has no USING KEY.
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
 }
 
 /// `BoundMergeIntoAction`.

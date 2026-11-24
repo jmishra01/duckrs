@@ -2104,6 +2104,7 @@ test/sql/cte/materialized/cte_streaming_over_materialization.test
 test/sql/cte/materialized/dml_materialized_cte.test
 test/sql/cte/materialized/incorrect_recursive_cte_materialized.test
 test/sql/cte/materialized/internal_3004.test
+test/sql/cte/materialized/materialized_cte_prepared.test
 test/sql/cte/materialized/recursive_array_slice_materialized.test
 test/sql/cte/materialized/recursive_cte_complex_pipelines.test
 test/sql/cte/materialized/recursive_cte_error_materialized.test
@@ -2130,7 +2131,12 @@ test/sql/cte/recursive_cte_error.test
 test/sql/cte/recursive_cte_event_schedule_reset.test
 test/sql/cte/recursive_cte_invariant_build.test
 test/sql/cte/recursive_cte_iteration_state_reuse.test
+test/sql/cte/recursive_cte_key_aggregate_subquery.test
+test/sql/cte/recursive_cte_key_aggregation.test
 test/sql/cte/recursive_cte_key_final_drain.test
+test/sql/cte/recursive_cte_key_finalize_reads.test
+test/sql/cte/recursive_cte_key_finalized_values.test
+test/sql/cte/recursive_cte_key_hll_aggregation.test
 test/sql/cte/recursive_cte_key_snapshot.test
 test/sql/cte/recursive_cte_large_payload.test
 test/sql/cte/recursive_cte_limit.test
@@ -2152,6 +2158,7 @@ test/sql/cte/test_recursive_cte_recurring.test
 test/sql/cte/test_recursive_cte_tutorial.test
 test/sql/cte/test_recursive_cte_union.test
 test/sql/cte/test_recursive_cte_union_all.test
+test/sql/cte/using_key_aggregate_qualification.test
 test/sql/delete/cleanup_delete_on_conflict.test
 test/sql/delete/delete_compression_after_restart.test
 test/sql/delete/delete_query_node.test
