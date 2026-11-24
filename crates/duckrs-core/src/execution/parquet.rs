@@ -1508,9 +1508,14 @@ fn open_file(
             mapping.push(Some(index));
         }
     }
-    for name in scan.names.iter().filter(|_| scan.schema.is_none()) {
+    for (at, name) in scan.names.iter().enumerate().filter(|_| scan.schema.is_none()) {
         let found = names.iter().position(|n| n.eq_ignore_ascii_case(name));
-        if found.is_none() && !scan.union_by_name {
+        // `MultiFileColumnMapper`: only a column the query reads has to be in every file
+        let read = scan
+            .projected
+            .as_ref()
+            .is_none_or(|projected| projected.get(at).copied().unwrap_or(true));
+        if found.is_none() && !scan.union_by_name && read {
             return Err(invalid(format!(
                 "Failed to read file \"{path}\": schema mismatch in glob: column \"{name}\" was read from the \
                  original file \"{}\", but could not be found in file \"{path}\".\nCandidate names: {}\nIf you are \
