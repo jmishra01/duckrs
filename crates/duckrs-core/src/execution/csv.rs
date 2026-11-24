@@ -1372,12 +1372,30 @@ fn read_rows(
 fn convert_column(strings: &Vector, count: usize, ty: &LogicalType, parsing: &Parsing) -> Result<Option<Vector>> {
     let format = match ty.id() {
         LogicalTypeId::Date => parsing.date_format.as_deref(),
-        LogicalTypeId::Timestamp => parsing.timestamp_format.as_deref(),
+        LogicalTypeId::Timestamp | LogicalTypeId::TimestampTz => parsing.timestamp_format.as_deref(),
         _ => None,
     };
+    if let Some(format) = format {
+        // `CSVCast::TryCastDateOperator` / `TryCastTimestampOperator`: the time the format parses, as UTC
+        let mut result = Vector::new(ty.clone(), count);
+        for row in 0..count {
+            let Some(bytes) = strings.str_at(row) else {
+                result.set_null(row, true);
+                continue;
+            };
+            let text = std::str::from_utf8(bytes).map_err(|e| Error::new(ErrorKind::Conversion, e.to_string()))?;
+            let micros = strptime_micros(text, format).map_err(|e| Error::new(ErrorKind::Conversion, e))?;
+            if ty.id() == LogicalTypeId::Date {
+                result.data_mut::<i32>()[row] = Timestamp(micros).date().0;
+            } else {
+                result.data_mut::<i64>()[row] = micros;
+            }
+        }
+        return Ok(Some(result));
+    }
     let numeric = ty.id() == LogicalTypeId::Bignum
         || (ty.is_numeric() && (parsing.thousands.is_some() || parsing.decimal_separator != b'.'));
-    if format.is_none() && !numeric {
+    if !numeric {
         return Ok(None);
     }
     let mut result = Vector::new(ty.clone(), count);
@@ -1388,15 +1406,7 @@ fn convert_column(strings: &Vector, count: usize, ty: &LogicalType, parsing: &Pa
             continue;
         }
         let text = value.try_to_string()?;
-        let converted = if let Some(format) = format {
-            let micros = strptime_micros(&text, format).map_err(|e| Error::new(ErrorKind::Conversion, e))?;
-            let timestamp = Timestamp(micros);
-            if ty.id() == LogicalTypeId::Date {
-                Value::date(timestamp.date())
-            } else {
-                Value::timestamp(timestamp)
-            }
-        } else {
+        let converted = {
             let Some(clean) = numeric_text(&text, ty, parsing) else {
                 return Err(Error::new(ErrorKind::Conversion, "not a number"));
             };

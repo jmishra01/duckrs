@@ -420,7 +420,7 @@ impl Binder<'_> {
             let options = &mut result.options;
             let mut shown = true;
             match option.as_str() {
-                "delim" | "sep" | "delimiter" => {
+                "delim" | "sep" | "delimiter" | "separator" => {
                     if options.delimiter.is_some() {
                         return Err(binder_error(
                             "CSV Reader function option delim and sep are aliases, only one can be supplied",
@@ -1443,7 +1443,7 @@ impl Binder<'_> {
                 .any(|(n, _)| names.contains(&n.as_str()))
         };
         let mut prompt = format!("FROM read_csv({}, auto_detect=false, ", string_literal(path));
-        if !given(&["delim", "sep", "delimiter"]) {
+        if !given(&["delim", "sep", "delimiter", "separator"]) {
             prompt += &format!("delim='{}', ", delimiter.replace('\'', "''"));
         }
         if !given(&["quote"]) {
@@ -1793,6 +1793,12 @@ impl Binder<'_> {
         let mut arguments = vec![string_literal(path), format!("columns := {{{}}}", fields.join(", "))];
         let options = self.copy_options(info)?;
         Self::check_copy_options(&options, true)?;
+        // `BindCopyOptions`: the CSV COPY function has its own list of options
+        if !self.copy_json
+            && let Some((name, _)) = options.iter().find(|(name, _)| !is_copy_option(CSV_COPY_OPTIONS, name))
+        {
+            return Err(unrecognized_copy_option(name, "csv", CSV_COPY_OPTIONS));
+        }
         // `CSVReaderOptions::SetReadOption`: FORCE_NOT_NULL names columns of the COPY (`ParseColumnList`),
         // before the file is sniffed
         if !self.copy_json
@@ -1812,7 +1818,7 @@ impl Binder<'_> {
         }
         let delimiter_given = options
             .iter()
-            .any(|(name, _)| matches!(name.as_str(), "delim" | "sep" | "delimiter"));
+            .any(|(name, _)| matches!(name.as_str(), "delim" | "sep" | "delimiter" | "separator"));
         if tsv && !delimiter_given {
             arguments.push("delimiter := '\t'".to_string());
         }
@@ -2190,7 +2196,7 @@ impl Binder<'_> {
                 }
                 "dateformat" | "date_format" => options.date_format = Some(text(&value)?),
                 "timestampformat" | "timestamp_format" => options.timestamp_format = Some(text(&value)?),
-                "delim" | "sep" | "delimiter" => options.delimiter = delimiter(&value)?,
+                "delim" | "sep" | "delimiter" | "separator" => options.delimiter = delimiter(&value)?,
                 "quote" => options.quote = single_byte(&value, "quote")?,
                 "escape" => {
                     options.escape = single_byte(&value, "escape")?;
@@ -3177,7 +3183,9 @@ pub(super) fn unrecognized_copy_option(option: &str, format: &str, own: &[&str])
     Error::new(
         ErrorKind::NotImplemented,
         format!(
-            "Unrecognized option {option} for {format}\n{}",
+            "Unrecognized option \"{}\" for {format}\n{}",
+            // an `Identifier`, which formats quoted
+            option.replace('"', "\"\""),
             duckrs_common::string_util::candidates_message(&candidates, "Candidate options")
         ),
     )
