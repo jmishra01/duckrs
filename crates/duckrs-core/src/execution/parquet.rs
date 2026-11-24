@@ -721,6 +721,37 @@ enum Special {
     Null,
     /// WKB, annotated GEOMETRY or GEOGRAPHY or named in the GeoParquet metadata, with its CRS (empty for none)
     Geometry(String),
+    /// strings annotated JSON (`ConvertedType::JSON`): a leaf, or a list of them (`true`)
+    Json(bool),
+}
+
+/// Whether the leaf `field` holds strings annotated JSON.
+fn is_json_leaf(field: &parquet::schema::types::Type) -> bool {
+    field.is_primitive()
+        && (field.get_basic_info().converted_type() == parquet::basic::ConvertedType::JSON
+            || matches!(field.get_basic_info().logical_type_ref(), Some(parquet::basic::LogicalType::Json)))
+}
+
+/// Whether `field` is a list of strings annotated JSON: a repeated JSON leaf, or a LIST of those (in two or three
+/// levels).
+fn is_json_list(field: &parquet::schema::types::Type) -> bool {
+    use parquet::basic::Repetition;
+    if field.is_primitive() {
+        return field.get_basic_info().repetition() == Repetition::REPEATED && is_json_leaf(field);
+    }
+    let info = field.get_basic_info();
+    let list = info.converted_type() == parquet::basic::ConvertedType::LIST
+        || matches!(info.logical_type_ref(), Some(parquet::basic::LogicalType::List));
+    let [repeated] = field.get_fields() else {
+        return false;
+    };
+    if !list || repeated.get_basic_info().repetition() != Repetition::REPEATED {
+        return false;
+    }
+    if repeated.is_primitive() {
+        return is_json_leaf(repeated);
+    }
+    matches!(repeated.get_fields(), [element] if is_json_leaf(element))
 }
 
 // Ported from duckdb/extension/parquet/parquet_reader.cpp (IsGeometryType) @ rust-port-baseline
@@ -744,11 +775,17 @@ fn special_columns(builder: &ParquetRecordBatchReaderBuilder<File>, geoparquet: 
         .get_fields()
         .iter()
         .map(|field| {
+            if is_json_list(field) {
+                return Special::Json(true);
+            }
             if !field.is_primitive() {
                 return match field.get_basic_info().logical_type_ref() {
                     Some(L::Variant(_)) => Special::Variant,
                     _ => Special::None,
                 };
+            }
+            if is_json_leaf(field) {
+                return Special::Json(false);
             }
             if field.get_physical_type() == parquet::basic::Type::BYTE_ARRAY {
                 match field.get_basic_info().logical_type_ref() {
@@ -797,6 +834,11 @@ fn column_type(
     if special.get(index) == Some(&Special::Null) {
         return Ok(LogicalType::SQLNULL);
     }
+    // `ParquetReader::DeriveLogicalType`: `ConvertedType::JSON` is JSON
+    if let Some(Special::Json(list)) = special.get(index) {
+        let json = crate::function::json::json_type();
+        return Ok(if *list { LogicalType::list(json) } else { json });
+    }
     if let Some(Special::Geometry(crs)) = special.get(index) {
         // `CoordinateReferenceSystem::TryIdentify`: a CRS nothing can tell is none
         let crs = duckrs_common::geometry_crs::try_identify(crs).ok().flatten();
@@ -813,6 +855,21 @@ fn column_type(
         });
     }
     logical_type(field, binary_as_string)
+}
+
+/// The type the values of top-level column `index` are decoded as: its [`column_type`], with the strings of a JSON
+/// column decoded as VARCHAR and then cast to JSON.
+fn read_type(
+    field: &Field,
+    special: &[Special],
+    index: usize,
+    binary_as_string: bool,
+    int96_as: Int96As,
+) -> Result<LogicalType> {
+    if special.get(index).is_some_and(|special| matches!(special, Special::Json(_))) {
+        return logical_type(field, binary_as_string);
+    }
+    column_type(field, special, index, binary_as_string, int96_as)
 }
 
 /// `ParseSchemaRecursive`: names that are the same but for case get `_1`, `_2`, ... appended.
@@ -1441,7 +1498,7 @@ fn open_file(
                 transforms.push(None);
                 continue;
             };
-            let file_type = column_type(schema.field(index), &int96, index, scan.binary_as_string, scan.int96_as)?;
+            let file_type = read_type(schema.field(index), &int96, index, scan.binary_as_string, scan.int96_as)?;
             transforms.push(Some(crate::execution::parquet_schema::build_transform(
                 column,
                 schema.field(index),
@@ -1463,7 +1520,7 @@ fn open_file(
             )));
         }
         file_types.push(match found {
-            Some(column) => column_type(
+            Some(column) => read_type(
                 schema.field(column),
                 &int96,
                 column,
