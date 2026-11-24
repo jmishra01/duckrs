@@ -1084,9 +1084,9 @@ pub fn check_lock(name: &str, global: &SettingValues, session: &SettingValues) -
     ))
 }
 
-/// `CustomUserAgentSetting` and `DuckDBAPISetting`: set when the database starts, not after.
+/// `CustomUserAgentSetting`, `DuckDBAPISetting` and `AccessModeSetting`: set when the database starts, not after.
 fn running_only(name: &str) -> Result<()> {
-    if matches!(name, "custom_user_agent" | "duckdb_api") {
+    if matches!(name, "custom_user_agent" | "duckdb_api" | "access_mode") {
         return Err(Error::new(
             ErrorKind::InvalidInput,
             format!("Cannot change {name} setting while database is running"),
