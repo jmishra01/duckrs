@@ -2095,8 +2095,12 @@ test/sql/cte/insert_cte_bug_3417.test
 test/sql/cte/lazy_cte_bind.test
 test/sql/cte/lazy_cte_bind_correlated.test
 test/sql/cte/materialized/annotated_and_auto_materialized.test
+test/sql/cte/materialized/cte_gated_buffered_consumer.test
+test/sql/cte/materialized/cte_gated_buffered_consumer_27925.test
+test/sql/cte/materialized/cte_gated_buffered_consumer_runtime_filter.test
 test/sql/cte/materialized/cte_runtime_filter_effects.test
 test/sql/cte/materialized/cte_runtime_filters.test
+test/sql/cte/materialized/cte_streaming_over_materialization.test
 test/sql/cte/materialized/dml_materialized_cte.test
 test/sql/cte/materialized/incorrect_recursive_cte_materialized.test
 test/sql/cte/materialized/internal_3004.test

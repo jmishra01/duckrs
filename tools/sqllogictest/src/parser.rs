@@ -123,6 +123,8 @@ pub enum Record {
     SetIgnoreErrorMessages(Vec<String>),
     SetAlwaysFailErrorMessages(Vec<String>),
     SetSeed(String),
+    /// `set query_timeout <seconds>`: how long one statement may run, 0 for no limit.
+    SetQueryTimeout(f64),
     SetVariable {
         name: String,
         value: String,
@@ -586,6 +588,18 @@ impl FileParser {
                     "seed" => match params.as_slice() {
                         [_, seed] => Record::SetSeed(seed.clone()),
                         _ => return lines.fail("set seed requires a single seed value"),
+                    },
+                    // `SQLLogicTestRunner::ExecuteFile`: seconds between 0 and 3600, NaN and infinity refused
+                    "query_timeout" => match params.as_slice() {
+                        [_, seconds] => match seconds.trim().parse::<f64>() {
+                            Ok(timeout) if (0.0..=3600.0).contains(&timeout) => Record::SetQueryTimeout(timeout),
+                            _ => {
+                                return lines.fail(
+                                    "set query_timeout requires a number of seconds between 0 and 3600 (0 disables)",
+                                );
+                            }
+                        },
+                        _ => return lines.fail("set query_timeout requires a single value (seconds, 0 disables)"),
                     },
                     "variable" => match params.as_slice() {
                         [_, name, value] => Record::SetVariable {

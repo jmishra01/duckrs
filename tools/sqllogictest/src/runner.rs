@@ -820,6 +820,10 @@ impl<'a> FileRunner<'a> {
                 shared.settings.write().unwrap().always_fail_error_messages = m.clone();
                 Flow::Next
             }
+            // `QueryWatchdog` interrupts a statement that runs past the timeout. duckrs can't interrupt a
+            // running query yet, so the file's own `--timeout` is what bounds a hang: the setting is
+            // checked and taken, and a hang still fails the file.
+            Record::SetQueryTimeout(_) => Flow::Next,
             Record::SetSeed(seed) => {
                 let con = self.con.as_deref_mut().expect("database is open");
                 match con.query(&format!("SELECT SETSEED({seed})")) {
