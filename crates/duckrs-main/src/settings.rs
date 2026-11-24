@@ -58,7 +58,8 @@ const UNHONORED: &[&str] = &[
     "active_grammar_extensions",
     // `allow_parser_override_extension` is honored: it picks between parser extensions that override
     // the parser (`Parser::ParseQuery`), and duckrs has none, so every value parses alike
-    "dialect_compatibility_mode",
+    // `dialect_compatibility_mode` is honored: SPARK changes how GROUP BY ALL and ORDER BY ALL bind when the
+    // parser reads ALL as a column, and the duckrs parser always reads it as the keyword
     "disable_timestamptz_casts",
     "errors_as_json",
     "legacy_disable_null_type",
