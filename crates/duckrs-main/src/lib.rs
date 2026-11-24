@@ -3519,7 +3519,20 @@ impl ClientContext {
         let mut binder = Binder::with_options(&catalog, self.bind_options());
         binder.parameters = self.parameters.clone();
         binder.session = Some(self.session_values());
-        let bound = binder.bind(statement)?;
+        // IF NOT EXISTS of a table that exists plans nothing: the export is of the query it would have run
+        let replaced;
+        let bind_target = match statement {
+            Statement::CreateTable(info)
+                if info.query.is_some() && info.on_conflict == duckrs_parser::ast::OnCreateConflict::Ignore =>
+            {
+                let mut info = info.clone();
+                info.on_conflict = duckrs_parser::ast::OnCreateConflict::Replace;
+                replaced = Statement::CreateTable(info);
+                &replaced
+            }
+            _ => statement,
+        };
+        let bound = binder.bind(bind_target)?;
         let modifies = !matches!(statement, Statement::Select(_));
         let plan = optimize(bound.plan, self.optimizer_options());
         duckrs_core::optimizer::join_order::take_error()?;
@@ -3554,6 +3567,7 @@ impl ClientContext {
                 &plan,
                 (!modifies || !names.is_empty()).then_some(names),
                 &database_of,
+                &duckrs_core::optimizer::can_throw,
             ),
         };
         match exported {
@@ -3575,14 +3589,21 @@ impl ClientContext {
         database_of: duckrs_core::planner::sql_export::DatabaseOf,
     ) -> std::result::Result<String, String> {
         use duckrs_core::planner::logical::LogicalOperatorKind as K;
+        let mut created_in = None;
         let (names, source) = match (&plan.kind, plan.children.first()) {
             (K::CopyToFile { names, .. } | K::CopyToParquet { names, .. }, Some(child)) => (names.clone(), child),
-            (K::CreateTableAs { columns, .. }, Some(child)) => {
+            (K::CreateTableAs { columns, schema, .. }, Some(child)) => {
+                created_in = Some(schema.clone());
                 (columns.iter().map(|c| c.name.clone()).collect(), child)
             }
             _ => return Err("The write has no SQL export".into()),
         };
-        let query = duckrs_core::planner::sql_export::export_query(source, &names, database_of)?;
+        let query = duckrs_core::planner::sql_export::export_query(
+            source,
+            &names,
+            database_of,
+            &duckrs_core::optimizer::can_throw,
+        )?;
         let sql = match statement {
             Statement::Copy(copy) => {
                 let mut copy = copy.clone();
@@ -3595,6 +3616,10 @@ impl ClientContext {
                 let mut info = info.clone();
                 info.query = Some(Box::new(duckrs_parser::ast::SelectStatement { node: query }));
                 info.columns.clear();
+                // the bound name: database, schema path and table (`base.GetQualifiedName()`)
+                if let Some(schema) = created_in.filter(|_| !info.temporary) {
+                    info.name.qualification = std::iter::once(self.db.name.clone()).chain(schema.path.clone()).collect();
+                }
                 info.to_string()
             }
             _ => unreachable!("checked by the caller"),

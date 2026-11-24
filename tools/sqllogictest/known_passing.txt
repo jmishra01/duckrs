@@ -4,6 +4,9 @@
 #   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
 # Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
 # stop passing. Regenerate with:
+#   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
+# Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
+# stop passing. Regenerate with:
 test/common/test_cast_hugeint.test
 test/common/test_cast_struct.test
 test/common/test_local_file_urls.test
@@ -3868,6 +3871,7 @@ test/sql/sql_export/cte_names.test
 test/sql/sql_export/execution_once.test
 test/sql/sql_export/explain_sql_formatting.test
 test/sql/sql_export/explain_sql_scopes.test
+test/sql/sql_export/function_result_types.test
 test/sql/sql_export/grouped_mark_roundtrip.test
 test/sql/sql_export/grouped_tuple_mark_roundtrip.test
 test/sql/sql_export/json_ordering.test
@@ -3888,6 +3892,7 @@ test/sql/sql_export/pruned_offset.test
 test/sql/sql_export/pure_values_input.test
 test/sql/sql_export/pushed_column_paths.test
 test/sql/sql_export/range_folded_offset.test
+test/sql/sql_export/range_frames.test
 test/sql/sql_export/range_origin_inputs.test
 test/sql/sql_export/recursive_payload_types.test
 test/sql/sql_export/regex_range_filter_export.test

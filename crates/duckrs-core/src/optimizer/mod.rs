@@ -46,6 +46,8 @@ mod relation_statistics;
 mod remove_redundant_order;
 pub mod reorder_filter;
 pub mod rewriter;
+/// `Expression::CanThrow`, for the SQL export of plans.
+pub use rewriter::can_throw;
 pub mod row_number_rewriter;
 mod sampling_pushdown;
 mod scalar_aggregate_merger;

@@ -39,9 +39,17 @@ type Res<T> = std::result::Result<T, Unsupported>;
 /// The name of the database a table is in, to qualify it with.
 pub type DatabaseOf<'a> = &'a dyn Fn(&TableCatalogEntry) -> Option<String>;
 
+/// `Expression::CanThrow`, which the optimizer knows: passed in, as the planner sits below it.
+pub type CanThrow<'a> = &'a dyn Fn(&BoundExpr) -> bool;
+
 /// `LogicalPlanSQLExporter::Export`: the SQL of `plan`, its result columns named `output_names`
 /// when given (they are not for a statement that reports a count).
-pub fn export_plan(plan: &LogicalOperator, output_names: Option<&[String]>, database_of: DatabaseOf) -> Res<String> {
+pub fn export_plan(
+    plan: &LogicalOperator,
+    output_names: Option<&[String]>,
+    database_of: DatabaseOf,
+    can_throw: CanThrow,
+) -> Res<String> {
     let mut exporter = Exporter {
         next_alias: 0,
         ctes: Vec::new(),
@@ -50,6 +58,7 @@ pub fn export_plan(plan: &LogicalOperator, output_names: Option<&[String]>, data
         lambdas: Vec::new(),
         delims: Vec::new(),
         database_of,
+        can_throw,
     };
     if let Some(statement) = exporter.statement(plan, output_names)? {
         return finish_sql(&statement);
@@ -68,7 +77,12 @@ pub fn export_plan(plan: &LogicalOperator, output_names: Option<&[String]>, data
 }
 
 /// The query of a plan, its columns named `names`, as a COPY or CREATE TABLE AS takes it.
-pub fn export_query(plan: &LogicalOperator, names: &[String], database_of: DatabaseOf) -> Res<QueryNode> {
+pub fn export_query(
+    plan: &LogicalOperator,
+    names: &[String],
+    database_of: DatabaseOf,
+    can_throw: CanThrow,
+) -> Res<QueryNode> {
     let mut exporter = Exporter {
         next_alias: 0,
         ctes: Vec::new(),
@@ -77,6 +91,7 @@ pub fn export_query(plan: &LogicalOperator, names: &[String], database_of: Datab
         lambdas: Vec::new(),
         delims: Vec::new(),
         database_of,
+        can_throw,
     };
     let relation = exporter.export(plan)?;
     let mut node = exporter.named_query(relation, names)?;
@@ -93,7 +108,10 @@ pub fn finish_sql(sql: &str) -> Res<String> {
     if sql.len() > MAX_SQL_LENGTH {
         return Err("The SQL of the plan is too long".into());
     }
-    Ok(format_sql(sql))
+    Ok(duckrs_parser::sql_formatter::format_sql(
+        sql,
+        &duckrs_parser::sql_formatter::FormatterConfig::default(),
+    ))
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -121,6 +139,8 @@ struct Column {
     expr: Expr,
     kind: Kind,
     volatile: bool,
+    /// computed by something that can fail (`CanThrow`): it stays where it was evaluated
+    throws: bool,
 }
 
 impl Column {
@@ -129,6 +149,7 @@ impl Column {
             expr,
             kind: Kind::Column,
             volatile: false,
+            throws: false,
         }
     }
 }
@@ -179,7 +200,11 @@ impl Select {
 
     /// `PlainScope`: columns of the FROM clause, filtered.
     fn is_plain(&self) -> bool {
-        self.is_simple() && self.sample.is_none() && self.columns.iter().all(|c| c.kind == Kind::Column)
+        // (a filter that can fail must not see the rows another one removes)
+        self.is_simple()
+            && self.sample.is_none()
+            && !self.unsafe_filters
+            && self.columns.iter().all(|c| c.kind == Kind::Column)
     }
 }
 
@@ -316,6 +341,19 @@ fn has_effects(e: &BoundExpr) -> bool {
     e.is_volatile() || raises(e)
 }
 
+/// `HasCompositionBarrier`: an expression that decides whether, or for which rows, its input runs.
+fn has_composition_barrier(e: &BoundExpr) -> bool {
+    matches!(
+        &e.kind,
+        BoundExprKind::Case { .. }
+            | BoundExprKind::ListLambda { .. }
+            | BoundExprKind::Operator {
+                op: BoundOperator::Try | BoundOperator::HasError | BoundOperator::Coalesce,
+                ..
+            }
+    ) || e.children().into_iter().any(has_composition_barrier)
+}
+
 /// The columns of the FROM clause an expression reads.
 fn read_bindings(expr: &BoundExpr, out: &mut Vec<ColumnBinding>) {
     if let BoundExprKind::ColumnRef { binding, depth: 0 } = &expr.kind {
@@ -344,6 +382,7 @@ struct Exporter<'a> {
     /// the duplicate-eliminated joins being exported, by their `delim`: the key values of a left row
     delims: Vec<(usize, Vec<Column>)>,
     database_of: DatabaseOf<'a>,
+    can_throw: CanThrow<'a>,
 }
 
 impl Exporter<'_> {
@@ -1018,6 +1057,7 @@ impl Exporter<'_> {
                         expr: system_function("unnest", vec![list]),
                         kind: Kind::Unnest,
                         volatile: false,
+                        throws: false,
                     });
                 }
                 Body::Select(select)
@@ -1423,6 +1463,8 @@ impl Exporter<'_> {
         }
         .into();
         from.alias = alias.clone();
+        // `ReconstructSQLSource`: the columns of the source go by their positions
+        from.column_name_alias = (0..table.columns.len()).map(|i| format!("column{i}")).collect();
         let column_of = |id: usize| {
             // `TableFunctionColumn`: the `row_number` column is the window it stands for
             if id == super::logical::COLUMN_IDENTIFIER_ROW_NUMBER {
@@ -1440,12 +1482,13 @@ impl Exporter<'_> {
                     expr: ExprKind::Window(Box::new(window)).into(),
                     kind: Kind::Window,
                     volatile: false,
+                    throws: false,
                 };
             }
             let name = if id == COLUMN_IDENTIFIER_ROW_ID {
                 "rowid".to_string()
             } else {
-                table.columns[id].name.clone()
+                format!("column{id}")
             };
             Column::plain(Expr::column(vec![alias.clone(), name]))
         };
@@ -1588,7 +1631,7 @@ impl Exporter<'_> {
             .collect();
         // WHERE comes before what a window, an aggregate or UNNEST computes; a filter that has
         // effects or fails runs only on the rows that pass the filters below it
-        let effects = expressions.iter().any(has_effects);
+        let effects = expressions.iter().any(|e| has_effects(e) || (self.can_throw)(e));
         let movable = positions.iter().all(|&p| select.columns[p].kind == Kind::Column)
             && select.columns.iter().all(|c| c.kind <= Kind::Computed)
             && (!effects || select.filters.is_empty())
@@ -1642,8 +1685,24 @@ impl Exporter<'_> {
                 BoundExprKind::ColumnRef { depth: 0, .. } | BoundExprKind::Constant(_)
             )
         });
+        // `ComposeProjection`: a CASE, TRY or COALESCE would decide whether a computed column runs, and
+        // a column that can fail is only moved where it is read once, as it is
+        let computed = |p: &usize| select.columns.get(*p).is_some_and(|c| c.kind != Kind::Column);
+        let barrier = expressions.iter().any(has_composition_barrier) && positions.iter().any(computed);
+        let failing = positions.iter().any(|&p| {
+            select.columns.get(p).is_some_and(|c| c.throws) && {
+                let uses = positions.iter().filter(|&&q| q == p).count();
+                let forwarded = expressions.iter().any(|e| {
+                    matches!(&e.kind, BoundExprKind::ColumnRef { binding, depth: 0 } if fields.get(p).is_some_and(|f| f.binding == *binding))
+                });
+                // (`HasEffectfulExpressions`: what has effects would see the rows the failure stops)
+                uses != 1 || !forwarded || expressions.iter().any(has_effects)
+            }
+        });
         let ok = (fromless || !matches!(select.from.kind, TableRefKind::Empty) || select.columns.is_empty())
             && (select.limit.is_none() || pure)
+            && !barrier
+            && !failing
             && Self::substitutable(&select, &positions, Kind::Window);
         if !ok {
             select = self.wrap(Relation {
@@ -1674,13 +1733,20 @@ impl Exporter<'_> {
             Kind::Computed
         };
         let mut volatile = e.is_volatile();
+        let mut throws = kind != Kind::Column && (self.can_throw)(e);
         for b in &read {
             if let Some((column, _)) = scope.columns.get(b) {
                 kind = kind.max(column.kind);
                 volatile |= column.volatile;
+                throws |= column.throws;
             }
         }
-        Ok(Column { expr, kind, volatile })
+        Ok(Column {
+            expr,
+            kind,
+            volatile,
+            throws,
+        })
     }
 
     fn aggregate(
@@ -1721,7 +1787,17 @@ impl Exporter<'_> {
             .iter()
             .filter_map(|b| fields.iter().position(|f| f.binding == *b))
             .collect();
-        if !Self::substitutable(&select, &positions, Kind::Computed) || matches!(select.from.kind, TableRefKind::Empty)
+        // `ComposeInput`: a computed input that can fail, or that a CASE, TRY or COALESCE reads, keeps its SELECT
+        let failing = positions.iter().any(|&p| select.columns.get(p).is_some_and(|c| c.throws));
+        let barrier = groups
+            .iter()
+            .chain(aggregates.iter().flat_map(|a| a.children.iter().chain(a.filter.iter())))
+            .any(has_composition_barrier)
+            && positions.iter().any(|&p| select.columns.get(p).is_some_and(|c| c.kind != Kind::Column));
+        if !Self::substitutable(&select, &positions, Kind::Computed)
+            || matches!(select.from.kind, TableRefKind::Empty)
+            || failing
+            || barrier
         {
             select = self.wrap(Relation {
                 body: Body::Select(select),
@@ -1744,6 +1820,7 @@ impl Exporter<'_> {
                 expr: g.clone(),
                 kind: Kind::Aggregate,
                 volatile: false,
+                throws: false,
             })
             .collect();
         for a in aggregates {
@@ -1752,6 +1829,7 @@ impl Exporter<'_> {
                 expr,
                 kind: Kind::Aggregate,
                 volatile: false,
+                throws: false,
             });
         }
         for function in grouping_functions {
@@ -1760,6 +1838,7 @@ impl Exporter<'_> {
                 expr: Expr::operator(OperatorType::Grouping, children),
                 kind: Kind::Aggregate,
                 volatile: false,
+                throws: false,
             });
         }
         select.columns = columns;
@@ -1799,6 +1878,13 @@ impl Exporter<'_> {
         for (e, modifiers) in &a.order_by {
             function.order_by.push(order_node(*modifiers, self.expr(scope, e)?));
         }
+        // `ExportAggregate`: a result type that binding specialized is restored with a cast
+        let specialized = a.function.return_type != a.return_type
+            && a.return_type.id() == LogicalTypeId::Decimal
+            && a.function.return_type.id() == LogicalTypeId::Decimal;
+        if specialized {
+            return Ok(cast(&a.return_type, function.into(), false));
+        }
         Ok(collate(&a.return_type, function.into()))
     }
 
@@ -1831,6 +1917,7 @@ impl Exporter<'_> {
                 expr,
                 kind: Kind::Window,
                 volatile: false,
+                throws: false,
             });
         }
         Ok(Body::Select(select))
@@ -2109,6 +2196,7 @@ impl Exporter<'_> {
                 expr: mark,
                 kind: Kind::Computed,
                 volatile: false,
+                throws: false,
             });
             return Ok(Body::Select(select));
         }
@@ -2147,6 +2235,7 @@ impl Exporter<'_> {
             expr: Expr::column(vec!["__mark_join_marker".into()]),
             kind: Kind::Mark,
             volatile: false,
+            throws: false,
         });
         let mut select = Select::new(from, columns);
         select.filters = left_filters;
@@ -2296,6 +2385,7 @@ impl Exporter<'_> {
                     expr: mark,
                     kind: Kind::Computed,
                     volatile: false,
+                    throws: false,
                 });
             }
             JoinType::Single => {
@@ -2330,6 +2420,7 @@ impl Exporter<'_> {
                         .into(),
                         kind: Kind::Computed,
                         volatile: false,
+                        throws: false,
                     });
                 }
             }
@@ -2518,11 +2609,7 @@ impl Exporter<'_> {
                 }
                 system_function(name, args)
             }
-            BoundExprKind::Function {
-                function,
-                children,
-                is_operator,
-            } => {
+            BoundExprKind::Function { function, children, .. } => {
                 // `TryExportCompressedMaterialization`: SQL has the values as they were, without the
                 // optimizer's compression, so a compress or decompress function is its input
                 if (function.name.starts_with("__internal_compress_")
@@ -2545,9 +2632,8 @@ impl Exporter<'_> {
                         _ => args.push(self.expr(scope, c)?),
                     }
                 }
-                if *is_operator && (1..=2).contains(&args.len()) {
-                    FunctionExpr::operator(function.name.clone(), args).into()
-                } else if matches!(function.name.as_str(), "struct_pack" | "union_value") {
+                // an operator is a call of its function too: the exported FunctionExpression is no operator
+                if matches!(function.name.as_str(), "struct_pack" | "union_value") {
                     // the names of the arguments are those of the fields
                     let fields = e.return_type.struct_children();
                     let skip = usize::from(function.name == "union_value");
@@ -2934,105 +3020,5 @@ fn from_value(value: &Value) -> Res<(Expr, bool)> {
         }
         (T::Union, _) => Err("A UNION value has no SQL constructor".into()),
         _ => string_cast(value),
-    }
-}
-
-// ---------------------------------------------------------------------------------------------------------------
-// Formatting (`FormatSQL`)
-// ---------------------------------------------------------------------------------------------------------------
-
-/// `FormatSQL`: the clauses of each SELECT on lines of their own, indented by how deep the query is.
-/// Only what is outside of literals and quoted names changes.
-pub fn format_sql(sql: &str) -> String {
-    const CLAUSES: [&str; 11] = [
-        "FROM", "WHERE", "GROUP BY", "HAVING", "QUALIFY", "WINDOW", "ORDER BY", "LIMIT", "OFFSET", "UNION", "EXCEPT",
-    ];
-    const MORE_CLAUSES: [&str; 1] = ["INTERSECT"];
-    let bytes = sql.as_bytes();
-    let mut out = String::with_capacity(sql.len() + 32);
-    // per open parenthesis: whether a query is in it
-    let mut stack: Vec<bool> = Vec::new();
-    let mut i = 0;
-    let word_at = |i: usize, word: &str| -> bool {
-        sql[i..].starts_with(word)
-            && (i == 0 || !is_word_byte(bytes[i - 1]))
-            && bytes.get(i + word.len()).is_none_or(|&b| !is_word_byte(b))
-    };
-    while i < bytes.len() {
-        let c = bytes[i];
-        if c == b'\'' || c == b'"' {
-            let start = i;
-            i += 1;
-            while i < bytes.len() {
-                if bytes[i] == c {
-                    if bytes.get(i + 1) == Some(&c) {
-                        i += 2;
-                        continue;
-                    }
-                    break;
-                }
-                i += 1;
-            }
-            i = (i + 1).min(bytes.len());
-            out.push_str(&sql[start..i]);
-            continue;
-        }
-        if c == b'(' {
-            let rest = sql[i + 1..].trim_start();
-            let query = rest.starts_with("SELECT ") || rest.starts_with("WITH ") || rest.starts_with("VALUES ");
-            stack.push(query);
-            out.push('(');
-            i += 1;
-            continue;
-        }
-        if c == b')' {
-            stack.pop();
-            out.push(')');
-            i += 1;
-            continue;
-        }
-        let in_query = stack.last().copied().unwrap_or(true);
-        if in_query && c == b' ' {
-            let next = i + 1;
-            if let Some(clause) = CLAUSES.iter().chain(MORE_CLAUSES.iter()).find(|w| word_at(next, w)) {
-                let depth = stack.iter().filter(|q| **q).count();
-                out.push('\n');
-                out.push_str(&"    ".repeat(depth));
-                out.push_str(clause);
-                i = next + clause.len();
-                continue;
-            }
-        }
-        let ch = sql[i..].chars().next().expect("in bounds");
-        out.push(ch);
-        i += ch.len_utf8();
-    }
-    out
-}
-
-fn is_word_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn formats_clauses_outside_literals() {
-        let sql = "SELECT 'a FROM b' AS c0 FROM t AS r0 WHERE (r0.i > 1) ORDER BY r0.i";
-        assert_eq!(
-            format_sql(sql),
-            "SELECT 'a FROM b' AS c0\nFROM t AS r0\nWHERE (r0.i > 1)\nORDER BY r0.i"
-        );
-        let nested = "SELECT r1.c0 FROM (SELECT x AS c0 FROM t) AS r1(c0)";
-        assert_eq!(
-            format_sql(nested),
-            "SELECT r1.c0\nFROM (SELECT x AS c0\n    FROM t) AS r1(c0)"
-        );
-        assert_eq!(
-            format_sql("SELECT string_agg(x ORDER BY y)"),
-            "SELECT string_agg(x ORDER BY y)"
-        );
     }
 }
