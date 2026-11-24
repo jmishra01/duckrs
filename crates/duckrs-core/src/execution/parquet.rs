@@ -97,7 +97,8 @@ pub struct ParquetScanData {
     pub page_pruning: PagePruning,
     /// `explicit_cardinality`: the rows the scan is estimated at
     pub explicit_cardinality: Option<u64>,
-    /// `parquet_metadata_cache`: the footers the scan reads are kept, and those kept describe the files
+    /// `parquet_metadata_cache`: the footers the scan reads are kept, and the row groups of those kept are its
+    /// partitions (`GetPartitionStats`); they don't give the scan column statistics
     pub metadata_cache: bool,
 }
 
@@ -3561,7 +3562,6 @@ fn all_files_opened(scan: &ParquetScanData) -> bool {
     scan.files.len() <= 1
         || scan.union_by_name
         || (scan.files_for_stats > 0 && scan.files.len() <= scan.files_for_stats)
-        || (scan.metadata_cache && scan.files.iter().all(|file| cached_metadata(file).is_some()))
 }
 
 /// `ParquetFileMetadataCache` in the `ObjectCache`: the footers of the files read with `parquet_metadata_cache`, by
