@@ -223,8 +223,10 @@ pub fn can_cast(text: &str, ty: &LogicalType, parsing: &Parsing) -> bool {
         LogicalTypeId::Time => can_cast_time(text, ty),
         // an offset makes it a TIMESTAMP WITH TIME ZONE
         LogicalTypeId::Timestamp => {
-            let after_time = text.rfind(':').map_or("", |at| &text[at..]);
-            !after_time.contains(['+', '-', 'Z', 'z']) && casts(text, ty)
+            // what follows the date (`T` or a space): an offset is a sign or a Z there, `+00:00` included
+            let trimmed = text.trim();
+            let time = trimmed.find(['T', 't', ' ']).map_or("", |at| &trimmed[at + 1..]);
+            !time.contains(['+', '-', 'Z', 'z']) && casts(text, ty)
         }
         // `Date::TryConvertDate` strictly stops at the date
         LogicalTypeId::Date => {

@@ -599,12 +599,14 @@ impl Binder<'_> {
                 "dateformat" | "date_format" => {
                     let format = text(&value)?;
                     if !format.eq_ignore_ascii_case("auto") {
+                        check_read_format(&format)?;
                         options.date_format = Some(format);
                     }
                 }
                 "timestampformat" | "timestamp_format" => {
                     let format = text(&value)?;
                     if !format.eq_ignore_ascii_case("auto") {
+                        check_read_format(&format)?;
                         options.timestamp_format = Some(format);
                     }
                 }
@@ -697,6 +699,15 @@ impl Binder<'_> {
                             "read_csv \"{option}\" parameter cannot have a NULL value"
                         )));
                     }
+                    // the parameter is a VARCHAR[], which nothing but a list casts to
+                    if !matches!(value.data(), ValueData::List(_)) {
+                        return Err(binder_error(format!(
+                            "Could not cast value {} to named parameter \"{option}\" of type VARCHAR[]: Unimplemented \
+                             type for cast ({} -> VARCHAR[])",
+                            value.try_to_string()?,
+                            value.logical_type()
+                        )));
+                    }
                     let names = strings(&value)?;
                     let mut seen = std::collections::HashSet::new();
                     for name in &names {
@@ -707,7 +718,7 @@ impl Binder<'_> {
                         }
                         if !seen.insert(name.to_lowercase()) {
                             return Err(binder_error(format!(
-                                "read_csv \"{option}\" must have unique values. {name} is repeated."
+                                "read_csv \"{option}\" must have unique values. \"{name}\" is repeated."
                             )));
                         }
                     }
@@ -810,6 +821,16 @@ impl Binder<'_> {
                 result.user_arguments.push((option, value_literal(&value)?));
             }
         }
+        // `user_defined_parameters` is an ordered map: by name, and a name once, with its last value
+        result.user_arguments.sort_by(|a, b| a.0.cmp(&b.0));
+        result.user_arguments.dedup_by(|later, earlier| {
+            if later.0 == earlier.0 {
+                std::mem::swap(&mut earlier.1, &mut later.1);
+                true
+            } else {
+                false
+            }
+        });
         // `VerifyTypeListsMatch`: with `columns`, the types of `types` must be those of the columns
         if let Some(columns) = &result.columns {
             let given: Vec<LogicalType> = if result.types_by_position.is_empty() {
@@ -929,9 +950,23 @@ impl Binder<'_> {
             }
         };
         if let Some(names) = &arguments.names {
+            // more names than columns: with null_padding, VARCHAR columns the rows are padded with
+            if names.len() > sniffed.names.len() && arguments.options.null_padding {
+                while sniffed.names.len() < names.len() {
+                    sniffed.names.push(names[sniffed.names.len()].clone());
+                    sniffed.types.push(LogicalType::VARCHAR);
+                }
+            }
+            // more names than columns: no dialect the sniffer tries has that many (`CSVSniffer::DetectDialect`)
             if names.len() > sniffed.names.len() {
-                return Err(binder_error(
-                    "read_csv: names has more entries than the file has columns",
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "Error when sniffing file \"{path}\".\nIt was not possible to automatically detect the CSV \
+                         parsing dialect\nThe names given ({}) are more than the columns found ({}).",
+                        names.len(),
+                        sniffed.names.len()
+                    ),
                 ));
             }
             sniffed.names[..names.len()].clone_from_slice(names);
@@ -1355,7 +1390,9 @@ impl Binder<'_> {
         };
         let (scans, errors) = (table(scans_name), table(errors_name));
         let (scans_ok, errors_ok) = (ours(&scans, "file_path"), ours(&errors, "error_message"));
-        if !scans_ok || !errors_ok {
+        // `CSVRejectsTable::GetOrCreate`: tables of these names are reused only as the pair they were made as
+        let partial = scans.is_some() != errors.is_some();
+        if !scans_ok || !errors_ok || partial {
             let mut message = String::new();
             if scans.is_some() {
                 message += &format!("Reject Scan Table name \"{scans_name}\" is already in use. ");
@@ -1418,6 +1455,18 @@ impl Binder<'_> {
                 column("error_message".to_string(), text),
             ],
         )?;
+        // `CSVRejectsTable`: one scan id for the scans of a query, whose files are numbered on from one another
+        static LAST: std::sync::Mutex<Option<(u64, u64, usize)>> = std::sync::Mutex::new(None);
+        let query = self.session.as_ref().map(|session| session.query_id);
+        let (scan_id, file_offset) = {
+            let mut last = LAST.lock().expect("not poisoned");
+            let (scan_id, file_offset) = match (*last, query) {
+                (Some((last_query, scan_id, next_file)), Some(query)) if last_query == query => (scan_id, next_file),
+                _ => (SCANS.fetch_add(1, Ordering::Relaxed), 0),
+            };
+            *last = query.map(|query| (query, scan_id, file_offset + arguments.files.len()));
+            (scan_id, file_offset)
+        };
         let user: Vec<String> = arguments
             .user_arguments
             .iter()
@@ -1428,7 +1477,8 @@ impl Binder<'_> {
             scans,
             limit: arguments.rejects_limit,
             line_size_limit: arguments.rejects_line_size_limit,
-            scan_id: SCANS.fetch_add(1, Ordering::Relaxed),
+            scan_id,
+            file_offset,
             user_arguments: (!user.is_empty()).then(|| user.join(", ")),
         })
     }
@@ -2260,7 +2310,15 @@ impl Binder<'_> {
                     }
                 }
                 "dateformat" | "date_format" => options.date_format = Some(text(&value)?),
-                "timestampformat" | "timestamp_format" => options.timestamp_format = Some(text(&value)?),
+                // `CSVReaderOptions::SetWriteOption`: ISO is the ISO 8601 format with microseconds
+                "timestampformat" | "timestamp_format" => {
+                    let format = text(&value)?;
+                    options.timestamp_format = Some(if format.eq_ignore_ascii_case("iso") {
+                        "%Y-%m-%dT%H:%M:%S.%fZ".to_string()
+                    } else {
+                        format
+                    });
+                }
                 "delim" | "sep" | "delimiter" | "separator" => options.delimiter = delimiter(&value)?,
                 "quote" => options.quote = single_byte(&value, "quote")?,
                 "escape" => {
@@ -3263,3 +3321,10 @@ fn is_bytes_option(name: &str) -> bool {
         "file_size_bytes" | "row_group_size_bytes" | "bloom_filter_fallback_max_bytes"
     )
 }
+/// `CSVReaderOptions::SetDateFormat`: a format to read with must parse (`StrTimeFormat::ParseFormatSpecifier`).
+fn check_read_format(format: &str) -> Result<()> {
+    crate::function::strptime::StrpFormat::new(format).map(|_| ()).map_err(|error| {
+        Error::new(ErrorKind::InvalidInput, format!("Could not parse DATEFORMAT: {error}"))
+    })
+}
+

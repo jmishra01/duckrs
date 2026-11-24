@@ -270,6 +270,8 @@ pub struct CsvRejects {
     /// how much of a line to keep, 0 for all of it
     pub line_size_limit: usize,
     pub scan_id: u64,
+    /// the id of its first file: the scans of one query number their files on from each other
+    pub file_offset: usize,
     pub user_arguments: Option<String>,
 }
 
@@ -911,6 +913,15 @@ fn scan_file_chunk(scan: &CsvScanData, state: &mut CsvScanState) -> Result<Optio
             let machine = Machine::new(file.dialect.clone(), bom);
             let rows = usize::from(file.header) + file.skip;
             let begin = skip_rows(&data, &machine.dialect, &machine.transitions(), bom, rows);
+            // `CSVError::LineSizeError`: the header is a line too
+            if file.header {
+                let header_start = skip_rows(&data, &machine.dialect, &machine.transitions(), bom, rows - 1);
+                let header = &data[header_start..begin.max(header_start)];
+                let size = header.iter().rposition(|&c| c != b'\n' && c != b'\r').map_or(0, |at| at + 1);
+                if size > scan.options.maximum_line_size() {
+                    return Err(line_size_error(&scan.options, size));
+                }
+            }
             // rows to skip past the first buffer: the file is read whole
             if state
                 .stream
@@ -1696,7 +1707,7 @@ fn flush_rejects(scan: &CsvScanData, state: &mut CsvScanState) -> Result<()> {
         .map(|r| {
             vec![
                 Some(rejects.scan_id.to_string()),
-                text(r.file),
+                text(r.file + rejects.file_offset),
                 text(r.line),
                 text(r.row_position),
                 r.position.map(|p| p.to_string()),
@@ -1729,7 +1740,7 @@ fn flush_rejects(scan: &CsvScanData, state: &mut CsvScanState) -> Result<()> {
         let new_line = new_line_identifier(&file.dialect);
         scans.push(vec![
             Some(rejects.scan_id.to_string()),
-            text(index),
+            text(index + rejects.file_offset),
             Some(file.path.clone()),
             Some(String::from_utf8_lossy(&file.dialect.delimiter).into_owned()),
             shown(file.dialect.quote),

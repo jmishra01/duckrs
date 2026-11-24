@@ -1654,7 +1654,9 @@ test/sql/copy/csv/csv_hive.test
 test/sql/copy/csv/csv_hive_filename_union.test
 test/sql/copy/csv/csv_home_directory.test
 test/sql/copy/csv/csv_limit_copy.test
+test/sql/copy/csv/csv_line_too_long.test
 test/sql/copy/csv/csv_multibyte_delimiter_escapes.test
+test/sql/copy/csv/csv_names.test
 test/sql/copy/csv/csv_null_byte.test
 test/sql/copy/csv/csv_null_padding.test
 test/sql/copy/csv/csv_nullstr_list.test
@@ -1710,6 +1712,7 @@ test/sql/copy/csv/rejects/csv_rejects_cache_key_collision.test
 test/sql/copy/csv/rejects/csv_rejects_flush_cast.test
 test/sql/copy/csv/rejects/csv_rejects_flush_message.test
 test/sql/copy/csv/rejects/csv_rejects_maximum_line.test
+test/sql/copy/csv/rejects/csv_rejects_two_tables.test
 test/sql/copy/csv/rejects/csv_unquoted_rejects.test
 test/sql/copy/csv/rejects/test_invalid_parameters.test
 test/sql/copy/csv/rejects/test_invalid_utf_rejects.test
@@ -1750,6 +1753,7 @@ test/sql/copy/csv/test_csv_projection_pushdown.test
 test/sql/copy/csv/test_csv_projection_pushdown_glob.test
 test/sql/copy/csv/test_date.test
 test/sql/copy/csv/test_date_sniffer.test
+test/sql/copy/csv/test_dateformat.test
 test/sql/copy/csv/test_decimal.test
 test/sql/copy/csv/test_double_sniffer.test
 test/sql/copy/csv/test_empty_header.test
@@ -1811,6 +1815,7 @@ test/sql/copy/csv/test_time.test
 test/sql/copy/csv/test_timestamp_offset.test
 test/sql/copy/csv/test_timestamptz_12926.test
 test/sql/copy/csv/test_union_by_name.test
+test/sql/copy/csv/test_union_by_name_types.test
 test/sql/copy/csv/test_unregistered_compression.test
 test/sql/copy/csv/test_utf16_odd_length.test
 test/sql/copy/csv/test_utf16_surrogate_pairs.test
