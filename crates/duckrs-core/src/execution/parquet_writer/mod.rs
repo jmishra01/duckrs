@@ -164,6 +164,9 @@ pub struct WriterOptions {
     pub bloom_filter_fpp: f64,
     pub key_values: Vec<(String, Vec<u8>)>,
     pub timestamp_as_int96: bool,
+    /// `timestamp_is_adjusted_to_utc`: the `isAdjustedToUTC` of TIMESTAMP columns, `None` (AUTO) for TIMESTAMPTZ
+    /// only (`GetTimestampIsAdjustedToUTC`)
+    pub timestamp_adjusted_to_utc: Option<bool>,
     /// `bloom_filter_fallback_max_bytes`: what the bloom filters of columns without a dictionary may take
     pub bloom_filter_fallback_max_bytes: usize,
     /// `not_null_columns`: the columns written REQUIRED, by position
@@ -206,6 +209,7 @@ impl Default for WriterOptions {
             bloom_filter_fpp: 0.01,
             key_values: Vec::new(),
             timestamp_as_int96: false,
+            timestamp_adjusted_to_utc: None,
             bloom_filter_fallback_max_bytes: 64 * 1024 * 1024,
             not_null_columns: Vec::new(),
             write_page_index: false,
@@ -1629,7 +1633,9 @@ fn leaf_schema_element(leaf: &Leaf, options: &WriterOptions) -> SchemaElement {
         return element;
     }
     let int96 = options.timestamp_as_int96;
-    let utc = matches!(ty.id(), T::TimestampTz);
+    let utc = options
+        .timestamp_adjusted_to_utc
+        .unwrap_or(matches!(ty.id(), T::TimestampTz));
     match ty.id() {
         T::TinyInt => element.converted = Some(converted::INT_8),
         T::SmallInt => element.converted = Some(converted::INT_16),
@@ -1649,10 +1655,10 @@ fn leaf_schema_element(leaf: &Leaf, options: &WriterOptions) -> SchemaElement {
             element.converted = Some(converted::TIMESTAMP_MICROS);
             element.logical = Some(LogicalAnnotation::Timestamp(utc, 2));
         }
-        T::TimestampNs if !int96 => element.logical = Some(LogicalAnnotation::Timestamp(false, 3)),
+        T::TimestampNs if !int96 => element.logical = Some(LogicalAnnotation::Timestamp(utc, 3)),
         T::TimestampMs if !int96 => {
             element.converted = Some(converted::TIMESTAMP_MILLIS);
-            element.logical = Some(LogicalAnnotation::Timestamp(false, 1));
+            element.logical = Some(LogicalAnnotation::Timestamp(utc, 1));
         }
         T::Enum | T::Varchar => element.converted = Some(converted::UTF8),
         T::Interval => {

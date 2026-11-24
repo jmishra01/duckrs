@@ -751,6 +751,20 @@ impl Binder<'_> {
                     writer.bloom_filter_fpp = ratio;
                 }
                 "write_timestamp_as_int96" => writer.timestamp_as_int96 = is_true(&value, &name)?,
+                // `EnumUtil::FromString<TimeStampIsAdjustedToUTC>` of the option in upper case
+                "timestamp_is_adjusted_to_utc" => {
+                    writer.timestamp_adjusted_to_utc = match value.try_to_string()?.to_uppercase().as_str() {
+                        "AUTO" => None,
+                        "TRUE" => Some(true),
+                        "FALSE" => Some(false),
+                        other => {
+                            return Err(Error::new(
+                                ErrorKind::NotImplemented,
+                                format!("Enum value: '{other}' not implemented"),
+                            ));
+                        }
+                    }
+                }
                 "geoparquet_version" => {
                     writer.geoparquet_version =
                         crate::execution::parquet_writer::GeoParquetVersion::parse(&value.try_to_string()?)?;
