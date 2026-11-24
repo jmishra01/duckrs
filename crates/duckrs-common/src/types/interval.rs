@@ -40,6 +40,30 @@ impl Interval {
         (i64::from(self.months) + carry_months, days, micros)
     }
 
+    /// The normalized interval, its fields saturated where they overflow and the rest borrowed into the next
+    /// smaller one (`interval_t::Normalize` with `Borrow`): its days or micros can then lie out of their ranges.
+    pub fn normalize_saturating(self) -> Self {
+        fn borrow(msf: i64, lsf: &mut i64, scale: i64) -> i32 {
+            let field = msf.clamp(i64::from(i32::MIN), i64::from(i32::MAX));
+            if field != msf {
+                let remainder = msf - field;
+                let max_units = i64::MAX / scale - 1;
+                *lsf = if remainder > max_units {
+                    i64::MAX
+                } else if remainder < -max_units {
+                    i64::MIN
+                } else {
+                    *lsf + remainder * scale
+                };
+            }
+            field as i32
+        }
+        let (months, mut days, mut micros) = self.normalize();
+        let months = borrow(months, &mut days, Self::DAYS_PER_MONTH);
+        let days = borrow(days, &mut micros, Self::MICROS_PER_DAY);
+        Self { months, days, micros }
+    }
+
     /// Equality after normalization (`interval_t::operator==`).
     pub fn equals(self, other: Self) -> bool {
         (self.months == other.months && self.days == other.days && self.micros == other.micros)

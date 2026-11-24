@@ -875,6 +875,33 @@ impl Group<'_> {
         };
         match (name, children) {
             ("coalesce", _) => self.union(children.iter()),
+            // `abs` keeps the order of values that are not negative, and reverses that of values that are not positive
+            ("abs", [child]) => match self.range(child) {
+                Range::Bounds(min, _) if sign(&min).is_some_and(|s| s != Ordering::Less) => self.monotone(expr, 0, true),
+                Range::Bounds(_, max) if sign(&max).is_some_and(|s| s != Ordering::Greater) => {
+                    self.monotone(expr, 0, false)
+                }
+                Range::Bounds(min, max) => {
+                    let BoundExprKind::Function { .. } = &expr.kind else {
+                        return Range::Unknown;
+                    };
+                    let at = |value: &Value| {
+                        let mut call = expr.clone();
+                        if let BoundExprKind::Function { children, .. } = &mut call.kind {
+                            children[0] = BoundExpr::constant(value.clone());
+                        }
+                        try_evaluate_scalar(&call).filter(|result| !result.is_null())
+                    };
+                    let zero = crate::execution::parquet::try_cast_value(&Value::integer(0), &expr.return_type);
+                    match (at(&min), at(&max), zero) {
+                        (Some(low), Some(high), Some(zero)) => {
+                            Range::Bounds(zero, if is(ComparisonOp::GreaterThan, &low, &high) { low } else { high })
+                        }
+                        _ => Range::Unknown,
+                    }
+                }
+                other => other,
+            },
             // `s || ''` and `replace(s, a, a)` are `s`
             ("||", [input, other]) | ("||", [other, input])
                 if constant(other).and_then(|v| v.try_to_string().ok()).as_deref() == Some("") =>
@@ -1166,6 +1193,45 @@ impl Group<'_> {
                 }) =>
             {
                 Range::Unknown
+            }
+            // `PropagateNumericStats` of two varying operands: the sum (or difference) of their bounds, where it
+            // cannot overflow
+            ("+" | "-", [left, right])
+                if constant(left).is_none()
+                    && constant(right).is_none()
+                    && matches!(
+                        expr.return_type.id(),
+                        LogicalTypeId::Float | LogicalTypeId::Double | LogicalTypeId::TinyInt | LogicalTypeId::SmallInt
+                            | LogicalTypeId::Integer | LogicalTypeId::BigInt
+                    ) =>
+            {
+                let (Range::Bounds(left_min, left_max), Range::Bounds(right_min, right_max)) =
+                    (self.range(left), self.range(right))
+                else {
+                    return Range::Unknown;
+                };
+                let (low, high) = if name == "+" {
+                    ((&left_min, &right_min), (&left_max, &right_max))
+                } else {
+                    ((&left_min, &right_max), (&left_max, &right_min))
+                };
+                let combine = |a: &Value, b: &Value| -> Option<Value> {
+                    let ty = &expr.return_type;
+                    let text = if matches!(ty.id(), LogicalTypeId::Float | LogicalTypeId::Double) {
+                        let (a, b) = (a.try_to_string().ok()?.parse::<f64>().ok()?, b.try_to_string().ok()?.parse::<f64>().ok()?);
+                        let result = if name == "+" { a + b } else { a - b };
+                        if result.is_nan() { "nan".to_string() } else { result.to_string() }
+                    } else {
+                        let (a, b) = (a.as_i128()?, b.as_i128()?);
+                        (if name == "+" { a.checked_add(b)? } else { a.checked_sub(b)? }).to_string()
+                    };
+                    // an integer result outside its type is an overflow, which the bounds cannot tell
+                    crate::execution::parquet::try_cast_value(&Value::varchar(text), ty)
+                };
+                match (combine(low.0, low.1), combine(high.0, high.1)) {
+                    (Some(min), Some(max)) => Range::Bounds(min, max),
+                    _ => Range::Unknown,
+                }
             }
             ("+" | "-" | "*" | "/" | "//", [left, right]) => {
                 let (varying, increasing) = match (constant(left), constant(right)) {

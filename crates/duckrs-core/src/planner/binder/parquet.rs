@@ -102,7 +102,9 @@ impl Binder<'_> {
         let name = call.name.name.to_lowercase();
         let args: Vec<_> = call.args.iter().map(named_argument).collect();
         let mut paths = None;
-        let (mut binary_as_string, mut union_by_name, mut file_row_number) = (false, false, false);
+        // `ParquetOptions::ParquetOptions`: the `binary_as_string` setting is the default of the option
+        let mut binary_as_string = self.bool_setting("binary_as_string", false);
+        let (mut union_by_name, mut file_row_number) = (false, false);
         let mut filename = None;
         let mut hive_options = super::copy::HiveOptions::default();
         let mut int96_as = crate::execution::parquet::Int96As::Timestamp;
@@ -111,6 +113,7 @@ impl Binder<'_> {
         let mut schema_value = None;
         let mut allow_empty = false;
         let mut files_for_stats = 0;
+        let (mut can_have_nan, mut explicit_cardinality) = (None, None);
         let (mut copy_names, mut copy_types): (Option<Vec<String>>, Option<Vec<LogicalType>>) = (None, None);
         for argument in &args {
             let value = self.constant_argument(&argument.expr)?;
@@ -121,7 +124,7 @@ impl Binder<'_> {
                 if value.is_null() {
                     return Err(binder_error(format!("{name} cannot take NULL list as parameter")));
                 }
-                paths = Some(strings(&value)?);
+                paths = Some(file_entries(&value)?);
                 continue;
             }
             let option = argument.name.to_lowercase();
@@ -159,7 +162,29 @@ impl Binder<'_> {
                         .and_then(|n| usize::try_from(n).ok())
                         .unwrap_or(0);
                 }
-                "explicit_cardinality" | "can_have_nan" => {}
+                "explicit_cardinality" => {
+                    explicit_cardinality = crate::execution::parquet::cast_value(&value, &LogicalType::UBIGINT)?
+                        .as_i128()
+                        .and_then(|n| u64::try_from(n).ok());
+                }
+                // prefetching is the crate's: the strategy only has to be one C++ knows
+                "prefetch_strategy" => {
+                    if value.is_null() {
+                        return Err(binder_error("Parquet prefetch_strategy cannot be empty!"));
+                    }
+                    let text = value.try_to_string()?;
+                    if !matches!(text.to_lowercase().as_str(), "auto" | "whole_group") {
+                        return Err(binder_error(format!(
+                            "Unrecognized prefetch_strategy '{text}' (supported: 'auto', 'whole_group')"
+                        )));
+                    }
+                }
+                "can_have_nan" => {
+                    if value.is_null() {
+                        return Err(binder_error("Parquet can_have_nan cannot be empty!"));
+                    }
+                    can_have_nan = Some(is_true(&value, &option)?);
+                }
                 "schema" => schema_value = Some(value),
                 // what COPY ... FROM passes on of the table it loads into
                 "__copy_names" => copy_names = Some(strings(&value)?),
@@ -192,7 +217,20 @@ impl Binder<'_> {
                 _ => return Err(crate::unported(format!("the {name} option {option}"))),
             }
         }
-        let patterns = paths.ok_or_else(|| binder_error(format!("{name} requires a file name")))?;
+        let entries = paths.ok_or_else(|| binder_error(format!("{name} requires a file name")))?;
+        // `ParquetReader::LoadMetadata`: a footer length given for a file must fit in it
+        for (path, footer_size) in &entries {
+            if let Some(length) = footer_size {
+                let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                if *length == 0 || *length > u64::from(u32::MAX) || size < 12 + *length {
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        format!("Invalid footer length provided for file '{path}'"),
+                    ));
+                }
+            }
+        }
+        let patterns: Vec<String> = entries.into_iter().map(|(path, _)| path).collect();
         let mut files = Vec::new();
         for pattern in &patterns {
             self.check_file_access(pattern)?;
@@ -252,7 +290,9 @@ impl Binder<'_> {
         // COPY ... FROM: the columns of the table are the types to read (`return_types` of the bind)
         let mut table_columns = Vec::new();
         if let (Some(copy_names), Some(copy_types)) = (&copy_names, &copy_types) {
-            if copy_types.len() != types.len() {
+            // with `file_row_number`, the last column of the table takes the row numbers
+            let read = copy_types.len().saturating_sub(usize::from(file_row_number));
+            if read != types.len() || read == copy_types.len() && file_row_number {
                 let schema_text = |names: &[String], types: &[LogicalType]| {
                     names
                         .iter()
@@ -279,9 +319,10 @@ impl Binder<'_> {
                     ),
                 ));
             }
-            types = copy_types.clone();
-            table_columns = copy_names.clone();
+            types = copy_types[..read].to_vec();
+            table_columns = copy_names[..read].to_vec();
         }
+        super::copy::check_generated_columns(&names, filename.as_deref(), file_row_number)?;
         let mut output_names = names.clone();
         let mut output_types = types.clone();
         if file_row_number {
@@ -344,7 +385,7 @@ impl Binder<'_> {
             }
         }
         let table_index = self.generate_table_index();
-        let (virtual_columns, bound_virtual) = crate::execution::multi_file::bind_virtual_columns(&output_names);
+        let (virtual_columns, bound_virtual) = crate::execution::multi_file::bind_parquet_virtual_columns(&output_names);
         self.bind_context.add_binding(Binding {
             alias,
             schema: None,
@@ -385,6 +426,8 @@ impl Binder<'_> {
             byte_lengths: Vec::new(),
             output: None,
             files_for_stats,
+            page_pruning: self.parquet_page_pruning(can_have_nan),
+            explicit_cardinality,
         };
         Ok(LogicalOperator::new(
             LogicalOperatorKind::ParquetScan {
@@ -562,7 +605,11 @@ impl Binder<'_> {
         for (name, value) in self.copy_options(info)? {
             match name.as_str() {
                 "format" | "compression" | "codec" | "row_group_size" | "debug_use_openssl" | "prefetch_strategy" => {}
-                "binary_as_string" | "can_have_nan" | "utf8_validation" | "int96_as" => {
+                // `ParquetMultiFileInfo::ParseCopyOption`: a key of a footer encrypted with a key added before
+                "encryption_config" if value.logical_type().id() != LogicalTypeId::Struct => {
+                    return Err(binder_error("Parquet encryption_config must be of type STRUCT"));
+                }
+                "binary_as_string" | "can_have_nan" | "utf8_validation" | "int96_as" | "file_row_number" => {
                     if value.is_null() {
                         return Err(binder_error(format!("Parquet {name} cannot be empty!")));
                     }
@@ -743,6 +790,20 @@ impl Binder<'_> {
                     writer.bloom_filter_fpp = ratio;
                 }
                 "write_timestamp_as_int96" => writer.timestamp_as_int96 = is_true(&value, &name)?,
+                // `EnumUtil::FromString<TimeStampIsAdjustedToUTC>` of the option in upper case
+                "timestamp_is_adjusted_to_utc" => {
+                    writer.timestamp_adjusted_to_utc = match value.try_to_string()?.to_uppercase().as_str() {
+                        "AUTO" => None,
+                        "TRUE" => Some(true),
+                        "FALSE" => Some(false),
+                        other => {
+                            return Err(Error::new(
+                                ErrorKind::NotImplemented,
+                                format!("Enum value: '{other}' not implemented"),
+                            ));
+                        }
+                    }
+                }
                 "geoparquet_version" => {
                     writer.geoparquet_version =
                         crate::execution::parquet_writer::GeoParquetVersion::parse(&value.try_to_string()?)?;
@@ -1121,17 +1182,74 @@ fn parse_field_ids(
     Ok(ids)
 }
 
+/// The files of a Parquet scan: paths, or STRUCTs of a `filename` and the options of that file
+/// (`OpenFileInfo::extended_info`), of which `footer_size` is kept.
+fn file_entries(value: &Value) -> Result<Vec<(String, Option<u64>)>> {
+    let ValueData::List(items) = value.data() else {
+        return Ok(strings(value)?.into_iter().map(|path| (path, None)).collect());
+    };
+    items
+        .iter()
+        .map(|item| {
+            let ValueData::Struct(children) = item.data() else {
+                return Ok((super::copy::text(item)?, None));
+            };
+            let fields = item.logical_type().struct_children();
+            let field = |name: &str| {
+                fields
+                    .iter()
+                    .position(|(field, _)| field.eq_ignore_ascii_case(name))
+                    .map(|at| &children[at])
+            };
+            let path = field("filename")
+                .ok_or_else(|| binder_error("a file given as a STRUCT needs a 'filename'"))
+                .and_then(super::copy::text)?;
+            let footer_size = match field("footer_size") {
+                Some(size) if !size.is_null() => Some(
+                    size.try_to_string()?
+                        .parse::<u64>()
+                        .map_err(|_| binder_error("footer_size must be an unsigned integer"))?,
+                ),
+                _ => None,
+            };
+            Ok((path, footer_size))
+        })
+        .collect()
+}
+
 impl Binder<'_> {
+    /// `parquet_use_page_index`, and the `can_have_nan` option or else `parquet_can_have_nan`.
+    fn parquet_page_pruning(&self, can_have_nan: Option<bool>) -> crate::execution::parquet::PagePruning {
+        let setting = |name: &str| {
+            self.session
+                .as_ref()
+                .and_then(|session| (session.setting)(name).ok())
+                .and_then(|value| match value.data() {
+                    ValueData::Bool(enabled) => Some(*enabled),
+                    _ => None,
+                })
+        };
+        crate::execution::parquet::PagePruning {
+            use_page_index: setting("parquet_use_page_index").unwrap_or(true),
+            can_have_nan: can_have_nan.or_else(|| setting("parquet_can_have_nan")).unwrap_or(false),
+        }
+    }
+
     /// `GeoParquetFileMetadata::IsGeoParquetConversionEnabled`: the `enable_geoparquet_conversion` setting.
     fn geoparquet_conversion(&self) -> bool {
+        self.bool_setting("enable_geoparquet_conversion", true)
+    }
+
+    /// The BOOLEAN setting `name`, or `default` where it isn't set.
+    fn bool_setting(&self, name: &str, default: bool) -> bool {
         self.session
             .as_ref()
-            .and_then(|session| (session.setting)("enable_geoparquet_conversion").ok())
+            .and_then(|session| (session.setting)(name).ok())
             .and_then(|value| match value.data() {
                 ValueData::Bool(enabled) => Some(*enabled),
                 _ => None,
             })
-            .unwrap_or(true)
+            .unwrap_or(default)
     }
 }
 

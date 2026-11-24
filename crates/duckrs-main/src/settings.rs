@@ -62,7 +62,6 @@ const UNHONORED: &[&str] = &[
     "disable_timestamptz_casts",
     "errors_as_json",
     "legacy_disable_null_type",
-    "binary_as_string",
     "schema",
     "search_path",
     "table_function_identifier_conversion",
@@ -70,7 +69,7 @@ const UNHONORED: &[&str] = &[
 
 /// `config.AddExtensionOption` of the Parquet extension, which is compiled in.
 /// The descriptions are those of `ParquetExtension::Load`.
-static EXTENSION_SETTINGS: [SettingDefinition; 7] = [
+static EXTENSION_SETTINGS: [SettingDefinition; 8] = [
     extension_setting(
         "binary_as_string",
         "BOOLEAN",
@@ -100,6 +99,12 @@ static EXTENSION_SETTINGS: [SettingDefinition; 7] = [
         "BOOLEAN",
         Some("false"),
         "Cache Parquet metadata - useful when reading the same files multiple times",
+    ),
+    extension_setting(
+        "parquet_can_have_nan",
+        "BOOLEAN",
+        Some("false"),
+        "In Parquet files without a nan_count, assume FLOAT/DOUBLE columns can hold NaN outside their min/max. The default for the can_have_nan option of Parquet scans.",
     ),
     extension_setting(
         "parquet_use_page_index",

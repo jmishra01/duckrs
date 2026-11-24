@@ -288,6 +288,7 @@ impl Binder<'_> {
         };
         // `BindTableFunction`: names of keys that differ in case only are made unique; the scan
         // still reads each key by its own name
+        super::copy::check_generated_columns(&names, filename.as_deref(), false)?;
         let mut output_names = super::copy::unique_names(&names);
         let mut output_types = types.clone();
         if let Some(column) = &filename {

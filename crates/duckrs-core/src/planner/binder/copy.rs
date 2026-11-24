@@ -39,6 +39,26 @@ pub(super) fn is_true(value: &Value, name: &str) -> Result<bool> {
     }
 }
 
+/// `MultiFileReader::BindOptions`: the columns that `file_row_number` and `filename` add may not be columns of
+/// the file.
+pub(super) fn check_generated_columns(names: &[String], filename: Option<&str>, file_row_number: bool) -> Result<()> {
+    let in_file = |column: &str| names.iter().any(|name| name.eq_ignore_ascii_case(column));
+    if file_row_number && in_file("file_row_number") {
+        return Err(binder_error(
+            "Option file_row_number adds column \"file_row_number\", but a column with this name is also in the file",
+        ));
+    }
+    if let Some(column) = filename
+        && in_file(column)
+    {
+        return Err(binder_error(format!(
+            "Option filename adds column \"{column}\", but a column with this name is also in the file. Try \
+             setting a different name: filename='<filename column name>'"
+        )));
+    }
+    Ok(())
+}
+
 /// The `filename` option of the multi-file readers (`MultiFileReader::ParseOption`): a VARCHAR names
 /// the column, anything else is cast to BOOLEAN.
 pub(super) fn filename_option(value: &Value, option: &str) -> Result<Option<String>> {
@@ -48,7 +68,7 @@ pub(super) fn filename_option(value: &Value, option: &str) -> Result<Option<Stri
     Ok(is_true(value, option)?.then(|| "filename".to_string()))
 }
 
-fn text(value: &Value) -> Result<String> {
+pub(super) fn text(value: &Value) -> Result<String> {
     value.try_to_string()
 }
 
@@ -400,7 +420,7 @@ impl Binder<'_> {
             let options = &mut result.options;
             let mut shown = true;
             match option.as_str() {
-                "delim" | "sep" | "delimiter" => {
+                "delim" | "sep" | "delimiter" | "separator" => {
                     if options.delimiter.is_some() {
                         return Err(binder_error(
                             "CSV Reader function option delim and sep are aliases, only one can be supplied",
@@ -1111,6 +1131,7 @@ impl Binder<'_> {
                 });
             }
         }
+        check_generated_columns(&names, arguments.filename.as_deref(), false)?;
         let mut output_names = names.clone();
         let mut output_types = types.clone();
         if let Some(column) = &arguments.filename {
@@ -1422,7 +1443,7 @@ impl Binder<'_> {
                 .any(|(n, _)| names.contains(&n.as_str()))
         };
         let mut prompt = format!("FROM read_csv({}, auto_detect=false, ", string_literal(path));
-        if !given(&["delim", "sep", "delimiter"]) {
+        if !given(&["delim", "sep", "delimiter", "separator"]) {
             prompt += &format!("delim='{}', ", delimiter.replace('\'', "''"));
         }
         if !given(&["quote"]) {
@@ -1772,6 +1793,12 @@ impl Binder<'_> {
         let mut arguments = vec![string_literal(path), format!("columns := {{{}}}", fields.join(", "))];
         let options = self.copy_options(info)?;
         Self::check_copy_options(&options, true)?;
+        // `BindCopyOptions`: the CSV COPY function has its own list of options
+        if !self.copy_json
+            && let Some((name, _)) = options.iter().find(|(name, _)| !is_copy_option(CSV_COPY_OPTIONS, name))
+        {
+            return Err(unrecognized_copy_option(name, "csv", CSV_COPY_OPTIONS));
+        }
         // `CSVReaderOptions::SetReadOption`: FORCE_NOT_NULL names columns of the COPY (`ParseColumnList`),
         // before the file is sniffed
         if !self.copy_json
@@ -1791,7 +1818,7 @@ impl Binder<'_> {
         }
         let delimiter_given = options
             .iter()
-            .any(|(name, _)| matches!(name.as_str(), "delim" | "sep" | "delimiter"));
+            .any(|(name, _)| matches!(name.as_str(), "delim" | "sep" | "delimiter" | "separator"));
         if tsv && !delimiter_given {
             arguments.push("delimiter := '\t'".to_string());
         }
@@ -2169,7 +2196,7 @@ impl Binder<'_> {
                 }
                 "dateformat" | "date_format" => options.date_format = Some(text(&value)?),
                 "timestampformat" | "timestamp_format" => options.timestamp_format = Some(text(&value)?),
-                "delim" | "sep" | "delimiter" => options.delimiter = delimiter(&value)?,
+                "delim" | "sep" | "delimiter" | "separator" => options.delimiter = delimiter(&value)?,
                 "quote" => options.quote = single_byte(&value, "quote")?,
                 "escape" => {
                     options.escape = single_byte(&value, "escape")?;
@@ -3156,7 +3183,9 @@ pub(super) fn unrecognized_copy_option(option: &str, format: &str, own: &[&str])
     Error::new(
         ErrorKind::NotImplemented,
         format!(
-            "Unrecognized option {option} for {format}\n{}",
+            "Unrecognized option \"{}\" for {format}\n{}",
+            // an `Identifier`, which formats quoted
+            option.replace('"', "\"\""),
             duckrs_common::string_util::candidates_message(&candidates, "Candidate options")
         ),
     )

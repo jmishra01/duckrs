@@ -346,6 +346,7 @@ fn create_physical(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
                 scan,
                 filter,
                 prune,
+                logger: crate::logging::current_file_logger(),
             })
         }
         LogicalOperatorKind::CopyToParquet { path, names, options } => Box::new(parquet::PhysicalCopyToParquet::new(
@@ -396,6 +397,31 @@ fn create_physical(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
         LogicalOperatorKind::EmptyResult { .. } => Box::new(PhysicalEmptyResult { types }),
         LogicalOperatorKind::DummyScan { .. } => Box::new(PhysicalDummyScan { types }),
         LogicalOperatorKind::ChunkGet { chunks, .. } => Box::new(PhysicalChunkScan { types, chunks }),
+        LogicalOperatorKind::ExpressionGet { expressions, function: None, .. }
+            if constant_rows(&expressions, &types) =>
+        {
+            // `CreatePlan(LogicalExpressionGet)`: rows of constants are a collection to scan (`PhysicalColumnDataScan`)
+            let mut chunks = Vec::new();
+            for rows in expressions.chunks(duckrs_common::STANDARD_VECTOR_SIZE) {
+                let mut columns: Vec<duckrs_common::vector::Vector> = types
+                    .iter()
+                    .map(|ty| duckrs_common::vector::Vector::new(ty.clone(), rows.len()))
+                    .collect();
+                for (row, expressions) in rows.iter().enumerate() {
+                    for (column, expr) in columns.iter_mut().zip(expressions) {
+                        let BoundExprKind::Constant(value) = &expr.kind else {
+                            unreachable!("checked");
+                        };
+                        column.set_value(row, value).expect("a constant fits a vector of its own type");
+                    }
+                }
+                chunks.push(DataChunk::from_columns(columns, rows.len()));
+            }
+            Box::new(PhysicalChunkScan {
+                types,
+                chunks: Arc::new(chunks),
+            })
+        }
         LogicalOperatorKind::ExpressionGet { expressions, .. } => {
             Box::new(PhysicalExpressionScan { types, expressions })
         }
@@ -897,6 +923,18 @@ impl Pipeline<'_> {
         }
         Ok(())
     }
+}
+
+/// Whether the rows of an expression get are constants of its types (`PhysicalExpressionScan::IsFoldable`, of what
+/// the binder folded already).
+fn constant_rows(rows: &[Vec<BoundExpr>], types: &[duckrs_common::types::LogicalType]) -> bool {
+    !rows.is_empty()
+        && rows.iter().all(|row| {
+            row.len() == types.len()
+                && row.iter().zip(types).all(|(expr, ty)| {
+                    matches!(&expr.kind, BoundExprKind::Constant(value) if value.logical_type() == ty)
+                })
+        })
 }
 
 /// `MetaPipeline::Build` / `PhysicalOperator::BuildPipelines`: collects, children first, the

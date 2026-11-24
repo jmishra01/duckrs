@@ -17,16 +17,21 @@ pub enum VirtualColumn {
     FileIndex,
     /// the position of the row in its file, from 0 (`COLUMN_IDENTIFIER_FILE_ROW_NUMBER`)
     FileRowNumber,
+    /// Parquet only: the row group of the row in its file, from 0 (`COLUMN_IDENTIFIER_FILE_ROW_GROUP_NUMBER`)
+    FileRowGroupNumber,
 }
 
 impl VirtualColumn {
     pub const ALL: [Self; 3] = [Self::Filename, Self::FileIndex, Self::FileRowNumber];
+    /// `ParquetMultiFileInfo::GetVirtualColumns`: those of every multi-file scan, and the row group
+    pub const PARQUET: [Self; 4] = [Self::Filename, Self::FileIndex, Self::FileRowNumber, Self::FileRowGroupNumber];
 
     pub fn name(self) -> &'static str {
         match self {
             Self::Filename => "filename",
             Self::FileIndex => "file_index",
             Self::FileRowNumber => "file_row_number",
+            Self::FileRowGroupNumber => "file_row_group_number",
         }
     }
 
@@ -35,13 +40,19 @@ impl VirtualColumn {
             Self::Filename => LogicalType::VARCHAR,
             Self::FileIndex => LogicalType::UBIGINT,
             Self::FileRowNumber => LogicalType::BIGINT,
+            Self::FileRowGroupNumber => LogicalType::UBIGINT,
         }
     }
 
     /// The virtual columns a scan with columns `names` offers: those that no column of it shadows.
     pub fn for_columns(names: &[String]) -> Vec<Self> {
-        Self::ALL
-            .into_iter()
+        Self::offered(&Self::ALL, names)
+    }
+
+    /// Those of `all` that no column of `names` shadows.
+    fn offered(all: &[Self], names: &[String]) -> Vec<Self> {
+        all.iter()
+            .copied()
             .filter(|column| !names.iter().any(|n| n.eq_ignore_ascii_case(column.name())))
             .collect()
     }
@@ -57,6 +68,41 @@ pub fn virtual_types(columns: &[VirtualColumn]) -> impl Iterator<Item = LogicalT
 pub struct VirtualRows {
     file: Option<usize>,
     rows: i64,
+    /// of a Parquet file: the row each of its row groups starts at
+    row_group_starts: Vec<i64>,
+}
+
+impl VirtualRows {
+    /// The rows the row groups of the file opened next start at, in order.
+    pub fn set_row_group_starts(&mut self, starts: Vec<i64>) {
+        self.row_group_starts = starts;
+    }
+
+    /// The row group that row `row` of the file is in.
+    fn row_group_of(&self, row: i64) -> u64 {
+        self.row_group_starts.partition_point(|&start| start <= row).saturating_sub(1) as u64
+    }
+
+    /// `file_row_group_number` of the `count` rows from row `first` of the file.
+    fn row_group_numbers(&self, first: i64, count: usize) -> Vector {
+        let mut result = Vector::new(LogicalType::UBIGINT, count);
+        for (row, number) in (first..).zip(result.data_mut::<u64>().iter_mut().take(count)) {
+            *number = self.row_group_of(row);
+        }
+        result
+    }
+
+    /// `file_row_group_number` of `count` rows whose file row numbers (BIGINT) are `numbers`.
+    pub fn row_group_numbers_of(&self, numbers: &Vector, count: usize) -> Vector {
+        let mut flat = numbers.clone();
+        flat.flatten(count);
+        let mut result = Vector::new(LogicalType::UBIGINT, count);
+        let rows = flat.data::<i64>();
+        for (number, row) in result.data_mut::<u64>().iter_mut().zip(rows).take(count) {
+            *number = self.row_group_of(*row);
+        }
+        result
+    }
 }
 
 /// `chunk`, rows of file number `file` at `path`, with `columns` after its own.
@@ -83,6 +129,7 @@ pub fn append_virtual_columns(
             VirtualColumn::Filename => Vector::constant(&Value::varchar(path)),
             VirtualColumn::FileIndex => Vector::constant(&Value::ubigint(file as u64)),
             VirtualColumn::FileRowNumber => Vector::sequence(LogicalType::BIGINT, first, 1)?,
+            VirtualColumn::FileRowGroupNumber => state.row_group_numbers(first, count),
         });
     }
     Ok(DataChunk::from_columns(result, count))
@@ -92,7 +139,21 @@ pub fn append_virtual_columns(
 /// and type (`Binding::virtual_columns`).
 #[allow(clippy::type_complexity)]
 pub fn bind_virtual_columns(names: &[String]) -> (Vec<VirtualColumn>, Vec<(String, LogicalType, usize)>) {
-    let columns = VirtualColumn::for_columns(names);
+    bind_offered_columns(&VirtualColumn::ALL, names)
+}
+
+/// [`bind_virtual_columns`] of a Parquet scan, which also offers `file_row_group_number`.
+#[allow(clippy::type_complexity)]
+pub fn bind_parquet_virtual_columns(names: &[String]) -> (Vec<VirtualColumn>, Vec<(String, LogicalType, usize)>) {
+    bind_offered_columns(&VirtualColumn::PARQUET, names)
+}
+
+#[allow(clippy::type_complexity)]
+fn bind_offered_columns(
+    all: &[VirtualColumn],
+    names: &[String],
+) -> (Vec<VirtualColumn>, Vec<(String, LogicalType, usize)>) {
+    let columns = VirtualColumn::offered(all, names);
     let bound = columns
         .iter()
         .enumerate()
