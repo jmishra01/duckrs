@@ -323,6 +323,24 @@ impl Binder<'_> {
                     }
                     _ => return Err(Error::new(ErrorKind::Parser, "Expected a single SELECT statement")),
                 };
+                // `ParseSubquery`: a parameter only inside the string never gets a value when prepared
+                if let Some(parameters) = self.parameters.as_ref().filter(|p| p.values.is_none()) {
+                    {
+                        let mut inner = Vec::new();
+                        let mut node = select.node.clone();
+                        duckrs_parser::transformer::visit_all_query_node_exprs_mut(&mut node, &mut |e: &mut Expr| {
+                            if let duckrs_parser::ast::ExprKind::Parameter(identifier) = &e.kind {
+                                inner.push(identifier.to_lowercase());
+                            }
+                        });
+                        if let Some(missing) = inner.iter().find(|name| !parameters.declared.contains(name)) {
+                            return Err(binder_error(format!(
+                                "Prepared statement parameter \"${missing}\" only appears inside query(): declare it \
+                                 in the outer statement as well, or use getvariable() to read a variable"
+                            )));
+                        }
+                    }
+                }
                 return self.bind_rewritten(&select, table_ref, &name).map(Some);
             }
             "query_table" => {

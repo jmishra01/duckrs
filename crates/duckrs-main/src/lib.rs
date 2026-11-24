@@ -1846,7 +1846,10 @@ impl ClientContext {
     }
 
     fn prepare_statement(&mut self, statement: Statement) -> Result<Arc<PreparedStatementData>> {
-        let parameters = Arc::new(ParameterValues::default());
+        let parameters = Arc::new(ParameterValues {
+            declared: parameter_names(&statement.to_string()),
+            ..ParameterValues::default()
+        });
         // these run without the binder, and have no parameters
         let client_statement = matches!(
             statement,
@@ -1929,6 +1932,8 @@ impl ClientContext {
             .parameters
             .iter()
             .filter(|p| !values.contains_key(*p))
+            // `MissingValuesException`: a user variable of that name stands in
+            .filter(|p| p.starts_with(|c: char| c.is_ascii_digit()) || !self.variables.contains_key(*p))
             .map(String::as_str)
             .collect();
         if !missing.is_empty() {
@@ -1942,7 +1947,7 @@ impl ClientContext {
         }
         self.parameters = Some(Arc::new(ParameterValues {
             values: Some(values),
-            seen: Default::default(),
+            ..ParameterValues::default()
         }));
         let result = self.run_statement(&prepared.statement);
         self.parameters = None;

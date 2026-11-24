@@ -2641,6 +2641,21 @@ impl Binder<'_> {
             } => self.bind_subquery(subquery, *subquery_type, child.as_deref(), *comparison)?,
             ExprKind::Parameter(identifier) => {
                 // `Binder::Bind(ParameterExpression)`
+                let key = identifier.to_lowercase();
+                let preparing = self.parameters.as_ref().is_some_and(|p| p.values.is_none());
+                let given = self
+                    .parameters
+                    .as_ref()
+                    .and_then(|p| p.values.as_ref())
+                    .is_some_and(|values| values.contains_key(&key));
+                // no value given: a user variable of that name, unless it is a position
+                if !preparing
+                    && !given
+                    && !key.starts_with(|c: char| c.is_ascii_digit())
+                    && let Some(value) = self.session.as_ref().and_then(|s| s.variables.get(&key))
+                {
+                    return Ok(BoundExpr::constant(value.clone()));
+                }
                 let Some(parameters) = &self.parameters else {
                     // a statement run directly has no values for its parameters
                     return Err(Error::new(
@@ -2648,7 +2663,6 @@ impl Binder<'_> {
                         format!("Values were not provided for the following parameters: {identifier}"),
                     ));
                 };
-                let key = identifier.to_lowercase();
                 let mut seen = parameters.seen.lock();
                 if !seen.contains(&key) {
                     seen.push(key.clone());

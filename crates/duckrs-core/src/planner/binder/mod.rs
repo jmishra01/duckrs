@@ -889,6 +889,9 @@ pub struct ParameterValues {
     pub values: Option<HashMap<String, Value>>,
     /// the parameters the statement refers to (`named_param_map`), in order of appearance
     pub seen: Mutex<Vec<String>>,
+    /// while a statement is prepared, the parameters in its text: one only inside the SQL text of
+    /// `query()` never gets a value
+    pub declared: Vec<String>,
 }
 
 /// How column references bind while a select list or HAVING clause is being bound.
