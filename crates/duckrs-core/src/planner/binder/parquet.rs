@@ -254,7 +254,9 @@ impl Binder<'_> {
         // COPY ... FROM: the columns of the table are the types to read (`return_types` of the bind)
         let mut table_columns = Vec::new();
         if let (Some(copy_names), Some(copy_types)) = (&copy_names, &copy_types) {
-            if copy_types.len() != types.len() {
+            // with `file_row_number`, the last column of the table takes the row numbers
+            let read = copy_types.len().saturating_sub(usize::from(file_row_number));
+            if read != types.len() || read == copy_types.len() && file_row_number {
                 let schema_text = |names: &[String], types: &[LogicalType]| {
                     names
                         .iter()
@@ -281,8 +283,8 @@ impl Binder<'_> {
                     ),
                 ));
             }
-            types = copy_types.clone();
-            table_columns = copy_names.clone();
+            types = copy_types[..read].to_vec();
+            table_columns = copy_names[..read].to_vec();
         }
         let mut output_names = names.clone();
         let mut output_types = types.clone();
@@ -564,7 +566,11 @@ impl Binder<'_> {
         for (name, value) in self.copy_options(info)? {
             match name.as_str() {
                 "format" | "compression" | "codec" | "row_group_size" | "debug_use_openssl" | "prefetch_strategy" => {}
-                "binary_as_string" | "can_have_nan" | "utf8_validation" | "int96_as" => {
+                // `ParquetMultiFileInfo::ParseCopyOption`: a key of a footer encrypted with a key added before
+                "encryption_config" if value.logical_type().id() != LogicalTypeId::Struct => {
+                    return Err(binder_error("Parquet encryption_config must be of type STRUCT"));
+                }
+                "binary_as_string" | "can_have_nan" | "utf8_validation" | "int96_as" | "file_row_number" => {
                     if value.is_null() {
                         return Err(binder_error(format!("Parquet {name} cannot be empty!")));
                     }
