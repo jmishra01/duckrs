@@ -987,7 +987,10 @@ fn timestamp_value(value: i64, unit: &TimeUnit, ty: &LogicalType) -> Result<Valu
     {
         return Value::new(ty.clone(), ValueData::Int64(value));
     }
+    // `ParquetTimestampMsToTimestamp` and the like: infinities are kept whatever the unit
+    let infinite = value == i64::MAX || value == -i64::MAX;
     let micros = match unit {
+        _ if infinite => Some(value),
         TimeUnit::Second => value.checked_mul(1_000_000),
         TimeUnit::Millisecond => value.checked_mul(1_000),
         TimeUnit::Microsecond => Some(value),
@@ -1001,9 +1004,18 @@ fn timestamp_value(value: i64, unit: &TimeUnit, ty: &LogicalType) -> Result<Valu
     })
 }
 
+/// A DECIMAL as the file stores it: like `ParquetDecimalUtils::ReadDecimalValue`, a value with more digits than the
+/// column's precision is kept as it is, in the column's physical type.
 fn decimal_value(unscaled: i128, ty: &LogicalType) -> Result<Value> {
     let (width, scale) = ty.decimal_properties().unwrap_or((38, 0));
-    Value::decimal(unscaled, width, scale)
+    let ty = LogicalType::decimal(width, scale);
+    let data = match ty.physical_type() {
+        duckrs_common::types::PhysicalType::Int16 => ValueData::Int16(unscaled as i16),
+        duckrs_common::types::PhysicalType::Int32 => ValueData::Int32(unscaled as i32),
+        duckrs_common::types::PhysicalType::Int64 => ValueData::Int64(unscaled as i64),
+        _ => ValueData::Int128(unscaled),
+    };
+    Value::new(ty, data)
 }
 
 /// The value of `row` of `array`, as a `ty`.
