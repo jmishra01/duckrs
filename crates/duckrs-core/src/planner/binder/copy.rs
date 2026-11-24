@@ -599,12 +599,14 @@ impl Binder<'_> {
                 "dateformat" | "date_format" => {
                     let format = text(&value)?;
                     if !format.eq_ignore_ascii_case("auto") {
+                        check_read_format(&format)?;
                         options.date_format = Some(format);
                     }
                 }
                 "timestampformat" | "timestamp_format" => {
                     let format = text(&value)?;
                     if !format.eq_ignore_ascii_case("auto") {
+                        check_read_format(&format)?;
                         options.timestamp_format = Some(format);
                     }
                 }
@@ -2260,7 +2262,15 @@ impl Binder<'_> {
                     }
                 }
                 "dateformat" | "date_format" => options.date_format = Some(text(&value)?),
-                "timestampformat" | "timestamp_format" => options.timestamp_format = Some(text(&value)?),
+                // `CSVReaderOptions::SetWriteOption`: ISO is the ISO 8601 format with microseconds
+                "timestampformat" | "timestamp_format" => {
+                    let format = text(&value)?;
+                    options.timestamp_format = Some(if format.eq_ignore_ascii_case("iso") {
+                        "%Y-%m-%dT%H:%M:%S.%fZ".to_string()
+                    } else {
+                        format
+                    });
+                }
                 "delim" | "sep" | "delimiter" | "separator" => options.delimiter = delimiter(&value)?,
                 "quote" => options.quote = single_byte(&value, "quote")?,
                 "escape" => {
@@ -3263,3 +3273,10 @@ fn is_bytes_option(name: &str) -> bool {
         "file_size_bytes" | "row_group_size_bytes" | "bloom_filter_fallback_max_bytes"
     )
 }
+/// `CSVReaderOptions::SetDateFormat`: a format to read with must parse (`StrTimeFormat::ParseFormatSpecifier`).
+fn check_read_format(format: &str) -> Result<()> {
+    crate::function::strptime::StrpFormat::new(format).map(|_| ()).map_err(|error| {
+        Error::new(ErrorKind::InvalidInput, format!("Could not parse DATEFORMAT: {error}"))
+    })
+}
+
