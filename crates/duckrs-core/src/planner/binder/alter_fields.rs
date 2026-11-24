@@ -394,6 +394,6 @@ impl Binder<'_> {
             definition.default_value = Some(bound);
             definition.default_text = Some(parsed.to_string());
         }
-        Ok(BoundAlter::Table(alter))
+        Ok(BoundAlter::Table(Box::new(alter)))
     }
 }

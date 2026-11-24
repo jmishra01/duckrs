@@ -129,7 +129,7 @@ pub fn choose_by_width(plan: &mut LogicalOperator, in_recursive_cte: bool) {
             }
         ) || op.children.iter().any(has_semi_or_anti)
     }
-    if !has_flippable_join(plan) && !(in_recursive_cte && has_semi_or_anti(plan)) {
+    if !(has_flippable_join(plan) || (in_recursive_cte && has_semi_or_anti(plan))) {
         return;
     }
     let estimate = estimate_plan(plan);

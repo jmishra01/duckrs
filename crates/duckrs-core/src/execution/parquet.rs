@@ -1244,6 +1244,7 @@ fn row_groups_to_scan(
 
 /// Whether the bloom filters of the row group rule out every row `expr` is true for: an equality of a column and
 /// a constant, or conjunctions of those (`ParquetReader::CheckBloomFilters`).
+#[allow(clippy::too_many_arguments)]
 fn bloom_rules_out(
     scan: &ParquetScanData,
     leaves: &[Option<usize>],
@@ -2763,6 +2764,7 @@ fn statistics_text(stats: &Statistics) -> (Option<String>, Option<String>, Optio
 
 /// `ParquetReader::GetPartitionStats` of the one file of a scan: per row group, its rows, the zone of each column
 /// of the file, and whether all the columns' bounds are exact (`ParquetPartitionRowGroup::MinMaxIsExact`).
+#[allow(clippy::type_complexity, reason = "per row group: its index, its zones and whether it is complete")]
 pub fn partition_statistics(scan: &ParquetScanData) -> Option<Vec<(u64, Vec<Option<crate::catalog::ColumnZone>>, bool)>> {
     let [file] = scan.files.as_slice() else {
         return None;
@@ -3057,14 +3059,6 @@ fn row_group_strings(zone: &crate::catalog::ColumnZone, varchar: bool) -> crate:
             }
         }
         _ => unknown_strings(),
-    }
-}
-
-/// Strings have bounds only where their string statistics do.
-fn string_bounds_only(stats: &mut crate::catalog::ColumnStatistics) {
-    if stats.strings.as_ref().is_some_and(|strings| strings.bounds.is_none()) {
-        stats.min = None;
-        stats.max = None;
     }
 }
 
@@ -4349,6 +4343,10 @@ pub fn reads_byte_length(scan: &ParquetScanData, column: usize) -> bool {
 /// in the form of `VariantStatsShreddingState`, merged by `MergeShredding` and given to the catalog as its
 /// [`crate::catalog::VariantStatistics`].
 mod variant_stats {
+    /// Of the `value` leaf of a shredding: whether it has NULLs, whether it has values, and its smallest and
+    /// largest bytes.
+    type LeafValues = (bool, bool, Option<(Vec<u8>, Vec<u8>)>);
+
     use super::*;
     use crate::optimizer::statistics::union;
 
@@ -4540,23 +4538,6 @@ mod variant_stats {
         }
     }
 
-    /// `VariantShreddedStats::IsFullyShredded`: whether every value of a shredding is in its typed part.
-    fn is_fully_shredded(ty: &LogicalType, stats: &Stats) -> bool {
-        if ty.id() != LogicalTypeId::Struct || ty.struct_children().len() == 1 {
-            return true;
-        }
-        let unknown_child = unknown();
-        let typed = stats.children.first().unwrap_or(&unknown_child);
-        let untyped = stats.children.get(1).unwrap_or(&unknown_child);
-        if !typed.can_be_null || !untyped.can_be_valid {
-            return true;
-        }
-        match (&untyped.min, &untyped.max) {
-            (Some(min), Some(max)) => min == max && min.try_to_string().is_ok_and(|min| min == "0"),
-            _ => false,
-        }
-    }
-
     const VARIANT_SHREDDED: u8 = 2;
 
     /// `TransformColumnStatistics` of a VARIANT group (`metadata`, `value`, `typed_value`): per row group, the shredding
@@ -4632,7 +4613,7 @@ mod variant_stats {
                     ..unknown()
                 })
             };
-            let value_leaf = |path: &[String]| -> Option<(bool, bool, Option<(Vec<u8>, Vec<u8>)>)> {
+            let value_leaf = |path: &[String]| -> Option<LeafValues> {
                 let leaf = leaves.iter().position(|leaf| leaf == path)?;
                 let statistics = group.column(leaf).statistics()?;
                 let nulls = statistics.null_count_opt()?;
@@ -4667,7 +4648,7 @@ mod variant_stats {
         typed_value: &parquet::schema::types::Type,
         arrow: &Field,
         leaf_stats: &dyn Fn(&[String], &LogicalType) -> Option<crate::catalog::ColumnStatistics>,
-        value_leaf: &dyn Fn(&[String]) -> Option<(bool, bool, Option<(Vec<u8>, Vec<u8>)>)>,
+        value_leaf: &dyn Fn(&[String]) -> Option<LeafValues>,
     ) -> Option<(LogicalType, crate::catalog::ColumnStatistics)> {
         let child = |name: &str| {
             let mut path = path.to_vec();
@@ -4720,7 +4701,7 @@ mod variant_stats {
         typed_value: &parquet::schema::types::Type,
         arrow: &Field,
         leaf_stats: &dyn Fn(&[String], &LogicalType) -> Option<crate::catalog::ColumnStatistics>,
-        value_leaf: &dyn Fn(&[String]) -> Option<(bool, bool, Option<(Vec<u8>, Vec<u8>)>)>,
+        value_leaf: &dyn Fn(&[String]) -> Option<LeafValues>,
     ) -> Option<(LogicalType, crate::catalog::ColumnStatistics)> {
         let child = |name: &str| {
             let mut path = path.to_vec();

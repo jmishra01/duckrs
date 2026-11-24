@@ -423,6 +423,7 @@ fn cascade_rewrite(
         })
         .collect();
     let mut state_types: Vec<LogicalType> = Vec::new();
+    #[allow(clippy::type_complexity, reason = "the parts of the finest grouping set")]
     let mut finest_parts: Option<(usize, usize, usize, Vec<BoundExpr>, Vec<BoundAggregate>)> = None;
     for at in 0..levels.len() {
         let set = &grouping_sets[levels[at].set];

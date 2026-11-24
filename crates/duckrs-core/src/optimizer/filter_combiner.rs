@@ -111,9 +111,7 @@ fn compare_info(left: &ValueInfo, right: &ValueInfo) -> Pruning {
     if is_less(left.op) && is_less(right.op) {
         return if holds(Op::LessThan, l, r) {
             Pruning::PruneRight
-        } else if holds(Op::GreaterThan, l, r) {
-            Pruning::PruneLeft
-        } else if left.op == Op::LessThanOrEqual {
+        } else if holds(Op::GreaterThan, l, r) || left.op == Op::LessThanOrEqual {
             Pruning::PruneLeft
         } else {
             Pruning::PruneRight

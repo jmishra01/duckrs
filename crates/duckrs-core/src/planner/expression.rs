@@ -667,7 +667,6 @@ impl fmt::Display for BoundExpr {
                 }
                 f.write_str(")")
             }
-            _ => write!(f, "{:?}", self.kind),
         }
     }
 }

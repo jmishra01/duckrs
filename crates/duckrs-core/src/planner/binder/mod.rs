@@ -81,6 +81,7 @@ pub(super) struct MaterializedCteState {
     pub cte_index: usize,
     pub data: Arc<Mutex<ColumnDataCollection>>,
     /// what the first reference bound: the plan, its names, types and column aliases
+    #[allow(clippy::type_complexity, reason = "the parts of a bound statement")]
     pub bound: Option<(LogicalOperator, Vec<String>, Vec<LogicalType>, Vec<(String, usize)>, StatementReturnType)>,
     /// the CTE reads the queries around it: each reference binds it on its own
     pub inline: bool,    /// `CTE_MATERIALIZE_ALWAYS`
@@ -1000,6 +1001,7 @@ pub struct Binder<'a> {
     pub parameters: Option<Arc<ParameterValues>>,
     /// The CTEs in scope, innermost last, with how many outer contexts they can see, and for one
     /// that is materialized, what its references read.
+    #[allow(clippy::type_complexity, reason = "a CTE in scope, as the comment above says")]
     ctes: Vec<(String, Arc<ast::CteInfo>, usize, Option<Arc<Mutex<MaterializedCteState>>>)>,
     /// The CTEs whose definition is being bound, which cannot refer to themselves.
     ctes_being_bound: Vec<String>,

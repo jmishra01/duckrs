@@ -1884,7 +1884,7 @@ impl StatisticsPropagator {
                         can_be_null: stats[0].can_be_null,
                         can_be_valid: stats[0].can_be_valid,
                         children: vec![value.clone()],
-                        lists: stats[0].lists.clone(),
+                        lists: stats[0].lists,
                         ..unknown()
                     };
                 }

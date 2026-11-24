@@ -553,11 +553,6 @@ struct FinishedBuild {
 }
 
 impl FinishedBuild {
-    /// The partition and the group of `key`, if a build row has it.
-    fn find(&self, key: &RowKey) -> Option<(usize, usize)> {
-        self.find_hashed(key_hash(key), key)
-    }
-
     fn find_hashed(&self, hash: u64, key: &RowKey) -> Option<(usize, usize)> {
         // the hash picks the partition and the slot in its table both
         let partition = if self.partitioned { partition_of_hash(hash) } else { 0 };
@@ -713,7 +708,7 @@ impl PhysicalJoin {
     pub fn for_algorithm(
         types: Vec<LogicalType>,
         join_type: JoinType,
-        mut conditions: Vec<JoinCondition>,
+        conditions: Vec<JoinCondition>,
         predicate: Option<BoundExpr>,
         algorithm: JoinAlgorithm,
         children: Vec<Box<dyn PhysicalOperator>>,

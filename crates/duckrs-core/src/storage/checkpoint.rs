@@ -229,6 +229,7 @@ pub(super) fn table_definition(
 }
 
 /// `TableDataReader::ReadTableData` and the row group pointers after it.
+#[allow(clippy::type_complexity, reason = "the pointers, the statistics and the row counts")]
 fn read_row_groups(
     buffer: &BufferManager,
     chains: &mut MetadataChains,

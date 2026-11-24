@@ -4432,7 +4432,6 @@ impl ClientContext {
         total: std::time::Duration,
         profiler: &duckrs_core::execution::profiler::OperatorProfiler,
     ) -> Result<()> {
-        use duckrs_core::execution::profiler::{Metric, QueryProfile, TrackedMetrics};
         let format = self.setting_text("enable_profiling");
         let output = self.setting_text("profiling_output");
         let (phases, root) = self.pending_profile.take().unwrap_or_default();

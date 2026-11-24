@@ -3975,6 +3975,15 @@ fn quote_identifier(name: &str) -> String {
     }
 }
 
+/// `AliasFunction`: the name it was bound with, for every row.
+fn alias_function(args: &duckrs_common::vector::DataChunk, result: &mut duckrs_common::vector::Vector) -> Result<()> {
+    let name = args.column(1).get_value(0);
+    for row in 0..args.len() {
+        result.set_value(row, &name)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3993,13 +4002,4 @@ mod tests {
         assert_eq!(ty("1e3"), LogicalType::DOUBLE);
         assert_eq!(number_to_value("-0.25").unwrap().try_to_string().unwrap(), "-0.25");
     }
-}
-
-/// `AliasFunction`: the name it was bound with, for every row.
-fn alias_function(args: &duckrs_common::vector::DataChunk, result: &mut duckrs_common::vector::Vector) -> Result<()> {
-    let name = args.column(1).get_value(0);
-    for row in 0..args.len() {
-        result.set_value(row, &name)?;
-    }
-    Ok(())
 }

@@ -1370,7 +1370,7 @@ fn big_csv(name: &str, rows: usize, bad: Option<usize>, quoted: bool) -> PathBuf
 /// `COPY` of `csv` into a new table of a new file with `threads`, in row groups of 16384 rows, so that the rows fill
 /// several of `WRITE_BUFFER_ROW_GROUP_COUNT` that are written ahead: what comes of it, the rows in their order, and
 /// where the segments of the row groups are, before and after a checkpoint.
-fn copied(name: &str, csv: &PathBuf, threads: usize) -> Result<Vec<String>, String> {
+fn copied(name: &str, csv: &std::path::Path, threads: usize) -> Result<Vec<String>, String> {
     loaded(name, &format!("COPY f.t FROM '{}' (HEADER)", csv.display()), threads)
 }
 

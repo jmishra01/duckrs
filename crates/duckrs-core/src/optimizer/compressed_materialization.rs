@@ -351,6 +351,7 @@ impl Pass<'_> {
         overrides: &HashMap<ColumnBinding, ColumnStatistics>,
     ) -> HashMap<ColumnBinding, ColumnBinding> {
         // per child: its compressing projection's index, and how each column is compressed
+        #[allow(clippy::type_complexity, reason = "per child: its table index, compressions and types")]
         let mut children: Vec<Option<(usize, Vec<Option<Compression>>, Vec<LogicalType>)>> = Vec::new();
         let outputs_before = op.column_bindings();
         let mut below: HashMap<ColumnBinding, (ColumnBinding, LogicalType)> = HashMap::new();

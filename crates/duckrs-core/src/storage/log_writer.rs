@@ -1101,6 +1101,7 @@ impl WriteAheadLog {
     }
 
     /// Makes what `catalog` holds durable: whether there was anything to do.
+    #[allow(clippy::too_many_arguments)]
     pub fn commit(
         &mut self,
         path: &Path,

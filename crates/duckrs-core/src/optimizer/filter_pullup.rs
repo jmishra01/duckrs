@@ -69,11 +69,12 @@ impl FilterPullup {
                 JoinType::Semi | JoinType::Left | JoinType::Anti => self.pullup_from_left(op),
                 _ => self.finish_pullup(op),
             },
-            K::AsOfJoin { join_type, .. } => match join_type {
-                // only the left side of an AsOf join passes its rows on as they are
-                JoinType::Inner | JoinType::Semi | JoinType::Left | JoinType::Anti => self.pullup_from_left(op),
-                _ => self.finish_pullup(op),
-            },
+            // only the left side of an AsOf join passes its rows on as they are
+            K::AsOfJoin {
+                join_type: JoinType::Inner | JoinType::Semi | JoinType::Left | JoinType::Anti,
+                ..
+            } => self.pullup_from_left(op),
+            K::AsOfJoin { .. } => self.finish_pullup(op),
             K::ExceptIntersect { .. } => self.pullup_set_operation(op),
             K::Distinct { on, .. } => {
                 if *on {
