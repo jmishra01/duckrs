@@ -2666,6 +2666,23 @@ pub(super) fn is_system_function(name: &str) -> bool {
         )
 }
 
+/// `BindSchemaOrCatalog` and `GetCatalogEntry` of an `AGGREGATE_FUNCTION_ENTRY`: the built-in aggregate a
+/// qualified name names, if any. A lone qualification that is a catalog is the catalog's `main` schema.
+pub(super) fn qualified_aggregate(
+    name: &ast::QualifiedName,
+) -> Option<&'static crate::function::aggregates::AggregateFunctionSet> {
+    let parts: Vec<&String> = name.qualification.iter().filter(|q| !q.is_empty()).collect();
+    let catalog = |part: &String| part.eq_ignore_ascii_case("system") || part.eq_ignore_ascii_case(DEFAULT_CATALOG);
+    let builtin = match parts.as_slice() {
+        [only] => catalog(only) || builtin_qualification(&name.qualification),
+        _ => builtin_qualification(&name.qualification),
+    };
+    if !builtin {
+        return None;
+    }
+    BuiltinFunctions::get().aggregate(&name.name)
+}
+
 fn builtin_qualification(qualification: &[String]) -> bool {
     // an operator's qualification has an empty entry for what it does not name
     let parts: Vec<&String> = qualification.iter().filter(|q| !q.is_empty()).collect();

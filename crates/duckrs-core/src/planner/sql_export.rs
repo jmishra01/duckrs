@@ -18,7 +18,7 @@ use super::expression::{
     SubqueryKind, WindowFunction,
 };
 use super::logical::{
-    BoundOrderByNode, COLUMN_IDENTIFIER_ROW_ID, CteKeyColumn, JoinCondition, LogicalOperator, LogicalOperatorKind as Op,
+    BoundOrderByNode, COLUMN_IDENTIFIER_ROW_ID, JoinCondition, LogicalOperator, LogicalOperatorKind as Op,
 };
 use crate::catalog::TableCatalogEntry;
 use duckrs_common::sort_key::{NullOrder as SortNulls, OrderModifiers, OrderType as SortOrder};
@@ -1068,17 +1068,31 @@ impl Exporter<'_> {
                 unresolved: recursive,
                 ..
             } => {
-                // USING KEY: the key columns, and how the others combine
-                let mut key_targets = Vec::new();
-                for (i, mode) in key.iter().enumerate() {
-                    let column = Expr::column(vec![field_name(i)]);
-                    key_targets.push(match mode {
-                        CteKeyColumn::Key => column,
-                        CteKeyColumn::Last => continue,
-                        CteKeyColumn::First => FunctionExpr::new("first", vec![column]).into(),
-                        CteKeyColumn::Min => FunctionExpr::new("min", vec![column]).into(),
-                        CteKeyColumn::Max => FunctionExpr::new("max", vec![column]).into(),
-                    });
+                // USING KEY: the key columns, and the aggregates of the others, but for `last` of
+                // a column, which is what a column USING KEY leaves out gets
+                let mut key_targets: Vec<Expr> = key.keys.iter().map(|&i| Expr::column(vec![field_name(i)])).collect();
+                for (column, aggregate) in &key.payload {
+                    let mut arguments = Vec::new();
+                    for child in &aggregate.children {
+                        let mut child = child;
+                        while let BoundExprKind::Cast { child: inner, .. } = &child.kind {
+                            child = inner;
+                        }
+                        let argument = match &child.kind {
+                            BoundExprKind::Reference(i) => Expr::column(vec![field_name(*i)]),
+                            BoundExprKind::Constant(value) => self.constant(value)?,
+                            _ => return Err("an aggregate of USING KEY over an expression has no SQL export".into()),
+                        };
+                        arguments.push(argument);
+                    }
+                    let implicit = aggregate.function.name == "last"
+                        && matches!(aggregate.children.as_slice(), [c] if matches!(c.kind, BoundExprKind::Reference(i) if i == *column));
+                    if implicit {
+                        continue;
+                    }
+                    let mut call: Expr = FunctionExpr::new(aggregate.function.name.clone(), arguments).into();
+                    call.alias = field_name(*column);
+                    key_targets.push(call);
                 }
                 let name = self.alias();
                 // `recurring.name` reads the rows so far
