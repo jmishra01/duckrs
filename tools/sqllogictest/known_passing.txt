@@ -1154,6 +1154,7 @@ test/sql/attach/attach_conflicting_options.test
 test/sql/attach/attach_copy.test
 test/sql/attach/attach_create_index.test
 test/sql/attach/attach_cross_catalog.test
+test/sql/attach/attach_custom_block_size.test
 test/sql/attach/attach_database_options.test
 test/sql/attach/attach_database_size.test
 test/sql/attach/attach_dbname_quotes.test
@@ -1164,6 +1165,7 @@ test/sql/attach/attach_dependencies.test
 test/sql/attach/attach_detach_in_transaction.test
 test/sql/attach/attach_detach_reattach_transaction.test
 test/sql/attach/attach_detach_same_name_transaction.test
+test/sql/attach/attach_did_you_mean.test
 test/sql/attach/attach_different_alias.test
 test/sql/attach/attach_duckdb_type.test
 test/sql/attach/attach_enable_external_access.test
@@ -1175,6 +1177,7 @@ test/sql/attach/attach_expr.test
 test/sql/attach/attach_external_access.test
 test/sql/attach/attach_foreign_key.test
 test/sql/attach/attach_foreign_key_external_catalog.test
+test/sql/attach/attach_hidden.test
 test/sql/attach/attach_home_directory.test
 test/sql/attach/attach_huggingface_index.test
 test/sql/attach/attach_if_not_exists.test
@@ -1222,6 +1225,7 @@ test/sql/attach/attach_wal_alter_sequence.test
 test/sql/attach/detach_keyword.test
 test/sql/attach/detach_manager_default_database.test
 test/sql/attach/in_memory_attach.test
+test/sql/attach/reattach_schema.test
 test/sql/attach/show_databases.test
 test/sql/attach/show_schemas.test
 test/sql/attach/system_catalog.test
@@ -3484,6 +3488,7 @@ test/sql/parser/nested_join_backtracking.test
 test/sql/parser/not_comparison_precedence.test
 test/sql/parser/numeric_literal_underscore_trailing_dot.test
 test/sql/parser/parser_rewrites_method_chain.test
+test/sql/parser/parser_rewrites_qualified_call.test
 test/sql/parser/position_prepare.test
 test/sql/parser/qualified_underscore_digit.test
 test/sql/parser/reject_accidental_expression_syntax.test
@@ -3588,6 +3593,7 @@ test/sql/pivot/unpivot_unnamed_subquery.test
 test/sql/pivot/unpivot_view.test
 test/sql/pragma/pragma_database_size_readonly.test
 test/sql/pragma/profiling/profiling_output_not_allowed.test
+test/sql/pragma/profiling/profiling_renderer_settings_null.test
 test/sql/pragma/profiling/test_all_profiling_settings.test
 test/sql/pragma/profiling/test_attach_and_checkpoint_latency.test
 test/sql/pragma/profiling/test_autocheckpoint_latency.test
@@ -3756,6 +3762,7 @@ test/sql/setops/union_pipeline.test
 test/sql/setops/union_shared_scan.test
 test/sql/setops/union_single_dedup.test
 test/sql/setops/value_union.test
+test/sql/settings/access_mode.test
 test/sql/settings/allowed_configs.test
 test/sql/settings/allowed_directories.test
 test/sql/settings/allowed_directories_atomic_update.test
@@ -3764,17 +3771,28 @@ test/sql/settings/allowed_paths.test
 test/sql/settings/concurrent_set_disabled_optimizers.test
 test/sql/settings/connection_local_settings.test
 test/sql/settings/debug_deprecated_settings.test
+test/sql/settings/default_grammar_extensions.test
 test/sql/settings/default_null_order_extended.test
+test/sql/settings/deprecated_settings.test
+test/sql/settings/dialect_compatibility_mode.test
 test/sql/settings/drop_set_schema.test
 test/sql/settings/enable_block_allocator.test
+test/sql/settings/http_client_pool_capacity.test
 test/sql/settings/integer_division_setting.test
+test/sql/settings/lock_configuration_pragmas.test
 test/sql/settings/lock_configuration_schema.test
+test/sql/settings/max_execution_time.test
+test/sql/settings/max_execution_time_nested_expansion.test
 test/sql/settings/max_memory_percentage.test
+test/sql/settings/max_streaming_buffer_size.test
+test/sql/settings/memory_limit_settings_unlimited.test
+test/sql/settings/pragma_assignment_deprecated.test
 test/sql/settings/reset/reset_threads.test
 test/sql/settings/set_null_settings.test
 test/sql/settings/set_schema_temp_main.test
 test/sql/settings/setting_alias.test
 test/sql/settings/setting_collation.test
+test/sql/settings/setting_collection_roundtrip.test
 test/sql/settings/setting_disabled_optimizer.test
 test/sql/settings/setting_exhaustive.test
 test/sql/settings/setting_null_order.test
@@ -3782,6 +3800,8 @@ test/sql/settings/setting_order.test
 test/sql/settings/setting_preserve_identifier_case.test
 test/sql/settings/setting_profiling_mode.test
 test/sql/settings/setting_threads.test
+test/sql/settings/setting_validation_and_reset.test
+test/sql/settings/test_disabled_file_systems.test
 test/sql/settings/test_disabled_file_systems_whitespace.test
 test/sql/settings/test_disabled_local_filesystem_metadata.test
 test/sql/settings/test_external_access_metadata.test
@@ -3902,6 +3922,7 @@ test/sql/storage/checkpointed_self_append_tinyint.test
 test/sql/storage/commit_abort.test
 test/sql/storage/commit_abort_medium.test
 test/sql/storage/commit_index_deletes.test
+test/sql/storage/compact_block_size/block_size_with_rollback.test
 test/sql/storage/compact_block_size/compact_block_size.test
 test/sql/storage/compact_block_size/create_table_compression.test
 test/sql/storage/compact_block_size/default_block_size.test
