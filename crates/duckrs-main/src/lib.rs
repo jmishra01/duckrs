@@ -2245,6 +2245,18 @@ impl ClientContext {
     /// Runs one statement within the current transaction, or as a transaction of its own
     /// (`ClientContext::PendingStatementOrPreparedStatementInternal` + `CleanupInternal`).
     fn run_statement(&mut self, statement: &Statement) -> Result<MaterializedQueryResult> {
+        // `max_execution_time`: the deadline of the statement, which the statements it runs share
+        use duckrs_core::execution::interrupt;
+        if interrupt::current().is_some() {
+            return self.run_statement_inner(statement);
+        }
+        let limit = self.setting_text("max_execution_time").parse::<u64>().unwrap_or(0);
+        let deadline =
+            (limit > 0).then(|| std::time::Instant::now() + std::time::Duration::from_millis(limit));
+        interrupt::with_deadline(deadline, || self.run_statement_inner(statement))
+    }
+
+    fn run_statement_inner(&mut self, statement: &Statement) -> Result<MaterializedQueryResult> {
         // `FileSystem::GetHomeDirectory` of this connection
         duckrs_core::execution::file_system::set_home_directory(Some(self.setting_text("home_directory")));
         duckrs_core::execution::file_system::set_file_search_path(&self.setting_text("file_search_path"));
