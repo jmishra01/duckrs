@@ -500,7 +500,7 @@ impl Transformer<'_> {
             };
             if value.kind == LiteralKind::Null {
                 return Err(binder_error(format!(
-                    "NULL is not supported as a valid option for {statement} option {}",
+                    "NULL is not supported as a valid option for {statement} option \"{}\"",
                     option.name
                 )));
             }
@@ -541,6 +541,24 @@ impl Transformer<'_> {
         })
     }
 
+    /// `TransformShowExternalResources`: `SELECT * FROM duckdb_external_resources(...)`, with `discover` for ALL
+    /// and the type asked for.
+    pub(in crate::transformer) fn show_external_resources(&mut self, node: &ParseNode) -> Result<SelectStatement> {
+        let mut arguments = Vec::new();
+        if self.sub(node, "ShowAllModifier").is_some() {
+            arguments.push("discover := true".to_string());
+        }
+        if let Some(with_type) = self.sub(node, "ShowExternalResourcesType") {
+            let name = Self::text(self.req(with_type, "ColIdOrString")?);
+            arguments.push(format!("type := '{}'", name.replace('\'', "''")));
+        }
+        let sql = format!("SELECT * FROM duckdb_external_resources({})", arguments.join(", "));
+        match crate::parse_ast(&sql)?.pop() {
+            Some(Statement::Select(select)) => Ok(select),
+            _ => Err(parser_error("SHOW EXTERNAL RESOURCES is a SELECT")),
+        }
+    }
+
     /// `ExternalResourceStatement`: CREATE/REGISTER/DESTROY/SHOW resources, ATTACH and CONNECT to one.
     pub(in crate::transformer) fn external_resource(&mut self, node: &ParseNode) -> Result<Statement> {
         let statement = self.alt(node)?;
@@ -578,7 +596,10 @@ impl Transformer<'_> {
                 resource.operation = ExternalResourceOperation::Destroy;
                 resource.name = Self::text(self.req(statement, "ColId")?);
             }
-            "ShowExternalResourcesStmt" => resource.all = self.sub(statement, "ShowAllModifier").is_some(),
+            // `TransformShowExternalResources`: a scan of `duckdb_external_resources`, `discover` with ALL
+            "ShowExternalResourcesStmt" => {
+                return Ok(Statement::Select(self.show_external_resources(statement)?));
+            }
             "AttachToExternalResource" => {
                 let source = self.external_resource_source(self.req(statement, "ExternalResourceSource")?)?;
                 let mut info = AttachInfo {

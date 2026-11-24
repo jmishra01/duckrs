@@ -1676,6 +1676,8 @@ impl ClientContext {
             secrets: Some(self.secret_view()),
             external_resources: Some(Arc::new(external_resources::ExternalResourceView {
                 db: self.home.clone(),
+                autoload: self.setting_text("autoload_known_extensions") == "true"
+                    && self.setting_text("autoinstall_known_extensions") == "true",
                 log: Some(self.log_target.clone()),
                 search_path: SearchEntry::list_text(&self.search_path),
             })),
@@ -2871,6 +2873,123 @@ impl ClientContext {
     }
 
     /// `PhysicalAttach`.
+    /// The values of the options of an external resource statement (`BindExternalResourceParams`).
+    fn external_resource_values(&mut self, options: &[(String, Expr)]) -> Result<Vec<(String, Value)>> {
+        let catalog = self.catalog();
+        let mut values = Vec::with_capacity(options.len());
+        for (name, expression) in options {
+            let mut binder = Binder::with_options(&catalog, self.bind_options());
+            binder.session = Some(self.session_values());
+            values.push((name.to_lowercase(), evaluate_scalar(&binder.bind_value_expression(expression)?)?));
+        }
+        Ok(values)
+    }
+
+    /// CREATE, REGISTER and DESTROY EXTERNAL RESOURCE (`Binder::Bind(ExternalResourceStatement)` +
+    /// `PhysicalExternalResource`).
+    fn external_resource_statement(&mut self, statement: &duckrs_parser::ast::ExternalResourceStatement) -> Result<()> {
+        use duckrs_parser::ast::ExternalResourceOperation as Operation;
+        if statement.name.is_empty() {
+            return Err(Error::new(ErrorKind::Binder, "EXTERNAL RESOURCE requires a name (AS <name>)"));
+        }
+        let home = self.home.clone();
+        let log = Some(self.log_target.clone());
+        match statement.operation {
+            Operation::Create | Operation::Register => {
+                let params = self.external_resource_values(&statement.options)?;
+                let handle = match &statement.handle {
+                    Some(handle) if statement.operation == Operation::Register => {
+                        let value = self.external_resource_values(&[(String::new(), (**handle).clone())])?;
+                        let value = value.into_iter().next().map(|(_, v)| v).unwrap_or_else(Value::sql_null);
+                        if value.is_null() {
+                            return Err(Error::new(
+                                ErrorKind::Binder,
+                                "REGISTER EXTERNAL RESOURCE: the handle must not be NULL",
+                            ));
+                        }
+                        Some(value)
+                    }
+                    _ => None,
+                };
+                external_resources::register_resource(
+                    &home,
+                    log.as_ref(),
+                    &statement.resource_type,
+                    &statement.name,
+                    &params,
+                    handle.as_ref(),
+                )
+            }
+            Operation::Destroy => {
+                let borrowers = external_resources::destroy_resource(&home, log.as_ref(), &statement.name)?;
+                // the attachments that borrowed it point at nothing now (best effort)
+                for database in borrowers {
+                    home.external_resources.take_attachment(&database);
+                    let _ = self.detach(&database, true);
+                }
+                Ok(())
+            }
+            Operation::Show => Err(duckrs_core::unported("SHOW EXTERNAL RESOURCES here")),
+        }
+    }
+
+    /// `PhysicalAttach` of ATTACH TO [NEW TEMPORARY] EXTERNAL RESOURCE: provision a resource the attachment owns,
+    /// or resolve the endpoint of a registered one it borrows, and attach that.
+    fn attach_to_external_resource(&mut self, info: &duckrs_parser::ast::AttachInfo) -> Result<()> {
+        let resource = info.external_resource.as_ref().expect("checked by the caller");
+        let home = self.home.clone();
+        let log = Some(self.log_target.clone());
+        let (launched, attachment) = if resource.reference_name.is_empty() {
+            let params = self.external_resource_values(&resource.params)?;
+            // the scoped resource is anonymous: its log entries go by the database it backs
+            let launched =
+                external_resources::provision(&home, log.as_ref(), &resource.provider, &params, &info.name, None)?;
+            let owned = launched.deleter(&resource.provider, &info.name);
+            (launched, external_resources::Attachment { owned: Some(owned), borrowed: None })
+        } else {
+            let Some(instance) = home.external_resources.lookup(&resource.reference_name) else {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("no external resource named \"{}\" is registered", resource.reference_name),
+                ));
+            };
+            let launched = external_resources::provision(
+                &home,
+                log.as_ref(),
+                &instance.resource_type,
+                &[],
+                &instance.name,
+                Some(&instance.handle),
+            )?;
+            (launched, external_resources::Attachment { owned: None, borrowed: Some(instance.name) })
+        };
+        // from here on the resource exists with nothing owning it: any failure reaps one this provisioned
+        let attached = (|| -> Result<()> {
+            let given: Vec<String> = info
+                .parsed_options
+                .iter()
+                .map(|(name, _)| name.clone())
+                .chain(info.options.iter().map(|(name, _)| name.clone()))
+                .collect();
+            let mut attach = (*info).clone();
+            attach.external_resource = None;
+            *attach.path = Expr::constant(duckrs_parser::ast::Literal::string(launched.uri.clone()));
+            for (name, value) in launched.attach_options(&given)? {
+                let text = value.try_to_string()?;
+                attach.parsed_options.push((name, Expr::constant(duckrs_parser::ast::Literal::string(text))));
+            }
+            self.attach(&attach)
+        })();
+        if let Err(error) = attached {
+            if let Some(owned) = &attachment.owned {
+                owned.try_delete(&home, log.as_ref());
+            }
+            return Err(error);
+        }
+        home.external_resources.set_attachment(&info.name, attachment);
+        Ok(())
+    }
+
     fn attach(&mut self, info: &duckrs_parser::ast::AttachInfo) -> Result<()> {
         use duckrs_parser::ast::OnCreateConflict as Conflict;
         if info.external_resource.is_some() {
@@ -3967,12 +4086,24 @@ impl ClientContext {
                 };
                 return Ok(Self::success());
             }
+            Statement::Attach(info) if info.external_resource.is_some() => {
+                self.attach_to_external_resource(info)?;
+                return Ok(Self::success());
+            }
             Statement::Attach(info) => {
                 self.attach(info)?;
                 return Ok(Self::success());
             }
             Statement::Detach { name, if_exists } => {
                 self.detach(name, *if_exists)?;
+                // `DetachDatabase`: the resource the database owned goes with it, once it is detached
+                if let Some(deleter) = self.home.external_resources.take_attachment(name).and_then(|a| a.owned) {
+                    deleter.delete(&self.home, Some(&self.log_target))?;
+                }
+                return Ok(Self::success());
+            }
+            Statement::ExternalResource(statement) => {
+                self.external_resource_statement(statement)?;
                 return Ok(Self::success());
             }
             Statement::SetVariable {

@@ -53,6 +53,8 @@ pub struct ExternalResource {
 pub struct ExternalResources {
     types: Mutex<Vec<ExternalResourceType>>,
     resources: Mutex<Vec<ExternalResource>>,
+    /// by attached database (lower case), the resource it owns or borrows
+    attachments: Mutex<std::collections::HashMap<String, Attachment>>,
 }
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -147,6 +149,36 @@ impl ExternalResources {
 
     pub fn list(&self) -> Vec<ExternalResource> {
         self.resources.lock().clone()
+    }
+}
+
+/// `EXTENSION_EXTERNAL_RESOURCE_TYPES`: the resource types the extensions are known to provide.
+const EXTENSION_EXTERNAL_RESOURCE_TYPES: &[(&str, &str)] = &[("aws:cloudformation:quack-on-ec2", "aws")];
+
+/// `ExternalResourceTypeRegistry::ProvidingExtension`.
+fn providing_extension(name: &str) -> Option<&'static str> {
+    EXTENSION_EXTERNAL_RESOURCE_TYPES
+        .iter()
+        .find(|(type_name, _)| *type_name == name)
+        .map(|(_, extension)| *extension)
+}
+
+/// The error of `function` for a resource type nothing registered (`LookupOrAutoload` failed): the extension that
+/// provides it, if one does. duckrs installs no extensions, so an autoload of one fails as an install that fails.
+fn unknown_type(function: &str, name: &str, autoload: bool) -> Error {
+    match providing_extension(name) {
+        Some(extension) if autoload => Error::new(
+            ErrorKind::Autoload,
+            format!(
+                "An error occurred while trying to automatically install the required extension '{extension}:\n\
+                 extensions cannot be installed in duckrs"
+            ),
+        ),
+        Some(extension) => invalid(format!(
+            "{function}: unknown resource type \"{name}\": it is provided by the {extension} extension, which could \
+             not be autoloaded. Try: INSTALL AND LOAD {extension};"
+        )),
+        None => invalid(format!("{function}: unknown resource type \"{name}\"")),
     }
 }
 
@@ -315,6 +347,8 @@ fn require_map(value: Value, function: &str, column: &str) -> Result<Value> {
 /// The external resource table functions as a statement of one connection sees them.
 pub struct ExternalResourceView {
     pub db: Arc<DatabaseInstance>,
+    /// `autoload_known_extensions` and `autoinstall_known_extensions` are both on
+    pub autoload: bool,
     /// the logger of the calling connection
     pub log: Option<Arc<duckrs_core::logging::LogTarget>>,
     /// the search path that was set (`GetSetPaths`), as text
@@ -571,10 +605,11 @@ impl ExternalResourceView {
             ));
         }
         let known = self.registry().list().iter().any(|r| r.resource_type == wanted);
+        if !wanted.is_empty() && !matched && providing_extension(&wanted).is_some() && self.autoload {
+            return Err(unknown_type("duckdb_external_resources", &wanted, true));
+        }
         if !matched && !wanted.is_empty() && !known {
-            return Err(invalid(format!(
-                "duckdb_external_resources: unknown resource type \"{wanted}\""
-            )));
+            return Err(unknown_type("duckdb_external_resources", &wanted, false));
         }
         Ok(ExternalResourceRows::Query(branches.join(" UNION ALL ")))
     }
@@ -640,9 +675,7 @@ impl ExternalResourceView {
             }
         }
         let Some(resource_type) = self.registry().lookup_type(&type_name) else {
-            return Err(invalid(format!(
-                "create_external_resource: unknown resource type \"{type_name}\""
-            )));
+            return Err(unknown_type("create_external_resource", &type_name, self.autoload));
         };
         let mut connection = self.connection(&resource_type.search_path)?;
         let adopting = adopt.is_some();
@@ -833,4 +866,264 @@ impl ExternalResourceTables for ExternalResourceView {
             _ => Err(duckrs_core::unported(function)),
         }
     }
+}
+
+/// `LaunchedResource`: what provisioning gives a statement.
+#[derive(Debug, Clone)]
+pub struct Launched {
+    pub uri: String,
+    pub attached_db_type: String,
+    pub result: Value,
+    pub deleter_function: String,
+    pub deleter_payload: Value,
+}
+
+/// `ResourceDeleter`: how a resource is torn down, `<deleter_function>(<deleter_payload>)`.
+#[derive(Debug, Clone)]
+pub struct Deleter {
+    pub function: String,
+    pub payload: Value,
+    pub resource_type: String,
+    pub resource_name: String,
+}
+
+/// What an attached database has to do with a resource: one it owns (`NEW TEMPORARY`, reaped by DETACH) or one
+/// it borrows (by name, left for DESTROY).
+#[derive(Debug, Clone, Default)]
+pub struct Attachment {
+    pub owned: Option<Deleter>,
+    pub borrowed: Option<String>,
+}
+
+impl ExternalResources {
+    pub fn set_attachment(&self, database: &str, attachment: Attachment) {
+        self.attachments.lock().insert(database.to_lowercase(), attachment);
+    }
+
+    pub fn take_attachment(&self, database: &str) -> Option<Attachment> {
+        self.attachments.lock().remove(&database.to_lowercase())
+    }
+
+    /// The databases attached to the resource `name` without owning it.
+    pub fn borrowers(&self, name: &str) -> Vec<String> {
+        self.attachments
+            .lock()
+            .iter()
+            .filter(|(_, a)| a.borrowed.as_deref() == Some(name))
+            .map(|(database, _)| database.clone())
+            .collect()
+    }
+}
+
+impl Deleter {
+    /// `ResourceDeleter::DeleteSQL`.
+    fn sql(&self) -> Option<String> {
+        (!self.function.is_empty())
+            .then(|| format!("SELECT * FROM {}({})", callback_sql(&self.function), value_sql(&self.payload)))
+    }
+
+    /// `ResourceDeleter::Delete`: the teardown on a connection of its own; a failure says how to retry it.
+    pub fn delete(&self, db: &Arc<DatabaseInstance>, log: Option<&Arc<duckrs_core::logging::LogTarget>>) -> Result<()> {
+        let Some(sql) = self.sql() else {
+            return Ok(());
+        };
+        let outcome = CallbackConnection::open(db).and_then(|mut connection| connection.query(&sql));
+        let error = outcome.as_ref().err().map(ToString::to_string).unwrap_or_default();
+        duckrs_core::logging::log_external_resource(
+            log,
+            &self.resource_type,
+            &self.resource_name,
+            "destroy",
+            &error,
+            &[],
+        );
+        if outcome.is_err() {
+            return Err(Error::new(
+                ErrorKind::Io,
+                format!(
+                    "external resource teardown failed: {error}. The resource was NOT torn down; run `{sql};` to \
+                     retry the teardown"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// `ResourceDeleter::TryDelete`: best effort.
+    pub fn try_delete(&self, db: &Arc<DatabaseInstance>, log: Option<&Arc<duckrs_core::logging::LogTarget>>) {
+        let _ = self.delete(db, log);
+    }
+}
+
+/// `ProvisionExternalResource`: `create_external_resource` on a connection of its own, with `adopt` the handle of a
+/// resource that exists already.
+pub fn provision(
+    db: &Arc<DatabaseInstance>,
+    log: Option<&Arc<duckrs_core::logging::LogTarget>>,
+    provider: &str,
+    params: &[(String, Value)],
+    resource_name: &str,
+    adopt: Option<&Value>,
+) -> Result<Launched> {
+    if provider.is_empty() {
+        return Err(Error::new(ErrorKind::Binder, "EXTERNAL RESOURCE: a resource type is required"));
+    }
+    let entries: Vec<Value> = params
+        .iter()
+        .filter(|(_, value)| !value.is_null())
+        .map(|(key, value)| {
+            Value::struct_value(vec![
+                ("key".to_string(), Value::varchar(key.clone())),
+                ("value".to_string(), Value::varchar(value.try_to_string().unwrap_or_default())),
+            ])
+        })
+        .collect();
+    let params = Value::new(handle_type(), ValueData::List(entries))?;
+    let name = if resource_name.is_empty() {
+        String::new()
+    } else {
+        format!(", resource_name := {}", sql_string(resource_name))
+    };
+    let handle = adopt.map_or_else(String::new, |handle| format!(", handle := {}", value_sql(handle)));
+    let sql = format!(
+        "SELECT uri, attached_db_type, result, deleter_function, deleter_payload FROM create_external_resource({}, \
+         params := {}{name}{handle})",
+        sql_string(provider),
+        value_sql(&params)
+    );
+    let result = CallbackConnection::open(db)?.query(&sql).map_err(|error| {
+        Error::new(
+            ErrorKind::Io,
+            format!("EXTERNAL RESOURCE: provisioning '{provider}' failed: {error}"),
+        )
+    })?;
+    if result.row_count() == 0 {
+        return Err(Error::new(
+            ErrorKind::Io,
+            format!("EXTERNAL RESOURCE: create_external_resource returned no rows for '{provider}'"),
+        ));
+    }
+    let launched = Launched {
+        uri: text(&result.value(0, 0)).unwrap_or_default(),
+        attached_db_type: text(&result.value(1, 0)).unwrap_or_default(),
+        result: result.value(2, 0),
+        deleter_function: text(&result.value(3, 0)).unwrap_or_default(),
+        deleter_payload: result.value(4, 0),
+    };
+    if result.value(0, 0).is_null() {
+        // a resource made only to be attached that has no endpoint is reaped; a borrowed one is never ours to
+        if adopt.is_none() {
+            launched.deleter(provider, resource_name).try_delete(db, log);
+        }
+        return Err(Error::new(
+            ErrorKind::Io,
+            format!("EXTERNAL RESOURCE: provisioning '{provider}' returned a NULL uri"),
+        ));
+    }
+    Ok(launched)
+}
+
+impl Launched {
+    pub fn deleter(&self, resource_type: &str, resource_name: &str) -> Deleter {
+        Deleter {
+            function: self.deleter_function.clone(),
+            payload: self.deleter_payload.clone(),
+            resource_type: resource_type.to_string(),
+            resource_name: resource_name.to_string(),
+        }
+    }
+
+    /// `ApplyLaunchedResource`: the options the resource supplies, which the statement may not give too (by
+    /// setting: `READ_ONLY` and `READWRITE` are one option under two names).
+    pub fn attach_options(&self, given: &[String]) -> Result<Vec<(String, Value)>> {
+        fn setting(key: &str) -> String {
+            let key = key.to_lowercase();
+            match key.as_str() {
+                "read_only" | "readonly" | "read_write" | "readwrite" | "access_mode" => "access_mode".to_string(),
+                _ => key,
+            }
+        }
+        let collide = |key: &str| -> Result<()> {
+            if given.iter().any(|g| setting(g) == setting(key)) {
+                return Err(invalid(format!(
+                    "EXTERNAL RESOURCE: the resource supplies \"{key}\", so it cannot also be given as an option on \
+                     the statement"
+                )));
+            }
+            Ok(())
+        };
+        let mut options = Vec::new();
+        if !self.attached_db_type.is_empty() {
+            collide("type")?;
+            options.push(("type".to_string(), Value::varchar(self.attached_db_type.clone())));
+        }
+        for (key, value) in map_entries(&self.result) {
+            let key = text(&key).unwrap_or_default();
+            if key == "uri" || key == "attached_db_type" {
+                continue;
+            }
+            collide(&key)?;
+            if value.is_null() {
+                return Err(invalid(format!(
+                    "EXTERNAL RESOURCE: NULL is not supported as a valid option for \"{key}\"; omit the key rather \
+                     than returning NULL"
+                )));
+            }
+            options.push((key, value));
+        }
+        Ok(options)
+    }
+}
+
+/// `PhysicalExternalResource` of CREATE and REGISTER: provision (or adopt `handle`) and record it under `name`.
+pub fn register_resource(
+    db: &Arc<DatabaseInstance>,
+    log: Option<&Arc<duckrs_core::logging::LogTarget>>,
+    resource_type: &str,
+    name: &str,
+    params: &[(String, Value)],
+    handle: Option<&Value>,
+) -> Result<()> {
+    let registry = &db.external_resources;
+    if registry.lookup(name).is_some() {
+        return Err(invalid(format!("external resource \"{name}\" is already registered")));
+    }
+    let launched = provision(db, log, resource_type, params, name, handle)?;
+    let resource = ExternalResource {
+        name: name.to_string(),
+        resource_type: resource_type.to_string(),
+        handle: launched.deleter_payload.clone(),
+        uri: launched.uri.clone(),
+        attached_db_type: launched.attached_db_type.clone(),
+        deleter_function: launched.deleter_function.clone(),
+        deleter_payload: launched.deleter_payload.clone(),
+    };
+    if let Err(error) = registry.add(resource) {
+        // provisioned, but nothing owns it
+        launched.deleter(resource_type, name).try_delete(db, log);
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// `PhysicalExternalResource` of DESTROY: teardown first, so a failed one leaves the resource registered to retry.
+/// The databases that borrowed it are what the caller detaches then.
+pub fn destroy_resource(
+    db: &Arc<DatabaseInstance>,
+    log: Option<&Arc<duckrs_core::logging::LogTarget>>,
+    name: &str,
+) -> Result<Vec<String>> {
+    let registry = &db.external_resources;
+    let Some(resource) = registry.lookup(name) else {
+        return Err(invalid(format!("external resource \"{name}\" is not registered")));
+    };
+    Deleter {
+        function: resource.deleter_function.clone(),
+        payload: resource.deleter_payload.clone(),
+        resource_type: resource.resource_type.clone(),
+        resource_name: resource.name.clone(),
+    }
+    .delete(db, log)?;
+    registry.remove(name);
+    Ok(registry.borrowers(name))
 }
