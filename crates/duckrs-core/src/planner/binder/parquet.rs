@@ -111,6 +111,7 @@ impl Binder<'_> {
         let mut schema_value = None;
         let mut allow_empty = false;
         let mut files_for_stats = 0;
+        let (mut can_have_nan, mut explicit_cardinality) = (None, None);
         let (mut copy_names, mut copy_types): (Option<Vec<String>>, Option<Vec<LogicalType>>) = (None, None);
         for argument in &args {
             let value = self.constant_argument(&argument.expr)?;
@@ -159,7 +160,29 @@ impl Binder<'_> {
                         .and_then(|n| usize::try_from(n).ok())
                         .unwrap_or(0);
                 }
-                "explicit_cardinality" | "can_have_nan" => {}
+                "explicit_cardinality" => {
+                    explicit_cardinality = crate::execution::parquet::cast_value(&value, &LogicalType::UBIGINT)?
+                        .as_i128()
+                        .and_then(|n| u64::try_from(n).ok());
+                }
+                // prefetching is the crate's: the strategy only has to be one C++ knows
+                "prefetch_strategy" => {
+                    if value.is_null() {
+                        return Err(binder_error("Parquet prefetch_strategy cannot be empty!"));
+                    }
+                    let text = value.try_to_string()?;
+                    if !matches!(text.to_lowercase().as_str(), "auto" | "whole_group") {
+                        return Err(binder_error(format!(
+                            "Unrecognized prefetch_strategy '{text}' (supported: 'auto', 'whole_group')"
+                        )));
+                    }
+                }
+                "can_have_nan" => {
+                    if value.is_null() {
+                        return Err(binder_error("Parquet can_have_nan cannot be empty!"));
+                    }
+                    can_have_nan = Some(is_true(&value, &option)?);
+                }
                 "schema" => schema_value = Some(value),
                 // what COPY ... FROM passes on of the table it loads into
                 "__copy_names" => copy_names = Some(strings(&value)?),
@@ -385,6 +408,8 @@ impl Binder<'_> {
             byte_lengths: Vec::new(),
             output: None,
             files_for_stats,
+            page_pruning: self.parquet_page_pruning(can_have_nan),
+            explicit_cardinality,
         };
         Ok(LogicalOperator::new(
             LogicalOperatorKind::ParquetScan {
@@ -1122,6 +1147,23 @@ fn parse_field_ids(
 }
 
 impl Binder<'_> {
+    /// `parquet_use_page_index`, and the `can_have_nan` option or else `parquet_can_have_nan`.
+    fn parquet_page_pruning(&self, can_have_nan: Option<bool>) -> crate::execution::parquet::PagePruning {
+        let setting = |name: &str| {
+            self.session
+                .as_ref()
+                .and_then(|session| (session.setting)(name).ok())
+                .and_then(|value| match value.data() {
+                    ValueData::Bool(enabled) => Some(*enabled),
+                    _ => None,
+                })
+        };
+        crate::execution::parquet::PagePruning {
+            use_page_index: setting("parquet_use_page_index").unwrap_or(true),
+            can_have_nan: can_have_nan.or_else(|| setting("parquet_can_have_nan")).unwrap_or(false),
+        }
+    }
+
     /// `GeoParquetFileMetadata::IsGeoParquetConversionEnabled`: the `enable_geoparquet_conversion` setting.
     fn geoparquet_conversion(&self) -> bool {
         self.session

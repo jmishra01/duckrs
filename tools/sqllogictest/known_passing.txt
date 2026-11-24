@@ -763,6 +763,7 @@ test/parquet/parquet_combine.test
 test/parquet/parquet_extract_pushdown.test
 test/parquet/parquet_schema_lossy_filter_cast.test
 test/parquet/parquet_schema_renamed_struct_filter.test
+test/parquet/parquet_stats_function.test
 test/parquet/parquet_version.test
 test/parquet/prefetching.test
 test/parquet/schema_nested_evolution.test
@@ -779,6 +780,7 @@ test/parquet/test_parquet_schema_null_nested.test
 test/parquet/time_millis.test
 test/parquet/timetz_parquet.test
 test/parquet/union_by_name_nested_struct_extract.test
+test/parquet/utf8_validation_page_index.test
 test/parquet/utf8_validation_plain_dba_dlba_dict.test
 test/parquet/utf8_validation_statistics.test
 test/parquet/variant/pushdown/variant_case_sensitivity.test
@@ -1820,6 +1822,10 @@ test/sql/copy/parquet/bloom_filter_decimal.test
 test/sql/copy/parquet/bloom_filter_fallback.test
 test/sql/copy/parquet/bloom_filter_fallback_options.test
 test/sql/copy/parquet/bloom_filter_fallback_types.test
+test/sql/copy/parquet/bloom_filter_interval.test
+test/sql/copy/parquet/bloom_filter_interval_saturated.test
+test/sql/copy/parquet/bloom_filter_pruned_row_groups.test
+test/sql/copy/parquet/bloom_filters.test
 test/sql/copy/parquet/broken_parquet.test
 test/sql/copy/parquet/byte_stream_split.test
 test/sql/copy/parquet/byte_stream_split_flba.test
@@ -1853,6 +1859,10 @@ test/sql/copy/parquet/multi_file/multi_file_filter_mixed.test
 test/sql/copy/parquet/multi_file/multi_file_filter_struct.test
 test/sql/copy/parquet/multi_file_conversion_error.test
 test/sql/copy/parquet/multi_file_max_files_for_stats.test
+test/sql/copy/parquet/page_index/page_index_cache_budget.test
+test/sql/copy/parquet/page_index/page_index_read.test
+test/sql/copy/parquet/page_index/page_index_reference.test
+test/sql/copy/parquet/page_index/page_index_robustness.test
 test/sql/copy/parquet/page_index/page_index_write.test
 test/sql/copy/parquet/parallel_parquet_glob.test
 test/sql/copy/parquet/parquet2.test
@@ -1894,6 +1904,7 @@ test/sql/copy/parquet/parquet_empty_enum.test
 test/sql/copy/parquet/parquet_encoding_skip.test
 test/sql/copy/parquet/parquet_enum_test.test
 test/sql/copy/parquet/parquet_expression_filter.test
+test/sql/copy/parquet/parquet_expression_filter_pruning.test
 test/sql/copy/parquet/parquet_external_access.test
 test/sql/copy/parquet/parquet_field_ids_invalid.test
 test/sql/copy/parquet/parquet_filename_filter.test
@@ -1920,6 +1931,7 @@ test/sql/copy/parquet/parquet_metadata_prepared.test
 test/sql/copy/parquet/parquet_metadata_rescan.test
 test/sql/copy/parquet/parquet_nan.test
 test/sql/copy/parquet/parquet_nan_count.test
+test/sql/copy/parquet/parquet_nan_setting.test
 test/sql/copy/parquet/parquet_negative_chunk_size.test
 test/sql/copy/parquet/parquet_no_stats.test
 test/sql/copy/parquet/parquet_nullbyte.test
@@ -1971,6 +1983,7 @@ test/sql/copy/parquet/test_parquet_gzip.test
 test/sql/copy/parquet/test_parquet_nested.test
 test/sql/copy/parquet/test_parquet_null.test
 test/sql/copy/parquet/test_parquet_scan.test
+test/sql/copy/parquet/timestamp_ms_stats.test
 test/sql/copy/parquet/timestamp_s.test
 test/sql/copy/parquet/timetz_parquet.test
 test/sql/copy/parquet/union_by_name_hive_partitioning.test
@@ -2011,6 +2024,7 @@ test/sql/copy/parquet/writer/parquet_write_uhugeint.test
 test/sql/copy/parquet/writer/parquet_write_unsigned.test
 test/sql/copy/parquet/writer/parquet_write_uuid.test
 test/sql/copy/parquet/writer/partition_without_hive.test
+test/sql/copy/parquet/writer/row_group_size_bytes.test
 test/sql/copy/parquet/writer/skip_empty_write.test
 test/sql/copy/parquet/writer/test_parquet_write.test
 test/sql/copy/parquet/writer/test_parquet_write_complex.test

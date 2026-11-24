@@ -10,7 +10,7 @@
 //! Values come in as [`Value`]s, one column at a time, in vectors of [`STANDARD_VECTOR_SIZE`] rows as
 //! `ColumnDataCollection` hands them out, because where pages end depends on that.
 
-mod encoding;
+pub(crate) mod encoding;
 pub(crate) mod geoparquet;
 mod written_stats;
 
@@ -1100,6 +1100,7 @@ fn has_parquet_type(ty: &LogicalType) -> bool {
             | T::TimestampTz
             | T::TimestampMs
             | T::TimestampNs
+            | T::TimestampTzNs
             | T::TimestampSec
             | T::UTinyInt
             | T::USmallInt
@@ -1442,10 +1443,10 @@ fn create_node(
             convert: Convert::I64,
             stats: signed,
         },
-        T::Timestamp | T::TimestampTz | T::TimestampMs | T::TimestampNs | T::TimestampSec if int96 => {
+        T::Timestamp | T::TimestampTz | T::TimestampMs | T::TimestampNs | T::TimestampTzNs | T::TimestampSec if int96 => {
             let (divide, multiply) = match ty.id() {
                 T::TimestampMs => (1, 1000),
-                T::TimestampNs => (1000, 1),
+                T::TimestampNs | T::TimestampTzNs => (1000, 1),
                 T::TimestampSec => (1, 1_000_000),
                 _ => (1, 1),
             };
@@ -1454,7 +1455,7 @@ fn create_node(
                 stats: StatsKind::Absent,
             }
         }
-        T::Timestamp | T::TimestampTz | T::TimestampMs | T::TimestampNs => LeafKind::Standard {
+        T::Timestamp | T::TimestampTz | T::TimestampMs | T::TimestampNs | T::TimestampTzNs => LeafKind::Standard {
             convert: Convert::I64,
             stats: signed,
         },
@@ -1650,6 +1651,7 @@ fn leaf_schema_element(leaf: &Leaf, options: &WriterOptions) -> SchemaElement {
             element.logical = Some(LogicalAnnotation::Timestamp(utc, 2));
         }
         T::TimestampNs if !int96 => element.logical = Some(LogicalAnnotation::Timestamp(false, 3)),
+        T::TimestampTzNs if !int96 => element.logical = Some(LogicalAnnotation::Timestamp(true, 3)),
         T::TimestampMs if !int96 => {
             element.converted = Some(converted::TIMESTAMP_MILLIS);
             element.logical = Some(LogicalAnnotation::Timestamp(false, 1));
@@ -2028,15 +2030,19 @@ fn interval_normalized_hash(bytes: &[u8]) -> Option<u64> {
         days: part(1) as i32,
         micros: i64::from(part(2)) * 1000,
     };
-    let (months, days, micros) = interval.normalize();
-    // `Borrow`: what does not fit a field saturates it
-    let months = months.clamp(i64::from(i32::MIN), i64::from(i32::MAX));
-    let days = days + micros / MICROS_PER_DAY;
-    let micros = micros % MICROS_PER_DAY;
-    if months < 0 || days < 0 || micros < 0 {
+    interval_hash_normalized(interval)
+}
+
+/// `ParquetIntervalUtils::TryHashNormalized`: the hash of the normalized interval with its whole days in the days
+/// field; `None` where a part is negative, as no stored interval is.
+pub fn interval_hash_normalized(interval: duckrs_common::types::Interval) -> Option<u64> {
+    let normalized = interval.normalize_saturating();
+    let days = i64::from(normalized.days) + normalized.micros / MICROS_PER_DAY;
+    let micros = normalized.micros % MICROS_PER_DAY;
+    if normalized.months < 0 || days < 0 || micros < 0 {
         return None;
     }
-    let mut out = (months as u32).to_le_bytes().to_vec();
+    let mut out = (normalized.months as u32).to_le_bytes().to_vec();
     out.extend_from_slice(&(days as u32).to_le_bytes());
     out.extend_from_slice(&((micros / 1000) as u32).to_le_bytes());
     Some(xxhash64(&out))
@@ -2226,9 +2232,10 @@ impl ParquetFileWriter {
             }
             buffer.extend(column);
         }
+        // `ParquetWriteSink`: once the rows buffered reach the row group size, they are all one row group
         let row_group_size = self.options.row_group_size.max(1);
-        while self.buffered_rows() >= row_group_size {
-            self.flush_rows(row_group_size)?;
+        if self.buffered_rows() >= row_group_size {
+            self.flush_rows(self.buffered_rows())?;
         }
         if let Some(limit) = self.options.row_group_size_bytes
             && self.buffered_bytes >= limit

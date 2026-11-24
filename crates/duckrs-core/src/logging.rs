@@ -1300,6 +1300,30 @@ pub fn log_file_system_to(target: Option<&Arc<LogTarget>>, path: &str, op: &str,
     let _ = manager.write_global(name, level, &message, false);
 }
 
+/// `PhysicalOperatorLogType::ConstructLogMessage` of a table scan: `class` and `event` with the pairs of `info`.
+fn physical_operator_message(class: &str, event: &str, info: &[(&str, String)]) -> String {
+    let info = info
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{{'operator_type': TABLE_SCAN, 'parameters': {{}}, 'class': {class}, 'event': {event}, 'info': {{{info}}}}}")
+}
+
+/// `DUCKDB_LOG(context, PhysicalOperatorLogType, ...)` of a table scan, with the logger of the statement it runs
+/// in. Errors of logging do not fail the scan.
+pub fn log_physical_operator(target: Option<&Arc<LogTarget>>, class: &str, event: &str, info: &[(&str, String)]) {
+    let Some(target) = target else {
+        return;
+    };
+    let (name, level) = ("PhysicalOperator", LogLevel::Debug);
+    let logger = target.logger.lock().expect("not poisoned").clone();
+    if logger.should_log(name, level) {
+        let message = physical_operator_message(class, event, info);
+        let _ = logger.log(&target.manager, name, level, &message, false);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
