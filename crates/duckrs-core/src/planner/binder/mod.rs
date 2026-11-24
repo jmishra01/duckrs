@@ -993,6 +993,8 @@ pub struct Binder<'a> {
     foreign_databases: Vec<read_duckdb::ForeignDatabase>,
     /// the tables and views (schema and name) that what is bound reads, for the dependencies of a view
     read_entries: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    /// the table function whose arguments are being bound, for `TableFunctionBinder`'s errors
+    table_function_name: String,
     /// how many bodies of system macros are being bound
     system_macro_depth: usize,
     /// the table function being bound was called as `system.main.f`: no macro shadows it
@@ -1034,7 +1036,7 @@ pub struct Binder<'a> {
     /// DELETE ... RETURNING: the statement gives the `rowid` of each row after its columns
     returning_row_id: bool,
     /// the aggregate of an outer query's columns that stopped this binder
-    pending_outer_aggregate: Option<ast::FunctionExpr>,
+    pending_outer_aggregate: Option<ast::Expr>,
 }
 
 /// What a recursive CTE is inside of its recursive part.
@@ -1116,6 +1118,7 @@ impl<'a> Binder<'a> {
             read_macros: Arc::default(),
             system_table_function: false,
             system_macro_depth: 0,
+            table_function_name: String::new(),
             row_subquery: false,
             bound_macros: Vec::new(),
             macro_arguments: Vec::new(),
@@ -1222,6 +1225,7 @@ impl<'a> Binder<'a> {
         binder.read_entries = self.read_entries.clone();
         binder.read_macros = self.read_macros.clone();
         binder.system_macro_depth = self.system_macro_depth;
+        binder.table_function_name = self.table_function_name.clone();
         binder.parameters = self.parameters.clone();
         binder.ctes = self.ctes.clone();
         binder.ctes_being_bound = self.ctes_being_bound.clone();

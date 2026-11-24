@@ -891,7 +891,12 @@ impl Binder<'_> {
         for child in &node.children {
             let mut binder = self.child_binder();
             binder.ctes = self.ctes.clone();
-            let bound = binder.bind_query_node(child)?;
+            let bound = binder.bind_query_node(child);
+            // an aggregate of an outer query's columns in a branch is the subquery's to move out
+            if bound.is_err() && binder.pending_outer_aggregate.is_some() {
+                self.pending_outer_aggregate = binder.pending_outer_aggregate.take();
+            }
+            let bound = bound?;
             self.next_table_index = binder.next_table_index;
             children.push(bound);
         }
@@ -1776,11 +1781,6 @@ impl Binder<'_> {
             None => None,
         };
         let windows = self.windows.take().expect("set above").windows;
-        if qualify.is_some() && windows.is_empty() {
-            return Err(binder_error(
-                "at least one window function must appear in the SELECT column or QUALIFY clause",
-            ));
-        }
         let aggregates = self.aggregates.take().expect("set above");
         let has_groups = !aggregates.groups.is_empty();
         let has_aggregates = !aggregates.aggregates.is_empty();
@@ -1803,6 +1803,12 @@ impl Binder<'_> {
                 }
                 return Err(binder_error(error));
             }
+        }
+        // after the columns outside the groups (`BindSelectNode`)
+        if qualify.is_some() && windows.is_empty() {
+            return Err(binder_error(
+                "at least one window function must appear in the SELECT column or QUALIFY clause",
+            ));
         }
         if has_groups || has_aggregates || having.is_some() {
             plan = LogicalOperator::new(
@@ -2417,6 +2423,83 @@ impl Binder<'_> {
     /// `BindContext::GenerateAllColumnExpressions` for one star.
     pub(super) fn generate_all_columns(&self, star: &ast::StarExpr) -> Result<Vec<Expr>> {
         let mut result = Vec::new();
+        // `t.*` of a table of a query around this one (a LATERAL's left side), or `s.*` of a STRUCT column of one:
+        // its columns or fields, as correlated columns, with the star's modifiers
+        if !star.relation_name.is_empty()
+            && !self
+                .bind_context
+                .bindings
+                .iter()
+                .any(|b| b.alias.eq_ignore_ascii_case(&star.relation_name))
+            && self.bind_context.matching_binding(&star.relation_name).ok().flatten().is_none()
+        {
+            let mut columns: Option<Vec<(String, Vec<String>)>> = None;
+            for context in self.outer_contexts.iter().rev() {
+                if let Some(binding) = context
+                    .bindings
+                    .iter()
+                    .find(|b| b.alias.eq_ignore_ascii_case(&star.relation_name))
+                {
+                    columns = Some(
+                        binding
+                            .names
+                            .iter()
+                            .map(|name| (name.clone(), vec![binding.alias.clone(), name.clone()]))
+                            .collect(),
+                    );
+                    break;
+                }
+                if let Some((binding, index)) = context.matching_binding(&star.relation_name)?
+                    && binding.types[index].id() == LogicalTypeId::Struct
+                {
+                    columns = Some(
+                        binding.types[index]
+                            .struct_children()
+                            .iter()
+                            .map(|(field, _)| {
+                                (
+                                    field.clone(),
+                                    vec![binding.alias.clone(), binding.names[index].clone(), field.clone()],
+                                )
+                            })
+                            .collect(),
+                    );
+                    break;
+                }
+            }
+            if let Some(columns) = columns {
+                let mut excluded = vec![false; star.exclude_list.len()];
+                for (name, path) in columns {
+                    if let Some(position) = star.exclude_list.iter().position(|e| e.column.eq_ignore_ascii_case(&name)) {
+                        excluded[position] = true;
+                        continue;
+                    }
+                    let mut column = Expr::column(path);
+                    column.alias = name.clone();
+                    if let Some((alias, replacement)) =
+                        star.replace_list.iter().find(|(n, _)| n.eq_ignore_ascii_case(&name))
+                    {
+                        column = replacement.clone();
+                        column.alias = alias.clone();
+                    }
+                    if let Some((_, alias)) = star
+                        .rename_list
+                        .iter()
+                        .find(|(n, _)| n.column.eq_ignore_ascii_case(&name))
+                    {
+                        column.alias = alias.clone();
+                    }
+                    result.push(column);
+                }
+                if let Some(position) = excluded.iter().position(|e| !e) {
+                    return Err(binder_error(format!(
+                        "Column \"{}\" in EXCLUDE list not found in FROM clause",
+                        star.exclude_list[position].column
+                    )));
+                }
+                return Ok(result);
+            }
+        }
         if self.bind_context.bindings.is_empty() {
             return Err(binder_error("SELECT * expression without FROM clause!"));
         }
@@ -2693,6 +2776,20 @@ impl Binder<'_> {
     }
 
     fn bind_unsampled_table_ref(&mut self, table_ref: &TableRef) -> Result<LogicalOperator> {
+        let TableRefKind::TableFunction { function, .. } = &table_ref.kind else {
+            return self.bind_unsampled_table_ref_inner(table_ref);
+        };
+        let name = match &function.kind {
+            ExprKind::Function(call) => call.name.name.to_lowercase(),
+            _ => String::new(),
+        };
+        let saved = std::mem::replace(&mut self.table_function_name, name);
+        let bound = self.bind_unsampled_table_ref_inner(table_ref);
+        self.table_function_name = saved;
+        bound
+    }
+
+    fn bind_unsampled_table_ref_inner(&mut self, table_ref: &TableRef) -> Result<LogicalOperator> {
         match &table_ref.kind {
             TableRefKind::Empty => {
                 let table_index = self.generate_table_index();

@@ -131,6 +131,9 @@ struct ParsedOperator {
     name: String,
     /// `Some(is_any)` for `op ANY` / `op ALL`.
     any_all: Option<bool>,
+    /// the right side is written as a subquery, `op ANY (SELECT ...)` (`AnyAllSubqueryTail`), not an expression that
+    /// is one, such as `ARRAY(SELECT ...)`
+    subquery_syntax: bool,
 }
 
 #[derive(Default)]
@@ -1072,9 +1075,23 @@ impl<'g> Transformer<'g> {
         let op = if self.name(op_node) == "AnyAllParsedOperator" {
             let any_all = self.req(op_node, "AnyAllOperator")?;
             let is_any = self.name(self.alt(self.req(any_all, "AnyOrAll")?)?) == "SubqueryAny";
+            let right = self.req(node, "BitwiseExpression")?;
             ParsedOperator {
                 name: Self::text(self.req(any_all, "AnyOperatorLiteral")?),
                 any_all: Some(is_any),
+                subquery_syntax: {
+                    // `((SELECT ...))` too: parentheses, then a query
+                    let mut tokens = Vec::new();
+                    leading_tokens(right, 16, &mut tokens);
+                    let opened = tokens.iter().take_while(|t| *t == "(").count();
+                    opened > 0
+                        && tokens.get(opened).is_some_and(|keyword| {
+                            matches!(
+                                keyword.to_ascii_uppercase().as_str(),
+                                "SELECT" | "WITH" | "FROM" | "VALUES" | "TABLE" | "PIVOT" | "UNPIVOT"
+                            )
+                        })
+                },
             }
         } else {
             let named = self.alt(op_node)?;
@@ -1083,7 +1100,11 @@ impl<'g> Transformer<'g> {
             } else {
                 Self::text(named)
             };
-            ParsedOperator { name, any_all: None }
+            ParsedOperator {
+                name,
+                any_all: None,
+                subquery_syntax: false,
+            }
         };
         Ok((op, self.expr(self.req(node, "BitwiseExpression")?)?))
     }
@@ -3274,7 +3295,10 @@ fn apply_other_operators(mut expr: Expr, tails: Vec<(ParsedOperator, Expr)>, reg
             continue;
         };
         let comparison = ComparisonOp::from_operator(&op.name);
-        if let ExprKind::Subquery { subquery: s, .. } = right.kind {
+        if let ExprKind::Subquery { subquery: s, .. } = &right.kind
+            && op.subquery_syntax
+        {
+            let s = s.clone();
             let Some(cmp) = comparison else {
                 return Err(parser_error(
                     "ANY and ALL operators require one of =,<>,>,<,>=,<= comparisons!",
@@ -3811,4 +3835,32 @@ fn group_by_unfolding(item: GroupByItem, result: &mut GroupByNode) -> Result<Vec
         }
     }
     Ok(sets)
+}
+
+/// The texts of the first `count` tokens a parse node spans.
+fn leading_tokens(node: &ParseNode, count: usize, out: &mut Vec<String>) {
+    if out.len() >= count {
+        return;
+    }
+    match node {
+        ParseNode::Terminal { value, .. } => match value {
+            TerminalValue::Literal(t) | TerminalValue::Identifier(t) | TerminalValue::Number(t) | TerminalValue::Operator(t) => {
+                out.push(t.clone())
+            }
+            TerminalValue::String { value, .. } => out.push(value.clone()),
+            TerminalValue::EndOfInput => {}
+        },
+        ParseNode::List(children) | ParseNode::Repeat(children) => {
+            for child in children {
+                leading_tokens(child, count, out);
+            }
+        }
+        ParseNode::Choice { child, .. } => leading_tokens(child, count, out),
+        ParseNode::Rule { child, .. } => leading_tokens(child, count, out),
+        ParseNode::Optional(child) => {
+            if let Some(child) = child {
+                leading_tokens(child, count, out);
+            }
+        }
+    }
 }

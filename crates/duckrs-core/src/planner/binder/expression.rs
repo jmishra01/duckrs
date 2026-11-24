@@ -31,7 +31,7 @@ use duckrs_parser::ast::sql_quoted_identifier;
 use duckrs_parser::ast::{
     CastType, ComparisonOp, Expr, ExprKind, FunctionExpr, Literal, LiteralKind, OperatorType, SubqueryType, TypeExpr,
 };
-use duckrs_parser::transformer::{visit_expr_mut, visit_query_node_exprs_mut};
+use duckrs_parser::transformer::visit_expr_mut;
 use parking_lot::Mutex;
 use std::sync::Arc;
 
@@ -301,6 +301,20 @@ pub(super) fn sql_value_function(name: &str) -> Option<&'static str> {
         _ => None,
     }
 }
+
+/// Every expression of a query, its set operations and WITH clause included, and the same in the queries of its
+/// subqueries.
+fn visit_query_and_subqueries(node: &mut ast::QueryNode, f: &mut dyn FnMut(&mut Expr)) {
+    duckrs_parser::transformer::visit_all_query_node_exprs_mut(node, &mut |e| {
+        f(e);
+        if let ExprKind::Subquery { subquery, .. } = &mut e.kind {
+            visit_query_and_subqueries(&mut subquery.node, f);
+        }
+    });
+}
+
+/// What an aggregate of an outer query's columns is, until the subquery around it moves it out.
+pub(super) const OUTER_AGGREGATE: &str = "aggregates of the columns of an outer query";
 
 impl Binder<'_> {
     /// `Binder::BindLogicalType` for the types slice 1 executes: the scalar types without
@@ -692,10 +706,10 @@ impl Binder<'_> {
 
     /// Whether an aggregate over `function`'s arguments belongs to a query around this one: its
     /// arguments name columns, and all of them are that query's.
-    fn aggregate_of_outer_query(&self, function: &FunctionExpr) -> bool {
+    fn aggregate_of_outer_query(&self, arguments: &[Expr]) -> bool {
         let (mut own, mut outer) = (false, false);
-        for argument in &function.args {
-            visit_expr_mut(&mut argument.expr.clone(), &mut |e| {
+        for argument in arguments {
+            visit_expr_mut(&mut argument.clone(), &mut |e| {
                 // the parameters of a lambda in the arguments are none of the query's columns
                 if let ExprKind::Lambda { lhs, expr, .. } = &mut e.kind {
                     let mut parameters = Vec::new();
@@ -714,9 +728,15 @@ impl Binder<'_> {
                     **lhs = Expr::from(ExprKind::Default);
                 }
                 if let ExprKind::ColumnRef(names) = &e.kind {
-                    if self.bind_context.bind_column_ref(names).is_ok() {
+                    // a USING column reads as ambiguous, and is still that scope's
+                    let has = |context: &super::BindContext| {
+                        context
+                            .bind_column_ref(names)
+                            .map_or_else(|error| error.message.starts_with("Ambiguous"), |_| true)
+                    };
+                    if has(&self.bind_context) {
                         own = true;
-                    } else if self.outer_contexts.iter().any(|c| c.bind_column_ref(names).is_ok()) {
+                    } else if self.outer_contexts.iter().any(has) {
                         outer = true;
                     }
                 }
@@ -741,17 +761,38 @@ impl Binder<'_> {
             .find_map(|context| context.struct_field_start(names))
     }
 
-    fn bind_outer_column(&mut self, names: &[String]) -> Option<BoundExpr> {
+    fn bind_outer_column(&mut self, names: &[String]) -> Result<Option<BoundExpr>> {
         for context in self.outer_contexts.iter().rev() {
-            let Ok((binding, ty, name)) = context.bind_column_ref(names) else {
-                continue;
+            let (binding, ty, name) = match context.bind_column_ref(names) {
+                Ok(found) => found,
+                // a name two tables of that scope have is an error there too, unless they are joined USING it: then
+                // it is the column of the table that always has it
+                Err(error) if error.message.starts_with("Ambiguous") => {
+                    let set = match names {
+                        [column] => context.using_binding(column)?.cloned(),
+                        _ => None,
+                    };
+                    let Some(set) = set else {
+                        return Err(error);
+                    };
+                    match &set.primary {
+                        Some(alias) => match context.bind_column_ref(&[alias.clone(), names[0].clone()]) {
+                            Ok(found) => found,
+                            Err(_) => return Err(error),
+                        },
+                        // a FULL join's USING column is the COALESCE of its tables' columns
+                        None => {
+                            let expr = set.expression(&names[0]);
+                            return self.bind_expression(&expr).map(Some);
+                        }
+                    }
+                }
+                Err(_) => continue,
             };
-            let alias = context
-                .bindings
-                .iter()
-                .find(|b| b.table_index == binding.table_index)?
-                .alias
-                .clone();
+            let Some(binding_of) = context.bindings.iter().find(|b| b.table_index == binding.table_index) else {
+                return Ok(None);
+            };
+            let alias = binding_of.alias.clone();
             let mut correlated = self.correlated.lock();
             if !correlated.iter().any(|c| c.binding == binding) {
                 correlated.push(CorrelatedColumn {
@@ -761,9 +802,9 @@ impl Binder<'_> {
             }
             let mut expr = BoundExpr::column_ref(binding, ty, name);
             expr.kind = BoundExprKind::ColumnRef { binding, depth: 1 };
-            return Some(expr);
+            return Ok(Some(expr));
         }
-        None
+        Ok(None)
     }
 
     /// A name a subquery could not find may be a correlated column, which is a missing feature
@@ -803,11 +844,26 @@ impl Binder<'_> {
         if group_expressions && let Some(state) = self.aggregates.as_ref() {
             let keys: Vec<Expr> = state.group_map.iter().map(|(key, _)| key.clone()).collect();
             let mut found: Vec<Expr> = Vec::new();
-            visit_query_node_exprs_mut(&mut rewritten.node, &mut |e| {
-                if matches!(e.kind, ExprKind::ColumnRef(_) | ExprKind::Constant(_)) {
+            // the subqueries in the subquery too: a group stands for itself at any depth
+            visit_query_and_subqueries(&mut rewritten.node, &mut |e| {
+                // an alias of this query's select list that is a group (`k IN (SELECT ... + k)`)
+                let aliased = match &e.kind {
+                    ExprKind::ColumnRef(names)
+                        if names.len() == 1 && self.bind_context.bind_column_ref(names).is_err() =>
+                    {
+                        self.alias_fallback
+                            .iter()
+                            .find(|(alias, _)| alias.eq_ignore_ascii_case(&names[0]))
+                            .map(|(_, aliased)| aliased.clone())
+                            // a USING column of a FULL join, which is the COALESCE it groups by
+                            .or_else(|| self.bind_context.using_expression(&names[0]).ok().flatten())
+                    }
+                    _ => None,
+                };
+                if aliased.is_none() && matches!(e.kind, ExprKind::ColumnRef(_) | ExprKind::Constant(_)) {
                     return;
                 }
-                let mut qualified = e.clone();
+                let mut qualified = aliased.unwrap_or_else(|| e.clone());
                 self.qualify_column_names(&mut qualified);
                 let qualified = without_aliases(&qualified);
                 if let Some(key) = keys.iter().find(|key| **key == qualified) {
@@ -858,21 +914,38 @@ impl Binder<'_> {
             match binder.bind_select_statement(&rewritten) {
                 Ok(bound) => break (binder, bound),
                 Err(error) => {
-                    let Some(function) = binder.pending_outer_aggregate.take() else {
+                    let Some(expr) = binder.pending_outer_aggregate.take() else {
                         return Err(self.correlated_error(error));
                     };
                     self.next_table_index = binder.next_table_index;
-                    let expr = Expr::from(ExprKind::Function(function));
                     let bound = self.bind_expression(&expr)?;
                     let name = format!("__outer_aggregate_{}", outer_aggregates.len());
                     let ty = bound.return_type.clone();
-                    visit_query_node_exprs_mut(&mut rewritten.node, &mut |e| {
+                    let mut replaced = false;
+                    // where it is, in the subquery or one of its own
+                    visit_query_and_subqueries(&mut rewritten.node, &mut |e| {
                         if e.kind == expr.kind {
                             let alias = std::mem::take(&mut e.alias);
                             *e = Expr::column(vec![name.clone()]);
                             e.alias = alias;
+                            replaced = true;
                         }
                     });
+                    // the aggregate came through an alias of this query (`HavingBinder`): it can't be moved out, and
+                    // binding again would find it again
+                    if !replaced {
+                        let alias = self
+                            .alias_fallback
+                            .iter()
+                            .find(|(_, aliased)| aliased.kind == expr.kind)
+                            .map(|(alias, _)| alias.clone());
+                        return Err(match alias {
+                            Some(alias) => binder_error(format!(
+                                "Having clause cannot reference alias \"{alias}\" in correlated subquery"
+                            )),
+                            None => self.correlated_error(error),
+                        });
+                    }
                     outer_aggregates.push((name, expr, ty));
                 }
             }
@@ -897,6 +970,19 @@ impl Binder<'_> {
                 Ok(bound) => correlated.push(bound),
                 Err(error) => {
                     self.alias_fallback.truncate(fallback_size);
+                    // in HAVING a column that is no group is an error at once: try again with the expressions of
+                    // the groups, as the select list does below
+                    if !group_expressions
+                        && error.message.contains("must appear in the GROUP BY clause")
+                        && self.aggregates.as_ref().is_some_and(|state| !state.group_map.is_empty())
+                    {
+                        self.subquery_group_expressions = true;
+                        let retried = self.bind_subquery(subquery, subquery_type, parsed_child, comparison);
+                        self.subquery_group_expressions = false;
+                        if retried.is_ok() {
+                            return retried;
+                        }
+                    }
                     return Err(error);
                 }
             }
@@ -1452,7 +1538,21 @@ impl Binder<'_> {
         let (table, qualification) = names.split_last()?;
         let schema =
             (!qualification.is_empty()).then(|| qualification.join(&crate::catalog::SCHEMA_PATH_SEPARATOR.to_string()));
-        let bindings = self.bind_context.bindings_of(schema.as_deref(), table).ok()?;
+        let own = self.bind_context.bindings_of(schema.as_deref(), table).ok();
+        // a table of a query around this one, when no scope has a column of that name (a LATERAL's left side)
+        let outer = || {
+            if schema.is_some() || self.outer_contexts.iter().any(|c| c.bind_column_ref(names).is_ok()) {
+                return None;
+            }
+            self.outer_contexts
+                .iter()
+                .rev()
+                .find_map(|context| context.bindings_of(None, table).ok())
+        };
+        let bindings = match own {
+            Some(bindings) => bindings,
+            None => outer()?,
+        };
         let [binding] = bindings.as_slice() else {
             return None;
         };
@@ -1613,6 +1713,18 @@ impl Binder<'_> {
                 return Ok(self.bind_lambda_parameter(names)?.expect("just checked"));
             }
             ExprKind::ColumnRef(names) if self.table_function_argument => {
+                // `TableFunctionBinder::BindColumnReference`: a column a query around binds is a lateral parameter,
+                // which a table function does not take; a name no scope binds is its text
+                if !self.table_function_name.is_empty()
+                    && self.outer_contexts.iter().any(|c| c.bind_column_ref(names).is_ok())
+                {
+                    return Err(binder_error(format!(
+                        "Table function \"{}\" does not support lateral join column parameters - cannot use column \
+                         \"{}\" in this context.\nThe function only supports literals as parameters.",
+                        self.table_function_name,
+                        names.join(".")
+                    )));
+                }
                 BoundExpr::constant(Value::varchar(names.join(".")))
             }
             ExprKind::ColumnRef(names) if self.struct_field_start(names).is_some() => {
@@ -1716,7 +1828,7 @@ impl Binder<'_> {
                             .alias_fallback
                             .iter()
                             .any(|(a, _)| a.eq_ignore_ascii_case(&names[0])));
-                if !is_own && let Some(outer) = self.bind_outer_column(names) {
+                if !is_own && let Some(outer) = self.bind_outer_column(names)? {
                     return Ok(outer);
                 }
                 if mode == Some(ColumnMode::Having) {
@@ -1740,6 +1852,18 @@ impl Binder<'_> {
                             if let Some(bound) = self.try_bind_alias_reference(column)? {
                                 return Ok(bound);
                             }
+                            // `BindContext::BindColumn` looking outward: a query without a FROM clause names the
+                            // columns of the nearest query around it that has some
+                            let error = match self.outer_contexts.iter().rev().find(|c| !c.bindings.is_empty()) {
+                                Some(outer) if self.bind_context.bindings.is_empty() => binder_error(format!(
+                                    "Referenced column \"{column}\" not found in FROM clause!{}",
+                                    duckrs_common::string_util::candidates_message(
+                                        &outer.similar_bindings(column),
+                                        "Candidate bindings"
+                                    )
+                                )),
+                                _ => error,
+                            };
                             return Err(self.lateral_error(names, error));
                         }
                     },
@@ -1917,6 +2041,14 @@ impl Binder<'_> {
                     .map(|c| Ok(self.bind_expression(c)?.cast_to(&LogicalType::BOOLEAN, false)))
                     .collect::<Result<Vec<_>>>()?;
                 BoundExpr::new(BoundExprKind::Conjunction { and: *and, children }, LogicalType::BOOLEAN)
+            }
+            // `GROUPING` of the groups of a query around this one is that query's (`BindGroupingFunction`)
+            ExprKind::Operator {
+                op: OperatorType::Grouping,
+                children,
+            } if self.aggregate_of_outer_query(children) => {
+                self.pending_outer_aggregate = Some(expr.clone());
+                return Err(crate::unported(OUTER_AGGREGATE));
             }
             ExprKind::Operator {
                 op: OperatorType::Grouping,
@@ -3341,9 +3473,9 @@ impl Binder<'_> {
     }
 
     fn bind_aggregate_call(&mut self, function: &FunctionExpr) -> Result<BoundExpr> {
-        if self.aggregate_of_outer_query(function) {
-            self.pending_outer_aggregate = Some(function.clone());
-            return Err(crate::unported("aggregates of the columns of an outer query"));
+        if self.aggregate_of_outer_query(&function.args.iter().map(|a| a.expr.clone()).collect::<Vec<_>>()) {
+            self.pending_outer_aggregate = Some(Expr::from(ExprKind::Function(function.clone())));
+            return Err(crate::unported(OUTER_AGGREGATE));
         }
         if self.inside_try {
             return Err(binder_error("aggregates are not allowed inside the TRY expression"));
