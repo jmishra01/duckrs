@@ -911,6 +911,15 @@ fn scan_file_chunk(scan: &CsvScanData, state: &mut CsvScanState) -> Result<Optio
             let machine = Machine::new(file.dialect.clone(), bom);
             let rows = usize::from(file.header) + file.skip;
             let begin = skip_rows(&data, &machine.dialect, &machine.transitions(), bom, rows);
+            // `CSVError::LineSizeError`: the header is a line too
+            if file.header {
+                let header_start = skip_rows(&data, &machine.dialect, &machine.transitions(), bom, rows - 1);
+                let header = &data[header_start..begin.max(header_start)];
+                let size = header.iter().rposition(|&c| c != b'\n' && c != b'\r').map_or(0, |at| at + 1);
+                if size > scan.options.maximum_line_size() {
+                    return Err(line_size_error(&scan.options, size));
+                }
+            }
             // rows to skip past the first buffer: the file is read whole
             if state
                 .stream

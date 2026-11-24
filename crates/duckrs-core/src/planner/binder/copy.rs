@@ -812,6 +812,16 @@ impl Binder<'_> {
                 result.user_arguments.push((option, value_literal(&value)?));
             }
         }
+        // `user_defined_parameters` is an ordered map: by name, and a name once, with its last value
+        result.user_arguments.sort_by(|a, b| a.0.cmp(&b.0));
+        result.user_arguments.dedup_by(|later, earlier| {
+            if later.0 == earlier.0 {
+                std::mem::swap(&mut earlier.1, &mut later.1);
+                true
+            } else {
+                false
+            }
+        });
         // `VerifyTypeListsMatch`: with `columns`, the types of `types` must be those of the columns
         if let Some(columns) = &result.columns {
             let given: Vec<LogicalType> = if result.types_by_position.is_empty() {
@@ -1357,7 +1367,9 @@ impl Binder<'_> {
         };
         let (scans, errors) = (table(scans_name), table(errors_name));
         let (scans_ok, errors_ok) = (ours(&scans, "file_path"), ours(&errors, "error_message"));
-        if !scans_ok || !errors_ok {
+        // `CSVRejectsTable::GetOrCreate`: tables of these names are reused only as the pair they were made as
+        let partial = scans.is_some() != errors.is_some();
+        if !scans_ok || !errors_ok || partial {
             let mut message = String::new();
             if scans.is_some() {
                 message += &format!("Reject Scan Table name \"{scans_name}\" is already in use. ");
