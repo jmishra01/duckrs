@@ -64,12 +64,15 @@ pub fn top_n(op: &mut LogicalOperator) {
         let K::Order { orders } = below.kind else {
             unreachable!("checked")
         };
-        let mut result = LogicalOperator::new(K::TopN {
+        let mut result = LogicalOperator::new(
+            K::TopN {
                 orders,
                 limit,
                 offset,
                 dynamic: None,
-            }, below.children);
+            },
+            below.children,
+        );
         while let Some(mut projection) = projections.pop() {
             projection.children.push(result);
             result = projection;

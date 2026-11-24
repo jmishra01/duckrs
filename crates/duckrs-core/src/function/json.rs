@@ -727,7 +727,11 @@ pub fn transform_with(json: &Json, ty: &LogicalType, strict: bool, formats: &For
                 values.push(Value::new(entry.clone(), ValueData::Struct(vec![key, item]))?);
             }
             if let Some(reason) = invalid_reason {
-                return if strict { Err(invalid(reason.to_string())) } else { Ok(Value::null(ty.clone())) };
+                return if strict {
+                    Err(invalid(reason.to_string()))
+                } else {
+                    Ok(Value::null(ty.clone()))
+                };
             }
             Value::new(ty.clone(), ValueData::List(values))
         }
@@ -781,7 +785,10 @@ pub fn transform_with(json: &Json, ty: &LogicalType, strict: bool, formats: &For
                 }
                 text = format!("{}...", &text[..end]);
             }
-            Err(invalid(format!("Expected {expected}, but got {}: {text}", json.type_name())))
+            Err(invalid(format!(
+                "Expected {expected}, but got {}: {text}",
+                json.type_name()
+            )))
         }
         // `TransformArrayToTuple`: the items by position, missing ones NULL, extra ones ignored
         (LogicalTypeId::Tuple, Json::Array(items)) => {
@@ -1193,9 +1200,7 @@ fn structure_type(json: &Json, parse_type: &dyn Fn(&str) -> Result<LogicalType>)
         Json::Str(name) => parse_type(name),
         Json::Array(items) => match items.as_slice() {
             [item] => Ok(LogicalType::list(structure_type(item, parse_type)?)),
-            _ => Err(binder_error(
-                "Too many values in array of JSON structure",
-            )),
+            _ => Err(binder_error("Too many values in array of JSON structure")),
         },
         Json::Object(items) if !items.is_empty() => {
             // `StructureToTypeObject`: STRUCT field names are case-insensitive

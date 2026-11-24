@@ -1042,7 +1042,9 @@ impl<'a> Replay<'a> {
             } => {
                 self.create_sequence(&schema, &name, data)?;
                 if comment.is_some() {
-                    self.catalog.schema_for(Some(&schema))?.set_sequence_comment(&name, comment);
+                    self.catalog
+                        .schema_for(Some(&schema))?
+                        .set_sequence_comment(&name, comment);
                 }
             }
             StoredEntry::Type {

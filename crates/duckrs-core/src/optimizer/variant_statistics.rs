@@ -143,7 +143,13 @@ fn shredding_of(ty: &LogicalType, stats: &Stats) -> Option<(LogicalType, Stats)>
         }
         LogicalTypeId::Map | LogicalTypeId::Union | LogicalTypeId::Enum | LogicalTypeId::Variant => None,
         _ if ty.is_nested() || crate::function::json::is_json_type(ty) => None,
-        _ => Some((ty.clone(), Stats { variant: None, ..stats.clone() })),
+        _ => Some((
+            ty.clone(),
+            Stats {
+                variant: None,
+                ..stats.clone()
+            },
+        )),
     }
 }
 
@@ -311,7 +317,10 @@ pub(super) fn extract(stats: &Stats, key: &Value) -> Option<Stats> {
             return None;
         }
         let name = key.try_to_string().ok()?;
-        let at = typed_type.struct_children().iter().position(|(field, _)| *field == name)?;
+        let at = typed_type
+            .struct_children()
+            .iter()
+            .position(|(field, _)| *field == name)?;
         (typed_type.struct_children()[at].1.clone(), child(&typed_stats, at))
     };
     if !fully_shredded(&field_type, &field_stats) {

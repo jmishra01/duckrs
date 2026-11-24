@@ -159,7 +159,11 @@ fn split_projections(plan: &mut LogicalOperator, statistics: &mut Option<&mut su
 
 /// The outputs of projections that are a STRUCT column of their child as it is.
 fn collect_projection_candidates(op: &LogicalOperator, candidates: &mut HashMap<ColumnBinding, LogicalType>) {
-    if let K::Projection { table_index, expressions } = &op.kind {
+    if let K::Projection {
+        table_index,
+        expressions,
+    } = &op.kind
+    {
         for (position, expr) in expressions.iter().enumerate() {
             if matches!(expr.kind, BoundExprKind::ColumnRef { depth: 0, .. })
                 && expr.return_type.id() == LogicalTypeId::Struct
@@ -180,7 +184,11 @@ fn split_outputs(
     pushed: &mut HashMap<ColumnBinding, Vec<(Path, usize)>>,
     statistics: &mut Option<&mut super::statistics::StatisticsMap>,
 ) {
-    if let K::Projection { table_index, expressions } = &mut op.kind {
+    if let K::Projection {
+        table_index,
+        expressions,
+    } = &mut op.kind
+    {
         let table_index = *table_index;
         for position in 0..expressions.len() {
             let binding = ColumnBinding::new(table_index, position);
@@ -262,7 +270,9 @@ fn collect_candidates(op: &LogicalOperator, candidates: &mut HashMap<ColumnBindi
             let Some(column) = table.columns.get(column_ids[position]) else {
                 continue;
             };
-            if matches!(column.ty.id(), LogicalTypeId::Struct | LogicalTypeId::Variant) && !table.is_generated(&column.name) {
+            if matches!(column.ty.id(), LogicalTypeId::Struct | LogicalTypeId::Variant)
+                && !table.is_generated(&column.name)
+            {
                 candidates.insert(ColumnBinding::new(*table_index, position), column.ty.clone());
             }
         }
@@ -364,9 +374,9 @@ fn pass_fields(
         expressions,
     } = &mut op.kind
         && *table_index == alias.table_index
-        && expressions.get(alias.column_index).is_some_and(
-            |e| matches!(&e.kind, BoundExprKind::ColumnRef { binding, depth: 0 } if *binding == source),
-        )
+        && expressions
+            .get(alias.column_index)
+            .is_some_and(|e| matches!(&e.kind, BoundExprKind::ColumnRef { binding, depth: 0 } if *binding == source))
     {
         let column_type = &candidates[&source];
         let mut added = Vec::with_capacity(paths.len());
@@ -614,8 +624,10 @@ fn add_positions(
                 continue;
             };
             let column_type = &candidates[&binding];
-            let built: Option<Vec<(BoundExpr, Vec<String>)>> =
-                paths.iter().map(|(path, _)| path_expression(column_type, path)).collect();
+            let built: Option<Vec<(BoundExpr, Vec<String>)>> = paths
+                .iter()
+                .map(|(path, _)| path_expression(column_type, path))
+                .collect();
             let Some(built) = built else {
                 pushed.remove(&binding);
                 continue;

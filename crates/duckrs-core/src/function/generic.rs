@@ -1235,8 +1235,7 @@ pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
             };
             // default NULL handling: a NULL constant argument makes the call a NULL constant
             if children.iter().any(|c| {
-                c.is_foldable()
-                    && crate::execution::expression_executor::evaluate_scalar(c).is_ok_and(|v| v.is_null())
+                c.is_foldable() && crate::execution::expression_executor::evaluate_scalar(c).is_ok_and(|v| v.is_null())
             }) {
                 return Ok(BoundExpr::constant(Value::null(LogicalType::VARCHAR)));
             }

@@ -143,7 +143,12 @@ fn aggregate(mut op: LogicalOperator, next: &mut usize, remaps: &mut Vec<Remap>)
     }
     let aggregate_types: Vec<LogicalType> = aggregates.iter().map(|a| a.return_type.clone()).collect();
     let group_map: HashMap<ColumnBinding, ColumnBinding> = (0..original.len())
-        .map(|at| (ColumnBinding::new(group_index, at), ColumnBinding::new(group_index, to_post[at])))
+        .map(|at| {
+            (
+                ColumnBinding::new(group_index, at),
+                ColumnBinding::new(group_index, to_post[at]),
+            )
+        })
         .collect();
     if !removals.iter().any(|r| r.derived) {
         remaps.push((group_map, None));
@@ -156,11 +161,19 @@ fn aggregate(mut op: LogicalOperator, next: &mut usize, remaps: &mut Vec<Remap>)
     let mut remap = HashMap::new();
     for (at, group) in original.iter().enumerate() {
         let post = ColumnBinding::new(group_index, to_post[at]);
-        expressions.push(BoundExpr::column_ref(post, group.return_type.clone(), group.alias.clone()));
+        expressions.push(BoundExpr::column_ref(
+            post,
+            group.return_type.clone(),
+            group.alias.clone(),
+        ));
         remap.insert(ColumnBinding::new(group_index, at), ColumnBinding::new(projection, at));
     }
     for (k, ty) in aggregate_types.iter().enumerate() {
-        expressions.push(BoundExpr::column_ref(ColumnBinding::new(aggregate_index, k), ty.clone(), String::new()));
+        expressions.push(BoundExpr::column_ref(
+            ColumnBinding::new(aggregate_index, k),
+            ty.clone(),
+            String::new(),
+        ));
         remap.insert(
             ColumnBinding::new(aggregate_index, k),
             ColumnBinding::new(projection, original.len() + k),

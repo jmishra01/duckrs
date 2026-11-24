@@ -42,7 +42,10 @@ fn is_functionally_dependent(expr: &BoundExpr, dependencies: &[&BoundExpr]) -> b
         return true;
     }
     let children = expr.children();
-    !children.is_empty() && children.into_iter().all(|child| is_functionally_dependent(child, dependencies))
+    !children.is_empty()
+        && children
+            .into_iter()
+            .all(|child| is_functionally_dependent(child, dependencies))
 }
 
 /// The unique keys of `op`'s rows, after simplifying the sorts at and below it.
@@ -78,7 +81,9 @@ fn visit(op: &mut LogicalOperator) -> Vec<Key> {
             let mut forwarded: HashMap<ColumnBinding, ColumnBinding> = HashMap::new();
             for (at, expr) in expressions.iter().enumerate() {
                 if let BoundExprKind::ColumnRef { binding, depth: 0 } = &expr.kind {
-                    forwarded.entry(*binding).or_insert(ColumnBinding::new(*table_index, at));
+                    forwarded
+                        .entry(*binding)
+                        .or_insert(ColumnBinding::new(*table_index, at));
                 }
             }
             keys.iter()
@@ -114,7 +119,9 @@ fn visit(op: &mut LogicalOperator) -> Vec<Key> {
         }
         K::Distinct { .. } => {
             visit(&mut op.children[0]);
-            let K::Distinct { targets, .. } = &op.kind else { unreachable!() };
+            let K::Distinct { targets, .. } = &op.kind else {
+                unreachable!()
+            };
             let key: Option<Key> = targets
                 .iter()
                 .map(|target| match &target.kind {
@@ -140,10 +147,7 @@ fn visit(op: &mut LogicalOperator) -> Vec<Key> {
 /// `VisitLogicalGet`: the primary keys, and the UNIQUE keys of NOT NULL columns, that the scan
 /// outputs all columns of.
 fn get_keys(op: &LogicalOperator) -> Vec<Key> {
-    let K::Get {
-        table, column_ids, ..
-    } = &op.kind
-    else {
+    let K::Get { table, column_ids, .. } = &op.kind else {
         return Vec::new();
     };
     if column_ids.is_empty() {
@@ -163,7 +167,14 @@ fn get_keys(op: &LogicalOperator) -> Vec<Key> {
             TableConstraint::NotNull(column) => Some(*column),
             _ => None,
         })
-        .chain(table.columns.iter().enumerate().filter(|(_, c)| c.not_null).map(|(i, _)| i))
+        .chain(
+            table
+                .columns
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.not_null)
+                .map(|(i, _)| i),
+        )
         .collect();
     let mut keys = Vec::new();
     for constraint in &table.constraints {
@@ -257,9 +268,8 @@ fn visit_partitioning(partitions: &mut Vec<BoundExpr>, keys: &[Key]) {
         }
     }
     if let Some(key) = smallest {
-        partitions.retain(|p| {
-            matches!(&p.kind, BoundExprKind::ColumnRef { binding, depth: 0 } if key.contains(binding))
-        });
+        partitions
+            .retain(|p| matches!(&p.kind, BoundExprKind::ColumnRef { binding, depth: 0 } if key.contains(binding)));
     }
 }
 

@@ -295,7 +295,11 @@ fn flatten_exists(
     let comparison = BoundExpr::new(
         BoundExprKind::Comparison {
             op: ComparisonOp::Equal,
-            left: Box::new(BoundExpr::column_ref(ColumnBinding::new(aggregate_index, 0), count_type, "")),
+            left: Box::new(BoundExpr::column_ref(
+                ColumnBinding::new(aggregate_index, 0),
+                count_type,
+                "",
+            )),
             right: Box::new(BoundExpr::constant(Value::bigint(1))),
         },
         LogicalType::BOOLEAN,

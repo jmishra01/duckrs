@@ -57,7 +57,10 @@ fn is_functionally_dependent(expr: &BoundExpr, dependencies: &[&BoundExpr]) -> b
         return true;
     }
     let children = expr.children();
-    !children.is_empty() && children.into_iter().all(|child| is_functionally_dependent(child, dependencies))
+    !children.is_empty()
+        && children
+            .into_iter()
+            .all(|child| is_functionally_dependent(child, dependencies))
 }
 
 fn is_order_dependent(window: &BoundWindow) -> bool {
@@ -72,7 +75,10 @@ fn frame_order_is_redundant(window: &BoundWindow) -> bool {
         return false;
     }
     let orders: Vec<&BoundExpr> = window.arg_orders.iter().map(|(e, _)| e).collect();
-    window.children.iter().all(|arg| is_functionally_dependent(arg, &orders))
+    window
+        .children
+        .iter()
+        .all(|arg| is_functionally_dependent(arg, &orders))
 }
 
 /// `IsOrderableDistinctAggregate`.
@@ -199,8 +205,11 @@ fn visit(op: &mut LogicalOperator, next: &mut usize, replacements: &mut HashMap<
     let original = op.children.pop().expect("a window has a child");
     // the copy has the bindings of the original, under new table indexes
     let copy = deep_copy(&original, next);
-    let map: HashMap<ColumnBinding, ColumnBinding> =
-        original.column_bindings().into_iter().zip(copy.column_bindings()).collect();
+    let map: HashMap<ColumnBinding, ColumnBinding> = original
+        .column_bindings()
+        .into_iter()
+        .zip(copy.column_bindings())
+        .collect();
     let rebind = |mut expr: BoundExpr| {
         expr.walk_mut(&mut |e| {
             if let crate::planner::expression::BoundExprKind::ColumnRef { binding, depth: 0 } = &mut e.kind
@@ -264,6 +273,9 @@ fn visit(op: &mut LogicalOperator, next: &mut usize, replacements: &mut HashMap<
         )
     };
     for i in 0..count {
-        replacements.insert(ColumnBinding::new(window_index, i), ColumnBinding::new(aggregate_index, i));
+        replacements.insert(
+            ColumnBinding::new(window_index, i),
+            ColumnBinding::new(aggregate_index, i),
+        );
     }
 }

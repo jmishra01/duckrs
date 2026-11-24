@@ -48,9 +48,7 @@ fn find_candidates(op: &LogicalOperator, cte: usize, info: &mut Info) {
         K::Filter { expressions } => {
             if let [child] = op.children.as_slice()
                 && let K::CteRef {
-                    table_index,
-                    cte_index,
-                    ..
+                    table_index, cte_index, ..
                 } = child.kind
             {
                 if cte_index == cte {

@@ -229,9 +229,14 @@ impl Binder<'_> {
             return Ok(None);
         }
         let search_first = self.search_schema.as_deref();
-        let found = match self.catalog.get_macro_in(schema, search_first, &name.name, table_macro)? {
+        let found = match self
+            .catalog
+            .get_macro_in(schema, search_first, &name.name, table_macro)?
+        {
             Some(found) => Some(found),
-            None => self.catalog.get_macro_in(schema, search_first, &name.name, !table_macro)?,
+            None => self
+                .catalog
+                .get_macro_in(schema, search_first, &name.name, !table_macro)?,
         };
         Ok(found.map(|(schema, entry)| {
             let mut read = self.read_macros.lock().expect("not poisoned");

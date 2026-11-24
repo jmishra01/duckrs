@@ -212,12 +212,7 @@ fn visit(op: &mut LogicalOperator, next: &mut usize, replacements: &mut Replacem
 }
 
 /// The rewrite of `filter -> projections -> window` into `projection -> [unnest ->] aggregate`.
-fn rewrite(
-    op: &mut LogicalOperator,
-    limit: i64,
-    next: &mut usize,
-    replacements: &mut Replacements,
-) -> bool {
+fn rewrite(op: &mut LogicalOperator, limit: i64, next: &mut usize, replacements: &mut Replacements) -> bool {
     let topmost_bindings = op.column_bindings();
     let topmost_types = op.types();
     // `TraverseProjectionBindings`: the bindings as the window outputs them
@@ -281,7 +276,11 @@ fn rewrite(
         let Some(at) = input_bindings.iter().position(|b| b == binding) else {
             return false;
         };
-        payload.push(BoundExpr::column_ref(*binding, input_types[at].clone(), format!("c{}", payload.len())));
+        payload.push(BoundExpr::column_ref(
+            *binding,
+            input_types[at].clone(),
+            format!("c{}", payload.len()),
+        ));
     }
     let (order, modifiers) = window.orders[0].clone();
     // only the value of the order itself: no payload needed
@@ -316,7 +315,8 @@ fn rewrite(
         1 => arguments.push(payload[0].clone()),
         _ => {
             let names = payload.iter().map(|p| p.alias.clone()).collect();
-            let Ok(packed) = crate::function::nested::bind_nested_function("struct_pack", names, payload.clone()) else {
+            let Ok(packed) = crate::function::nested::bind_nested_function("struct_pack", names, payload.clone())
+            else {
                 return false;
             };
             arguments.push(packed);
@@ -378,8 +378,10 @@ fn rewrite(
         let mut expressions = vec![aggregate_ref.clone()];
         if include_row_number {
             let generic = crate::function::generic::bind_generic_function;
-            let Ok(length) = generic("array_length", vec![aggregate_ref.clone(), BoundExpr::constant(Value::bigint(1))])
-            else {
+            let Ok(length) = generic(
+                "array_length",
+                vec![aggregate_ref.clone(), BoundExpr::constant(Value::bigint(1))],
+            ) else {
                 return false;
             };
             let Ok(series) = generic("generate_series", vec![BoundExpr::constant(Value::bigint(1)), length]) else {
@@ -477,7 +479,9 @@ fn rewrite(
         for (i, binding) in bindings.iter().enumerate() {
             if unread.contains(&i) {
                 finals.push(BoundExpr::constant(Value::null(topmost_types[i].clone())));
-                replacements.map.insert(topmost_bindings[i], ColumnBinding::new(final_index, i));
+                replacements
+                    .map
+                    .insert(topmost_bindings[i], ColumnBinding::new(final_index, i));
                 continue;
             }
             let (column, ty) = if let Some(&group) = group_of.get(&i) {
@@ -497,7 +501,9 @@ fn rewrite(
                 expr = expr.cast_to(&topmost_types[i], false);
             }
             finals.push(expr);
-            replacements.map.insert(topmost_bindings[i], ColumnBinding::new(final_index, i));
+            replacements
+                .map
+                .insert(topmost_bindings[i], ColumnBinding::new(final_index, i));
         }
         replacements.stops.insert(final_index);
         *op = LogicalOperator::new(
@@ -518,7 +524,9 @@ fn rewrite(
     for (i, binding) in bindings.iter().enumerate() {
         if unread.contains(&i) {
             finals.push(BoundExpr::constant(Value::null(topmost_types[i].clone())));
-            replacements.map.insert(topmost_bindings[i], ColumnBinding::new(final_index, i));
+            replacements
+                .map
+                .insert(topmost_bindings[i], ColumnBinding::new(final_index, i));
             continue;
         }
         let at = if let Some(group) = group_of.get(&i) {
@@ -535,7 +543,9 @@ fn rewrite(
             expr = expr.cast_to(&topmost_types[i], false);
         }
         finals.push(expr);
-        replacements.map.insert(topmost_bindings[i], ColumnBinding::new(final_index, i));
+        replacements
+            .map
+            .insert(topmost_bindings[i], ColumnBinding::new(final_index, i));
     }
     replacements.stops.insert(final_index);
     *op = LogicalOperator::new(

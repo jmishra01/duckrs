@@ -75,7 +75,12 @@ fn visit(op: &mut LogicalOperator, options: LateMaterializationOptions, next: &m
 }
 
 /// `OptimizeLargeLimit`: only projections between the limit and a scan without filters.
-fn optimize_large_limit(op: &LogicalOperator, limit: u64, has_offset: bool, options: LateMaterializationOptions) -> bool {
+fn optimize_large_limit(
+    op: &LogicalOperator,
+    limit: u64,
+    has_offset: bool,
+    options: LateMaterializationOptions,
+) -> bool {
     if !has_offset && !options.preserve_insertion_order {
         return false;
     }
@@ -228,9 +233,17 @@ fn try_late_materialization(op: &mut LogicalOperator, next: &mut usize, root: bo
         ),
         K::ParquetScan { table_index, scan } => {
             let outputs = scan.output_types().len();
-            let read = scan.projected.as_ref().map_or(outputs, |p| p.iter().filter(|&&b| b).count());
+            let read = scan
+                .projected
+                .as_ref()
+                .map_or(outputs, |p| p.iter().filter(|&&b| b).count());
             // `ParquetGetRowIdColumns`: the file and the row in it
-            (*table_index, scan.filters.clone(), read, parquet_row_ids(scan).is_none())
+            (
+                *table_index,
+                scan.filters.clone(),
+                read,
+                parquet_row_ids(scan).is_none(),
+            )
         }
         _ => unreachable!("the loop ends at a scan"),
     };
@@ -323,7 +336,11 @@ fn try_late_materialization(op: &mut LogicalOperator, next: &mut usize, root: bo
         .map(|((left, _), (right, ty, name))| JoinCondition {
             bound: None,
             left: left.clone(),
-            right: BoundExpr::column_ref(ColumnBinding::new(rhs_index, right.column_index), ty.clone(), name.clone()),
+            right: BoundExpr::column_ref(
+                ColumnBinding::new(rhs_index, right.column_index),
+                ty.clone(),
+                name.clone(),
+            ),
             comparison: ComparisonOp::Equal,
             filter: None,
         })

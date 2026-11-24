@@ -58,10 +58,7 @@ fn repetition_invariant(aggregate: &BoundAggregate) -> bool {
 
 /// `TryReuseMaterializedAggregate`.
 pub(super) fn try_reuse(op: &mut LogicalOperator, ctes: &Ctes, next: &mut usize) -> bool {
-    let K::Aggregate {
-        groups, aggregates, ..
-    } = &op.kind
-    else {
+    let K::Aggregate { groups, aggregates, .. } = &op.kind else {
         return false;
     };
     let [input] = op.children.as_slice() else {
@@ -337,7 +334,12 @@ fn collect_graph(op: &LogicalOperator, domain: Option<&Vec<usize>>, path: &mut V
             if !descend(op, 0, domain, path, graph) {
                 return false;
             }
-            graph.sources.last_mut().expect("the scan below").filters.extend(filters);
+            graph
+                .sources
+                .last_mut()
+                .expect("the scan below")
+                .filters
+                .extend(filters);
             true
         }
         K::Join {
@@ -389,7 +391,13 @@ fn collect_graph(op: &LogicalOperator, domain: Option<&Vec<usize>>, path: &mut V
     }
 }
 
-fn descend(op: &LogicalOperator, child: usize, domain: Option<&Vec<usize>>, path: &mut Vec<usize>, graph: &mut Graph) -> bool {
+fn descend(
+    op: &LogicalOperator,
+    child: usize,
+    domain: Option<&Vec<usize>>,
+    path: &mut Vec<usize>,
+    graph: &mut Graph,
+) -> bool {
     path.push(child);
     let result = collect_graph(&op.children[child], domain, path, graph);
     path.pop();
@@ -555,7 +563,10 @@ fn rewrite_to_cte(
             expr.alias.clone(),
         ));
     }
-    if matches!(expr.kind, BoundExprKind::ColumnRef { .. } | BoundExprKind::Subquery { .. }) {
+    if matches!(
+        expr.kind,
+        BoundExprKind::ColumnRef { .. } | BoundExprKind::Subquery { .. }
+    ) {
         return None;
     }
     let mut result = expr.clone();

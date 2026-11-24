@@ -62,7 +62,11 @@ fn visit(op: &mut LogicalOperator, replacements: &mut HashMap<ColumnBinding, Col
     if !can_optimize(op) {
         return;
     }
-    let K::Window { table_index: window_index, .. } = op.kind else {
+    let K::Window {
+        table_index: window_index,
+        ..
+    } = op.kind
+    else {
         unreachable!("checked");
     };
     let mut get = op.children.pop().expect("a window has a child");
@@ -81,6 +85,9 @@ fn visit(op: &mut LogicalOperator, replacements: &mut HashMap<ColumnBinding, Col
     if let Some(positions) = projection {
         positions.push(position);
     }
-    replacements.insert(ColumnBinding::new(window_index, 0), ColumnBinding::new(*table_index, position));
+    replacements.insert(
+        ColumnBinding::new(window_index, 0),
+        ColumnBinding::new(*table_index, position),
+    );
     *op = get;
 }

@@ -6,10 +6,10 @@
 //! the other rows before it reads the rest of their columns, and before they reach the join.
 
 use crate::planner::expression::{BoundExpr, BoundExprKind};
-use duckrs_common::value::Value;
 use crate::planner::logical::{LogicalOperator, LogicalOperatorKind};
-use duckrs_common::types::{LogicalType, LogicalTypeId};
 use duckrs_common::sort_key::{NullOrder, OrderModifiers, OrderType, create_sort_keys};
+use duckrs_common::types::{LogicalType, LogicalTypeId};
+use duckrs_common::value::Value;
 use duckrs_common::vector::{SelectionVector, Vector};
 use duckrs_parser::ast::JoinType;
 use std::fmt;
@@ -161,7 +161,13 @@ enum Pushed<'a> {
 
 impl Pushed<'_> {
     /// The filter on the scan's column at `position`, of type `ty`, reached through `casts`.
-    fn on_column(&self, position: usize, ty: &LogicalType, name: &str, casts: &[(LogicalType, bool)]) -> Option<BoundExpr> {
+    fn on_column(
+        &self,
+        position: usize,
+        ty: &LogicalType,
+        name: &str,
+        casts: &[(LogicalType, bool)],
+    ) -> Option<BoundExpr> {
         match self {
             Pushed::Join(filter) => {
                 let (input, keep_null) = filter_input(position, ty, name, casts, filter)?;
@@ -177,7 +183,8 @@ impl Pushed<'_> {
             // the sort key rebuilt on the column, through casts that keep its order: no TRY_CAST, and none that
             // can fail
             Pushed::TopN(filter, ok) => {
-                let mut input = BoundExpr::new(BoundExprKind::Reference(position), ty.clone()).with_alias(name.to_string());
+                let mut input =
+                    BoundExpr::new(BoundExprKind::Reference(position), ty.clone()).with_alias(name.to_string());
                 let mut source = ty.clone();
                 for (target, try_cast) in casts {
                     if *try_cast || cast_can_fail(&source, target) {
@@ -836,7 +843,9 @@ impl JoinFilter {
                 format!("optional: {}", retain(format!("{name} IN ({})", list.join(", "))))
             }
             // a prefix-range filter takes the place of the range
-            Published::Range(..) if runtime.is_some() && self.runtime.get().copied().flatten() == Some(RuntimeFilter::PrefixRange) => {
+            Published::Range(..)
+                if runtime.is_some() && self.runtime.get().copied().flatten() == Some(RuntimeFilter::PrefixRange) =>
+            {
                 return runtime;
             }
             Published::Range(min, max) => format!(
@@ -896,7 +905,8 @@ impl JoinFilter {
                     let prefix = string_prefix(unified.str_at(row));
                     prefix >= *min && {
                         let at = u64::from(prefix - min);
-                        bits.get((at / 64) as usize).is_some_and(|word| word & (1 << (at % 64)) != 0)
+                        bits.get((at / 64) as usize)
+                            .is_some_and(|word| word & (1 << (at % 64)) != 0)
                     }
                 };
                 if pass {
@@ -1119,8 +1129,7 @@ fn push_join_filters_with(op: &mut LogicalOperator, estimates: Option<&[u64]>, n
         return;
     }
     let equalities = conditions.iter().filter(|c| c.is_equality()).count();
-    let probe_estimate =
-        noted.unwrap_or_else(|| crate::optimizer::join_order::estimated_cardinality(&op.children[0]));
+    let probe_estimate = noted.unwrap_or_else(|| crate::optimizer::join_order::estimated_cardinality(&op.children[0]));
     let build_filtered = is_filtering(&op.children[1]);
     // `CreateDynamicMinMaxFilters` of an inequality: the bound of the build keys on the column of the probe side
     for condition in conditions.iter_mut() {
@@ -1191,8 +1200,18 @@ fn push_top_n_filter(op: &mut LogicalOperator) {
     use duckrs_common::types::PhysicalType as P;
     let numeric = matches!(
         ty.physical_type(),
-        P::Int8 | P::Int16 | P::Int32 | P::Int64 | P::Int128 | P::UInt8 | P::UInt16 | P::UInt32 | P::UInt64 | P::UInt128
-            | P::Float | P::Double
+        P::Int8
+            | P::Int16
+            | P::Int32
+            | P::Int64
+            | P::Int128
+            | P::UInt8
+            | P::UInt16
+            | P::UInt32
+            | P::UInt64
+            | P::UInt128
+            | P::Float
+            | P::Double
     );
     if !(numeric || ty.id() == LogicalTypeId::Varchar) {
         return;
@@ -1279,19 +1298,18 @@ fn filter_input(
     }
     // `RequiresRuntimeFilterExpressionReconstruction`: without a cast that can fail the column itself is
     // compared, with the keys cast to its type
-    let input = if reconstruct || filter.null_safe { input } else { column_ref };
+    let input = if reconstruct || filter.null_safe {
+        input
+    } else {
+        column_ref
+    };
     Some((input, keep_null))
 }
 
 /// `FindFilterTargets`: puts `filter` on output column `column` of `op` into the scans its values
 /// come from, where the way there keeps them as they are and drops no row that a row of the scan
 /// would make. Gives whether it went anywhere.
-fn push_into(
-    op: &mut LogicalOperator,
-    column: usize,
-    casts: &[(LogicalType, bool)],
-    filter: &Pushed,
-) -> bool {
+fn push_into(op: &mut LogicalOperator, column: usize, casts: &[(LogicalType, bool)], filter: &Pushed) -> bool {
     use LogicalOperatorKind as K;
     if has_volatile_expressions(op) {
         return false;
@@ -1333,7 +1351,9 @@ fn push_into(
                 if table.row_count() >= MIN_BLOOM_TABLE_ROWS {
                     filter.bloom.store(true, Ordering::Relaxed);
                 }
-                filter.scan_estimate.fetch_max(table.row_count() as u64, Ordering::Relaxed);
+                filter
+                    .scan_estimate
+                    .fetch_max(table.row_count() as u64, Ordering::Relaxed);
             }
             if !filters.iter().any(|f| filter.same(f, &pushed)) {
                 filters.push(pushed);
@@ -1368,7 +1388,11 @@ fn push_into(
             let Some(kept) = keep.get(column).copied() else {
                 return false;
             };
-            match op.children[0].column_bindings().iter().position(|binding| *binding == kept) {
+            match op.children[0]
+                .column_bindings()
+                .iter()
+                .position(|binding| *binding == kept)
+            {
                 Some(child_column) => push_into(&mut op.children[0], child_column, casts, filter),
                 None => false,
             }
@@ -1418,7 +1442,9 @@ fn push_into(
         K::ExceptIntersect { except: true, .. } => push_into(&mut op.children[0], column, casts, filter),
         // the columns of its input, not those it unnests
         K::Unnest { .. } => column < left_columns && push_into(&mut op.children[0], column, casts, filter),
-        K::MaterializedCte { .. } => can_skip(&mut op.children[0]) && push_into(&mut op.children[1], column, casts, filter),
+        K::MaterializedCte { .. } => {
+            can_skip(&mut op.children[0]) && push_into(&mut op.children[1], column, casts, filter)
+        }
         // `FindJoinFilterTargets`: an INNER join takes the filter on either side, and to the columns
         // its equalities make equal; a filtered build side makes the probe side's rows go
         K::CrossProduct

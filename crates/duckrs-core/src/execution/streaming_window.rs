@@ -46,14 +46,16 @@ fn has_state_destructor(kind: AggregateKind, window: &BoundWindow) -> bool {
     };
     let any_kept = || window.children.iter().any(|c| keeps_value(&c.return_type));
     match kind {
-        AggregateKind::Min | AggregateKind::Max | AggregateKind::First | AggregateKind::Last | AggregateKind::AnyValue => {
-            any_kept()
-        }
+        AggregateKind::Min
+        | AggregateKind::Max
+        | AggregateKind::First
+        | AggregateKind::Last
+        | AggregateKind::AnyValue => any_kept(),
         AggregateKind::SumBignum => true,
         AggregateKind::Holistic(holistic) => match holistic {
-            Mode | Median | QuantileCont | QuantileDisc | Mad | Entropy | VariantGroupObject | MinN | MaxN | ArgMinN
-            | ArgMaxN | ArgMinNullsLastN | ArgMaxNullsLastN | ApproxTopK | BitstringAgg | CombineAggr | Histogram
-            | HistogramBins | HistogramExact | ApproxQuantile | Sorted => true,
+            Mode | Median | QuantileCont | QuantileDisc | Mad | Entropy | VariantGroupObject | MinN | MaxN
+            | ArgMinN | ArgMaxN | ArgMinNullsLastN | ArgMaxNullsLastN | ApproxTopK | BitstringAgg | CombineAggr
+            | Histogram | HistogramBins | HistogramExact | ApproxQuantile | Sorted => true,
             ArgMin | ArgMax | ArgMinNull | ArgMaxNull | ArgMinNullsLast | ArgMaxNullsLast => any_kept(),
             _ => false,
         },
@@ -79,7 +81,11 @@ fn lead_lag_offset(window: &BoundWindow) -> Option<i64> {
             return None;
         }
     }
-    Some(if window.function == WindowFunction::Lead { -offset } else { offset })
+    Some(if window.function == WindowFunction::Lead {
+        -offset
+    } else {
+        offset
+    })
 }
 
 /// `ComputeDefault`.
@@ -169,9 +175,10 @@ pub struct PhysicalStreamingWindow {
 
 impl PhysicalStreamingWindow {
     pub fn new(types: Vec<LogicalType>, windows: Vec<BoundWindow>, children: Vec<Box<dyn PhysicalOperator>>) -> Self {
-        let delays = windows
-            .iter()
-            .any(|w| matches!(w.function, WindowFunction::Lag | WindowFunction::Lead) && lead_lag_offset(w).is_some_and(|o| o < 0));
+        let delays = windows.iter().any(|w| {
+            matches!(w.function, WindowFunction::Lag | WindowFunction::Lead)
+                && lead_lag_offset(w).is_some_and(|o| o < 0)
+        });
         Self {
             types,
             windows,
@@ -237,7 +244,12 @@ impl PhysicalStreamingWindow {
                 Rank | DenseRank => WindowState::Constant(Value::bigint(1)),
                 PercentRank => WindowState::Constant(Value::double(0.0)),
                 Aggregate => WindowState::Aggregate {
-                    state: window.aggregate.as_ref().expect("an aggregate window has a function").kind.initial_state(),
+                    state: window
+                        .aggregate
+                        .as_ref()
+                        .expect("an aggregate window has a function")
+                        .kind
+                        .initial_state(),
                     seen: HashSet::new(),
                 },
                 Lag | Lead => {
@@ -302,12 +314,13 @@ impl PhysicalStreamingWindow {
                     let filtered: Vec<bool> = match &window.filter {
                         Some(filter) => {
                             let filter = execute(filter, input)?;
-                            (0..count).map(|row| filter.get_value(row) == Value::boolean(true)).collect()
+                            (0..count)
+                                .map(|row| filter.get_value(row) == Value::boolean(true))
+                                .collect()
                         }
                         None => vec![true; count],
                     };
-                    let compares =
-                        window.distinct || matches!(function.kind, AggregateKind::Min | AggregateKind::Max);
+                    let compares = window.distinct || matches!(function.kind, AggregateKind::Min | AggregateKind::Max);
                     let keys = match &argument {
                         Some(argument) if compares => Some(value_keys(argument, count)?),
                         _ => None,
@@ -323,7 +336,13 @@ impl PhysicalStreamingWindow {
                             add = !argument.get_value(row).is_null() && seen.insert(keys[row].clone());
                         }
                         if add {
-                            function.update_keyed(argument.as_ref(), count, &[(row, 0)], &mut states, keys.as_deref())?;
+                            function.update_keyed(
+                                argument.as_ref(),
+                                count,
+                                &[(row, 0)],
+                                &mut states,
+                                keys.as_deref(),
+                            )?;
                         }
                         column.push(Some(function.finalize(&states[0], &window.return_type, input_type)?));
                     }
@@ -356,7 +375,9 @@ impl PhysicalStreamingWindow {
                         if first.is_none() && !(window.ignore_nulls && value.is_null()) {
                             *first = Some(value);
                         }
-                        column.push(Some(first.clone().unwrap_or_else(|| Value::null(window.return_type.clone()))));
+                        column.push(Some(
+                            first.clone().unwrap_or_else(|| Value::null(window.return_type.clone())),
+                        ));
                     }
                 }
                 WindowState::Last(last) => {
@@ -367,7 +388,11 @@ impl PhysicalStreamingWindow {
                         column.push(Some(last.clone()));
                     }
                 }
-                WindowState::Nth { index, count: seen, value: nth } => {
+                WindowState::Nth {
+                    index,
+                    count: seen,
+                    value: nth,
+                } => {
                     for value in values(&argument) {
                         if *seen < *index && !(window.ignore_nulls && value.is_null()) {
                             *seen += 1;
@@ -397,7 +422,10 @@ impl PhysicalStreamingWindow {
         let mut results: Vec<std::vec::IntoIter<Option<Value>>> = results.into_iter().map(Vec::into_iter).collect();
         for row in 0..count {
             let values = (0..input.column_count()).map(|c| input.get_value(c, row)).collect();
-            let row_results = results.iter_mut().map(|r| r.next().expect("a result per row")).collect();
+            let row_results = results
+                .iter_mut()
+                .map(|r| r.next().expect("a result per row"))
+                .collect();
             state.delayed.push_back(Delayed {
                 values,
                 results: row_results,

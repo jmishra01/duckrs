@@ -13,9 +13,9 @@
 //! (overflow-free arithmetic among them), row groups, distinct counts, and the statistics of aggregates and windows. Those columns
 //! count as unknown.
 
+use super::conjunction_of;
 use super::filter_pushdown::empty_result;
 use super::rewriter::{fold_boolean, rewrite_expression, split_conjuncts};
-use super::conjunction_of;
 use crate::catalog::{ColumnStatistics, TableCatalogEntry, TableDistinctCounts};
 use crate::execution::run_plan;
 use crate::function::binder::bind_aggregate_function;
@@ -52,7 +52,16 @@ pub(crate) fn has_ordered_statistics(ty: &LogicalType) -> bool {
     ty.is_numeric()
         || matches!(
             ty.id(),
-            Boolean | Date | Time | TimestampSec | TimestampMs | Timestamp | TimestampNs | TimestampTz | TimestampTzNs | Varchar
+            Boolean
+                | Date
+                | Time
+                | TimestampSec
+                | TimestampMs
+                | Timestamp
+                | TimestampNs
+                | TimestampTz
+                | TimestampTzNs
+                | Varchar
         )
 }
 
@@ -105,7 +114,10 @@ fn add_nested_statistics(
     statistics: &mut [Stats],
 ) -> Option<()> {
     let nested = |ty: &LogicalType| {
-        matches!(ty.id(), LogicalTypeId::List | LogicalTypeId::Array | LogicalTypeId::Map | LogicalTypeId::Struct)
+        matches!(
+            ty.id(),
+            LogicalTypeId::List | LogicalTypeId::Array | LogicalTypeId::Map | LogicalTypeId::Struct
+        )
     };
     let columns: Vec<usize> = (0..table.columns.len())
         .filter(|&c| nested(&table.columns[c].ty) && statistics[c].children.is_empty())
@@ -542,7 +554,11 @@ fn string_stats_bounds(stats: &Stats) -> Stats {
     let ty = min.logical_type().clone();
     // a bound that is the value itself is exact (`EXACT_STATS`), as of a constant; any other was cut, which the
     // value cut tells as merged bounds do not
-    let lower = if low == exact_min { exact_min.clone() } else { exact_min[..exact_min.len().min(size)].to_vec() };
+    let lower = if low == exact_min {
+        exact_min.clone()
+    } else {
+        exact_min[..exact_min.len().min(size)].to_vec()
+    };
     let upper = if high == exact_max {
         Some(exact_max.clone())
     } else {
@@ -590,7 +606,11 @@ fn list_search_never_matches(
     if element_type != Some(needle_type) {
         return false;
     }
-    decide(ComparisonOp::Equal, &string_stats_bounds(child), &string_stats_bounds(needle)) == Some(false)
+    decide(
+        ComparisonOp::Equal,
+        &string_stats_bounds(child),
+        &string_stats_bounds(needle),
+    ) == Some(false)
 }
 
 /// A comparison of an expression of each side of a join: a `JoinCondition` in C++.
@@ -603,7 +623,9 @@ fn is_side_comparison(expr: &BoundExpr, sides: &[Vec<ColumnBinding>; 2]) -> bool
         let mut mixed = false;
         e.clone().walk_mut(&mut |e| {
             if let BoundExprKind::ColumnRef { binding, depth } = e.kind {
-                let side = (depth == 0).then(|| sides.iter().position(|s| s.contains(&binding))).flatten();
+                let side = (depth == 0)
+                    .then(|| sides.iter().position(|s| s.contains(&binding)))
+                    .flatten();
                 match (side, found) {
                     (None, _) => mixed = true,
                     (Some(side), None) => found = Some(side),
@@ -661,7 +683,12 @@ fn decide(op: ComparisonOp, left: &Stats, right: &Stats) -> Option<bool> {
 
 /// Whether `column op constant` holds for all the values of a column with `column` statistics that are
 /// not NULL (`Some(true)`), for none (`Some(false)`), or is not known.
-pub(super) fn decide_with_constant(op: ComparisonOp, column: &Stats, constant: &Value, ty: &LogicalType) -> Option<bool> {
+pub(super) fn decide_with_constant(
+    op: ComparisonOp,
+    column: &Stats,
+    constant: &Value,
+    ty: &LogicalType,
+) -> Option<bool> {
     decide(op, column, &value_stats(constant, ty))
 }
 
@@ -707,7 +734,11 @@ pub(crate) fn union(a: Stats, b: Stats) -> Stats {
         },
         distinct: None,
         children: if a.children.len() == b.children.len() {
-            a.children.into_iter().zip(b.children).map(|(a, b)| union(a, b)).collect()
+            a.children
+                .into_iter()
+                .zip(b.children)
+                .map(|(a, b)| union(a, b))
+                .collect()
         } else {
             Vec::new()
         },
@@ -752,7 +783,9 @@ fn value_stats(value: &Value, ty: &LogicalType) -> Stats {
             ..unknown()
         };
         match ty.id() {
-            LogicalTypeId::List | LogicalTypeId::Array | LogicalTypeId::Map => ty.child_type().map(none).into_iter().collect(),
+            LogicalTypeId::List | LogicalTypeId::Array | LogicalTypeId::Map => {
+                ty.child_type().map(none).into_iter().collect()
+            }
             LogicalTypeId::Struct => ty.struct_children().iter().map(|(_, child)| none(child)).collect(),
             _ => Vec::new(),
         }
@@ -1207,7 +1240,11 @@ impl StatisticsPropagator {
             }
             return unknown();
         }
-        if let Some(answer) = decide(op, &string_stats_bounds(&left_stats), &string_stats_bounds(&right_stats)) {
+        if let Some(answer) = decide(
+            op,
+            &string_stats_bounds(&left_stats),
+            &string_stats_bounds(&right_stats),
+        ) {
             // `FILTER_TRUE_OR_NULL` / `FILTER_FALSE_OR_NULL`: NULL with either side, which both stay
             let sides = if left_stats.can_be_null || right_stats.can_be_null {
                 vec![(**left).clone(), (**right).clone()]
@@ -1453,7 +1490,8 @@ impl StatisticsPropagator {
             && !needle_value.is_null()
             && needle.can_be_valid
             && let (Some(min), Some(max)) = (&child.min, &child.max)
-            && let (Ok(min), Ok(max), Ok(prefix)) = (min.try_to_string(), max.try_to_string(), needle_value.try_to_string())
+            && let (Ok(min), Ok(max), Ok(prefix)) =
+                (min.try_to_string(), max.try_to_string(), needle_value.try_to_string())
             && !children[0].is_volatile()
         {
             // C++'s string statistics keep 12 bytes of the bounds
@@ -1514,8 +1552,22 @@ impl StatisticsPropagator {
         // a function that gives NULL for NULL, of an argument that is only NULL, is only NULL
         if matches!(
             function.name.as_str(),
-            "array_extract" | "list_extract" | "list_element" | "map_extract_value" | "split_part" | "lower" | "upper"
-                | "length" | "substring" | "substr" | "replace" | "trim" | "ltrim" | "rtrim" | "left" | "right"
+            "array_extract"
+                | "list_extract"
+                | "list_element"
+                | "map_extract_value"
+                | "split_part"
+                | "lower"
+                | "upper"
+                | "length"
+                | "substring"
+                | "substr"
+                | "replace"
+                | "trim"
+                | "ltrim"
+                | "rtrim"
+                | "left"
+                | "right"
         ) && !expr_is_volatile_function(&function.name)
             && stats.iter().any(|s| s.can_be_null && !s.can_be_valid)
         {
@@ -1657,15 +1709,21 @@ impl StatisticsPropagator {
             };
         }
         // `StringStats` of `length`: the longest string bounds it, and so does the shortest without unicode
-        if matches!(function.name.as_str(), "length" | "len" | "char_length" | "character_length" | "strlen" | "octet_length")
-            && let [child] = stats.as_slice()
+        if matches!(
+            function.name.as_str(),
+            "length" | "len" | "char_length" | "character_length" | "strlen" | "octet_length"
+        ) && let [child] = stats.as_slice()
             && let Some(strings) = &child.strings
             && let Some(max) = strings.max_length
         {
             let bytes = matches!(function.name.as_str(), "strlen" | "octet_length");
             let shortest = strings.min_length.unwrap_or(0);
             // a character takes at most 4 bytes
-            let min = if bytes || !strings.has_unicode { shortest } else { shortest.div_ceil(4) };
+            let min = if bytes || !strings.has_unicode {
+                shortest
+            } else {
+                shortest.div_ceil(4)
+            };
             return Stats {
                 min: Some(Value::bigint(min as i64)),
                 max: Some(Value::bigint(max as i64)),
@@ -1775,12 +1833,16 @@ impl StatisticsPropagator {
                 } else if children.len() == 2 {
                     // the named arguments are packed into the second; each replaces the field of its name
                     let named = |ty: &LogicalType, name: &str| {
-                        ty.struct_children().iter().position(|(n, _)| n.eq_ignore_ascii_case(name))
+                        ty.struct_children()
+                            .iter()
+                            .position(|(n, _)| n.eq_ignore_ascii_case(name))
                     };
                     for (name, _) in return_type.struct_children() {
                         let child = match named(&children[1].return_type, name) {
                             Some(at) => field(&stats[1], at),
-                            None => named(&children[0].return_type, name).map_or_else(unknown, |at| field(&stats[0], at)),
+                            None => {
+                                named(&children[0].return_type, name).map_or_else(unknown, |at| field(&stats[0], at))
+                            }
                         };
                         fields.push(child);
                     }
@@ -1855,7 +1917,12 @@ impl StatisticsPropagator {
             "list_position" | "list_indexof" | "array_position" | "array_indexof"
                 if children.len() == 2
                     && has_ordered_statistics(&return_type)
-                    && list_search_never_matches(&stats[0], &stats[1], children[0].return_type.child_type(), &children[1].return_type) =>
+                    && list_search_never_matches(
+                        &stats[0],
+                        &stats[1],
+                        children[0].return_type.child_type(),
+                        &children[1].return_type,
+                    ) =>
             {
                 return Stats {
                     can_be_null: true,
@@ -1932,21 +1999,78 @@ impl StatisticsPropagator {
             let supported = part.is_some_and(|part| {
                 matches!(
                     part.to_lowercase().as_str(),
-                    "millennium" | "millennia" | "mil" | "mils" | "millenia"
-                        | "century" | "centuries" | "cent" | "c"
-                        | "decade" | "decades" | "dec" | "decs"
-                        | "year" | "years" | "y" | "yr" | "yrs"
-                        | "quarter" | "quarters"
-                        | "month" | "months" | "mon" | "mons"
-                        | "week" | "weeks" | "w" | "weekofyear" | "yearweek"
+                    "millennium"
+                        | "millennia"
+                        | "mil"
+                        | "mils"
+                        | "millenia"
+                        | "century"
+                        | "centuries"
+                        | "cent"
+                        | "c"
+                        | "decade"
+                        | "decades"
+                        | "dec"
+                        | "decs"
+                        | "year"
+                        | "years"
+                        | "y"
+                        | "yr"
+                        | "yrs"
+                        | "quarter"
+                        | "quarters"
+                        | "month"
+                        | "months"
+                        | "mon"
+                        | "mons"
+                        | "week"
+                        | "weeks"
+                        | "w"
+                        | "weekofyear"
+                        | "yearweek"
                         | "isoyear"
-                        | "day" | "days" | "d" | "dayofmonth"
-                        | "dow" | "dayofweek" | "weekday" | "isodow" | "doy" | "dayofyear" | "julian" | "jd"
-                        | "hour" | "hours" | "h" | "hr" | "hrs"
-                        | "minute" | "minutes" | "min" | "mins" | "m"
-                        | "second" | "seconds" | "sec" | "secs" | "s" | "epoch"
-                        | "millisecond" | "milliseconds" | "ms" | "msec" | "msecs" | "msecond" | "mseconds"
-                        | "microsecond" | "microseconds" | "us" | "usec" | "usecs" | "usecond" | "useconds"
+                        | "day"
+                        | "days"
+                        | "d"
+                        | "dayofmonth"
+                        | "dow"
+                        | "dayofweek"
+                        | "weekday"
+                        | "isodow"
+                        | "doy"
+                        | "dayofyear"
+                        | "julian"
+                        | "jd"
+                        | "hour"
+                        | "hours"
+                        | "h"
+                        | "hr"
+                        | "hrs"
+                        | "minute"
+                        | "minutes"
+                        | "min"
+                        | "mins"
+                        | "m"
+                        | "second"
+                        | "seconds"
+                        | "sec"
+                        | "secs"
+                        | "s"
+                        | "epoch"
+                        | "millisecond"
+                        | "milliseconds"
+                        | "ms"
+                        | "msec"
+                        | "msecs"
+                        | "msecond"
+                        | "mseconds"
+                        | "microsecond"
+                        | "microseconds"
+                        | "us"
+                        | "usec"
+                        | "usecs"
+                        | "usecond"
+                        | "useconds"
                 )
             });
             let (Some(min), Some(max)) = (stats[1].min.clone(), stats[1].max.clone()) else {
@@ -2107,7 +2231,10 @@ impl StatisticsPropagator {
         // `PropagateModuloStats` of DECIMAL, on the unscaled values, and of FLOAT and DOUBLE (`FloatingModuloBounds`)
         if children.len() == 2
             && function.name == "%"
-            && matches!(return_type.id(), LogicalTypeId::Decimal | LogicalTypeId::Float | LogicalTypeId::Double)
+            && matches!(
+                return_type.id(),
+                LogicalTypeId::Decimal | LogicalTypeId::Float | LogicalTypeId::Double
+            )
         {
             let (left, right) = (&stats[0], &stats[1]);
             let text = |value: &Option<Value>| value.as_ref().and_then(|v| v.try_to_string().ok());
@@ -2126,9 +2253,12 @@ impl StatisticsPropagator {
             };
             if let Some((width, scale)) = return_type.decimal_properties() {
                 let unscaled = |value: &Option<Value>| decimal_unscaled(&text(value)?, scale);
-                let (Some(lmin), Some(lmax), Some(rmin), Some(rmax)) =
-                    (unscaled(&left.min), unscaled(&left.max), unscaled(&right.min), unscaled(&right.max))
-                else {
+                let (Some(lmin), Some(lmax), Some(rmin), Some(rmax)) = (
+                    unscaled(&left.min),
+                    unscaled(&left.max),
+                    unscaled(&right.min),
+                    unscaled(&right.max),
+                ) else {
                     return unknown();
                 };
                 let zero_divisor = rmin <= 0 && rmax >= 0;
@@ -2300,7 +2430,8 @@ impl StatisticsPropagator {
             }
             // a DECIMAL of another width, as the bound function gives it
             let cast = BoundExpr::constant(value).cast_to(&return_type, true);
-            crate::execution::expression_executor::try_evaluate_scalar(&cast).filter(|v| v.logical_type() == &return_type)
+            crate::execution::expression_executor::try_evaluate_scalar(&cast)
+                .filter(|v| v.logical_type() == &return_type)
         };
         let corners: Option<Vec<Value>> = match function.name.as_str() {
             "+" => [apply(&a, &c), apply(&b, &d)].into_iter().collect(),
@@ -2549,7 +2680,10 @@ impl StatisticsPropagator {
         // as a table filter (which a filter that can fail keeps it from becoming), where the statistics then
         // tell it is always true: not in a plan that adds rows, which they don't see
         if !self.side_effects && !kept.iter().any(crate::optimizer::rewriter::can_throw) {
-            kept = kept.into_iter().map(|expr| true_or_null_as_not_null(expr, &op.children[0])).collect();
+            kept = kept
+                .into_iter()
+                .map(|expr| true_or_null_as_not_null(expr, &op.children[0]))
+                .collect();
         }
         // `x != a AND x != b ...` that leaves no value of an integer column's range (a NOT IN list
         // covering it) is never true
@@ -2690,12 +2824,13 @@ impl StatisticsPropagator {
         // so with one side without NULLs `IS NOT DISTINCT FROM` is `=`
         // a MARK join gives on what the comparison is, NULL too
         for condition in conditions.iter_mut().filter(|_| join_type != JoinType::Mark) {
-            if !matches!(condition.comparison, ComparisonOp::NotDistinctFrom | ComparisonOp::DistinctFrom) {
+            if !matches!(
+                condition.comparison,
+                ComparisonOp::NotDistinctFrom | ComparisonOp::DistinctFrom
+            ) {
                 continue;
             }
-            let nested = |e: &BoundExpr| {
-                matches!(e.return_type.id(), LogicalTypeId::Union | LogicalTypeId::Tuple)
-            };
+            let nested = |e: &BoundExpr| matches!(e.return_type.id(), LogicalTypeId::Union | LogicalTypeId::Tuple);
             if nested(&condition.left) || nested(&condition.right) {
                 continue;
             }
@@ -2723,7 +2858,10 @@ impl StatisticsPropagator {
             {
                 let (a, b) = (*a, *b);
                 self.update_columns(ComparisonOp::Equal, a, b);
-                for (side, (expr, before)) in [(&condition.left, &left), (&condition.right, &right)].into_iter().enumerate() {
+                for (side, (expr, before)) in [(&condition.left, &left), (&condition.right, &right)]
+                    .into_iter()
+                    .enumerate()
+                {
                     let binding = if side == 0 { a } else { b };
                     let after = self.lookup(binding);
                     range_filters[side].extend(join_range_filters(expr, before, &after));
@@ -2737,15 +2875,16 @@ impl StatisticsPropagator {
             if filters.is_empty() || no_rows || self.filter_simplification || has_failing_filter(&op.children[side]) {
                 continue;
             }
-            let child = std::mem::replace(&mut op.children[side], LogicalOperator::new(K::CrossProduct, Vec::new()));
+            let child = std::mem::replace(
+                &mut op.children[side],
+                LogicalOperator::new(K::CrossProduct, Vec::new()),
+            );
             let filtered = LogicalOperator::new(K::Filter { expressions: filters }, vec![child]);
             op.children[side] = super::filter_pushdown::push_down(filtered);
         }
         let sides = [op.children[0].column_bindings(), op.children[1].column_bindings()];
         let K::Join {
-            conditions,
-            predicate,
-            ..
+            conditions, predicate, ..
         } = &mut op.kind
         else {
             unreachable!()
@@ -2759,16 +2898,23 @@ impl StatisticsPropagator {
                 // a comparison of a column of each side is a join condition in C++, which statistics only take
                 // out where it is always true (`FILTER_ALWAYS_TRUE`) and leave as it is otherwise
                 let mut conjuncts = Vec::new();
-                split_conjuncts(std::mem::replace(condition, BoundExpr::constant(Value::boolean(true))), &mut conjuncts);
+                split_conjuncts(
+                    std::mem::replace(condition, BoundExpr::constant(Value::boolean(true))),
+                    &mut conjuncts,
+                );
                 let mut kept = Vec::new();
                 for mut conjunct in conjuncts {
                     if is_side_comparison(&conjunct, &sides) {
-                        let BoundExprKind::Comparison { op: comparison, left, right } = &mut conjunct.kind else {
+                        let BoundExprKind::Comparison {
+                            op: comparison,
+                            left,
+                            right,
+                        } = &mut conjunct.kind
+                        else {
                             unreachable!()
                         };
-                        let nested = |e: &BoundExpr| {
-                            matches!(e.return_type.id(), LogicalTypeId::Union | LogicalTypeId::Tuple)
-                        };
+                        let nested =
+                            |e: &BoundExpr| matches!(e.return_type.id(), LogicalTypeId::Union | LogicalTypeId::Tuple);
                         let any_nested = nested(left) || nested(right);
                         let (left, right) = (self.expression(left, false), self.expression(right, false));
                         // `SimplifyDistinctComparison` with `ComparisonContext::JOIN`
@@ -2784,7 +2930,10 @@ impl StatisticsPropagator {
                             };
                         }
                         let distinct = matches!(comparison, ComparisonOp::DistinctFrom | ComparisonOp::NotDistinctFrom);
-                        match (!distinct).then(|| decide(*comparison, &string_stats_bounds(&left), &string_stats_bounds(&right))).flatten() {
+                        match (!distinct)
+                            .then(|| decide(*comparison, &string_stats_bounds(&left), &string_stats_bounds(&right)))
+                            .flatten()
+                        {
                             Some(true) if !left.can_be_null && !right.can_be_null => continue,
                             Some(false) => no_rows |= matches_only,
                             _ => {}
@@ -3008,7 +3157,9 @@ impl StatisticsPropagator {
                     && grouping_functions.is_empty()
                     && !groups.is_empty()
                     && !aggregates.iter().any(|a| a.distinct)
-                    && self.perfect_hash_bits(groups).is_some_and(|bits| bits <= self.perfect_ht_threshold);
+                    && self
+                        .perfect_hash_bits(groups)
+                        .is_some_and(|bits| bits <= self.perfect_ht_threshold);
                 // the result has no more rows than the input (its maximum, not its estimate)
                 *domain_cap = (!self.filter_simplification)
                     .then(|| self.group_domain_bound(groups))
@@ -3108,19 +3259,25 @@ impl StatisticsPropagator {
         for group in groups {
             let ty = &group.return_type;
             let stats = self.expression(&mut group.clone(), false);
-            let ranged = matches!(ty.physical_type(), Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64)
-                && (ty.is_integral()
-                    || matches!(
-                        ty.id(),
-                        LogicalTypeId::Date
-                            | LogicalTypeId::Time
-                            | LogicalTypeId::Timestamp
-                            | LogicalTypeId::TimestampSec
-                            | LogicalTypeId::TimestampMs
-                            | LogicalTypeId::TimestampNs
-                            | LogicalTypeId::TimestampTz
-                    ));
-            let known = stats.min.as_ref().and_then(Value::as_i128).zip(stats.max.as_ref().and_then(Value::as_i128));
+            let ranged = matches!(
+                ty.physical_type(),
+                Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64
+            ) && (ty.is_integral()
+                || matches!(
+                    ty.id(),
+                    LogicalTypeId::Date
+                        | LogicalTypeId::Time
+                        | LogicalTypeId::Timestamp
+                        | LogicalTypeId::TimestampSec
+                        | LogicalTypeId::TimestampMs
+                        | LogicalTypeId::TimestampNs
+                        | LogicalTypeId::TimestampTz
+                ));
+            let known = stats
+                .min
+                .as_ref()
+                .and_then(Value::as_i128)
+                .zip(stats.max.as_ref().and_then(Value::as_i128));
             let key = match known.filter(|_| ranged) {
                 Some((min, max)) => {
                     let range = u128::try_from(max - min).ok()?;
@@ -3148,11 +3305,18 @@ impl StatisticsPropagator {
         for group in groups {
             let ty = &group.return_type;
             let physical = ty.physical_type();
-            if !matches!(physical, Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64) {
+            if !matches!(
+                physical,
+                Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64
+            ) {
                 return None;
             }
             let stats = self.expression(&mut group.clone(), false);
-            let known = stats.min.as_ref().and_then(Value::as_i128).zip(stats.max.as_ref().and_then(Value::as_i128));
+            let known = stats
+                .min
+                .as_ref()
+                .and_then(Value::as_i128)
+                .zip(stats.max.as_ref().and_then(Value::as_i128));
             let (min, max) = match known {
                 Some(range) => range,
                 None if matches!(physical, Int8 | Int16 | UInt8 | UInt16) => integer_range(ty)?,
@@ -3188,7 +3352,9 @@ fn string_function_max_length(name: &str, children: &[BoundExpr], stats: &[Stats
             if let Some(mut offset) = constant(&children[1]) {
                 let count = match children.get(2) {
                     None => Some(None),
-                    Some(length) => constant(length).filter(|&l| l > 0 && l <= i128::from(u32::MAX)).map(Some),
+                    Some(length) => constant(length)
+                        .filter(|&l| l > 0 && l <= i128::from(u32::MAX))
+                        .map(Some),
                 };
                 if let Some(mut count) = count {
                     let mut valid = true;
@@ -3220,7 +3386,11 @@ fn string_function_max_length(name: &str, children: &[BoundExpr], stats: &[Stats
         "repeat" if children.len() == 2 => {
             let count = constant(&children[1])?;
             let input_max = input_max?;
-            let size = if count > 0 { input_max.checked_mul(u64::try_from(count).ok()?)? } else { 0 };
+            let size = if count > 0 {
+                input_max.checked_mul(u64::try_from(count).ok()?)?
+            } else {
+                0
+            };
             (size <= u64::from(u32::MAX)).then_some(size)
         }
         _ => None,
@@ -3377,10 +3547,9 @@ fn simplify_constant_or_null(expressions: &mut Vec<BoundExpr>) {
     if expressions.len() < 2 || !expressions.iter().any(is_candidate) {
         return;
     }
-    if expressions
-        .iter()
-        .any(|e| crate::optimizer::rewriter::can_throw(e) || e.is_volatile() || crate::optimizer::rewriter::contains_barrier(e))
-    {
+    if expressions.iter().any(|e| {
+        crate::optimizer::rewriter::can_throw(e) || e.is_volatile() || crate::optimizer::rewriter::contains_barrier(e)
+    }) {
         return;
     }
     let mut at = 0;
@@ -3438,7 +3607,9 @@ fn in_zonemap(stats: &Stats, values: &[Value]) -> Option<bool> {
         return Some(false);
     }
     if compare_values(ComparisonOp::Equal, min, max) == Some(true)
-        && values.iter().any(|v| compare_values(ComparisonOp::Equal, v, min) == Some(true))
+        && values
+            .iter()
+            .any(|v| compare_values(ComparisonOp::Equal, v, min) == Some(true))
     {
         return Some(true);
     }
@@ -3484,7 +3655,8 @@ fn true_or_null_as_not_null(expr: BoundExpr, child: &LogicalOperator) -> BoundEx
     for argument in &children[1..] {
         match &argument.kind {
             BoundExprKind::ColumnRef { binding, depth: 0 } if scan.contains(binding) => {
-                let same = |c: &BoundExpr| matches!(&c.kind, BoundExprKind::ColumnRef { binding: b, .. } if b == binding);
+                let same =
+                    |c: &BoundExpr| matches!(&c.kind, BoundExprKind::ColumnRef { binding: b, .. } if b == binding);
                 if column.is_some_and(|c| !same(c)) {
                     return expr;
                 }
@@ -3831,15 +4003,37 @@ fn arg_monotonicity(name: &str, at: usize, types: &[LogicalType]) -> Option<i8> 
         // the base of a two-argument log can be below 1
         ("log", 2) => None,
         (
-            "ceil" | "ceiling" | "floor" | "trunc" | "round" | "round_even" | "roundbankers" | "sqrt" | "cbrt" | "ln"
-            | "log10" | "log" | "log2" | "degrees" | "radians" | "atan" | "sinh" | "asinh" | "tanh" | "isoyear"
-            | "era" | "last_day" | "to_timestamp" | "normalized_interval" | "epoch_ms" | "epoch_us" | "epoch_ns",
+            "ceil"
+            | "ceiling"
+            | "floor"
+            | "trunc"
+            | "round"
+            | "round_even"
+            | "roundbankers"
+            | "sqrt"
+            | "cbrt"
+            | "ln"
+            | "log10"
+            | "log"
+            | "log2"
+            | "degrees"
+            | "radians"
+            | "atan"
+            | "sinh"
+            | "asinh"
+            | "tanh"
+            | "isoyear"
+            | "era"
+            | "last_day"
+            | "to_timestamp"
+            | "normalized_interval"
+            | "epoch_ms"
+            | "epoch_us"
+            | "epoch_ns",
             _,
         ) => (at == 0).then_some(1),
         // `SetNonDecreasingExceptInterval`
-        ("year" | "decade" | "century" | "millennium" | "epoch", _) => {
-            (at == 0 && id(0)? != T::Interval).then_some(1)
-        }
+        ("year" | "decade" | "century" | "millennium" | "epoch", _) => (at == 0 && id(0)? != T::Interval).then_some(1),
         ("make_date" | "make_timestamp" | "make_timestamp_ns" | "make_timestamp_ms", 1) => (at == 0).then_some(1),
         ("date_diff" | "datediff" | "date_sub" | "datesub", 3) => match at {
             1 => Some(-1),
@@ -3975,7 +4169,10 @@ fn evaluate_part(name: &str, value: &Value) -> Option<Value> {
     let call = match name.strip_prefix("date_part:") {
         Some(part) => crate::function::dates::bind_date_function(
             "date_part",
-            vec![BoundExpr::constant(Value::varchar(part)), BoundExpr::constant(value.clone())],
+            vec![
+                BoundExpr::constant(Value::varchar(part)),
+                BoundExpr::constant(value.clone()),
+            ],
         )
         .ok()?,
         None => {
@@ -3993,7 +4190,12 @@ fn evaluate_part(name: &str, value: &Value) -> Option<Value> {
 fn date_part_stats(name: &str, child: &Stats, child_type: &LogicalType, return_type: &LogicalType) -> Option<Stats> {
     use LogicalTypeId as T;
     let time = matches!(child_type.id(), T::Time | T::TimeNs);
-    if !time && !matches!(child_type.id(), T::Date | T::Timestamp | T::TimestampSec | T::TimestampMs | T::TimestampNs) {
+    if !time
+        && !matches!(
+            child_type.id(),
+            T::Date | T::Timestamp | T::TimestampSec | T::TimestampMs | T::TimestampNs
+        )
+    {
         return None;
     }
     let (min, max) = (child.min.clone()?, child.max.clone()?);
@@ -4029,14 +4231,15 @@ fn date_part_stats(name: &str, child: &Stats, child_type: &LogicalType, return_t
         // `YearWeekOperator::PropagateStatistics`: from ISO year 0 on down the week is subtracted,
         // and the endpoints no longer bound the values between them
         "yearweek" | "date_part:yearweek"
-            if evaluate_part("date_part:isoyear", &min)?.as_i128().is_none_or(|year| year < 1) =>
+            if evaluate_part("date_part:isoyear", &min)?
+                .as_i128()
+                .is_none_or(|year| year < 1) =>
         {
             return None;
         }
-        "year" | "decade" | "century" | "millennium" | "yearweek" | "date_part:yearweek" | "date_part:isoyear" | "isoyear" | "epoch_ms"
-        | "epoch_us" | "epoch_ns" | "date_part:epoch" | "epoch" | "date_part:julian" | "julian" => {
-            (Some(evaluate_part(name, &min)?), Some(evaluate_part(name, &max)?))
-        }
+        "year" | "decade" | "century" | "millennium" | "yearweek" | "date_part:yearweek" | "date_part:isoyear"
+        | "isoyear" | "epoch_ms" | "epoch_us" | "epoch_ns" | "date_part:epoch" | "epoch" | "date_part:julian"
+        | "julian" => (Some(evaluate_part(name, &min)?), Some(evaluate_part(name, &max)?)),
         "month" if !time => within(&["year"], 1, 12)?,
         "day" | "dayofmonth" if !time => within(&["year", "month"], 1, 31)?,
         "quarter" if !time => within(&["year"], 1, 4)?,
@@ -4128,7 +4331,11 @@ pub(crate) fn power_bounds(base: Option<(f64, f64)>, (exponent_min, exponent_max
     if exponent_min == 0.0 && exponent_max == 0.0 {
         return Some((1.0, 1.0));
     }
-    if !exponent_min.is_finite() || exponent_min != exponent_max || exponent_min < 0.0 || exponent_min.trunc() != exponent_min {
+    if !exponent_min.is_finite()
+        || exponent_min != exponent_max
+        || exponent_min < 0.0
+        || exponent_min.trunc() != exponent_min
+    {
         return None;
     }
     let (base_min, base_max) = base?;

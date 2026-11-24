@@ -586,7 +586,9 @@ fn operator_json(node: &ProfileNode, tracked: &TrackedMetrics, legacy: bool) -> 
         JsonEntry::Object(_) => true,
         JsonEntry::Value(text) => key == "children" || text.starts_with('{') || text.starts_with('['),
     };
-    object.entries.sort_by(|a, b| nested(a).cmp(&nested(b)).then_with(|| a.0.cmp(&b.0)));
+    object
+        .entries
+        .sort_by(|a, b| nested(a).cmp(&nested(b)).then_with(|| a.0.cmp(&b.0)));
     object
 }
 

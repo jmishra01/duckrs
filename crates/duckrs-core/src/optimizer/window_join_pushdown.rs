@@ -40,7 +40,10 @@ fn is_functionally_dependent(expr: &BoundExpr, dependencies: &[&BoundExpr]) -> b
         return true;
     }
     let children = expr.children();
-    !children.is_empty() && children.into_iter().all(|child| is_functionally_dependent(child, dependencies))
+    !children.is_empty()
+        && children
+            .into_iter()
+            .all(|child| is_functionally_dependent(child, dependencies))
 }
 
 /// `WindowJoinPushdown::CanOptimize`: the side of the window, if the join can go below it.
@@ -57,7 +60,10 @@ fn can_optimize(op: &LogicalOperator) -> Option<usize> {
     let [condition] = conditions.as_slice() else {
         return None;
     };
-    if !matches!(condition.comparison, ComparisonOp::Equal | ComparisonOp::NotDistinctFrom) {
+    if !matches!(
+        condition.comparison,
+        ComparisonOp::Equal | ComparisonOp::NotDistinctFrom
+    ) {
         return None;
     }
     let is_window = |i: usize| matches!(op.children[i].kind, K::Window { .. });
@@ -76,7 +82,11 @@ fn can_optimize(op: &LogicalOperator) -> Option<usize> {
     let K::Window { windows, .. } = &op.children[window_side].kind else {
         return None;
     };
-    let b = if window_side == 0 { &condition.left } else { &condition.right };
+    let b = if window_side == 0 {
+        &condition.left
+    } else {
+        &condition.right
+    };
     // FD P -> b
     for window in windows {
         let partitions: Vec<&BoundExpr> = window.partitions.iter().collect();
@@ -88,7 +98,11 @@ fn can_optimize(op: &LogicalOperator) -> Option<usize> {
         return Some(window_side);
     }
     // x unique
-    let x = if window_side == 1 { &condition.left } else { &condition.right };
+    let x = if window_side == 1 {
+        &condition.left
+    } else {
+        &condition.right
+    };
     let BoundExprKind::ColumnRef { binding, depth: 0 } = &x.kind else {
         return None;
     };
@@ -127,9 +141,9 @@ pub(super) fn unique_column_combinations(op: &LogicalOperator) -> Vec<BTreeSet<C
         } => {
             let child_sets = unique_column_combinations(&op.children[0]);
             let forwarded = |binding: &ColumnBinding| {
-                expressions.iter().position(|e| {
-                    matches!(&e.kind, BoundExprKind::ColumnRef { binding: b, depth: 0 } if b == binding)
-                })
+                expressions
+                    .iter()
+                    .position(|e| matches!(&e.kind, BoundExprKind::ColumnRef { binding: b, depth: 0 } if b == binding))
             };
             child_sets
                 .into_iter()

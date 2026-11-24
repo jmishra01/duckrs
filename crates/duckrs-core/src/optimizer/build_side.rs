@@ -124,7 +124,11 @@ pub fn choose_by_width(plan: &mut LogicalOperator, in_recursive_cte: bool) {
         matches!(
             op.kind,
             K::Join {
-                join_type: JoinType::Semi | JoinType::Anti | JoinType::RightSemi | JoinType::RightAnti | JoinType::Outer,
+                join_type: JoinType::Semi
+                    | JoinType::Anti
+                    | JoinType::RightSemi
+                    | JoinType::RightAnti
+                    | JoinType::Outer,
                 ..
             }
         ) || op.children.iter().any(has_semi_or_anti)
@@ -143,13 +147,18 @@ fn reads_active_cte(op: &LogicalOperator) -> bool {
 
 /// `ContainsCorrelationSensitiveOperators`.
 fn correlation_sensitive(op: &LogicalOperator) -> bool {
-    matches!(op.kind, K::DelimGet { .. } | K::DelimJoin { .. } | K::LateralJoin { .. })
-        || op.children.iter().any(correlation_sensitive)
+    matches!(
+        op.kind,
+        K::DelimGet { .. } | K::DelimJoin { .. } | K::LateralJoin { .. }
+    ) || op.children.iter().any(correlation_sensitive)
 }
 
 /// `PropagatesBuildSide`: the join gives on rows of its build side, which a hash table kept across rounds would not.
 fn propagates_build_side(join_type: JoinType) -> bool {
-    matches!(join_type, JoinType::Outer | JoinType::Right | JoinType::RightAnti | JoinType::RightSemi)
+    matches!(
+        join_type,
+        JoinType::Outer | JoinType::Right | JoinType::RightAnti | JoinType::RightSemi
+    )
 }
 
 /// `InverseJoinType`, of the joins that have one.

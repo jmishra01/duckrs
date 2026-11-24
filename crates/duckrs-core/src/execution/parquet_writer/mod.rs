@@ -1447,7 +1447,9 @@ fn create_node(
             convert: Convert::I64,
             stats: signed,
         },
-        T::Timestamp | T::TimestampTz | T::TimestampMs | T::TimestampNs | T::TimestampTzNs | T::TimestampSec if int96 => {
+        T::Timestamp | T::TimestampTz | T::TimestampMs | T::TimestampNs | T::TimestampTzNs | T::TimestampSec
+            if int96 =>
+        {
             let (divide, multiply) = match ty.id() {
                 T::TimestampMs => (1, 1000),
                 T::TimestampNs | T::TimestampTzNs => (1000, 1),

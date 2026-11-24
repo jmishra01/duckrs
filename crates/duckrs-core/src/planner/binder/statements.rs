@@ -309,7 +309,10 @@ impl Binder<'_> {
     /// The catalog of an attached database other than this binder's that `name` is qualified by, and
     /// the schema in it (`None` for its default one). The first part of `a.b` is a schema if this
     /// catalog has one, as in C++.
-    pub(super) fn other_database_of(&self, name: &QualifiedName) -> Option<(Arc<crate::catalog::Catalog>, Option<String>)> {
+    pub(super) fn other_database_of(
+        &self,
+        name: &QualifiedName,
+    ) -> Option<(Arc<crate::catalog::Catalog>, Option<String>)> {
         let first = name.qualification.first()?;
         let session = self.session.as_ref()?;
         if first.eq_ignore_ascii_case(&session.database)
@@ -361,7 +364,10 @@ impl Binder<'_> {
             // `PrepareCTE`: a CTE runs once, and `CTEInlining` puts its query back where that is
             // better, unless it says MATERIALIZED
             let materialized = (cte.materialized != ast::CteMaterialize::Never
-                && matches!(cte.query.kind, QueryNodeKind::Select(_) | QueryNodeKind::SetOperation(_)))
+                && matches!(
+                    cte.query.kind,
+                    QueryNodeKind::Select(_) | QueryNodeKind::SetOperation(_)
+                ))
             .then(|| {
                 Arc::new(Mutex::new(super::MaterializedCteState {
                     cte_index: self.generate_table_index(),
@@ -371,8 +377,12 @@ impl Binder<'_> {
                     always: cte.materialized == ast::CteMaterialize::Always,
                 }))
             });
-            self.ctes
-                .push((name.clone(), Arc::new(cte.clone()), self.outer_contexts.len(), materialized));
+            self.ctes.push((
+                name.clone(),
+                Arc::new(cte.clone()),
+                self.outer_contexts.len(),
+                materialized,
+            ));
         }
         let result = match &node.kind {
             QueryNodeKind::Select(select) => self.bind_select_node(select, &node.modifiers),
@@ -394,7 +404,10 @@ impl Binder<'_> {
             let Some((plan, ..)) = state.bound.take() else {
                 continue;
             };
-            let query = std::mem::replace(&mut result.plan, LogicalOperator::new(LogicalOperatorKind::CrossProduct, Vec::new()));
+            let query = std::mem::replace(
+                &mut result.plan,
+                LogicalOperator::new(LogicalOperatorKind::CrossProduct, Vec::new()),
+            );
             result.plan = LogicalOperator::new(
                 LogicalOperatorKind::MaterializedCte {
                     name,
@@ -430,7 +443,13 @@ impl Binder<'_> {
                     return self.finish_cte_reference(table_ref, name, &cte, bound);
                 }
                 state.data = Arc::new(Mutex::new(ColumnDataCollection::new(bound.types.clone())));
-                state.bound = Some((bound.plan, bound.names, bound.types, bound.column_aliases, bound.return_type));
+                state.bound = Some((
+                    bound.plan,
+                    bound.names,
+                    bound.types,
+                    bound.column_aliases,
+                    bound.return_type,
+                ));
             }
             let state = state.lock();
             let (_, names, types, column_aliases, return_type) = state.bound.as_ref().expect("bound above");
@@ -673,13 +692,19 @@ impl Binder<'_> {
                 }
                 ExprKind::Function(call) => {
                     if call.filter.is_some() {
-                        return Err(binder_error("FILTER clause is not yet supported for aggregates in USING KEY"));
+                        return Err(binder_error(
+                            "FILTER clause is not yet supported for aggregates in USING KEY",
+                        ));
                     }
                     if !call.order_by.is_empty() {
-                        return Err(binder_error("ORDER BY clause is not yet supported for aggregates in USING KEY"));
+                        return Err(binder_error(
+                            "ORDER BY clause is not yet supported for aggregates in USING KEY",
+                        ));
                     }
                     if call.distinct {
-                        return Err(binder_error("DISTINCT is not yet supported for aggregates in USING KEY"));
+                        return Err(binder_error(
+                            "DISTINCT is not yet supported for aggregates in USING KEY",
+                        ));
                     }
                     let set = super::expression::qualified_aggregate(&call.name).ok_or_else(|| cant_be_used(target))?;
                     let mut children = Vec::with_capacity(call.args.len());
@@ -796,7 +821,12 @@ impl Binder<'_> {
             .collect::<Result<_>>()?;
         let payload_comparisons = aggregates
             .iter()
-            .map(|(_, a)| collated(BoundExpr::new(BoundExprKind::Reference(0), a.return_type.clone()), &a.return_type))
+            .map(|(_, a)| {
+                collated(
+                    BoundExpr::new(BoundExprKind::Reference(0), a.return_type.clone()),
+                    &a.return_type,
+                )
+            })
             .collect::<Result<_>>()?;
         let key = CteKey {
             keys,
@@ -835,9 +865,9 @@ impl Binder<'_> {
             }
         }
         let needs_wrap = modifiers.iter().any(|modifier| match modifier {
-            ResultModifier::Order(orders) => orders.iter().any(|order| {
-                !simple(&order.expr) && !node.children.iter().any(|child| provided(&order.expr, child))
-            }),
+            ResultModifier::Order(orders) => orders
+                .iter()
+                .any(|order| !simple(&order.expr) && !node.children.iter().any(|child| provided(&order.expr, child))),
             _ => false,
         });
         if needs_wrap {
@@ -914,7 +944,14 @@ impl Binder<'_> {
                 // columns, by their collations, with NULLs equal
                 let mut plans = plans.into_iter();
                 let (left, right) = (plans.next().expect("two children"), plans.next().expect("two children"));
-                let plan = self.set_operation_join(operation == SetOpType::Except, node.setop_all, &types, left, right, table_index)?;
+                let plan = self.set_operation_join(
+                    operation == SetOpType::Except,
+                    node.setop_all,
+                    &types,
+                    left,
+                    right,
+                    table_index,
+                )?;
                 return self.finish_set_operation(plan, node, modifiers, &aliases, &types, table_index, names);
             }
         };
@@ -1104,7 +1141,10 @@ impl Binder<'_> {
         fn selected_by(expr: &Expr, node: &QueryNode, found: &mut Vec<usize>) {
             match &node.kind {
                 QueryNodeKind::SetOperation(operation) => {
-                    operation.children.iter().for_each(|child| selected_by(expr, child, found));
+                    operation
+                        .children
+                        .iter()
+                        .for_each(|child| selected_by(expr, child, found));
                 }
                 QueryNodeKind::Select(select) => {
                     let wanted = without_aliases(expr);
@@ -1122,7 +1162,8 @@ impl Binder<'_> {
             let mut unused = Vec::new();
             return self.prepare_modifier(modifier, &mut unused, &mut SelectBindState::default());
         };
-        if matches!(nodes.as_slice(), [node] if matches!(&node.expr.kind, ExprKind::Star(star) if star.expr.is_none())) {
+        if matches!(nodes.as_slice(), [node] if matches!(&node.expr.kind, ExprKind::Star(star) if star.expr.is_none()))
+        {
             let node = &nodes[0];
             return Ok(PreparedModifier::OrderAll(
                 self.options.resolve_order(node.order, node.nulls),
@@ -1135,12 +1176,17 @@ impl Binder<'_> {
                 && let Some(pattern) = &star.expr
             {
                 let ExprKind::Constant(literal) = &pattern.kind else {
-                    return Err(not_implemented("COLUMNS of a set operation's ORDER BY other than a regex"));
+                    return Err(not_implemented(
+                        "COLUMNS of a set operation's ORDER BY other than a regex",
+                    ));
                 };
-                let regex = regex::Regex::new(&literal.text)
-                    .map_err(|e| Error::new(ErrorKind::InvalidInput, e.to_string()))?;
-                let mut matched: Vec<usize> =
-                    aliases.iter().filter(|(a, _)| regex.is_match(a)).map(|(_, i)| *i).collect();
+                let regex =
+                    regex::Regex::new(&literal.text).map_err(|e| Error::new(ErrorKind::InvalidInput, e.to_string()))?;
+                let mut matched: Vec<usize> = aliases
+                    .iter()
+                    .filter(|(a, _)| regex.is_match(a))
+                    .map(|(_, i)| *i)
+                    .collect();
                 matched.sort_unstable();
                 matched.dedup();
                 if matched.is_empty() {
@@ -1193,7 +1239,12 @@ impl Binder<'_> {
                         ExprKind::ColumnRef(names) => names.last().expect("a name").clone(),
                         _ => expression_name(&node.expr),
                     };
-                    let by_alias = || aliases.iter().find(|(a, _)| a.eq_ignore_ascii_case(&name)).map(|(_, i)| *i);
+                    let by_alias = || {
+                        aliases
+                            .iter()
+                            .find(|(a, _)| a.eq_ignore_ascii_case(&name))
+                            .map(|(_, i)| *i)
+                    };
                     // `projection_map`: an expression at different positions is ambiguous
                     let mut selected = Vec::new();
                     operation
@@ -1799,7 +1850,11 @@ impl Binder<'_> {
         // the hidden entries that ORDER BY and DISTINCT ON add are called what they compute
         let mut modifier_names = names.clone();
         modifier_names.extend(expressions.iter().skip(names.len()).map(|e| {
-            if e.alias.is_empty() { e.to_string() } else { e.alias.clone() }
+            if e.alias.is_empty() {
+                e.to_string()
+            } else {
+                e.alias.clone()
+            }
         }));
         let projection_index = self.generate_table_index();
         let plan = LogicalOperator::new(
@@ -2112,11 +2167,13 @@ impl Binder<'_> {
                             child: Box::new(target),
                             collation: collation.clone(),
                         })
-                        .with_alias(if matches!(&child.kind, ExprKind::Constant(_) | ExprKind::Positional(_)) {
-                            ORDER_POSITION_COLLATE
-                        } else {
-                            ""
-                        });
+                        .with_alias(
+                            if matches!(&child.kind, ExprKind::Constant(_) | ExprKind::Positional(_)) {
+                                ORDER_POSITION_COLLATE
+                            } else {
+                                ""
+                            },
+                        );
                         &rewritten
                     }
                     None => expr,
@@ -2185,7 +2242,9 @@ impl Binder<'_> {
         }
         // `BindSelectNode`: a struct UNNEST expands only as an entry of the select list itself
         if self.struct_unnest_fields(&qualified).is_some() {
-            return Err(binder_error("UNNEST of struct cannot be used in ORDER BY/DISTINCT ON clause"));
+            return Err(binder_error(
+                "UNNEST of struct cannot be used in ORDER BY/DISTINCT ON clause",
+            ));
         }
         let index = select_list.len();
         state.projection_map.push((key, index));
@@ -2234,7 +2293,10 @@ impl Binder<'_> {
             let mut expanded = false;
             for (expr, ty, extracted) in expressions {
                 // an empty struct at the top expands to no columns at all
-                if !extracted && matches!(ty.id(), LogicalTypeId::Struct | LogicalTypeId::Tuple) && ty.struct_children().is_empty() {
+                if !extracted
+                    && matches!(ty.id(), LogicalTypeId::Struct | LogicalTypeId::Tuple)
+                    && ty.struct_children().is_empty()
+                {
                     return Some(Vec::new());
                 }
                 if !matches!(ty.id(), LogicalTypeId::Struct | LogicalTypeId::Tuple) || ty.struct_children().is_empty() {
@@ -2562,7 +2624,10 @@ impl Binder<'_> {
             return;
         };
         let set_returning = call.name.qualification.is_empty()
-            && matches!(call.name.name.to_lowercase().as_str(), "range" | "generate_series" | "unnest");
+            && matches!(
+                call.name.name.to_lowercase().as_str(),
+                "range" | "generate_series" | "unnest"
+            );
         if !set_returning
             || table_ref.alias.is_empty()
             || !table_ref.column_name_alias.is_empty()
@@ -2633,48 +2698,55 @@ impl Binder<'_> {
                     return Err(not_implemented("AT clauses"));
                 }
                 // `ReplacementScan`: a file named like a table, once the catalog has no such table
-                let lower = name.name.to_lowercase();
-                if name.qualification.is_empty()
-                    && [".csv", ".tsv", ".csv.gz", ".tsv.gz", ".csv.zst", ".tsv.zst"]
-                        .iter()
-                        .any(|end| lower.ends_with(end))
-                    && (crate::execution::file_system::has_glob(&name.name)
-                        || !crate::execution::file_system::glob_or_directory(&name.name, "csv").is_empty())
+                // `ReplacementScan::GetFullPath`: every component of the name, as a file name
+                let full_path: String = name
+                    .qualification
+                    .iter()
+                    .filter(|q| !q.is_empty())
+                    .chain(std::iter::once(&name.name))
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(".");
+                let lower = full_path.to_lowercase();
+                if [".csv", ".tsv", ".csv.gz", ".tsv.gz", ".csv.zst", ".tsv.zst"]
+                    .iter()
+                    .any(|end| lower.ends_with(end))
+                    && (crate::execution::file_system::has_glob(&full_path)
+                        || !crate::execution::file_system::glob_or_directory(&full_path, "csv").is_empty())
                 {
                     let call = ast::FunctionExpr::new(
                         "read_csv_auto",
-                        vec![Expr::constant(ast::Literal::string(name.name.clone()))],
+                        vec![Expr::constant(ast::Literal::string(full_path.clone()))],
                     );
                     let mut file_ref = table_ref.clone();
                     if file_ref.alias.is_empty() {
-                        let file = name.name.rsplit('/').next().unwrap_or(&name.name);
+                        let file = full_path.rsplit('/').next().unwrap_or(&full_path);
                         file_ref.alias = file.split('.').next().unwrap_or(file).to_string();
                     }
                     return self.bind_read_csv(&call, &file_ref);
                 }
-                if name.qualification.is_empty()
-                    && [
-                        ".json",
-                        ".jsonl",
-                        ".ndjson",
-                        ".json.gz",
-                        ".jsonl.gz",
-                        ".ndjson.gz",
-                        ".json.zst",
-                        ".jsonl.zst",
-                        ".ndjson.zst",
-                    ]
-                    .iter()
-                    .any(|end| lower.ends_with(end))
-                    && !crate::execution::file_system::glob_or_directory(&name.name, "json").is_empty()
+                if [
+                    ".json",
+                    ".jsonl",
+                    ".ndjson",
+                    ".json.gz",
+                    ".jsonl.gz",
+                    ".ndjson.gz",
+                    ".json.zst",
+                    ".jsonl.zst",
+                    ".ndjson.zst",
+                ]
+                .iter()
+                .any(|end| lower.ends_with(end))
+                    && !crate::execution::file_system::glob_or_directory(&full_path, "json").is_empty()
                 {
                     let call = ast::FunctionExpr::new(
                         "read_json_auto",
-                        vec![Expr::constant(ast::Literal::string(name.name.clone()))],
+                        vec![Expr::constant(ast::Literal::string(full_path.clone()))],
                     );
                     let mut file_ref = table_ref.clone();
                     if file_ref.alias.is_empty() {
-                        let file = name.name.rsplit('/').next().unwrap_or(&name.name);
+                        let file = full_path.rsplit('/').next().unwrap_or(&full_path);
                         file_ref.alias = file.split('.').next().unwrap_or(file).to_string();
                     }
                     return self.bind_read_json(&call, &file_ref);
@@ -2695,18 +2767,17 @@ impl Binder<'_> {
                     }
                     return self.bind_read_duckdb(&call, &file_ref);
                 }
-                if name.qualification.is_empty()
-                    && lower.ends_with(".parquet")
-                    && !crate::execution::file_system::glob_or_directory(&name.name, "parquet").is_empty()
+                if lower.ends_with(".parquet")
+                    && !crate::execution::file_system::glob_or_directory(&full_path, "parquet").is_empty()
                 {
                     // `ParquetScanReplacement`
                     let call = ast::FunctionExpr::new(
                         "parquet_scan",
-                        vec![Expr::constant(ast::Literal::string(name.name.clone()))],
+                        vec![Expr::constant(ast::Literal::string(full_path.clone()))],
                     );
                     let mut file_ref = table_ref.clone();
                     if file_ref.alias.is_empty() {
-                        let file = name.name.rsplit('/').next().unwrap_or(&name.name);
+                        let file = full_path.rsplit('/').next().unwrap_or(&full_path);
                         file_ref.alias = file.split('.').next().unwrap_or(file).to_string();
                     }
                     return self.bind_read_parquet(&call, &file_ref);
@@ -2875,7 +2946,9 @@ impl Binder<'_> {
                     && Self::is_system_table(&name.name)
                     && crate::catalog::defaults::default_view(None, &name.name).is_none()
                 {
-                    return self.bind_system_table(table_ref, &name.name).map(|op| table_function_rows(op, &name.name));
+                    return self
+                        .bind_system_table(table_ref, &name.name)
+                        .map(|op| table_function_rows(op, &name.name));
                 }
                 // `BindBaseTableRef`: a file that is there, but that no reader is for
                 if entry.is_err()
@@ -2892,7 +2965,9 @@ impl Binder<'_> {
                 }
                 // the `duckdb_logs` view of `default_views.cpp`
                 if entry.is_err() && name.qualification.is_empty() && name.name.eq_ignore_ascii_case("duckdb_logs") {
-                    return self.bind_log_table("duckdb_logs", true, table_ref).map(|op| table_function_rows(op, "duckdb_logs"));
+                    return self
+                        .bind_log_table("duckdb_logs", true, table_ref)
+                        .map(|op| table_function_rows(op, "duckdb_logs"));
                 }
                 // the other views of the system catalog (`DefaultViewGenerator`), by their query
                 if entry.is_err() {
@@ -3137,7 +3212,9 @@ impl Binder<'_> {
                     && call.args.is_empty()
                     && Self::is_system_table(&call.name.name)
                 {
-                    return self.bind_system_table(table_ref, &call.name.name).map(|op| table_function_rows(op, &call.name.name));
+                    return self
+                        .bind_system_table(table_ref, &call.name.name)
+                        .map(|op| table_function_rows(op, &call.name.name));
                 }
                 self.bind_range(function, table_ref)
             }
@@ -3198,7 +3275,10 @@ impl Binder<'_> {
         self.next_table_index = binder.next_table_index;
         if view.secure {
             // the boundary that keeps the optimizer out of the view
-            let plan = std::mem::replace(&mut bound.plan, LogicalOperator::new(LogicalOperatorKind::CrossProduct, vec![]));
+            let plan = std::mem::replace(
+                &mut bound.plan,
+                LogicalOperator::new(LogicalOperatorKind::CrossProduct, vec![]),
+            );
             bound.plan = LogicalOperator::new(
                 LogicalOperatorKind::SecureView {
                     view_name: view.name.clone(),
@@ -3227,7 +3307,9 @@ impl Binder<'_> {
         };
         let name = call.name.name.to_lowercase();
         if name == "duckdb_settings" {
-            return self.bind_duckdb_settings(call, table_ref).map(|op| table_function_rows(op, &name));
+            return self
+                .bind_duckdb_settings(call, table_ref)
+                .map(|op| table_function_rows(op, &name));
         }
         if matches!(
             name.as_str(),
@@ -3238,10 +3320,14 @@ impl Binder<'_> {
                 .map(|op| table_function_rows(op, &name));
         }
         if name == "duckdb_logs" || name == "duckdb_log_contexts" {
-            return self.bind_duckdb_logs(&name, call, table_ref).map(|op| table_function_rows(op, &name));
+            return self
+                .bind_duckdb_logs(&name, call, table_ref)
+                .map(|op| table_function_rows(op, &name));
         }
         if name == "pragma_storage_info" {
-            return self.bind_storage_info(call, table_ref).map(|op| table_function_rows(op, &name));
+            return self
+                .bind_storage_info(call, table_ref)
+                .map(|op| table_function_rows(op, &name));
         }
         // `DuckDBMemoryFunction`: a row per `MemoryTag`. duckrs does not account memory by tag (as
         // `pragma_database_size` reports no memory usage), so every tag shows no bytes.
@@ -3268,7 +3354,9 @@ impl Binder<'_> {
                 .iter()
                 .map(|tag| vec![Value::varchar(*tag), Value::bigint(0), Value::bigint(0)])
                 .collect();
-            let names = ["tag", "memory_usage_bytes", "temporary_storage_bytes"].map(str::to_string).to_vec();
+            let names = ["tag", "memory_usage_bytes", "temporary_storage_bytes"]
+                .map(str::to_string)
+                .to_vec();
             let types = vec![LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT];
             return self
                 .bind_rows(table_ref, &name, names, types, rows)
@@ -3481,7 +3569,8 @@ impl Binder<'_> {
             let mut binding = super::generated::table_binding(table, alias, table_index, names);
             binding.schema = Some(table.schema.clone());
             // past the logical columns, and moved after the stored ones below
-            binding.row_id = (self.returning_row_id && !self.merge_action_column).then(|| table.logical_columns().len());
+            binding.row_id =
+                (self.returning_row_id && !self.merge_action_column).then(|| table.logical_columns().len());
             self.bind_context.add_binding(binding);
         } else {
             self.bind_context.add_binding(Binding {
@@ -3731,7 +3820,10 @@ impl Binder<'_> {
                     // `UpdateBinder`
                     let errors = (
                         std::mem::replace(&mut binder.window_error, "window functions are not allowed in UPDATE"),
-                        std::mem::replace(&mut binder.aggregate_error, "aggregate functions are not allowed in UPDATE"),
+                        std::mem::replace(
+                            &mut binder.aggregate_error,
+                            "aggregate functions are not allowed in UPDATE",
+                        ),
                     );
                     let bound = binder.bind_expression(value);
                     (binder.window_error, binder.aggregate_error) = errors;
@@ -3885,7 +3977,10 @@ impl Binder<'_> {
                     };
                     // `InsertBinder`
                     let errors = (
-                        std::mem::replace(&mut self.window_error, "INSERT statement cannot contain window functions!"),
+                        std::mem::replace(
+                            &mut self.window_error,
+                            "INSERT statement cannot contain window functions!",
+                        ),
                         std::mem::replace(&mut self.aggregate_error, "INSERT statement cannot contain aggregates!"),
                     );
                     let bound = self.bind_values(rows, Some(&expected_types), &defaults);

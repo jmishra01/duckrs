@@ -772,7 +772,11 @@ pub fn estimate_per_file(
     sample_size: usize,
 ) -> Option<u64> {
     let count = records.len();
-    let tuples = count.min(sample_size.div_ceil(STANDARD_VECTOR_SIZE).saturating_mul(STANDARD_VECTOR_SIZE));
+    let tuples = count.min(
+        sample_size
+            .div_ceil(STANDARD_VECTOR_SIZE)
+            .saturating_mul(STANDARD_VECTOR_SIZE),
+    );
     if tuples == 0 {
         return None;
     }

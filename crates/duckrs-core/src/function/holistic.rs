@@ -343,7 +343,9 @@ fn interpolate(lo: &Value, d: f64, hi: &Value, ty: &LogicalType) -> Result<Value
             let (width, scale) = ty.decimal_properties().expect("a DECIMAL");
             // a DECIMAL stored as a HUGEINT interpolates as one, from its exact difference
             if ty.physical_type() == duckrs_common::types::PhysicalType::Int128
-                && let Some(value) = b.checked_sub(a).and_then(|delta| a.checked_add((delta as f64 * d) as i128))
+                && let Some(value) = b
+                    .checked_sub(a)
+                    .and_then(|delta| a.checked_add((delta as f64 * d) as i128))
             {
                 return Value::decimal(value, width, scale);
             }
@@ -758,10 +760,7 @@ fn extremes(rows: &[Value], ty: &LogicalType, greatest: bool, value: usize, key:
             keys[*a] < keys[*b]
         }
     });
-    let items = order
-        .into_iter()
-        .map(|at| fields(chosen[at])[value].clone())
-        .collect();
+    let items = order.into_iter().map(|at| fields(chosen[at])[value].clone()).collect();
     Value::new(ty.clone(), ValueData::List(items))
 }
 
@@ -1097,12 +1096,17 @@ fn bit_strings(rows: &[Value], ty: &LogicalType, name: &str, combine: fn(u8, u8)
 fn bits(rows: &[Value], ty: &LogicalType, combine: fn(u128, u128) -> u128) -> Result<Value> {
     let mut result: Option<u128> = None;
     for row in rows {
-        if let Some(value) = row.as_i128() {
-            let value = value as u128;
+        // a UHUGEINT past HUGEINT's range is still its bits
+        let value = match row.data() {
+            ValueData::UInt128(value) => Some(*value),
+            _ => row.as_i128().map(|value| value as u128),
+        };
+        if let Some(value) = value {
             result = Some(result.map_or(value, |bits| combine(bits, value)));
         }
     }
     match result {
+        Some(bits) if ty.id() == LogicalTypeId::UHugeInt => Ok(Value::uhugeint(bits)),
         Some(bits) => cast(Value::hugeint(bits as i128), ty),
         None => Ok(Value::null(ty.clone())),
     }
@@ -1210,7 +1214,10 @@ pub fn finish(kind: Holistic, rows: &[Value], ty: &LogicalType) -> Result<Value>
         // `MedianFunction`: a type that cannot be interpolated takes the discrete median. Its rows are
         // its values (a STRUCT value is not the arguments of a quantile)
         Median => {
-            let rows: Vec<Value> = rows.iter().map(|r| Value::struct_value(vec![("a0".into(), r.clone())])).collect();
+            let rows: Vec<Value> = rows
+                .iter()
+                .map(|r| Value::struct_value(vec![("a0".into(), r.clone())]))
+                .collect();
             quantiles(&rows, ty, can_interpolate(ty))?
         }
         QuantileCont => quantiles(rows, ty, true)?,
@@ -1363,9 +1370,9 @@ pub fn finish(kind: Holistic, rows: &[Value], ty: &LogicalType) -> Result<Value>
             let mut count: u128 = 0;
             for row in rows.iter().filter(|v| !v.is_null()) {
                 let value = row.as_i128().unwrap_or(0);
-                sum = sum.checked_add(value).ok_or_else(|| {
-                    out_of_range("decimal_average: intermediate sum overflowed HUGEINT range")
-                })?;
+                sum = sum
+                    .checked_add(value)
+                    .ok_or_else(|| out_of_range("decimal_average: intermediate sum overflowed HUGEINT range"))?;
                 count += 1;
             }
             if count == 0 {

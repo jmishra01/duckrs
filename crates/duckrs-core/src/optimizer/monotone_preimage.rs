@@ -110,10 +110,18 @@ fn comparison(op: ComparisonOp, left: BoundExpr, right: Value) -> BoundExpr {
 fn column_bound(lower: bool, column: &BoundExpr, bound: i64, edge: i64, has_infinity: bool) -> BoundExpr {
     let ty = &column.return_type;
     if has_infinity && bound == edge {
-        let op = if lower { ComparisonOp::GreaterThan } else { ComparisonOp::LessThan };
+        let op = if lower {
+            ComparisonOp::GreaterThan
+        } else {
+            ComparisonOp::LessThan
+        };
         return comparison(op, column.clone(), infinity(ty, lower));
     }
-    let op = if lower { ComparisonOp::GreaterThanOrEqual } else { ComparisonOp::LessThanOrEqual };
+    let op = if lower {
+        ComparisonOp::GreaterThanOrEqual
+    } else {
+        ComparisonOp::LessThanOrEqual
+    };
     comparison(op, column.clone(), numeric(ty, bound))
 }
 
@@ -139,7 +147,10 @@ pub fn monotone_preimage(expr: &mut BoundExpr, is_root: bool) -> bool {
     } else {
         return false;
     };
-    let BoundExprKind::Function { function: f, children, .. } = &function.kind else {
+    let BoundExprKind::Function {
+        function: f, children, ..
+    } = &function.kind
+    else {
         return false;
     };
     let [column] = children.as_slice() else {
@@ -189,12 +200,26 @@ pub fn monotone_preimage(expr: &mut BoundExpr, is_root: bool) -> bool {
     };
     let ge = |i: i64| compare_values(ComparisonOp::GreaterThanOrEqual, &evaluate(i)?, &c);
     let gt = |i: i64| compare_values(ComparisonOp::GreaterThan, &evaluate(i)?, &c);
-    let need_ge = matches!(op, ComparisonOp::GreaterThanOrEqual | ComparisonOp::LessThan | ComparisonOp::Equal);
-    let need_gt = matches!(op, ComparisonOp::GreaterThan | ComparisonOp::LessThanOrEqual | ComparisonOp::Equal);
+    let need_ge = matches!(
+        op,
+        ComparisonOp::GreaterThanOrEqual | ComparisonOp::LessThan | ComparisonOp::Equal
+    );
+    let need_gt = matches!(
+        op,
+        ComparisonOp::GreaterThan | ComparisonOp::LessThanOrEqual | ComparisonOp::Equal
+    );
     let (mut a, mut b);
     if increasing {
-        let x_ge = if need_ge { first_true_suffix(&ge, dom_lo, dom_hi) } else { Some(0) };
-        let x_gt = if need_gt { first_true_suffix(&gt, dom_lo, dom_hi) } else { Some(0) };
+        let x_ge = if need_ge {
+            first_true_suffix(&ge, dom_lo, dom_hi)
+        } else {
+            Some(0)
+        };
+        let x_gt = if need_gt {
+            first_true_suffix(&gt, dom_lo, dom_hi)
+        } else {
+            Some(0)
+        };
         let (Some(x_ge), Some(x_gt)) = (x_ge, x_gt) else {
             return false;
         };
@@ -206,8 +231,16 @@ pub fn monotone_preimage(expr: &mut BoundExpr, is_root: bool) -> bool {
             _ => (x_ge, x_gt - 1),
         };
     } else {
-        let y_ge = if need_ge { last_true_prefix(&ge, dom_lo, dom_hi) } else { Some(0) };
-        let y_gt = if need_gt { last_true_prefix(&gt, dom_lo, dom_hi) } else { Some(0) };
+        let y_ge = if need_ge {
+            last_true_prefix(&ge, dom_lo, dom_hi)
+        } else {
+            Some(0)
+        };
+        let y_gt = if need_gt {
+            last_true_prefix(&gt, dom_lo, dom_hi)
+        } else {
+            Some(0)
+        };
         let (Some(y_ge), Some(y_gt)) = (y_ge, y_gt) else {
             return false;
         };
@@ -227,15 +260,17 @@ pub fn monotone_preimage(expr: &mut BoundExpr, is_root: bool) -> bool {
         if has_infinity {
             return false;
         }
-        let call = crate::function::BuiltinFunctions::get().scalar("constant_or_null").and_then(|set| {
-            crate::function::binder::bind_scalar_function(
-                set,
-                vec![BoundExpr::constant(Value::boolean(false)), column],
-                false,
-                &try_evaluate_scalar,
-            )
-            .ok()
-        });
+        let call = crate::function::BuiltinFunctions::get()
+            .scalar("constant_or_null")
+            .and_then(|set| {
+                crate::function::binder::bind_scalar_function(
+                    set,
+                    vec![BoundExpr::constant(Value::boolean(false)), column],
+                    false,
+                    &try_evaluate_scalar,
+                )
+                .ok()
+            });
         let Some(call) = call else {
             return false;
         };
@@ -260,7 +295,11 @@ pub fn monotone_preimage(expr: &mut BoundExpr, is_root: bool) -> bool {
         below_matches = matches;
     }
     let lower = if need_lower && below_matches {
-        Some(comparison(ComparisonOp::NotEqual, column.clone(), infinity(&column.return_type, true)))
+        Some(comparison(
+            ComparisonOp::NotEqual,
+            column.clone(),
+            infinity(&column.return_type, true),
+        ))
     } else if need_lower {
         Some(column_bound(true, &column, a, dom_lo, has_infinity))
     } else {

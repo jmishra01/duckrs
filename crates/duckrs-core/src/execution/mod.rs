@@ -44,8 +44,8 @@ pub mod constraints;
 mod merge;
 pub mod random_engine;
 mod special_joins;
-mod upsert;
 mod streaming_window;
+mod upsert;
 mod window;
 pub use window::set_streaming as set_streaming_windows;
 
@@ -397,9 +397,11 @@ fn create_physical(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
         LogicalOperatorKind::EmptyResult { .. } => Box::new(PhysicalEmptyResult { types }),
         LogicalOperatorKind::DummyScan { .. } => Box::new(PhysicalDummyScan { types }),
         LogicalOperatorKind::ChunkGet { chunks, .. } => Box::new(PhysicalChunkScan { types, chunks }),
-        LogicalOperatorKind::ExpressionGet { expressions, function: None, .. }
-            if constant_rows(&expressions, &types) =>
-        {
+        LogicalOperatorKind::ExpressionGet {
+            expressions,
+            function: None,
+            ..
+        } if constant_rows(&expressions, &types) => {
             // `CreatePlan(LogicalExpressionGet)`: rows of constants are a collection to scan (`PhysicalColumnDataScan`)
             let mut chunks = Vec::new();
             for rows in expressions.chunks(duckrs_common::STANDARD_VECTOR_SIZE) {
@@ -412,7 +414,9 @@ fn create_physical(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
                         let BoundExprKind::Constant(value) = &expr.kind else {
                             unreachable!("checked");
                         };
-                        column.set_value(row, value).expect("a constant fits a vector of its own type");
+                        column
+                            .set_value(row, value)
+                            .expect("a constant fits a vector of its own type");
                     }
                 }
                 chunks.push(DataChunk::from_columns(columns, rows.len()));
@@ -526,7 +530,11 @@ fn create_physical(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
                 .then(|| options.sample_size.parse::<f64>().unwrap_or(0.0) as u64);
             let mut sample = PhysicalSample::new(options, children.remove(0));
             if let Some(rows) = rows {
-                sample.rate = if child_cardinality > 0 { rows as f64 / child_cardinality as f64 } else { 1.0 };
+                sample.rate = if child_cardinality > 0 {
+                    rows as f64 / child_cardinality as f64
+                } else {
+                    1.0
+                };
                 // the sample can keep more rows than asked for: a LIMIT stops at them
                 let types = sample.types.clone();
                 return Box::new(PhysicalLimit {
@@ -931,9 +939,9 @@ fn constant_rows(rows: &[Vec<BoundExpr>], types: &[duckrs_common::types::Logical
     !rows.is_empty()
         && rows.iter().all(|row| {
             row.len() == types.len()
-                && row.iter().zip(types).all(|(expr, ty)| {
-                    matches!(&expr.kind, BoundExprKind::Constant(value) if value.logical_type() == ty)
-                })
+                && row.iter().zip(types).all(
+                    |(expr, ty)| matches!(&expr.kind, BoundExprKind::Constant(value) if value.logical_type() == ty),
+                )
         })
 }
 

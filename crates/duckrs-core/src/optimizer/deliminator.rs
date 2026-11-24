@@ -333,7 +333,12 @@ fn remove_join_with_delim_get(
             return None;
         };
         mark = *join_type == JoinType::Mark;
-        if delim_gets != 1 || !matches!(join_type, JoinType::Mark | JoinType::Semi | JoinType::Anti | JoinType::Single) {
+        if delim_gets != 1
+            || !matches!(
+                join_type,
+                JoinType::Mark | JoinType::Semi | JoinType::Anti | JoinType::Single
+            )
+        {
             return None;
         }
         let count = conditions.len();

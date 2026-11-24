@@ -479,7 +479,11 @@ impl JoinCondition {
     }
     /// The comparison of the condition for its sides, `IS NOT DISTINCT FROM` if `null_safe`.
     pub fn equality(null_safe: bool) -> ComparisonOp {
-        if null_safe { ComparisonOp::NotDistinctFrom } else { ComparisonOp::Equal }
+        if null_safe {
+            ComparisonOp::NotDistinctFrom
+        } else {
+            ComparisonOp::Equal
+        }
     }
 }
 
@@ -769,7 +773,9 @@ impl LogicalOperator {
             }
             LogicalOperatorKind::ExpressionGet { table_index, types, .. }
             | LogicalOperatorKind::ChunkGet { table_index, types, .. } => numbered(*table_index, types.len()),
-            LogicalOperatorKind::ParquetScan { table_index, scan } => numbered(*table_index, scan.emitted_types().len()),
+            LogicalOperatorKind::ParquetScan { table_index, scan } => {
+                numbered(*table_index, scan.emitted_types().len())
+            }
             LogicalOperatorKind::JsonScan { table_index, scan } => scan
                 .projected_columns()
                 .into_iter()
@@ -903,7 +909,10 @@ impl LogicalOperator {
                 .collect(),
             LogicalOperatorKind::ParquetScan { scan, .. } => {
                 let scan = std::sync::Arc::make_mut(scan);
-                scan.filters.iter_mut().chain(scan.optional_filters.iter_mut()).collect()
+                scan.filters
+                    .iter_mut()
+                    .chain(scan.optional_filters.iter_mut())
+                    .collect()
             }
             LogicalOperatorKind::MergeInto {
                 actions,
@@ -922,9 +931,10 @@ impl LogicalOperator {
             LogicalOperatorKind::Filter { expressions }
             | LogicalOperatorKind::Projection { expressions, .. }
             | LogicalOperatorKind::Unnest { expressions, .. } => expressions.iter_mut().collect(),
-            LogicalOperatorKind::Distinct { targets, orders, .. } => {
-                targets.iter_mut().chain(orders.iter_mut().map(|o| &mut o.expr)).collect()
-            }
+            LogicalOperatorKind::Distinct { targets, orders, .. } => targets
+                .iter_mut()
+                .chain(orders.iter_mut().map(|o| &mut o.expr))
+                .collect(),
             LogicalOperatorKind::LateralJoin {
                 correlated, predicate, ..
             } => correlated.iter_mut().chain(predicate.iter_mut()).collect(),

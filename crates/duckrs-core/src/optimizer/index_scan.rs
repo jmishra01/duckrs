@@ -267,15 +267,20 @@ pub fn plan_index_scans(op: &mut LogicalOperator, options: &OptimizerOptions) {
     {
         // `TableScanInitGlobal` looks into the optional filters for an IN list
         let mut all = filters.clone();
-        all.extend(optional_filters.iter().filter(|f| {
-            matches!(
-                f.kind,
-                BoundExprKind::Operator {
-                    op: crate::planner::expression::BoundOperator::In,
-                    ..
-                }
-            )
-        }).cloned());
+        all.extend(
+            optional_filters
+                .iter()
+                .filter(|f| {
+                    matches!(
+                        f.kind,
+                        BoundExprKind::Operator {
+                            op: crate::planner::expression::BoundOperator::In,
+                            ..
+                        }
+                    )
+                })
+                .cloned(),
+        );
         if !all.is_empty() {
             *rows = index_rows(table, column_ids, &all, options).map(Arc::new);
         }

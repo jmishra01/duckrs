@@ -6,8 +6,8 @@
 //! C++ builds the `remap_struct` call as a parsed expression from constant values; here it is the
 //! SQL of that expression, which is also the text a DEFAULT is stored with.
 
-use super::alter::BoundTableAlter;
 use super::alter::BoundAlter;
+use super::alter::BoundTableAlter;
 use super::{Binder, binder_error};
 use duckrs_common::types::{LogicalType, LogicalTypeId};
 use duckrs_common::{Error, ErrorKind, Result};
@@ -137,16 +137,20 @@ fn add_field_to_struct(
             ))));
         }
         children.push((name.to_string(), field_type.clone()));
-        return Ok(Ok((LogicalType::struct_type(children), pack(default.to_string(), name))));
+        return Ok(Ok((
+            LogicalType::struct_type(children),
+            pack(default.to_string(), name),
+        )));
     }
     let next = &path[depth + 1];
     let list = ty.id() == LogicalTypeId::List;
     for (child, child_type) in children.iter_mut() {
         if (list && next.eq_ignore_ascii_case("element")) || child.eq_ignore_ascii_case(next) {
-            let (new_type, defaults) = match add_field_to_struct(child_type, path, name, field_type, default, depth + 1)? {
-                Ok(result) => result,
-                Err(error) => return Ok(Err(error)),
-            };
+            let (new_type, defaults) =
+                match add_field_to_struct(child_type, path, name, field_type, default, depth + 1)? {
+                    Ok(result) => result,
+                    Err(error) => return Ok(Err(error)),
+                };
             *child_type = new_type;
             let defaults = pack(defaults, if list { "list" } else { child });
             return Ok(Ok((nested_type(ty, children), defaults)));
@@ -191,7 +195,8 @@ fn change_field(
     let mut new_children = Vec::new();
     for (child, child_type) in &children {
         let mut field_name = child.clone();
-        let (child_mapping, new_type) = if (list && entry.eq_ignore_ascii_case("element")) || child.eq_ignore_ascii_case(entry)
+        let (child_mapping, new_type) = if (list && entry.eq_ignore_ascii_case("element"))
+            || child.eq_ignore_ascii_case(entry)
         {
             found = true;
             if last {

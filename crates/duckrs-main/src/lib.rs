@@ -1504,6 +1504,17 @@ impl ClientContext {
         let (list_db, list_session) = (self.home.clone(), self.settings.clone());
         let files_db = self.home.clone();
         let attached_db = self.home.clone();
+        let transaction_catalogs: Vec<(Arc<Catalog>, Arc<Catalog>)> = self
+            .transaction
+            .as_ref()
+            .map(|transaction| {
+                transaction
+                    .forks
+                    .iter()
+                    .map(|(database, fork)| (database.catalog.clone(), fork.catalog.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
         Arc::new(SessionValues {
             database: self.db.name.clone(),
             default_database: self.routed_from.clone().unwrap_or_else(|| self.db.name.clone()),
@@ -1582,14 +1593,22 @@ impl ClientContext {
                     .collect()
             }),
             attached_catalog: Box::new(move |name: &str| {
-                if name.eq_ignore_ascii_case(&attached_db.name) && !attached_db.is_detached() {
-                    return Some(attached_db.catalog.clone());
-                }
-                attached_db
-                    .attached
-                    .read()
-                    .get(&name.to_lowercase())
-                    .map(|database| database.catalog.clone())
+                let catalog = if name.eq_ignore_ascii_case(&attached_db.name) && !attached_db.is_detached() {
+                    attached_db.catalog.clone()
+                } else {
+                    attached_db
+                        .attached
+                        .read()
+                        .get(&name.to_lowercase())
+                        .map(|database| database.catalog.clone())?
+                };
+                // a database the transaction changed is read as the transaction sees it
+                Some(
+                    transaction_catalogs
+                        .iter()
+                        .find(|(database, _)| Arc::ptr_eq(database, &catalog))
+                        .map_or(catalog, |(_, fork)| fork.clone()),
+                )
             }),
         })
     }

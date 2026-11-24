@@ -1307,7 +1307,9 @@ fn physical_operator_message(class: &str, event: &str, info: &[(&str, String)]) 
         .map(|(key, value)| format!("{key}={value}"))
         .collect::<Vec<_>>()
         .join(", ");
-    format!("{{'operator_type': TABLE_SCAN, 'parameters': {{}}, 'class': {class}, 'event': {event}, 'info': {{{info}}}}}")
+    format!(
+        "{{'operator_type': TABLE_SCAN, 'parameters': {{}}, 'class': {class}, 'event': {event}, 'info': {{{info}}}}}"
+    )
 }
 
 /// `DUCKDB_LOG(context, PhysicalOperatorLogType, ...)` of a table scan, with the logger of the statement it runs

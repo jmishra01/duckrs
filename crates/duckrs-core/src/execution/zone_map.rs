@@ -91,7 +91,10 @@ pub(crate) const SPECIAL_NULL_HANDLING: &[&str] = &[
 pub(crate) fn evaluate_part(part: &str, value: &Value) -> Option<Value> {
     let call = crate::function::dates::bind_date_function(
         "date_part",
-        vec![BoundExpr::constant(Value::varchar(part)), BoundExpr::constant(value.clone())],
+        vec![
+            BoundExpr::constant(Value::varchar(part)),
+            BoundExpr::constant(value.clone()),
+        ],
     )
     .ok()?;
     try_evaluate_scalar(&call).filter(|value| !value.is_null())
@@ -171,7 +174,12 @@ fn compute_zones(table: &TableCatalogEntry, column: usize, known: &[ColumnZone])
         return compute_nested_zones(table, column, &element);
     }
     // UUIDs and ENUMs keep the statistics of the integers they are stored as
-    if !has_ordered_statistics(ty) && !matches!(ty.id(), LogicalTypeId::Interval | LogicalTypeId::Uuid | LogicalTypeId::Enum) {
+    if !has_ordered_statistics(ty)
+        && !matches!(
+            ty.id(),
+            LogicalTypeId::Interval | LogicalTypeId::Uuid | LogicalTypeId::Enum
+        )
+    {
         return Vec::new();
     }
     if let Some(source) = table
@@ -204,53 +212,53 @@ fn compute_zones(table: &TableCatalogEntry, column: usize, known: &[ColumnZone])
 /// What `count` values of `vector` add to `zone`: their bounds by the keys they sort by, NULLs, and the lengths of
 /// strings.
 fn add_to_zone(zone: &mut ColumnZone, vector: &duckrs_common::vector::Vector, count: usize) {
-        let Ok(keys) = group_keys(&[vector], count) else {
-            zone.unknown = true;
+    let Ok(keys) = group_keys(&[vector], count) else {
+        zone.unknown = true;
+        return;
+    };
+    let validity = vector.to_unified(count);
+    let (mut smallest, mut largest): (Option<usize>, Option<usize>) = (None, None);
+    for (row, key) in keys.iter().enumerate() {
+        if !validity.is_valid(row) {
+            zone.has_null = true;
+            continue;
+        }
+        if smallest.is_none_or(|at| key < &keys[at]) {
+            smallest = Some(row);
+        }
+        if largest.is_none_or(|at| key > &keys[at]) {
+            largest = Some(row);
+        }
+    }
+    let merge = |current: &mut Option<Value>, row: Option<usize>, keep: Ordering| {
+        let Some(value) = row.map(|row| vector.get_value(row)) else {
             return;
         };
-        let validity = vector.to_unified(count);
-        let (mut smallest, mut largest): (Option<usize>, Option<usize>) = (None, None);
-        for (row, key) in keys.iter().enumerate() {
-            if !validity.is_valid(row) {
-                zone.has_null = true;
-                continue;
-            }
-            if smallest.is_none_or(|at| key < &keys[at]) {
-                smallest = Some(row);
-            }
-            if largest.is_none_or(|at| key > &keys[at]) {
-                largest = Some(row);
-            }
-        }
-        let merge = |current: &mut Option<Value>, row: Option<usize>, keep: Ordering| {
-            let Some(value) = row.map(|row| vector.get_value(row)) else {
-                return;
+        let replace = current.as_ref().is_none_or(|old| {
+            let op = match keep {
+                Ordering::Less => ComparisonOp::LessThan,
+                _ => ComparisonOp::GreaterThan,
             };
-            let replace = current.as_ref().is_none_or(|old| {
-                let op = match keep {
-                    Ordering::Less => ComparisonOp::LessThan,
-                    _ => ComparisonOp::GreaterThan,
-                };
-                compare_values(op, &value, old) == Some(true)
-            });
-            if replace {
-                *current = Some(value);
-            }
-        };
-        merge(&mut zone.min, smallest, Ordering::Less);
-        merge(&mut zone.max, largest, Ordering::Greater);
-        // the lengths of strings (`StringStats` keeps the longest and whether there is unicode)
-        if vector.logical_type().id() == LogicalTypeId::Varchar {
-            for row in (0..count).filter(|&row| validity.is_valid(row)) {
-                let Ok(text) = vector.get_value(row).try_to_string() else {
-                    continue;
-                };
-                let length = text.len() as u64;
-                let (low, high) = zone.lengths.unwrap_or((length, length));
-                zone.lengths = Some((low.min(length), high.max(length)));
-                zone.has_unicode |= !text.is_ascii();
-            }
+            compare_values(op, &value, old) == Some(true)
+        });
+        if replace {
+            *current = Some(value);
         }
+    };
+    merge(&mut zone.min, smallest, Ordering::Less);
+    merge(&mut zone.max, largest, Ordering::Greater);
+    // the lengths of strings (`StringStats` keeps the longest and whether there is unicode)
+    if vector.logical_type().id() == LogicalTypeId::Varchar {
+        for row in (0..count).filter(|&row| validity.is_valid(row)) {
+            let Ok(text) = vector.get_value(row).try_to_string() else {
+                continue;
+            };
+            let length = text.len() as u64;
+            let (low, high) = zone.lengths.unwrap_or((length, length));
+            zone.lengths = Some((low.min(length), high.max(length)));
+            zone.has_unicode |= !text.is_ascii();
+        }
+    }
 }
 
 /// `ColumnSegment` statistics, which a scan checks per vector (`RowGroup::CheckZonemapSegments`): a zone per vector
@@ -305,7 +313,12 @@ pub(crate) fn vector_zones_of(
         };
         let ty = vector.logical_type();
         let mut zone = ColumnZone::default();
-        if has_ordered_statistics(ty) || matches!(ty.id(), LogicalTypeId::Interval | LogicalTypeId::Uuid | LogicalTypeId::Enum) {
+        if has_ordered_statistics(ty)
+            || matches!(
+                ty.id(),
+                LogicalTypeId::Interval | LogicalTypeId::Uuid | LogicalTypeId::Enum
+            )
+        {
             add_to_zone(&mut zone, vector, count);
         } else {
             // values without ordered statistics (nested ones among them): nothing to go by
@@ -452,7 +465,8 @@ fn outside_elements(value: &Value, elements: &ColumnZone) -> bool {
                 if std::ptr::eq(v, max) {
                     cut.push(0xff);
                 }
-                Value::new(v.logical_type().clone(), duckrs_common::value::ValueData::Bytes(cut)).unwrap_or_else(|_| v.clone())
+                Value::new(v.logical_type().clone(), duckrs_common::value::ValueData::Bytes(cut))
+                    .unwrap_or_else(|_| v.clone())
             }
             _ => v.clone(),
         }
@@ -470,7 +484,8 @@ fn nested_element_type(ty: &LogicalType) -> Option<LogicalType> {
         LogicalTypeId::Map => ty.child_type()?.struct_children().get(1)?.1.clone(),
         _ => return None,
     };
-    (has_ordered_statistics(&element) || matches!(element.id(), LogicalTypeId::Blob | LogicalTypeId::Interval)).then_some(element)
+    (has_ordered_statistics(&element) || matches!(element.id(), LogicalTypeId::Blob | LogicalTypeId::Interval))
+        .then_some(element)
 }
 
 /// The zones of a nested column: what is NULL, and the bounds of its elements.
@@ -517,10 +532,18 @@ fn compute_nested_zones(table: &TableCatalogEntry, column: usize, element: &Logi
                     zone.elements = None;
                     break;
                 }
-                if elements.min.as_ref().is_none_or(|min| compare_values(ComparisonOp::LessThan, item, min) == Some(true)) {
+                if elements
+                    .min
+                    .as_ref()
+                    .is_none_or(|min| compare_values(ComparisonOp::LessThan, item, min) == Some(true))
+                {
                     elements.min = Some(item.clone());
                 }
-                if elements.max.as_ref().is_none_or(|max| compare_values(ComparisonOp::GreaterThan, item, max) == Some(true)) {
+                if elements
+                    .max
+                    .as_ref()
+                    .is_none_or(|max| compare_values(ComparisonOp::GreaterThan, item, max) == Some(true))
+                {
                     elements.max = Some(item.clone());
                 }
             }
@@ -779,8 +802,11 @@ impl Group<'_> {
     fn elements(&self, expr: &BoundExpr) -> Option<ColumnZone> {
         match &expr.kind {
             BoundExprKind::Reference(index) => self.zone(*index)?.elements.map(|zone| *zone),
-            BoundExprKind::Function { function, children, .. } if function.name == "map_values" && children.len() == 1 => {
-                self.elements(&children[0]).filter(|_| children[0].return_type.id() == LogicalTypeId::Map)
+            BoundExprKind::Function { function, children, .. }
+                if function.name == "map_values" && children.len() == 1 =>
+            {
+                self.elements(&children[0])
+                    .filter(|_| children[0].return_type.id() == LogicalTypeId::Map)
             }
             // `list_transform(l, x -> f(x))`: f of the elements' range, for a lambda that reads nothing else
             BoundExprKind::ListLambda {
@@ -877,7 +903,9 @@ impl Group<'_> {
             ("coalesce", _) => self.union(children.iter()),
             // `abs` keeps the order of values that are not negative, and reverses that of values that are not positive
             ("abs", [child]) => match self.range(child) {
-                Range::Bounds(min, _) if sign(&min).is_some_and(|s| s != Ordering::Less) => self.monotone(expr, 0, true),
+                Range::Bounds(min, _) if sign(&min).is_some_and(|s| s != Ordering::Less) => {
+                    self.monotone(expr, 0, true)
+                }
                 Range::Bounds(_, max) if sign(&max).is_some_and(|s| s != Ordering::Greater) => {
                     self.monotone(expr, 0, false)
                 }
@@ -894,9 +922,14 @@ impl Group<'_> {
                     };
                     let zero = crate::execution::parquet::try_cast_value(&Value::integer(0), &expr.return_type);
                     match (at(&min), at(&max), zero) {
-                        (Some(low), Some(high), Some(zero)) => {
-                            Range::Bounds(zero, if is(ComparisonOp::GreaterThan, &low, &high) { low } else { high })
-                        }
+                        (Some(low), Some(high), Some(zero)) => Range::Bounds(
+                            zero,
+                            if is(ComparisonOp::GreaterThan, &low, &high) {
+                                low
+                            } else {
+                                high
+                            },
+                        ),
                         _ => Range::Unknown,
                     }
                 }
@@ -909,7 +942,9 @@ impl Group<'_> {
                 self.range(input)
             }
             ("replace", [input, from, to])
-                if constant(from).is_some() && constant(from).map(|v| v.try_to_string().ok()) == constant(to).map(|v| v.try_to_string().ok()) =>
+                if constant(from).is_some()
+                    && constant(from).map(|v| v.try_to_string().ok())
+                        == constant(to).map(|v| v.try_to_string().ok()) =>
             {
                 self.range(input)
             }
@@ -919,11 +954,15 @@ impl Group<'_> {
                 else {
                     return Range::Unknown;
                 };
-                let null_on_zero = matches!(&expr.kind, BoundExprKind::Function { function, .. } if function.null_on_zero);
+                let null_on_zero =
+                    matches!(&expr.kind, BoundExprKind::Function { function, .. } if function.null_on_zero);
                 let bounds = match (lmin.as_i128(), lmax.as_i128(), rmin.as_i128(), rmax.as_i128()) {
-                    (Some(a), Some(b), Some(c), Some(d)) => {
-                        crate::optimizer::statistics::integer_modulo_bounds((a, b), (c, d), &expr.return_type, null_on_zero)
-                    }
+                    (Some(a), Some(b), Some(c), Some(d)) => crate::optimizer::statistics::integer_modulo_bounds(
+                        (a, b),
+                        (c, d),
+                        &expr.return_type,
+                        null_on_zero,
+                    ),
                     _ => None,
                 };
                 let bound = |n: i128| crate::execution::parquet::try_cast_value(&Value::hugeint(n), &expr.return_type);
@@ -934,9 +973,10 @@ impl Group<'_> {
             }
             // the lengths of strings (`StringStats`): in bytes, and in characters, which without unicode
             // are bytes and with it at least a quarter of them
-            ("length" | "len" | "char_length" | "character_length" | "length_grapheme" | "strlen" | "octet_length", [input])
-                if self.lengths(input).is_some() =>
-            {
+            (
+                "length" | "len" | "char_length" | "character_length" | "length_grapheme" | "strlen" | "octet_length",
+                [input],
+            ) if self.lengths(input).is_some() => {
                 let (low, high, unicode) = self.lengths(input).expect("checked");
                 let bytes = matches!(name, "strlen" | "octet_length");
                 let low = if bytes || !unicode {
@@ -946,7 +986,8 @@ impl Group<'_> {
                 } else {
                     low.div_ceil(4)
                 };
-                let bound = |n: u64| crate::execution::parquet::try_cast_value(&Value::bigint(n as i64), &expr.return_type);
+                let bound =
+                    |n: u64| crate::execution::parquet::try_cast_value(&Value::bigint(n as i64), &expr.return_type);
                 match (bound(low), bound(high)) {
                     (Some(low), Some(high)) => Range::Bounds(low, high),
                     _ => Range::Unknown,
@@ -955,21 +996,23 @@ impl Group<'_> {
             // a needle in the prefix that all strings of the group share (of the bytes C++ keeps of the bounds)
             // is in all of them
             ("contains", [input, needle])
-                if constant(needle).and_then(|n| n.try_to_string().ok()).is_some_and(|needle| {
-                    let Range::Bounds(min, max) = self.range(input) else {
-                        return false;
-                    };
-                    let (Ok(min), Ok(max)) = (min.try_to_string(), max.try_to_string()) else {
-                        return false;
-                    };
-                    let shared = min
-                        .bytes()
-                        .zip(max.bytes())
-                        .take(STRING_STATISTICS_BYTES)
-                        .take_while(|(a, b)| a == b)
-                        .count();
-                    min.get(..shared).is_some_and(|prefix| prefix.contains(needle.as_str()))
-                }) =>
+                if constant(needle)
+                    .and_then(|n| n.try_to_string().ok())
+                    .is_some_and(|needle| {
+                        let Range::Bounds(min, max) = self.range(input) else {
+                            return false;
+                        };
+                        let (Ok(min), Ok(max)) = (min.try_to_string(), max.try_to_string()) else {
+                            return false;
+                        };
+                        let shared = min
+                            .bytes()
+                            .zip(max.bytes())
+                            .take(STRING_STATISTICS_BYTES)
+                            .take_while(|(a, b)| a == b)
+                            .count();
+                        min.get(..shared).is_some_and(|prefix| prefix.contains(needle.as_str()))
+                    }) =>
             {
                 Range::Bounds(Value::boolean(true), Value::boolean(true))
             }
@@ -1048,20 +1091,26 @@ impl Group<'_> {
             }
             // a time part of values that share the larger units follows them: `hour` within a day,
             // `minute` within an hour, `second` and the smaller ones within a minute
-            ("hour" | "minute" | "second" | "millisecond" | "microsecond" | "nanosecond", [input]) => match self.range(input) {
-                Range::Bounds(min, max) => {
-                    let larger: &[&str] = match name {
-                        "hour" => &["year", "doy"],
-                        "minute" => &["year", "doy", "hour"],
-                        _ => &["year", "doy", "hour", "minute"],
-                    };
-                    let same = larger
-                        .iter()
-                        .all(|part| super::zone_map::evaluate_part(part, &min) == super::zone_map::evaluate_part(part, &max));
-                    if same { self.monotone(expr, 0, true) } else { Range::Unknown }
+            ("hour" | "minute" | "second" | "millisecond" | "microsecond" | "nanosecond", [input]) => {
+                match self.range(input) {
+                    Range::Bounds(min, max) => {
+                        let larger: &[&str] = match name {
+                            "hour" => &["year", "doy"],
+                            "minute" => &["year", "doy", "hour"],
+                            _ => &["year", "doy", "hour", "minute"],
+                        };
+                        let same = larger.iter().all(|part| {
+                            super::zone_map::evaluate_part(part, &min) == super::zone_map::evaluate_part(part, &max)
+                        });
+                        if same {
+                            self.monotone(expr, 0, true)
+                        } else {
+                            Range::Unknown
+                        }
+                    }
+                    other => other,
                 }
-                other => other,
-            },
+            }
             // `week` of dates in one ISO year follows them
             ("week" | "weekofyear", [input]) => match self.range(input) {
                 Range::Bounds(min, max) => {
@@ -1189,7 +1238,9 @@ impl Group<'_> {
             // adding months clamps to the end of the month, which does not keep the order of timestamps
             ("+" | "-", [left, right])
                 if [left, right].into_iter().any(|side| {
-                    constant(side).is_some_and(|c| matches!(c.data(), duckrs_common::value::ValueData::Interval(i) if i.months != 0))
+                    constant(side).is_some_and(
+                        |c| matches!(c.data(), duckrs_common::value::ValueData::Interval(i) if i.months != 0),
+                    )
                 }) =>
             {
                 Range::Unknown
@@ -1201,8 +1252,12 @@ impl Group<'_> {
                     && constant(right).is_none()
                     && matches!(
                         expr.return_type.id(),
-                        LogicalTypeId::Float | LogicalTypeId::Double | LogicalTypeId::TinyInt | LogicalTypeId::SmallInt
-                            | LogicalTypeId::Integer | LogicalTypeId::BigInt
+                        LogicalTypeId::Float
+                            | LogicalTypeId::Double
+                            | LogicalTypeId::TinyInt
+                            | LogicalTypeId::SmallInt
+                            | LogicalTypeId::Integer
+                            | LogicalTypeId::BigInt
                     ) =>
             {
                 let (Range::Bounds(left_min, left_max), Range::Bounds(right_min, right_max)) =
@@ -1218,12 +1273,24 @@ impl Group<'_> {
                 let combine = |a: &Value, b: &Value| -> Option<Value> {
                     let ty = &expr.return_type;
                     let text = if matches!(ty.id(), LogicalTypeId::Float | LogicalTypeId::Double) {
-                        let (a, b) = (a.try_to_string().ok()?.parse::<f64>().ok()?, b.try_to_string().ok()?.parse::<f64>().ok()?);
+                        let (a, b) = (
+                            a.try_to_string().ok()?.parse::<f64>().ok()?,
+                            b.try_to_string().ok()?.parse::<f64>().ok()?,
+                        );
                         let result = if name == "+" { a + b } else { a - b };
-                        if result.is_nan() { "nan".to_string() } else { result.to_string() }
+                        if result.is_nan() {
+                            "nan".to_string()
+                        } else {
+                            result.to_string()
+                        }
                     } else {
                         let (a, b) = (a.as_i128()?, b.as_i128()?);
-                        (if name == "+" { a.checked_add(b)? } else { a.checked_sub(b)? }).to_string()
+                        (if name == "+" {
+                            a.checked_add(b)?
+                        } else {
+                            a.checked_sub(b)?
+                        })
+                        .to_string()
                     };
                     // an integer result outside its type is an overflow, which the bounds cannot tell
                     crate::execution::parquet::try_cast_value(&Value::varchar(text), ty)
@@ -1320,7 +1387,10 @@ impl Group<'_> {
                         _ => return Range::Unknown,
                     }
                 }
-                let BoundExprKind::Function { function, is_operator, .. } = &expr.kind else {
+                let BoundExprKind::Function {
+                    function, is_operator, ..
+                } = &expr.kind
+                else {
                     return Range::Unknown;
                 };
                 let call = BoundExpr::new(
@@ -1401,9 +1471,10 @@ impl Group<'_> {
             BoundExprKind::Operator {
                 op: op @ (BoundOperator::In | BoundOperator::NotIn),
                 children,
-            } if children.len() > 1 => {
-                self.never_true(&crate::planner::expression::in_as_comparisons(*op == BoundOperator::NotIn, children))
-            }
+            } if children.len() > 1 => self.never_true(&crate::planner::expression::in_as_comparisons(
+                *op == BoundOperator::NotIn,
+                children,
+            )),
             BoundExprKind::Operator {
                 op: BoundOperator::Not,
                 children,
@@ -1600,7 +1671,8 @@ impl Group<'_> {
                     (BoundOperator::IsNotNull, Some(zone)) => zone.min.is_none() && zone.elements.is_none(),
                     // a function that is only NULL in the group
                     (BoundOperator::IsNotNull, None) if children.len() == 1 => {
-                        matches!(children[0].kind, BoundExprKind::Function { .. }) && matches!(self.range(&children[0]), Range::Null)
+                        matches!(children[0].kind, BoundExprKind::Function { .. })
+                            && matches!(self.range(&children[0]), Range::Null)
                     }
                     _ => false,
                 }

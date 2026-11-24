@@ -53,7 +53,8 @@ fn offset_index(file: &mut File, chunk: &ColumnChunkMetaData) -> Option<Vec<Page
 
 /// `HasColumnIndex` and `HasOffsetIndex`.
 fn has_page_index(chunk: &ColumnChunkMetaData) -> bool {
-    let positive = |offset: Option<i64>, length: Option<i32>| offset.is_some_and(|o| o > 0) && length.is_some_and(|l| l > 0);
+    let positive =
+        |offset: Option<i64>, length: Option<i32>| offset.is_some_and(|o| o > 0) && length.is_some_and(|l| l > 0);
     positive(chunk.column_index_offset(), chunk.column_index_length())
         && positive(chunk.offset_index_offset(), chunk.offset_index_length())
 }
@@ -78,7 +79,8 @@ fn offset_index_is_valid(locations: &[PageLocation], rows: u64, file_size: u64, 
             return false;
         }
         let (offset, size) = (location.offset as u64, location.compressed_page_size as u64);
-        if offset + size > file_size || offset < begin || offset + size > end || location.first_row_index as u64 >= rows {
+        if offset + size > file_size || offset < begin || offset + size > end || location.first_row_index as u64 >= rows
+        {
             return false;
         }
         if at > 0 {
@@ -221,7 +223,9 @@ fn page_zones(
             }
             try_cast_value(&Value::varchar(statistic_text(descriptor, bytes)?), ty)
         };
-        let nulls = null_counts.and_then(|counts| counts.get(page)).and_then(ThriftValue::int);
+        let nulls = null_counts
+            .and_then(|counts| counts.get(page))
+            .and_then(ThriftValue::int);
         let mut zone = ColumnZone {
             has_null: nulls.is_none_or(|n| n > 0),
             ..ColumnZone::default()

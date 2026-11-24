@@ -226,7 +226,10 @@ fn replacements_of(op: &LogicalOperator, union_index: usize) -> Replacements {
     let (group_count, aggregate_count) = (groups.len(), aggregates.len());
     let mut map = Replacements::new();
     for at in 0..group_count {
-        map.insert(ColumnBinding::new(*group_index, at), ColumnBinding::new(union_index, at));
+        map.insert(
+            ColumnBinding::new(*group_index, at),
+            ColumnBinding::new(union_index, at),
+        );
     }
     for at in 0..aggregate_count {
         map.insert(
@@ -308,7 +311,9 @@ fn expand(op: &mut LogicalOperator, next: &mut usize) -> Option<Replacements> {
     let input = &op.children[0];
     let input_types = input.types();
     let input_bindings = input.column_bindings();
-    let input_names: Vec<String> = (0..input_types.len()).map(|i| format!("__grouping_sets_input_{i}")).collect();
+    let input_names: Vec<String> = (0..input_types.len())
+        .map(|i| format!("__grouping_sets_input_{i}"))
+        .collect();
     let cte_index = fresh(next);
     let data = Arc::new(Mutex::new(ColumnDataCollection::new(input_types.clone())));
     let mut branches = Vec::with_capacity(grouping_sets.len());
@@ -456,7 +461,13 @@ fn cascade_rewrite(
             let source = &levels[levels[at].source.expect("a coarser level has a source")];
             let source_set = &grouping_sets[source.set];
             let ref_index = fresh(next);
-            let child = cte_ref(ref_index, source.cte_index, &source.output_types, &source.output_names, &source.data);
+            let child = cte_ref(
+                ref_index,
+                source.cte_index,
+                &source.output_types,
+                &source.output_names,
+                &source.data,
+            );
             let level_groups: Vec<BoundExpr> = set
                 .iter()
                 .map(|g| {
@@ -536,7 +547,13 @@ fn cascade_rewrite(
             definitions.push((at, level_aggregate));
             let level = &levels[at];
             (
-                cte_ref(ref_index, level.cte_index, &level.output_types, &level.output_names, &level.data),
+                cte_ref(
+                    ref_index,
+                    level.cte_index,
+                    &level.output_types,
+                    &level.output_names,
+                    &level.data,
+                ),
                 Box::new(move |position| ColumnBinding::new(ref_index, position)),
             )
         } else {
@@ -564,9 +581,11 @@ fn cascade_rewrite(
         let mut expressions = Vec::new();
         for (g, group) in groups.iter().enumerate() {
             expressions.push(match level.group_positions.get(&g) {
-                Some(&position) => {
-                    BoundExpr::column_ref(binding_of(position), group.return_type.clone(), level.output_names[position].clone())
-                }
+                Some(&position) => BoundExpr::column_ref(
+                    binding_of(position),
+                    group.return_type.clone(),
+                    level.output_names[position].clone(),
+                ),
                 None => BoundExpr::constant(Value::null(group.return_type.clone())),
             });
         }

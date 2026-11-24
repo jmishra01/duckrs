@@ -712,7 +712,10 @@ impl ListLengths {
 
 /// `VariantStatsShreddingState`, with the type of the typed part of a shredded VARIANT and its statistics.
 #[derive(Debug, Clone)]
-#[allow(clippy::large_enum_variant, reason = "always behind the `Box` of `ColumnStatistics::variant`")]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "always behind the `Box` of `ColumnStatistics::variant`"
+)]
 pub enum VariantStatistics {
     /// what a checkpoint that shredded nothing leaves
     Uninitialized,
@@ -740,7 +743,6 @@ impl ColumnStatistics {
 }
 
 impl ListLengths {
-
     /// Of one list of `length` elements.
     pub fn of(length: u64) -> Self {
         Self {
@@ -749,7 +751,6 @@ impl ListLengths {
             total: Some(length),
         }
     }
-
 
     /// `StatsMergeType::EXPAND_BOUNDS` and `ResetTotalListLength`: lists that may be counted twice have no total.
     pub fn without_total(self) -> Self {
@@ -1682,7 +1683,11 @@ impl ViewCatalogEntry {
 
     /// `ViewCatalogEntry::ToSQL`.
     pub fn to_sql(&self) -> String {
-        let mut sql = String::from(if self.secure { "CREATE SECURE VIEW " } else { "CREATE VIEW " });
+        let mut sql = String::from(if self.secure {
+            "CREATE SECURE VIEW "
+        } else {
+            "CREATE VIEW "
+        });
         if !self.schema.eq_ignore_ascii_case(DEFAULT_SCHEMA) {
             sql += &sql_identifier(&self.schema);
             sql.push('.');

@@ -518,7 +518,11 @@ impl fmt::Display for BoundExpr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.kind {
             // `BoundFunctionExpression::ToString` of `nextval('name')` and its kin
-            BoundExprKind::Sequence { op, sequence, arguments } => {
+            BoundExprKind::Sequence {
+                op,
+                sequence,
+                arguments,
+            } => {
                 let name = match op {
                     SequenceOp::Next => "nextval",
                     SequenceOp::Current => "currval",
@@ -589,7 +593,11 @@ impl fmt::Display for BoundExpr {
                 _ => {
                     let args: Vec<String> = children.iter().map(|c| c.to_string()).collect();
                     // `KeywordHelper::WriteOptionallyQuoted`: a name that is no identifier is quoted
-                    let plain = function.name.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_')
+                    let plain = function
+                        .name
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_alphabetic() || c == '_')
                         && function.name.chars().all(|c| c.is_alphanumeric() || c == '_');
                     if plain {
                         write!(f, "{}({})", function.name, args.join(", "))

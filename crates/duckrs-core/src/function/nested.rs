@@ -572,7 +572,12 @@ fn bind_union_extract(child: BoundExpr, key: &BoundExpr) -> Result<BoundExpr> {
 pub(crate) fn struct_extract_at_index(child: BoundExpr, index: usize) -> Option<BoundExpr> {
     let member = child.return_type.struct_children().get(index)?.1.clone();
     let index = BoundExpr::constant(Value::bigint(index as i64));
-    Some(bound_function("struct_extract", vec![child, index], member, struct_extract))
+    Some(bound_function(
+        "struct_extract",
+        vec![child, index],
+        member,
+        struct_extract,
+    ))
 }
 
 /// `StructExtractResolveTypes` with a constant key.
@@ -748,9 +753,9 @@ pub fn bind_nested_function(name: &str, names: Vec<String>, children: Vec<BoundE
                 "union_extract" if !matches!(child.return_type.id(), LogicalTypeId::Union | LogicalTypeId::Unknown) => {
                     Err(binder_error("union_extract can only take a union parameter"))
                 }
-                "struct_extract" | "struct_extract_at" if child.return_type.id() == LogicalTypeId::Variant => {
-                    Err(binder_error("struct_extract can only be used on a STRUCT, not on VARIANT"))
-                }
+                "struct_extract" | "struct_extract_at" if child.return_type.id() == LogicalTypeId::Variant => Err(
+                    binder_error("struct_extract can only be used on a STRUCT, not on VARIANT"),
+                ),
                 // `GetExtractAtFunction`: a position into any struct
                 "struct_extract_at" => bind_struct_extract_with(child, key, true),
                 "struct_extract" | "union_extract" => bind_struct_extract(child, key),

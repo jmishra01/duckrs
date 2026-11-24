@@ -185,24 +185,26 @@ fn plain_scan(op: &LogicalOperator) -> Option<Scan> {
         }
         let key = format!(
             "json {:?}",
-            ((
-                &scan.files,
-                &scan.format,
-                &scan.compression,
-                scan.records,
-                scan.objects,
-                &scan.names,
-                &scan.types,
-            ),
             (
-                scan.ignore_errors,
-                scan.case_insensitive,
-                &scan.date_format,
-                &scan.timestamp_format,
-                scan.filename,
-                &scan.hive,
-                &scan.virtual_columns,
-            ))
+                (
+                    &scan.files,
+                    &scan.format,
+                    &scan.compression,
+                    scan.records,
+                    scan.objects,
+                    &scan.names,
+                    &scan.types,
+                ),
+                (
+                    scan.ignore_errors,
+                    scan.case_insensitive,
+                    &scan.date_format,
+                    &scan.timestamp_format,
+                    scan.filename,
+                    &scan.hive,
+                    &scan.virtual_columns,
+                )
+            )
         );
         return Some(Scan {
             relation: Relation::File(key),
@@ -362,7 +364,10 @@ fn conjunction(and: bool, mut terms: Vec<BoundExpr>) -> BoundExpr {
     if terms.len() == 1 {
         return terms.pop().expect("one term");
     }
-    BoundExpr::new(BoundExprKind::Conjunction { and, children: terms }, LogicalType::BOOLEAN)
+    BoundExpr::new(
+        BoundExprKind::Conjunction { and, children: terms },
+        LogicalType::BOOLEAN,
+    )
 }
 
 fn bindings_of(expr: &BoundExpr, out: &mut Vec<ColumnBinding>) {
@@ -739,7 +744,12 @@ fn match_branch(leaf: usize, op: &LogicalOperator) -> Option<Branch> {
         bindings_of(conjunct, &mut read);
     }
     for aggregate in aggregates {
-        for child in aggregate.children.iter().chain(&aggregate.filter).chain(&aggregate.distinct_key) {
+        for child in aggregate
+            .children
+            .iter()
+            .chain(&aggregate.filter)
+            .chain(&aggregate.distinct_key)
+        {
             bindings_of(child, &mut read);
         }
     }
