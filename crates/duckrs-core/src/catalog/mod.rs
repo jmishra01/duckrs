@@ -1711,6 +1711,8 @@ pub struct MacroCatalogEntry {
     pub comment: Option<String>,
     /// with `enable_macro_dependencies`, the entries of this catalog its bodies read
     pub dependencies: Vec<MacroDependency>,
+    /// a macro of the system catalog (`internal`): its bodies call what the system catalog has
+    pub internal: bool,
 }
 
 /// An entry a macro reads (`LogicalDependency`): a table or view, or a macro.
@@ -2629,6 +2631,7 @@ impl SchemaCatalogEntry {
             macros,
             comment: None,
             dependencies,
+            internal: false,
         };
         entries.insert(key(name), Arc::new(entry));
         Ok(())

@@ -285,7 +285,7 @@ fn null_type_parameter(type_name: &str, names: &[&str], children: &[Expr]) -> Re
 }
 
 /// `ColumnQualifier::SQLValueFunctionName`: what these words call when no column has their name.
-fn sql_value_function(name: &str) -> Option<&'static str> {
+pub(super) fn sql_value_function(name: &str) -> Option<&'static str> {
     match name.to_lowercase().as_str() {
         "current_catalog" => Some("current_catalog"),
         "current_date" => Some("current_date"),
@@ -1815,6 +1815,15 @@ impl Binder<'_> {
                     .iter()
                     .map(|c| self.bind_expression(c))
                     .collect::<Result<Vec<_>>>()?;
+                // `BindOperatorAsFunction`: the name is looked up as a call would be, and a macro can't take
+                // bound children; a system macro's body is bound in the system catalog
+                let name = ast::QualifiedName {
+                    qualification: Vec::new(),
+                    name: "array_slice".to_string(),
+                };
+                if self.system_macro_depth == 0 && self.find_macro(&name, false)?.is_some() {
+                    return Err(binder_error("array_slice is not a scalar function"));
+                }
                 bind_generic_function("array_slice", bound)?
             }
             ExprKind::Operator {

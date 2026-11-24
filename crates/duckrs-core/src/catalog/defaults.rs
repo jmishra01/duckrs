@@ -93,6 +93,7 @@ fn build_macro(schema: &str, name: &str, table_macro: bool) -> Option<Arc<MacroC
         macros: macros.clone(),
         comment: None,
         dependencies: Vec::new(),
+        internal: true,
     }))
 }
 

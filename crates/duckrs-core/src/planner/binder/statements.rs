@@ -1487,7 +1487,15 @@ impl Binder<'_> {
         let mut names = Vec::with_capacity(select_list.len());
         let mut state = SelectBindState::default();
         for (i, expr) in select_list.iter_mut().enumerate() {
-            names.push(expression_name(expr));
+            // `BindPositionalReference`: the reference binds as the column, and is named after it
+            if let ExprKind::Positional(position) = expr.kind
+                && expr.alias.is_empty()
+                && let Ok(column) = self.bind_context.position_to_column(position)
+            {
+                names.push(column.last().cloned().unwrap_or_default());
+            } else {
+                names.push(expression_name(expr));
+            }
             let written = match (&expr.kind, expr.alias.is_empty()) {
                 (ExprKind::ColumnRef(parts), true) => parts.last().cloned(),
                 _ => None,
@@ -3101,10 +3109,33 @@ impl Binder<'_> {
                         return Err(binder_error("Unnamed parameters cannot come after named parameters"));
                     }
                 }
+                // a call `system.main.f` became: the built-in, whatever macro has its name
+                let system = std::mem::take(&mut self.system_table_function);
                 if let ExprKind::Function(call) = &function.kind
+                    && !system
                     && let Some(entry) = self.find_macro(&call.name, true)?
                 {
                     return self.bind_table_macro(table_ref, call, entry);
+                }
+                // `system.main.f`: a table function of the system catalog, as an unqualified call that no
+                // macro can shadow
+                if let ExprKind::Function(call) = &function.kind
+                    && let [catalog, schema] = call.name.qualification.as_slice()
+                    && catalog.eq_ignore_ascii_case("system")
+                    && (schema.eq_ignore_ascii_case(crate::catalog::DEFAULT_SCHEMA) || schema.eq_ignore_ascii_case("pg_catalog"))
+                    && crate::catalog::defaults::default_macro(Some(schema), &call.name.name, true).is_none()
+                    && CPP_TABLE_FUNCTIONS.contains(&call.name.name.to_lowercase().as_str())
+                {
+                    let mut unqualified = table_ref.clone();
+                    if let TableRefKind::TableFunction { function, .. } = &mut unqualified.kind
+                        && let ExprKind::Function(call) = &mut function.kind
+                    {
+                        call.name.qualification.clear();
+                    }
+                    let saved = std::mem::replace(&mut self.system_table_function, true);
+                    let bound = self.bind_unsampled_table_ref(&unqualified);
+                    self.system_table_function = saved;
+                    return bound;
                 }
                 if let ExprKind::Function(call) = &function.kind
                     && call.name.qualification.is_empty()
@@ -4404,7 +4435,7 @@ pub(super) fn unnest_depths(ty: &LogicalType, max_depth: usize) -> (usize, usize
 
 /// The table functions of C++ (the core and the json, parquet and icu extensions). A name outside
 /// this list is unknown to C++ as well, not merely unported.
-const CPP_TABLE_FUNCTIONS: &[&str] = &[
+pub(super) const CPP_TABLE_FUNCTIONS: &[&str] = &[
     "add_grammar_extension",
     "arrow_scan",
     "arrow_scan_dumb",

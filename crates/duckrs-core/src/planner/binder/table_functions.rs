@@ -231,9 +231,11 @@ impl Binder<'_> {
                     return Err(binder_error("duckdb_logs_parsed takes a log type"));
                 };
                 let t = &log_type.expr;
+                // the body calls what the system catalog has, whatever macro shadows it
                 format!(
-                    "SELECT * EXCLUDE (message), UNNEST(CASE WHEN type ILIKE {t} THEN parse_duckdb_log_message({t}, \
-                     message) END) FROM duckdb_logs(denormalized_table=1) WHERE type ILIKE {t}"
+                    "SELECT * EXCLUDE (message), UNNEST(CASE WHEN system.main.\"~~*\"(type, {t}) THEN \
+                     parse_duckdb_log_message({t}, message) END) FROM duckdb_logs(denormalized_table=1) \
+                     WHERE system.main.\"~~*\"(type, {t})"
                 )
             }
             "repeat" => {
