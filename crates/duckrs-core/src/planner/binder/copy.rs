@@ -1432,6 +1432,18 @@ impl Binder<'_> {
                 column("error_message".to_string(), text),
             ],
         )?;
+        // `CSVRejectsTable`: one scan id for the scans of a query, whose files are numbered on from one another
+        static LAST: std::sync::Mutex<Option<(u64, u64, usize)>> = std::sync::Mutex::new(None);
+        let query = self.session.as_ref().map(|session| session.query_id);
+        let (scan_id, file_offset) = {
+            let mut last = LAST.lock().expect("not poisoned");
+            let (scan_id, file_offset) = match (*last, query) {
+                (Some((last_query, scan_id, next_file)), Some(query)) if last_query == query => (scan_id, next_file),
+                _ => (SCANS.fetch_add(1, Ordering::Relaxed), 0),
+            };
+            *last = query.map(|query| (query, scan_id, file_offset + arguments.files.len()));
+            (scan_id, file_offset)
+        };
         let user: Vec<String> = arguments
             .user_arguments
             .iter()
@@ -1442,7 +1454,8 @@ impl Binder<'_> {
             scans,
             limit: arguments.rejects_limit,
             line_size_limit: arguments.rejects_line_size_limit,
-            scan_id: SCANS.fetch_add(1, Ordering::Relaxed),
+            scan_id,
+            file_offset,
             user_arguments: (!user.is_empty()).then(|| user.join(", ")),
         })
     }

@@ -270,6 +270,8 @@ pub struct CsvRejects {
     /// how much of a line to keep, 0 for all of it
     pub line_size_limit: usize,
     pub scan_id: u64,
+    /// the id of its first file: the scans of one query number their files on from each other
+    pub file_offset: usize,
     pub user_arguments: Option<String>,
 }
 
@@ -1705,7 +1707,7 @@ fn flush_rejects(scan: &CsvScanData, state: &mut CsvScanState) -> Result<()> {
         .map(|r| {
             vec![
                 Some(rejects.scan_id.to_string()),
-                text(r.file),
+                text(r.file + rejects.file_offset),
                 text(r.line),
                 text(r.row_position),
                 r.position.map(|p| p.to_string()),
@@ -1738,7 +1740,7 @@ fn flush_rejects(scan: &CsvScanData, state: &mut CsvScanState) -> Result<()> {
         let new_line = new_line_identifier(&file.dialect);
         scans.push(vec![
             Some(rejects.scan_id.to_string()),
-            text(index),
+            text(index + rejects.file_offset),
             Some(file.path.clone()),
             Some(String::from_utf8_lossy(&file.dialect.delimiter).into_owned()),
             shown(file.dialect.quote),
