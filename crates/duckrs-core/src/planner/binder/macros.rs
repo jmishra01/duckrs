@@ -376,8 +376,13 @@ impl Binder<'_> {
         let mut named: Vec<(&str, &Expr, LogicalType)> = Vec::new();
         for argument in &call.args {
             let ty = if requires_bind {
-                self.bind_expression(&argument.expr)
-                    .map_or(unknown.clone(), |bound| expression_return_type(&bound))
+                // bound for its type alone: the correlation it notes is the body's to note, if the body uses it
+                let correlated = self.correlated.lock().len();
+                let ty = self
+                    .bind_expression(&argument.expr)
+                    .map_or(unknown.clone(), |bound| expression_return_type(&bound));
+                self.correlated.lock().truncate(correlated);
+                ty
             } else {
                 unknown.clone()
             };

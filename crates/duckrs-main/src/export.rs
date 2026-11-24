@@ -277,14 +277,32 @@ fn schema_statements(
             }
         }
     }
-    // `DependencyManager::ReorderEntries`: a table's defaults and generated columns can call macros
+    // `PhysicalExport::ExtractEntries`: tables, then macros; `DependencyManager::ReorderEntries` puts a macro that
+    // a table's defaults or generated columns call before the tables
+    let mut table_sql = Vec::with_capacity(tables.len());
+    for (schema, table) in tables {
+        table_sql.push(duckrs_core::storage::table_create_sql(schema, table)?);
+    }
+    let called_by_tables = |entry: &duckrs_core::catalog::MacroCatalogEntry| {
+        let name = entry.name.to_lowercase();
+        let quoted = format!("\"{name}\"(");
+        let bare = format!("{name}(");
+        !entry.table_macro
+            && table_sql.iter().any(|sql| {
+                let sql = sql.to_lowercase();
+                sql.contains(&quoted)
+                    || sql.match_indices(&bare).any(|(at, _)| {
+                        at == 0 || !sql[..at].ends_with(|c: char| c.is_alphanumeric() || c == '_')
+                    })
+            })
+    };
+    let (early, late): (Vec<_>, Vec<_>) = macros.into_iter().partition(|(_, entry, _)| called_by_tables(entry));
     let mut statements = schema_sql;
     statements.extend(sequences);
     statements.extend(types);
-    statements.extend(order_macros(macros));
-    for (schema, table) in tables {
-        statements.push(duckrs_core::storage::table_create_sql(schema, table)?);
-    }
+    statements.extend(order_macros(early));
+    statements.extend(table_sql);
+    statements.extend(order_macros(late));
     statements.extend(views);
     statements.extend(indexes);
     Ok(statements)

@@ -407,7 +407,14 @@ impl Binder<'_> {
         binder.session = self.session.clone();
         binder.macro_arguments = self.macro_arguments.clone();
         binder.parameters = self.parameters.clone();
-        let bound = binder.bind_expression(argument)?;
+        let bound = match binder.bind_expression(argument) {
+            Ok(bound) => bound,
+            // `TryBindLambdaOrJson`: an arrow lambda that does not bind is reported as deprecated
+            Err(_) if !self.options.single_arrow_lambdas && has_arrow_lambda(argument) => {
+                return Err(binder_error(super::lambda::DEPRECATED_ARROW));
+            }
+            Err(error) => return Err(error),
+        };
         if !bound.is_foldable() {
             return Err(binder_error("Unsupported expression in COLUMNS"));
         }
@@ -713,4 +720,19 @@ pub(super) fn literal_text(literal: &Literal) -> String {
         LiteralKind::Null => "NULL".to_string(),
         _ => literal.text.clone(),
     }
+}
+
+/// Whether `expr` has a lambda written with the deprecated arrow.
+fn has_arrow_lambda(expr: &Expr) -> bool {
+    let mut found = false;
+    visit_expr_mut(&mut expr.clone(), &mut |e| {
+        found |= matches!(
+            e.kind,
+            ExprKind::Lambda {
+                syntax: duckrs_parser::ast::LambdaSyntax::Arrow,
+                ..
+            }
+        );
+    });
+    found
 }

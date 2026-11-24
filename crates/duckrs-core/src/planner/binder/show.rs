@@ -1834,13 +1834,11 @@ impl Binder<'_> {
                         macro_rows("system", 2, schema, &entry, true)?;
                     }
                 }
-                for schema in self.catalog.schemas().iter() {
-                    let temporary = schema.name.eq_ignore_ascii_case(TEMP_SCHEMA);
-                    let database = if temporary { "temp" } else { self.catalog.name.as_str() };
-                    let schema_name = if temporary { "main" } else { schema.name.as_str() };
+                // the macros of every attached database (`GetAllSchemas`)
+                for listed in self.listed_schemas() {
                     for table_macro in [false, true] {
-                        for entry in schema.macro_entries(table_macro) {
-                            macro_rows(database, if temporary { 3 } else { 1 }, schema_name, &entry, false)?;
+                        for entry in listed.schema.macro_entries(table_macro) {
+                            macro_rows(&listed.database, listed.database_oid, &listed.display, &entry, false)?;
                         }
                     }
                 }
