@@ -1776,11 +1776,6 @@ impl Binder<'_> {
             None => None,
         };
         let windows = self.windows.take().expect("set above").windows;
-        if qualify.is_some() && windows.is_empty() {
-            return Err(binder_error(
-                "at least one window function must appear in the SELECT column or QUALIFY clause",
-            ));
-        }
         let aggregates = self.aggregates.take().expect("set above");
         let has_groups = !aggregates.groups.is_empty();
         let has_aggregates = !aggregates.aggregates.is_empty();
@@ -1803,6 +1798,12 @@ impl Binder<'_> {
                 }
                 return Err(binder_error(error));
             }
+        }
+        // after the columns outside the groups (`BindSelectNode`)
+        if qualify.is_some() && windows.is_empty() {
+            return Err(binder_error(
+                "at least one window function must appear in the SELECT column or QUALIFY clause",
+            ));
         }
         if has_groups || has_aggregates || having.is_some() {
             plan = LogicalOperator::new(
@@ -2693,6 +2694,20 @@ impl Binder<'_> {
     }
 
     fn bind_unsampled_table_ref(&mut self, table_ref: &TableRef) -> Result<LogicalOperator> {
+        let TableRefKind::TableFunction { function, .. } = &table_ref.kind else {
+            return self.bind_unsampled_table_ref_inner(table_ref);
+        };
+        let name = match &function.kind {
+            ExprKind::Function(call) => call.name.name.to_lowercase(),
+            _ => String::new(),
+        };
+        let saved = std::mem::replace(&mut self.table_function_name, name);
+        let bound = self.bind_unsampled_table_ref_inner(table_ref);
+        self.table_function_name = saved;
+        bound
+    }
+
+    fn bind_unsampled_table_ref_inner(&mut self, table_ref: &TableRef) -> Result<LogicalOperator> {
         match &table_ref.kind {
             TableRefKind::Empty => {
                 let table_index = self.generate_table_index();

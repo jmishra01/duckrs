@@ -10,7 +10,7 @@ use super::statements::not_implemented;
 use super::{BindContext, Binder, Binding, UsingColumnSet, binder_error};
 use crate::planner::expression::{BoundExpr, BoundExprKind, ColumnBinding};
 use crate::planner::logical::{JoinCondition, LogicalOperator, LogicalOperatorKind};
-use duckrs_common::Result;
+use duckrs_common::{ErrorKind, Result};
 use duckrs_common::types::{LogicalType, LogicalTypeId};
 use duckrs_common::value::Value;
 use duckrs_parser::ast::{
@@ -332,7 +332,14 @@ impl Binder<'_> {
         let right = self.bind_table_ref(&join.right);
         self.outer_contexts.pop();
         let lateral_columns = std::mem::replace(&mut self.correlated, enclosing);
-        let right = right?;
+        // `LateralBinder::BindExpression`: an aggregate of the left side's columns can't be bound in the right side
+        let right = right.map_err(|error| {
+            if error.kind == ErrorKind::NotImplemented && error.message.contains(super::expression::OUTER_AGGREGATE) {
+                binder_error("LATERAL join cannot contain aggregates")
+            } else {
+                error
+            }
+        })?;
         let lateral_columns = lateral_columns.lock().clone();
         let mut left_context = self.left_of_join.pop().expect("pushed above");
         // what the left side does not have is correlated with a query around this one
