@@ -987,6 +987,8 @@ pub struct Binder<'a> {
     foreign_databases: Vec<read_duckdb::ForeignDatabase>,
     /// the tables and views (schema and name) that what is bound reads, for the dependencies of a view
     read_entries: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    /// the macros (schema, name and kind) that what is bound calls, for the dependencies of a macro
+    read_macros: Arc<std::sync::Mutex<Vec<(String, String, bool)>>>,
     /// the subquery being bound is the columns of another, as a row for `(a, b) IN (...)`
     row_subquery: bool,
     /// The table macros being bound, innermost last (`bound_macros`).
@@ -1096,6 +1098,7 @@ impl<'a> Binder<'a> {
             search_schema: None,
             foreign_databases: Vec::new(),
             read_entries: Arc::default(),
+            read_macros: Arc::default(),
             row_subquery: false,
             bound_macros: Vec::new(),
             macro_arguments: Vec::new(),
@@ -1200,6 +1203,7 @@ impl<'a> Binder<'a> {
         binder.search_schema = self.search_schema.clone();
         binder.foreign_databases = self.foreign_databases.clone();
         binder.read_entries = self.read_entries.clone();
+        binder.read_macros = self.read_macros.clone();
         binder.parameters = self.parameters.clone();
         binder.ctes = self.ctes.clone();
         binder.ctes_being_bound = self.ctes_being_bound.clone();

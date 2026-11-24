@@ -249,7 +249,9 @@ fn schema_statements(
         }
         for table_macro in [false, true] {
             for entry in schema.macro_entries(table_macro) {
-                macros.push(
+                macros.push((
+                    schema.ident(),
+                    entry.clone(),
                     CreateInfo {
                         name: qualified(schema, &entry.name),
                         on_conflict: OnCreateConflict::Error,
@@ -260,7 +262,7 @@ fn schema_statements(
                         },
                     }
                     .to_string(),
-                );
+                ));
             }
         }
         for entry in schema.tables_and_views() {
@@ -279,7 +281,7 @@ fn schema_statements(
     let mut statements = schema_sql;
     statements.extend(sequences);
     statements.extend(types);
-    statements.extend(macros);
+    statements.extend(order_macros(macros));
     for (schema, table) in tables {
         statements.push(duckrs_core::storage::table_create_sql(schema, table)?);
     }
@@ -687,4 +689,28 @@ fn load_statements(
         out += &line;
     }
     out
+}
+
+/// `DependencyManager::ReorderEntries` for macros: one that calls another comes after it.
+fn order_macros(mut pending: Vec<(String, Arc<duckrs_core::catalog::MacroCatalogEntry>, String)>) -> Vec<String> {
+    let mut ordered = Vec::with_capacity(pending.len());
+    while !pending.is_empty() {
+        let waits = |entry: &duckrs_core::catalog::MacroCatalogEntry,
+                     pending: &[(String, Arc<duckrs_core::catalog::MacroCatalogEntry>, String)]| {
+            entry.dependencies.iter().any(|d| {
+                d.table_macro.is_some_and(|kind| {
+                    pending.iter().any(|(schema, other, _)| {
+                        !std::ptr::eq(&**other, entry)
+                            && other.table_macro == kind
+                            && schema.eq_ignore_ascii_case(&d.schema)
+                            && other.name.eq_ignore_ascii_case(&d.name)
+                    })
+                })
+            })
+        };
+        // a cycle can't be ordered: what is left goes in the order it was found
+        let at = (0..pending.len()).find(|&i| !waits(&pending[i].1, &pending)).unwrap_or(0);
+        ordered.push(pending.remove(at).2);
+    }
+    ordered
 }

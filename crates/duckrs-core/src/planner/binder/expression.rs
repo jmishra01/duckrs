@@ -1509,6 +1509,10 @@ impl Binder<'_> {
                 _ => Vec::new(),
             };
             if children.iter().any(|child| self.is_unknown_macro_parameter(child)) {
+                // a macro it calls is still read: noted for the dependencies of the macro being created
+                if let ExprKind::Function(function) = &expr.kind {
+                    self.find_macro(&function.name, false)?;
+                }
                 // the arguments bind first: a column that isn't there is the error
                 for child in children {
                     if !matches!(child.kind, ExprKind::Lambda { .. }) {

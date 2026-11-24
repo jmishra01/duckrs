@@ -1704,12 +1704,39 @@ pub struct MacroCatalogEntry {
     pub macros: Vec<MacroFunction>,
     /// What `COMMENT ON MACRO` said.
     pub comment: Option<String>,
+    /// with `enable_macro_dependencies`, the entries of this catalog its bodies read
+    pub dependencies: Vec<MacroDependency>,
+}
+
+/// An entry a macro reads (`LogicalDependency`): a table or view, or a macro.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MacroDependency {
+    pub schema: String,
+    pub name: String,
+    /// `None` for a table or view, else whether it is a table macro
+    pub table_macro: Option<bool>,
 }
 
 impl MacroCatalogEntry {
     /// `CatalogTypeToString`.
     pub fn type_name(&self) -> &'static str {
         macro_type_name(self.table_macro)
+    }
+
+    /// Whether it reads the table or view `name` of `schema`.
+    pub fn depends_on_entry(&self, schema: &str, name: &str) -> bool {
+        self.dependencies.iter().any(|d| {
+            d.table_macro.is_none() && d.schema.eq_ignore_ascii_case(schema) && d.name.eq_ignore_ascii_case(name)
+        })
+    }
+
+    /// Whether it calls the macro `name` of `schema`, of this kind.
+    pub fn depends_on_macro(&self, schema: &str, name: &str, table_macro: bool) -> bool {
+        self.dependencies.iter().any(|d| {
+            d.table_macro == Some(table_macro)
+                && d.schema.eq_ignore_ascii_case(schema)
+                && d.name.eq_ignore_ascii_case(name)
+        })
     }
 }
 
@@ -2576,6 +2603,7 @@ impl SchemaCatalogEntry {
         table_macro: bool,
         macros: Vec<MacroFunction>,
         on_conflict: OnCreateConflict,
+        dependencies: Vec<MacroDependency>,
     ) -> Result<()> {
         let mut entries = self.macros[usize::from(table_macro)].write();
         if entries.contains_key(&key(name)) {
@@ -2595,6 +2623,7 @@ impl SchemaCatalogEntry {
             table_macro,
             macros,
             comment: None,
+            dependencies,
         };
         entries.insert(key(name), Arc::new(entry));
         Ok(())
@@ -3370,13 +3399,32 @@ impl Catalog {
         name: &str,
         table_macro: bool,
     ) -> Result<Option<Arc<MacroCatalogEntry>>> {
+        Ok(self
+            .get_macro_in(schema, search_first, name, table_macro)?
+            .map(|(_, entry)| entry))
+    }
+
+    /// [`Self::get_macro`], with the schema it was found in.
+    pub fn get_macro_in(
+        &self,
+        schema: Option<&str>,
+        search_first: Option<&str>,
+        name: &str,
+        table_macro: bool,
+    ) -> Result<Option<(String, Arc<MacroCatalogEntry>)>> {
         Ok(match schema {
-            Some(schema) => self.schema_for(Some(schema))?.get_macro(name, table_macro),
+            Some(schema) => {
+                let schema = self.schema_for(Some(schema))?;
+                schema.get_macro(name, table_macro).map(|entry| (schema.ident(), entry))
+            }
             None => [TEMP_SCHEMA]
                 .iter()
                 .chain(search_first.iter())
                 .chain(search_schemas().iter().map(String::as_str).collect::<Vec<_>>().iter())
-                .find_map(|schema| self.get_schema(schema)?.get_macro(name, table_macro)),
+                .find_map(|schema| {
+                    let schema = self.get_schema(schema)?;
+                    schema.get_macro(name, table_macro).map(|entry| (schema.ident(), entry))
+                }),
         })
     }
 

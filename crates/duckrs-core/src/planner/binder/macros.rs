@@ -9,7 +9,7 @@
 
 use super::expression::checked_cast;
 use super::{Binder, binder_error};
-use crate::catalog::MacroCatalogEntry;
+use crate::catalog::{MacroCatalogEntry, MacroDependency};
 use crate::function::binder::expression_return_type;
 use crate::function::cast_rules::implicit_cast;
 use crate::planner::expression::BoundExpr;
@@ -229,11 +229,18 @@ impl Binder<'_> {
             return Ok(None);
         }
         let search_first = self.search_schema.as_deref();
-        let wanted = self.catalog.get_macro(schema, search_first, &name.name, table_macro)?;
-        match wanted {
-            Some(entry) => Ok(Some(entry)),
-            None => self.catalog.get_macro(schema, search_first, &name.name, !table_macro),
-        }
+        let found = match self.catalog.get_macro_in(schema, search_first, &name.name, table_macro)? {
+            Some(found) => Some(found),
+            None => self.catalog.get_macro_in(schema, search_first, &name.name, !table_macro)?,
+        };
+        Ok(found.map(|(schema, entry)| {
+            let mut read = self.read_macros.lock().expect("not poisoned");
+            let noted = (schema, entry.name.clone(), entry.table_macro);
+            if !read.contains(&noted) {
+                read.push(noted);
+            }
+            entry
+        }))
     }
 
     /// `MacroFunction::BindMacroFunction`: picks the overload, and returns it with an argument
@@ -454,7 +461,7 @@ impl Binder<'_> {
         macros: &[MacroFunction],
         table_macro: bool,
         schema: &str,
-    ) -> Result<()> {
+    ) -> Result<Vec<MacroDependency>> {
         let mut signatures: Vec<Vec<Option<LogicalType>>> = Vec::with_capacity(macros.len());
         for function in macros {
             let mut signature = Vec::with_capacity(function.parameters.len());
@@ -494,6 +501,8 @@ impl Binder<'_> {
                 .collect();
             let mut binder = Binder::with_options(self.catalog, self.options.clone());
             binder.search_schema = Some(schema.to_string());
+            binder.read_entries = self.read_entries.clone();
+            binder.read_macros = self.read_macros.clone();
             // a body that reads a setting reads that of the session (`current_setting`)
             binder.session = self.session.clone();
             let parameters = parameter_names(function);
@@ -576,7 +585,23 @@ impl Binder<'_> {
                 }
             }
         }
-        Ok(())
+        // `BindCreateFunctionInfo`'s catalog lookup callback: the entries the bodies read
+        let mut dependencies: Vec<MacroDependency> = Vec::new();
+        for (schema, name) in self.read_entries.lock().expect("not poisoned").iter() {
+            dependencies.push(MacroDependency {
+                schema: schema.clone(),
+                name: name.clone(),
+                table_macro: None,
+            });
+        }
+        for (schema, name, table_macro) in self.read_macros.lock().expect("not poisoned").iter() {
+            dependencies.push(MacroDependency {
+                schema: schema.clone(),
+                name: name.clone(),
+                table_macro: Some(*table_macro),
+            });
+        }
+        Ok(dependencies)
     }
 
     /// A default value has to be a constant the parameter's type accepts.
