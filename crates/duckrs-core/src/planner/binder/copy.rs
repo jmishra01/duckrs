@@ -699,6 +699,15 @@ impl Binder<'_> {
                             "read_csv \"{option}\" parameter cannot have a NULL value"
                         )));
                     }
+                    // the parameter is a VARCHAR[], which nothing but a list casts to
+                    if !matches!(value.data(), ValueData::List(_)) {
+                        return Err(binder_error(format!(
+                            "Could not cast value {} to named parameter \"{option}\" of type VARCHAR[]: Unimplemented \
+                             type for cast ({} -> VARCHAR[])",
+                            value.try_to_string()?,
+                            value.logical_type()
+                        )));
+                    }
                     let names = strings(&value)?;
                     let mut seen = std::collections::HashSet::new();
                     for name in &names {
@@ -709,7 +718,7 @@ impl Binder<'_> {
                         }
                         if !seen.insert(name.to_lowercase()) {
                             return Err(binder_error(format!(
-                                "read_csv \"{option}\" must have unique values. {name} is repeated."
+                                "read_csv \"{option}\" must have unique values. \"{name}\" is repeated."
                             )));
                         }
                     }
@@ -941,9 +950,23 @@ impl Binder<'_> {
             }
         };
         if let Some(names) = &arguments.names {
+            // more names than columns: with null_padding, VARCHAR columns the rows are padded with
+            if names.len() > sniffed.names.len() && arguments.options.null_padding {
+                while sniffed.names.len() < names.len() {
+                    sniffed.names.push(names[sniffed.names.len()].clone());
+                    sniffed.types.push(LogicalType::VARCHAR);
+                }
+            }
+            // more names than columns: no dialect the sniffer tries has that many (`CSVSniffer::DetectDialect`)
             if names.len() > sniffed.names.len() {
-                return Err(binder_error(
-                    "read_csv: names has more entries than the file has columns",
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "Error when sniffing file \"{path}\".\nIt was not possible to automatically detect the CSV \
+                         parsing dialect\nThe names given ({}) are more than the columns found ({}).",
+                        names.len(),
+                        sniffed.names.len()
+                    ),
                 ));
             }
             sniffed.names[..names.len()].clone_from_slice(names);
