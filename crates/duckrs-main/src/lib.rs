@@ -10,6 +10,7 @@ mod text_tree_renderer;
 mod triggers;
 
 mod export;
+mod external_resources;
 mod logging;
 mod secret;
 pub mod settings;
@@ -89,6 +90,8 @@ pub struct DatabaseInstance {
     log_manager: duckrs_core::logging::SharedLogManager,
     /// `DBConfig::secret_manager`: the secrets and their storages
     secrets: secret::SecretManager,
+    /// `ExternalResourceTypeRegistry` and `ExternalResourcesManager`
+    external_resources: external_resources::ExternalResources,
     /// `DatabaseManager::GetNewQueryNumber`: the queries so far
     query_number: AtomicU64,
     /// `global_transaction_id`: the transactions so far, an auto-commit statement being one
@@ -311,6 +314,7 @@ impl DatabaseInstance {
             detached: AtomicBool::new(false),
             log_manager: Arc::default(),
             secrets: secret::SecretManager::default(),
+            external_resources: external_resources::ExternalResources::default(),
             query_number: AtomicU64::new(0),
             transaction_number: AtomicU64::new(0),
             hidden: false,
@@ -1254,6 +1258,9 @@ pub struct ClientContext {
     /// `ConnectionSecretStorage`: the secrets `CREATE SECRET ... IN connection` made, which only
     /// this connection sees
     connection_secrets: secret::ConnectionSecrets,
+    /// an internal connection an external resource callback runs on, within a statement of another connection:
+    /// that statement holds the locks of the database already
+    nested: bool,
     /// its temporary objects, which the `temp` catalog holds in C++
     temp: Arc<SchemaCatalogEntry>,
     /// the connection's logger (`ClientContext::logger`), which `write_log` finds by its id
@@ -1514,6 +1521,7 @@ impl ClientContext {
             appended: None,
             replacement_scans: Default::default(),
             connection_secrets: Arc::default(),
+            nested: false,
             temp: SessionTemp::new_schema(),
             log_target,
             log_target_id,
@@ -1666,6 +1674,11 @@ impl ClientContext {
             },
             settings: Box::new(move || settings::list_settings(&list_db.settings.read(), &list_session)),
             secrets: Some(self.secret_view()),
+            external_resources: Some(Arc::new(external_resources::ExternalResourceView {
+                db: self.home.clone(),
+                log: Some(self.log_target.clone()),
+                search_path: SearchEntry::list_text(&self.search_path),
+            })),
             database_files: Box::new(move || {
                 let mut databases = vec![files_db.clone()];
                 databases.extend(files_db.attached.read().values().cloned());
@@ -2547,6 +2560,8 @@ impl ClientContext {
                 },
                 (result, _) => result,
             }
+        } else if self.nested {
+            self.execute_statement(statement)
         } else if matches!(statement, Statement::Select(_)) {
             let _reading = db.statements.read();
             self.execute_statement(statement)

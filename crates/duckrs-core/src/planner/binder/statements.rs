@@ -3472,6 +3472,11 @@ impl Binder<'_> {
                 .bind_secret_function(&name, call, table_ref)
                 .map(|op| table_function_rows(op, &name));
         }
+        if super::EXTERNAL_RESOURCE_FUNCTIONS.contains(&name.as_str()) {
+            return self
+                .bind_external_resource_function(&name, call, table_ref)
+                .map(|op| table_function_rows(op, &name));
+        }
         if name == "duckdb_logs" || name == "duckdb_log_contexts" {
             return self
                 .bind_duckdb_logs(&name, call, table_ref)
