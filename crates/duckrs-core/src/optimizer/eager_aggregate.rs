@@ -117,10 +117,8 @@ pub(super) fn try_execute(op: &LogicalOperator) -> Option<LogicalOperator> {
             table_partitions(table, column_ids)?
         }
         K::ParquetScan { table_index, scan } => {
-            if !scan.extracts.is_empty()
-                || scan.files.len() != 1
-                || scan.union_by_name
-                || !scan.optional_filters.is_empty()
+            // one file: `union_by_name` reads it with its own types
+            if !scan.extracts.is_empty() || scan.files.len() != 1 || !scan.optional_filters.is_empty()
             {
                 return None;
             }
@@ -351,9 +349,25 @@ fn decidable(filter: &BoundExpr) -> bool {
             && has_comparator(&e.return_type)
     };
     let constant = |e: &BoundExpr| matches!(e.kind, BoundExprKind::Constant(_));
+    // `ExpressionFilter::CheckStatistics`: arithmetic of one numeric column, whose bounds the statistics propagate
+    fn arithmetic(e: &BoundExpr, column: &dyn Fn(&BoundExpr) -> bool) -> bool {
+        match &e.kind {
+            BoundExprKind::Function { function, children, .. } => {
+                matches!(function.name.as_str(), "+" | "-" | "*" | "abs")
+                    && !matches!(e.return_type.id(), LogicalTypeId::Varchar | LogicalTypeId::Blob | LogicalTypeId::Bit)
+                    && has_comparator(&e.return_type)
+                    && children
+                        .iter()
+                        .all(|c| matches!(c.kind, BoundExprKind::Constant(_)) || arithmetic(c, column))
+            }
+            BoundExprKind::Cast { .. } => false,
+            _ => column(e),
+        }
+    }
+    let operand = |e: &BoundExpr| numeric_column(e) || arithmetic(e, &numeric_column);
     match &filter.kind {
         BoundExprKind::Comparison { left, right, .. } => {
-            (numeric_column(left) && constant(right)) || (constant(left) && numeric_column(right))
+            (operand(left) && constant(right)) || (constant(left) && operand(right))
         }
         BoundExprKind::Between { input, lower, upper } => numeric_column(input) && constant(lower) && constant(upper),
         BoundExprKind::Operator {

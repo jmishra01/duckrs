@@ -68,35 +68,38 @@ pub fn virtual_types(columns: &[VirtualColumn]) -> impl Iterator<Item = LogicalT
 pub struct VirtualRows {
     file: Option<usize>,
     rows: i64,
-    /// of a Parquet file: the row groups read, in order, each with how many rows it has
-    row_groups: Vec<(u64, i64)>,
+    /// of a Parquet file: the row each of its row groups starts at
+    row_group_starts: Vec<i64>,
 }
 
 impl VirtualRows {
-    /// The row groups the scan reads of the file it opens next, in order, with their row counts.
-    pub fn set_row_groups(&mut self, row_groups: Vec<(u64, i64)>) {
-        self.row_groups = row_groups;
+    /// The rows the row groups of the file opened next start at, in order.
+    pub fn set_row_group_starts(&mut self, starts: Vec<i64>) {
+        self.row_group_starts = starts;
     }
 
-    /// `file_row_group_number` of the `count` rows from position `first` of the rows read of the file.
+    /// The row group that row `row` of the file is in.
+    fn row_group_of(&self, row: i64) -> u64 {
+        self.row_group_starts.partition_point(|&start| start <= row).saturating_sub(1) as u64
+    }
+
+    /// `file_row_group_number` of the `count` rows from row `first` of the file.
     fn row_group_numbers(&self, first: i64, count: usize) -> Vector {
         let mut result = Vector::new(LogicalType::UBIGINT, count);
-        let numbers = result.data_mut::<u64>();
-        let mut groups = self.row_groups.iter();
-        let (mut group, mut end) = (0u64, 0i64);
-        for (row, number) in (first..).zip(numbers.iter_mut().take(count)) {
-            while row >= end {
-                match groups.next() {
-                    Some(&(next, rows)) => {
-                        group = next;
-                        end += rows;
-                    }
-                    None => {
-                        end = i64::MAX;
-                    }
-                }
-            }
-            *number = group;
+        for (row, number) in (first..).zip(result.data_mut::<u64>().iter_mut().take(count)) {
+            *number = self.row_group_of(row);
+        }
+        result
+    }
+
+    /// `file_row_group_number` of `count` rows whose file row numbers (BIGINT) are `numbers`.
+    pub fn row_group_numbers_of(&self, numbers: &Vector, count: usize) -> Vector {
+        let mut flat = numbers.clone();
+        flat.flatten(count);
+        let mut result = Vector::new(LogicalType::UBIGINT, count);
+        let rows = flat.data::<i64>();
+        for (number, row) in result.data_mut::<u64>().iter_mut().zip(rows).take(count) {
+            *number = self.row_group_of(*row);
         }
         result
     }
