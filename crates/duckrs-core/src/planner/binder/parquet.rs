@@ -286,6 +286,7 @@ impl Binder<'_> {
             types = copy_types[..read].to_vec();
             table_columns = copy_names[..read].to_vec();
         }
+        super::copy::check_generated_columns(&names, filename.as_deref(), file_row_number)?;
         let mut output_names = names.clone();
         let mut output_types = types.clone();
         if file_row_number {

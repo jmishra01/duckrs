@@ -39,6 +39,26 @@ pub(super) fn is_true(value: &Value, name: &str) -> Result<bool> {
     }
 }
 
+/// `MultiFileReader::BindOptions`: the columns that `file_row_number` and `filename` add may not be columns of
+/// the file.
+pub(super) fn check_generated_columns(names: &[String], filename: Option<&str>, file_row_number: bool) -> Result<()> {
+    let in_file = |column: &str| names.iter().any(|name| name.eq_ignore_ascii_case(column));
+    if file_row_number && in_file("file_row_number") {
+        return Err(binder_error(
+            "Option file_row_number adds column \"file_row_number\", but a column with this name is also in the file",
+        ));
+    }
+    if let Some(column) = filename
+        && in_file(column)
+    {
+        return Err(binder_error(format!(
+            "Option filename adds column \"{column}\", but a column with this name is also in the file. Try \
+             setting a different name: filename='<filename column name>'"
+        )));
+    }
+    Ok(())
+}
+
 /// The `filename` option of the multi-file readers (`MultiFileReader::ParseOption`): a VARCHAR names
 /// the column, anything else is cast to BOOLEAN.
 pub(super) fn filename_option(value: &Value, option: &str) -> Result<Option<String>> {
@@ -1111,6 +1131,7 @@ impl Binder<'_> {
                 });
             }
         }
+        check_generated_columns(&names, arguments.filename.as_deref(), false)?;
         let mut output_names = names.clone();
         let mut output_types = types.clone();
         if let Some(column) = &arguments.filename {
