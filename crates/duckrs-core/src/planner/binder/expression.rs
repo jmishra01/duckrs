@@ -728,9 +728,15 @@ impl Binder<'_> {
                     **lhs = Expr::from(ExprKind::Default);
                 }
                 if let ExprKind::ColumnRef(names) = &e.kind {
-                    if self.bind_context.bind_column_ref(names).is_ok() {
+                    // a USING column reads as ambiguous, and is still that scope's
+                    let has = |context: &super::BindContext| {
+                        context
+                            .bind_column_ref(names)
+                            .map_or_else(|error| error.message.starts_with("Ambiguous"), |_| true)
+                    };
+                    if has(&self.bind_context) {
                         own = true;
-                    } else if self.outer_contexts.iter().any(|c| c.bind_column_ref(names).is_ok()) {
+                    } else if self.outer_contexts.iter().any(has) {
                         outer = true;
                     }
                 }
@@ -755,17 +761,38 @@ impl Binder<'_> {
             .find_map(|context| context.struct_field_start(names))
     }
 
-    fn bind_outer_column(&mut self, names: &[String]) -> Option<BoundExpr> {
+    fn bind_outer_column(&mut self, names: &[String]) -> Result<Option<BoundExpr>> {
         for context in self.outer_contexts.iter().rev() {
-            let Ok((binding, ty, name)) = context.bind_column_ref(names) else {
-                continue;
+            let (binding, ty, name) = match context.bind_column_ref(names) {
+                Ok(found) => found,
+                // a name two tables of that scope have is an error there too, unless they are joined USING it: then
+                // it is the column of the table that always has it
+                Err(error) if error.message.starts_with("Ambiguous") => {
+                    let set = match names {
+                        [column] => context.using_binding(column)?.cloned(),
+                        _ => None,
+                    };
+                    let Some(set) = set else {
+                        return Err(error);
+                    };
+                    match &set.primary {
+                        Some(alias) => match context.bind_column_ref(&[alias.clone(), names[0].clone()]) {
+                            Ok(found) => found,
+                            Err(_) => return Err(error),
+                        },
+                        // a FULL join's USING column is the COALESCE of its tables' columns
+                        None => {
+                            let expr = set.expression(&names[0]);
+                            return self.bind_expression(&expr).map(Some);
+                        }
+                    }
+                }
+                Err(_) => continue,
             };
-            let alias = context
-                .bindings
-                .iter()
-                .find(|b| b.table_index == binding.table_index)?
-                .alias
-                .clone();
+            let Some(binding_of) = context.bindings.iter().find(|b| b.table_index == binding.table_index) else {
+                return Ok(None);
+            };
+            let alias = binding_of.alias.clone();
             let mut correlated = self.correlated.lock();
             if !correlated.iter().any(|c| c.binding == binding) {
                 correlated.push(CorrelatedColumn {
@@ -775,9 +802,9 @@ impl Binder<'_> {
             }
             let mut expr = BoundExpr::column_ref(binding, ty, name);
             expr.kind = BoundExprKind::ColumnRef { binding, depth: 1 };
-            return Some(expr);
+            return Ok(Some(expr));
         }
-        None
+        Ok(None)
     }
 
     /// A name a subquery could not find may be a correlated column, which is a missing feature
@@ -828,6 +855,8 @@ impl Binder<'_> {
                             .iter()
                             .find(|(alias, _)| alias.eq_ignore_ascii_case(&names[0]))
                             .map(|(_, aliased)| aliased.clone())
+                            // a USING column of a FULL join, which is the COALESCE it groups by
+                            .or_else(|| self.bind_context.using_expression(&names[0]).ok().flatten())
                     }
                     _ => None,
                 };
@@ -1799,7 +1828,7 @@ impl Binder<'_> {
                             .alias_fallback
                             .iter()
                             .any(|(a, _)| a.eq_ignore_ascii_case(&names[0])));
-                if !is_own && let Some(outer) = self.bind_outer_column(names) {
+                if !is_own && let Some(outer) = self.bind_outer_column(names)? {
                     return Ok(outer);
                 }
                 if mode == Some(ColumnMode::Having) {
