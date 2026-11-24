@@ -31,7 +31,7 @@ use duckrs_parser::ast::sql_quoted_identifier;
 use duckrs_parser::ast::{
     CastType, ComparisonOp, Expr, ExprKind, FunctionExpr, Literal, LiteralKind, OperatorType, SubqueryType, TypeExpr,
 };
-use duckrs_parser::transformer::{visit_expr_mut, visit_query_node_exprs_mut};
+use duckrs_parser::transformer::visit_expr_mut;
 use parking_lot::Mutex;
 use std::sync::Arc;
 
@@ -300,6 +300,17 @@ pub(super) fn sql_value_function(name: &str) -> Option<&'static str> {
         "user" => Some("user"),
         _ => None,
     }
+}
+
+/// Every expression of a query, its set operations and WITH clause included, and the same in the queries of its
+/// subqueries.
+fn visit_query_and_subqueries(node: &mut ast::QueryNode, f: &mut dyn FnMut(&mut Expr)) {
+    duckrs_parser::transformer::visit_all_query_node_exprs_mut(node, &mut |e| {
+        f(e);
+        if let ExprKind::Subquery { subquery, .. } = &mut e.kind {
+            visit_query_and_subqueries(&mut subquery.node, f);
+        }
+    });
 }
 
 /// What an aggregate of an outer query's columns is, until the subquery around it moves it out.
@@ -806,11 +817,24 @@ impl Binder<'_> {
         if group_expressions && let Some(state) = self.aggregates.as_ref() {
             let keys: Vec<Expr> = state.group_map.iter().map(|(key, _)| key.clone()).collect();
             let mut found: Vec<Expr> = Vec::new();
-            visit_query_node_exprs_mut(&mut rewritten.node, &mut |e| {
-                if matches!(e.kind, ExprKind::ColumnRef(_) | ExprKind::Constant(_)) {
+            // the subqueries in the subquery too: a group stands for itself at any depth
+            visit_query_and_subqueries(&mut rewritten.node, &mut |e| {
+                // an alias of this query's select list that is a group (`k IN (SELECT ... + k)`)
+                let aliased = match &e.kind {
+                    ExprKind::ColumnRef(names)
+                        if names.len() == 1 && self.bind_context.bind_column_ref(names).is_err() =>
+                    {
+                        self.alias_fallback
+                            .iter()
+                            .find(|(alias, _)| alias.eq_ignore_ascii_case(&names[0]))
+                            .map(|(_, aliased)| aliased.clone())
+                    }
+                    _ => None,
+                };
+                if aliased.is_none() && matches!(e.kind, ExprKind::ColumnRef(_) | ExprKind::Constant(_)) {
                     return;
                 }
-                let mut qualified = e.clone();
+                let mut qualified = aliased.unwrap_or_else(|| e.clone());
                 self.qualify_column_names(&mut qualified);
                 let qualified = without_aliases(&qualified);
                 if let Some(key) = keys.iter().find(|key| **key == qualified) {
@@ -869,7 +893,8 @@ impl Binder<'_> {
                     let name = format!("__outer_aggregate_{}", outer_aggregates.len());
                     let ty = bound.return_type.clone();
                     let mut replaced = false;
-                    visit_query_node_exprs_mut(&mut rewritten.node, &mut |e| {
+                    // where it is, in the subquery or one of its own
+                    visit_query_and_subqueries(&mut rewritten.node, &mut |e| {
                         if e.kind == expr.kind {
                             let alias = std::mem::take(&mut e.alias);
                             *e = Expr::column(vec![name.clone()]);
@@ -916,6 +941,19 @@ impl Binder<'_> {
                 Ok(bound) => correlated.push(bound),
                 Err(error) => {
                     self.alias_fallback.truncate(fallback_size);
+                    // in HAVING a column that is no group is an error at once: try again with the expressions of
+                    // the groups, as the select list does below
+                    if !group_expressions
+                        && error.message.contains("must appear in the GROUP BY clause")
+                        && self.aggregates.as_ref().is_some_and(|state| !state.group_map.is_empty())
+                    {
+                        self.subquery_group_expressions = true;
+                        let retried = self.bind_subquery(subquery, subquery_type, parsed_child, comparison);
+                        self.subquery_group_expressions = false;
+                        if retried.is_ok() {
+                            return retried;
+                        }
+                    }
                     return Err(error);
                 }
             }

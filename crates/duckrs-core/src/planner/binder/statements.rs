@@ -891,7 +891,12 @@ impl Binder<'_> {
         for child in &node.children {
             let mut binder = self.child_binder();
             binder.ctes = self.ctes.clone();
-            let bound = binder.bind_query_node(child)?;
+            let bound = binder.bind_query_node(child);
+            // an aggregate of an outer query's columns in a branch is the subquery's to move out
+            if bound.is_err() && binder.pending_outer_aggregate.is_some() {
+                self.pending_outer_aggregate = binder.pending_outer_aggregate.take();
+            }
+            let bound = bound?;
             self.next_table_index = binder.next_table_index;
             children.push(bound);
         }
