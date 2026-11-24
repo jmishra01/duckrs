@@ -3340,6 +3340,35 @@ impl Catalog {
                 .into_iter()
                 .map(|(s, score, v)| (s.to_string(), score, v.to_string())),
         );
+        // `GetCatalogEntries`: an unqualified name is looked for in the other attached databases too, which name it
+        // by the database (and the schema, other than `main`)
+        if schema.is_none() {
+            for database in self.databases() {
+                self.with_database(&database.name, &mut |catalog| {
+                    // this catalog under the name the session gave it: its `main` is this one's
+                    let same_main = match (catalog.get_schema(DEFAULT_SCHEMA), self.get_schema(DEFAULT_SCHEMA)) {
+                        (Some(a), Some(b)) => Arc::ptr_eq(&a, &b),
+                        _ => false,
+                    };
+                    if std::ptr::eq(catalog, self) || same_main {
+                        return;
+                    }
+                    for entry in catalog.schemas() {
+                        if entry.name.eq_ignore_ascii_case(TEMP_SCHEMA) {
+                            continue;
+                        }
+                        if let Some((score, similar)) = entry.similar_entry(name) {
+                            let qualified = if entry.name.eq_ignore_ascii_case(DEFAULT_SCHEMA) {
+                                database.name.clone()
+                            } else {
+                                format!("{}.{}", database.name, entry.name)
+                            };
+                            candidates.push((qualified, score, similar));
+                        }
+                    }
+                });
+            }
+        }
         // `SimilarEntriesInSchemas`: the best of all, ties kept
         let mut seen: Vec<(f64, String)> = Vec::new();
         let mut unseen: Vec<(f64, String)> = Vec::new();
