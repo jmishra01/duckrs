@@ -372,12 +372,28 @@ fn file_vector_zones(
     let Ok(segments) = source.segment_zones(column, &path) else {
         return Arc::default();
     };
+    // a scan numbers the rows that are there, the segments the rows as stored: with rows deleted (holes), a
+    // vector's rows are those stored from the first one's row id to the last one's
     let rows = table.row_count();
+    let stored_rows = source.row_count();
+    let ids = source.row_ids();
     let vectors = rows.div_ceil(duckrs_common::STANDARD_VECTOR_SIZE);
     let mut zones = Vec::with_capacity(vectors);
     let mut at = 0;
     for vector in 0..vectors {
-        let (first, last) = (vector * duckrs_common::STANDARD_VECTOR_SIZE, ((vector + 1) * duckrs_common::STANDARD_VECTOR_SIZE).min(rows));
+        let (live_first, live_last) = (
+            vector * duckrs_common::STANDARD_VECTOR_SIZE,
+            ((vector + 1) * duckrs_common::STANDARD_VECTOR_SIZE).min(rows),
+        );
+        // rows appended to the table since it was read: nothing is known of them here
+        if live_last > stored_rows {
+            zones.push(ColumnZone {
+                unknown: true,
+                ..ColumnZone::default()
+            });
+            continue;
+        }
+        let (first, last) = (ids.id(live_first) as usize, ids.id(live_last - 1) as usize + 1);
         while at < segments.len() && segments[at].0 + segments[at].1 <= first {
             at += 1;
         }
