@@ -82,6 +82,33 @@ impl Binder<'_> {
                 continue;
             }
             let option = argument.name.to_lowercase();
+            // `AddReadJSONParameters` and `AddAutoDetectParameters`: what read_json_objects does not take
+            if objects
+                && matches!(
+                    option.as_str(),
+                    "columns"
+                        | "auto_detect"
+                        | "geojson"
+                        | "sample_size"
+                        | "dateformat"
+                        | "date_format"
+                        | "timestampformat"
+                        | "timestamp_format"
+                        | "records"
+                        | "array"
+                        | "maximum_sample_files"
+                        | "case_insensitive_keys"
+                        | "maximum_depth"
+                        | "field_appearance_threshold"
+                        | "map_inference_threshold"
+                        | "convert_strings_to_integers"
+                )
+            {
+                return Err(binder_error(format!(
+                    "Invalid named parameter \"{}\" for function {name}",
+                    argument.name
+                )));
+            }
             let number = || -> Result<i64> {
                 value
                     .try_to_string()?
@@ -163,7 +190,11 @@ impl Binder<'_> {
                 "timestampformat" | "timestamp_format" => formats.timestamp = Some(value.try_to_string()?),
                 "compression" => compression = Compression::parse(&value.try_to_string()?)?,
                 // -1 (`DConstants::INVALID_INDEX`): no objects become MAPs
-                "map_inference_threshold" => map_inference = number()? != -1,
+                "map_inference_threshold" => {
+                    let threshold = number()?;
+                    map_inference = threshold != -1;
+                    formats.map_threshold = usize::try_from(threshold).ok();
+                }
                 "maximum_sample_files" => {
                     let files = number()?;
                     maximum_sample_files = if files < 0 { usize::MAX } else { files as usize };
@@ -216,6 +247,7 @@ impl Binder<'_> {
             (vec!["json".to_string()], vec![json_type()], false)
         } else if let Some(columns) = columns {
             // `JSONScan::AutoDetect` still samples the first file when the format or `records` is left to it
+            let mut sampled_objects = true;
             if (format == JsonFormat::Auto || records.is_none())
                 && let Some(path) = files.first()
             {
@@ -224,9 +256,15 @@ impl Binder<'_> {
                 let size = std::fs::metadata(path).map_or(data.len() as u64, |m| m.len());
                 cardinality_per_file =
                     crate::execution::json_scan::estimate_per_file(&data, &found, detected, size, sample_size);
+                sampled_objects = found
+                    .iter()
+                    .take(sample_size)
+                    .any(|record| matches!(record, Ok((Json::Object(_), _))));
             }
+            // records left to it, one column and no objects sampled: the values themselves are the column
+            let use_records = records.unwrap_or(!(columns.len() == 1 && !sampled_objects));
             let (names, types): (Vec<_>, Vec<_>) = columns.into_iter().unzip();
-            (names, types, records.unwrap_or(true))
+            (names, types, use_records)
         } else {
             let mut sampled: Vec<Json> = Vec::new();
             // `DetectStructure`: up to `sample_size` records of each of the first files
@@ -257,6 +295,12 @@ impl Binder<'_> {
             let structure = infer_with(&references, formats.case_insensitive);
             let ty = structure.logical_type_with(maximum_depth, map_inference);
             let ty = refine_type(ty, &references, &formats);
+            if formats.date.is_none() {
+                formats.date = formats.detected_date.get().map(str::to_string);
+            }
+            if formats.timestamp.is_none() {
+                formats.timestamp = formats.detected_timestamp.get().map(str::to_string);
+            }
             let is_object = ty.id() == LogicalTypeId::Struct;
             let use_records = records.unwrap_or(is_object);
             if use_records && !is_object {

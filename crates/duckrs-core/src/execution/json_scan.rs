@@ -413,10 +413,49 @@ pub fn refine_type(ty: LogicalType, values: &[&Json], formats: &Formats) -> Logi
                 return ty;
             }
             let zoned = LogicalType::new(Id::TimestampTz);
-            for candidate in [LogicalType::DATE, LogicalType::TIMESTAMP, zoned, LogicalType::UUID] {
-                if texts.iter().all(|text| string_fits(text, &candidate, formats)) {
-                    return candidate;
+            if formats.date.is_some() && texts.iter().all(|text| string_fits(text, &LogicalType::DATE, formats)) {
+                return LogicalType::DATE;
+            }
+            // `DateFormatMap`: without a format given, the first template every value fits; one format for all
+            // columns
+            if formats.date.is_none() {
+                let candidates: Vec<&'static str> = match formats.detected_date.get() {
+                    Some(found) => vec![found],
+                    None => DATE_TEMPLATES.to_vec(),
+                };
+                if let Some(found) = candidates
+                    .into_iter()
+                    .find(|format| texts.iter().all(|text| strptime_micros(text, format).is_ok()))
+                {
+                    formats.detected_date.set(Some(found));
+                    return LogicalType::DATE;
                 }
+            }
+            // `EliminateCandidateFormats`: without a format given, the first template every value fits, a special
+            // (`infinity`, `epoch`) fitting any; a template with an offset makes it a TIMESTAMPTZ, and values with and
+            // without one fit none
+            if formats.timestamp.is_none() {
+                let special = |text: &str| {
+                    matches!(text.to_ascii_lowercase().as_str(), "infinity" | "-infinity" | "epoch")
+                };
+                if let Some(found) = TIMESTAMP_TEMPLATES.into_iter().find(|format| {
+                    texts.iter().all(|text| special(text) || strptime_micros(text, format).is_ok())
+                }) {
+                    if found.contains('Z') || found.contains("%z") {
+                        return zoned;
+                    }
+                    // the scan reads a form no cast reads with the format found; one such format for the file
+                    if !found.contains('T') && formats.detected_timestamp.get().is_none_or(|known| known == found) {
+                        formats.detected_timestamp.set(Some(found));
+                    }
+                    return LogicalType::TIMESTAMP;
+                }
+            } else if texts.iter().all(|text| string_fits(text, &LogicalType::TIMESTAMP, formats)) {
+                // a format given makes only TIMESTAMPs, read with it
+                return LogicalType::TIMESTAMP;
+            }
+            if texts.iter().all(|text| string_fits(text, &LogicalType::UUID, formats)) {
+                return LogicalType::UUID;
             }
             ty
         }
@@ -438,7 +477,7 @@ pub fn refine_type(ty: LogicalType, values: &[&Json], formats: &Formats) -> Logi
                 .collect();
             if formats
                 .map_threshold
-                .is_some_and(|threshold| children.len() > threshold)
+                .is_some_and(|threshold| children.len() >= threshold)
             {
                 let first = children[0].1.clone();
                 let same = children.iter().all(|(_, child)| *child == first);
@@ -471,9 +510,33 @@ pub struct Formats {
     pub case_insensitive: bool,
     /// `error_duplicate_key`: an object with a key twice is an error (the scan's, unless it ignores errors)
     pub error_duplicate_key: bool,
-    /// objects with more keys than this are MAPs (`map_inference_threshold`); `None` turns that off
+    /// objects with at least this many keys are MAPs (`map_inference_threshold`); `None` turns that off
     pub map_threshold: Option<usize>,
+    /// the date format auto-detection settled on (`DateFormatMap`), which the scan then reads with
+    pub detected_date: std::cell::Cell<Option<&'static str>>,
+    /// the timestamp format it settled on
+    pub detected_timestamp: std::cell::Cell<Option<&'static str>>,
 }
+
+/// The timestamp formats of `FORMAT_TEMPLATES`, from the last, as they are tried; the ISO ones a cast reads too.
+const TIMESTAMP_TEMPLATES: [&str; 12] = [
+    "%Y-%m-%dT%H:%M:%S.%f%z",
+    "%Y-%m-%dT%H:%M:%S%z",
+    "%Y-%m-%dT%H:%M:%S.%fZ",
+    "%Y-%m-%dT%H:%M:%SZ",
+    "%Y-%m-%dT%H:%M:%S",
+    "%y-%m-%d %H:%M:%S",
+    "%Y-%m-%d %H:%M:%S",
+    "%d-%m-%y %H:%M:%S",
+    "%d-%m-%Y %H:%M:%S",
+    "%m-%d-%y %I:%M:%S %p",
+    "%m-%d-%Y %I:%M:%S %p",
+    "%Y-%m-%d %H:%M:%S.%f",
+];
+
+/// `FORMAT_TEMPLATES` of `JSONScanData::InitializeFormats`, in the order `EliminateCandidateFormats` tries them: from
+/// the last.
+const DATE_TEMPLATES: [&str; 6] = ["%y-%m-%d", "%Y-%m-%d", "%d-%m-%y", "%d-%m-%Y", "%m-%d-%y", "%m-%d-%Y"];
 
 fn string_fits(text: &str, ty: &LogicalType, formats: &Formats) -> bool {
     let format = match ty.id() {
@@ -592,8 +655,9 @@ fn record_row(
         return Ok(Some(vec![value]));
     }
     let Json::Object(items) = record else {
+        // `TransformObject`: with errors ignored, what is no object is a row of NULLs
         if scan.ignore_errors {
-            return Ok(None);
+            return Ok(Some(scan.types.iter().map(|ty| Value::null(ty.clone())).collect()));
         }
         return Err(Error::new(
             ErrorKind::InvalidInput,
@@ -678,6 +742,8 @@ impl PhysicalOperator for PhysicalJsonScan {
             case_insensitive: scan.case_insensitive,
             error_duplicate_key: !scan.ignore_errors,
             map_threshold: None,
+            detected_date: Default::default(),
+            detected_timestamp: Default::default(),
         };
         let strict = !scan.ignore_errors;
         let wanted: Vec<bool> = (0..scan.types.len())

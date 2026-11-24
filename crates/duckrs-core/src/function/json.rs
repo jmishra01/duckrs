@@ -551,10 +551,26 @@ pub fn transform(json: &Json, ty: &LogicalType, strict: bool) -> Result<Value> {
 
 /// [`transform`], with the formats of dates and timestamps.
 pub fn transform_with(json: &Json, ty: &LogicalType, strict: bool, formats: &Formats) -> Result<Value> {
-    if let Json::Str(text) = json
-        && let Some(value) = formatted_value(text, ty, formats)
-    {
-        return Ok(value);
+    if let Json::Str(text) = json {
+        if let Some(value) = formatted_value(text, ty, formats) {
+            return Ok(value);
+        }
+        // `TransformFromStringWithFormat`: a string that the given format does not read is an error, not a cast
+        let format = match ty.id() {
+            LogicalTypeId::Date => formats.date.as_deref(),
+            LogicalTypeId::Timestamp => formats.timestamp.as_deref(),
+            _ => None,
+        };
+        // the specials (`infinity`, `epoch`) are read whatever the format
+        let special = matches!(text.to_ascii_lowercase().as_str(), "infinity" | "-infinity" | "epoch");
+        if let Some(format) = format.filter(|_| !special) {
+            if !strict {
+                return Ok(Value::null(ty.clone()));
+            }
+            return Err(invalid(format!(
+                "Could not parse string \"{text}\" according to format specifier \"{format}\""
+            )));
+        }
     }
     let transform = |json: &Json, ty: &LogicalType, strict: bool| transform_with(json, ty, strict, formats);
     let fail = |json: &Json| -> Result<Value> {
