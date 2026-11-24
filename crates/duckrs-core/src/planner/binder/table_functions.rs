@@ -105,6 +105,12 @@ fn union_tables_query(tables: &Value, by_name: bool) -> Result<String> {
 impl Binder<'_> {
     /// A table function's argument, which C++ evaluates when binding.
     pub(super) fn constant_argument(&mut self, expr: &Expr) -> Result<Value> {
+        self.argument_value(expr, true)
+    }
+
+    /// [`Self::constant_argument`]; a COPY option may also be one that does not fold, as `random()`
+    /// (`EvaluateScalar` with `allow_unfoldable`).
+    pub(super) fn argument_value(&mut self, expr: &Expr, foldable: bool) -> Result<Value> {
         // `TableFunctionBinder::BindExpression`
         let mut subquery = false;
         duckrs_parser::transformer::visit_expr_mut(&mut expr.clone(), &mut |e: &mut Expr| {
@@ -145,7 +151,7 @@ impl Binder<'_> {
                 "Parameter types could not be resolved",
             ));
         }
-        if !bound.is_foldable() {
+        if foldable && !bound.is_foldable() {
             return Err(binder_error("Table function requires a constant parameter"));
         }
         evaluate_scalar(&bound)

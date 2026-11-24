@@ -3085,6 +3085,13 @@ impl StatisticsPropagator {
                 self.hidden.insert(base);
             }
         }
+        // `PropagateStatistics(LogicalProjection)`: a projection of nothing is nothing
+        if matches!(op.kind, K::Projection { .. })
+            && op.children.first().is_some_and(|child| matches!(child.kind, K::EmptyResult { .. }))
+        {
+            *op = empty_result(op);
+            return;
+        }
         self.count_valid_as_count_star(op);
         // `ParquetCopyToPropagateStatistics`: columns that can't be NULL are written REQUIRED
         if matches!(op.kind, K::CopyToParquet { .. }) {

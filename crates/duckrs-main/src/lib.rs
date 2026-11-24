@@ -104,6 +104,8 @@ pub struct DatabaseInstance {
 #[derive(Debug, Default)]
 pub struct AttachOptions {
     pub read_only: bool,
+    /// `TYPE duckdb` or a `duckdb:` prefix: a DuckDB database, whatever the file looks like
+    pub duckdb_type: bool,
     pub block_size: Option<u64>,
     pub row_group_size: Option<u64>,
     /// `STORAGE_VERSION`, as given and as known
@@ -397,7 +399,7 @@ impl DatabaseInstance {
     pub fn open_with(path: &Path, options: &AttachOptions) -> Result<Arc<Self>> {
         duckrs_core::function::json::register_projjson_parser();
         let read_only = options.read_only;
-        if storage::is_open_file(path) {
+        if !options.duckdb_type && storage::is_open_file(path) {
             return Self::open_data_file(path, options);
         }
         if read_only && !storage::is_database_file(path) {
@@ -2860,8 +2862,16 @@ impl ClientContext {
             return Err(duckrs_core::unported("ATTACH TO EXTERNAL RESOURCE"));
         }
         let path = evaluate_scalar(&bind_constant_expression(&self.catalog(), &info.path)?)?.try_to_string()?;
-        let path = duckrs_core::execution::file_system::expand_path(&path);
         let mut options = AttachOptions::default();
+        // `DBPathAndType::ExtractExtensionPrefix`: `duckdb:` names the type of the database
+        let path = match path.get(..7) {
+            Some(prefix) if prefix.eq_ignore_ascii_case("duckdb:") => {
+                options.duckdb_type = true;
+                path[7..].to_string()
+            }
+            _ => path,
+        };
+        let path = duckrs_core::execution::file_system::expand_path(&path);
         let mut mode_given = false;
         let mut compress_given = false;
         let mut encryption_key: Option<Vec<u8>> = None;
@@ -2900,7 +2910,7 @@ impl ClientContext {
                     options.read_only = text == "false";
                     mode_given = true;
                 }
-                "type" if text == "duckdb" => {}
+                "type" if text == "duckdb" => options.duckdb_type = true,
                 // `DatabaseManager::GetDatabaseType`: a storage extension of that name
                 "type" => {
                     return Err(Error::new(
@@ -3216,6 +3226,15 @@ impl ClientContext {
             database.hidden = options.hidden;
             database.attach_options.clone_from(&options.listed);
             database.name.clone_from(&name);
+            // `OpenFileStorageAttach`: a data file reads as `file` and as the name it is attached under
+            if !options.duckdb_type
+                && storage::is_open_file(Path::new(&path))
+                && let Some(schema) = database.catalog.get_schema(duckrs_core::catalog::DEFAULT_SCHEMA)
+                && let Some(TableOrView::View(file)) = schema.get_entry("file")
+                && schema.get_entry(&name).is_none()
+            {
+                schema.create_view(&name, file.query.clone(), Vec::new(), OnCreateConflict::Error, Vec::new(), false)?;
+            }
             DatabaseInstance::write_ahead_with(&opened);
             opened
         };

@@ -1771,7 +1771,7 @@ impl Binder<'_> {
             }
             let value = match expression {
                 Some(expression) if expression.is_empty_star() => Value::varchar("*"),
-                Some(expression) => self.constant_argument(expression)?,
+                Some(expression) => self.argument_value(expression, false)?,
                 None => Value::boolean(true),
             };
             // `BindCopyOption`; SHREDDING says itself what it takes
