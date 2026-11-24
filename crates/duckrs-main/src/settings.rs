@@ -559,6 +559,51 @@ fn on_set(setting: &SettingDefinition, value: Value) -> Result<Value> {
                 None => Value::null(LogicalType::VARCHAR),
             });
         }
+        // `ValidateGrammarExtensionsExist`: duckrs registers no grammar extension
+        "active_grammar_extensions" | "default_grammar_extensions" => {
+            // NULL is none
+            if value.is_null() {
+                return Value::list(LogicalType::VARCHAR, Vec::new());
+            }
+            if let duckrs_common::value::ValueData::List(names) = value.data()
+                && !names.is_empty()
+            {
+                // `GetGrammarExtensionNames`: names, each once
+                let mut seen: Vec<String> = Vec::new();
+                for name in names {
+                    if name.is_null() {
+                        return invalid(format!("'{}' list values cannot be NULL", setting.name));
+                    }
+                    let name = name.try_to_string()?;
+                    if seen.iter().any(|s| s.eq_ignore_ascii_case(&name)) {
+                        return invalid(format!("'{}' list contains duplicate value '{name}'", setting.name));
+                    }
+                    seen.push(name);
+                }
+                let names = seen;
+                return invalid(format!(
+                    "Can't set '{}', the following extensions don't exist: {}",
+                    setting.name,
+                    names.join(",")
+                ));
+            }
+        }
+        // `ProfilingRendererSettingsSetting::SetLocal`: a value for each setting named
+        "profiling_renderer_settings" => {
+            if let duckrs_common::value::ValueData::List(entries) = value.data() {
+                for entry in entries {
+                    if let duckrs_common::value::ValueData::Struct(pair) = entry.data()
+                        && pair.len() == 2
+                        && pair[1].is_null()
+                    {
+                        return invalid(format!(
+                            "profiling_renderer_settings: the value of \"{}\" cannot be NULL",
+                            pair[0].try_to_string()?
+                        ));
+                    }
+                }
+            }
+        }
         // `ExternalFileCacheLocalMaxBlockSizeSetting::OnSet`
         "external_file_cache_local_max_block_size" => {
             if value.as_i128() == Some(0) {
@@ -693,6 +738,17 @@ fn on_set(setting: &SettingDefinition, value: Value) -> Result<Value> {
                         return invalid(format!("Unknown configuration option \"{name}\" in allowed_configs"));
                     }
                 }
+                // kept by their canonical names, so that an alias finds them (`CheckLock`)
+                let canonical = names
+                    .iter()
+                    .map(|name| {
+                        let name = name.try_to_string()?;
+                        Ok(Value::varchar(
+                            find_setting(&name).map_or(name.clone(), |(_, setting)| setting.name.to_string()),
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                return Value::list(LogicalType::VARCHAR, canonical);
             }
         }
         // `DisabledOptimizersSetting::SetGlobal`: `OptimizerTypeFromString` of each entry
@@ -861,7 +917,12 @@ fn default_value(setting: &SettingDefinition) -> Option<Value> {
         | "disabled_optimizers"
         | "http_proxy"
         | "profiling_output" => return Some(Value::varchar("")),
-        "allowed_configs" | "allowed_directories" | "allowed_paths" | "extension_directories" => {
+        "allowed_configs"
+        | "allowed_directories"
+        | "allowed_paths"
+        | "extension_directories"
+        | "active_grammar_extensions"
+        | "default_grammar_extensions" => {
             return Value::list(LogicalType::VARCHAR, Vec::new()).ok();
         }
         "enable_progress_bar" => return Some(Value::boolean(false)),
@@ -870,6 +931,16 @@ fn default_value(setting: &SettingDefinition) -> Option<Value> {
         "profiling_coverage" => return Some(Value::varchar("SELECT")),
         "default_secret_storage" => return Some(Value::varchar("local_file")),
         "checkpoint_threshold" => return Some(Value::varchar("16.0 MiB")),
+        // `ProfilingRendererSettingsSetting::GetSetting`: no settings, an empty MAP
+        "profiling_renderer_settings" => {
+            let ty = LogicalType::map(LogicalType::VARCHAR, LogicalType::VARCHAR);
+            return Value::new(ty, duckrs_common::value::ValueData::List(Vec::new())).ok();
+        }
+        // `HTTPTransportManager::AutomaticCapacity`: derived from the machine, at least 1
+        "http_client_pool_capacity" => {
+            let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+            return Some(Value::bigint(threads.max(1) as i64));
+        }
         // `ClientConfig::streaming_buffer_size`
         "max_streaming_buffer_size" => return Some(Value::varchar("10.0 MiB")),
         _ => {}
