@@ -1,8 +1,12 @@
 # Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
 # stop passing. Regenerate with:
 #   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
+#   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
+# Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
+# stop passing. Regenerate with:
 test/common/test_cast_hugeint.test
 test/common/test_cast_struct.test
+test/common/test_local_file_urls.test
 test/fuzzer/afl/alter_if_exists.test
 test/fuzzer/afl/analyze_empty_table.test
 test/fuzzer/afl/case_map_cast.test
@@ -79,6 +83,7 @@ test/fuzzer/duckfuzz/window_expression_equality.test
 test/fuzzer/duckfuzz/window_negate_stats.test
 test/fuzzer/duckfuzz/window_null_range.test
 test/fuzzer/fuzz_not_operator.test
+test/fuzzer/issue4298.test
 test/fuzzer/pedro/C_C++_API_query_verification.test
 test/fuzzer/pedro/aggregate_assertion_errors.test
 test/fuzzer/pedro/alter_column_generated.test
@@ -1405,13 +1410,21 @@ test/sql/catalog/nested_schema/drop_nested_schema.test
 test/sql/catalog/nested_schema/drop_nested_schema_persist.test
 test/sql/catalog/nested_schema/nested_alter.test
 test/sql/catalog/nested_schema/nested_constraints.test
+test/sql/catalog/nested_schema/nested_entries.test
+test/sql/catalog/nested_schema/nested_entries_persist.test
 test/sql/catalog/nested_schema/nested_export.test
+test/sql/catalog/nested_schema/nested_schema_limits.test
+test/sql/catalog/nested_schema/nested_schema_search_path.test
+test/sql/catalog/nested_schema/nested_schema_storage_version.test
 test/sql/catalog/nested_schema/nested_table.test
 test/sql/catalog/nested_schema/nested_table_columnref.test
 test/sql/catalog/nested_schema/nested_table_dml.test
 test/sql/catalog/nested_schema/nested_table_dml_persist.test
 test/sql/catalog/nested_schema/nested_table_persist.test
+test/sql/catalog/nested_schema/nested_view_attached.test
 test/sql/catalog/nested_schema/nested_view_function_attached.test
+test/sql/catalog/nested_schema/nested_view_function_catalog.test
+test/sql/catalog/nested_schema/nested_wal_replay.test
 test/sql/catalog/nested_schema/nested_wal_replay_index.test
 test/sql/catalog/nested_schema/persist.test
 test/sql/catalog/nested_schema_ctas.test
@@ -1447,6 +1460,7 @@ test/sql/catalog/test_querying_from_detached_catalog.test
 test/sql/catalog/test_quoted_column_name.test
 test/sql/catalog/test_schema.test
 test/sql/catalog/test_schema_conflict.test
+test/sql/catalog/test_set_schema.test
 test/sql/catalog/test_set_search_path.test
 test/sql/catalog/test_standard_schema.test
 test/sql/catalog/test_temporary_index.test
@@ -1469,6 +1483,7 @@ test/sql/catalog/view/test_view_schema_change.test
 test/sql/catalog/view/test_view_schema_change_with_dependencies.test
 test/sql/catalog/view/test_view_sql.test
 test/sql/catalog/view/test_view_sql_with_dependencies.test
+test/sql/catalog/view/view_catalog_alias.test
 test/sql/catalog/view/view_if_not_exists.test
 test/sql/collate/collate_filter_pushdown.test
 test/sql/collate/collate_group_subquery.test
@@ -1482,6 +1497,7 @@ test/sql/collate/collate_ordered_aggregate.test
 test/sql/collate/collate_string_col.test
 test/sql/collate/collate_struct_minmax.test
 test/sql/collate/collate_subquery.test
+test/sql/collate/collated_cast_rendering_storage.test
 test/sql/collate/nop_collation_join_filter_pushdown.test
 test/sql/collate/test_collate_accent_insensitive.test
 test/sql/collate/test_collate_between.test
@@ -2207,6 +2223,7 @@ test/sql/cte/test_recursive_cte_tutorial.test
 test/sql/cte/test_recursive_cte_union.test
 test/sql/cte/test_recursive_cte_union_all.test
 test/sql/cte/using_key_aggregate_qualification.test
+test/sql/delete/bulk_delete_version_info_memory.test
 test/sql/delete/cleanup_delete_on_conflict.test
 test/sql/delete/delete_compression_after_restart.test
 test/sql/delete/delete_query_node.test
@@ -2217,6 +2234,7 @@ test/sql/delete/large_deletes_transactions.test
 test/sql/delete/list_delete.test
 test/sql/delete/masked_vector_further_delete.test
 test/sql/delete/masked_vector_rollback.test
+test/sql/delete/partial_delete_version_info_memory.test
 test/sql/delete/test_delete.test
 test/sql/delete/test_delete_indexed.test
 test/sql/delete/test_large_delete.test
@@ -2230,6 +2248,7 @@ test/sql/detailed_profiler/test_detailed_profiler.test
 test/sql/error/aggregate_order_by.test
 test/sql/error/error_location_not_duplicated.test
 test/sql/error/escape_percent_sign.test
+test/sql/error/incorrect_sql.test
 test/sql/error/missing_type.test
 test/sql/error/mix_aggregate_and_non_aggregate.test
 test/sql/error/subquery_single_column.test
@@ -2847,6 +2866,7 @@ test/sql/index/art/storage/test_art_if_not_exists_constraint_name.test
 test/sql/index/art/storage/test_art_import.test
 test/sql/index/art/storage/test_art_import_export.test
 test/sql/index/art/storage/test_art_list_sort_checkpoint_on_close.test
+test/sql/index/art/storage/test_art_mem_limit.test
 test/sql/index/art/storage/test_art_names.test
 test/sql/index/art/storage/test_art_node256_leaf_layout.test
 test/sql/index/art/storage/test_art_readonly.test
@@ -3497,6 +3517,7 @@ test/sql/parser/parser_rewrites_qualified_call.test
 test/sql/parser/position_prepare.test
 test/sql/parser/qualified_underscore_digit.test
 test/sql/parser/reject_accidental_expression_syntax.test
+test/sql/parser/reject_accidental_statement_syntax.test
 test/sql/parser/reject_accidental_type_syntax.test
 test/sql/parser/reject_unknown_option_values.test
 test/sql/parser/single_quoted_names.test
@@ -3703,6 +3724,7 @@ test/sql/returning/returning_delete_same_transaction.test
 test/sql/returning/returning_insert.test
 test/sql/returning/returning_large.test
 test/sql/returning/returning_update.test
+test/sql/sample/can_sample_from_ingested_files.test
 test/sql/sample/helper_operator_coverage.test
 test/sql/sample/repeatable_seed_range.test
 test/sql/sample/reservoir_sample.test
@@ -3853,8 +3875,10 @@ test/sql/sql_export/legacy_source_serialization.test
 test/sql/sql_export/mark_collation.test
 test/sql/sql_export/mark_condition_shapes.test
 test/sql/sql_export/mark_export_effects.test
+test/sql/sql_export/mark_nested_comparison_roundtrip.test
 test/sql/sql_export/mark_results.test
 test/sql/sql_export/named_scalar_arguments.test
+test/sql/sql_export/nested_collations.test
 test/sql/sql_export/nested_values.test
 test/sql/sql_export/null_safe_mark_roundtrip.test
 test/sql/sql_export/numbered_scan_results.test
@@ -3865,6 +3889,7 @@ test/sql/sql_export/pure_values_input.test
 test/sql/sql_export/pushed_column_paths.test
 test/sql/sql_export/range_folded_offset.test
 test/sql/sql_export/range_origin_inputs.test
+test/sql/sql_export/recursive_payload_types.test
 test/sql/sql_export/regex_range_filter_export.test
 test/sql/sql_export/scope_reuse.test
 test/sql/sql_export/single_child_union.test
@@ -4212,6 +4237,8 @@ test/sql/storage/partial_blocks/many_columns_storage.test
 test/sql/storage/partial_blocks/many_columns_strings.test
 test/sql/storage/partial_blocks/many_columns_validity.test
 test/sql/storage/partial_blocks/partial_block_tail_memory.test
+test/sql/storage/partial_delete_checkpoint_mask.test
+test/sql/storage/partial_delete_pending_compress.test
 test/sql/storage/piecemeal_delete_checkpoint_compress.test
 test/sql/storage/pragma_storage_info_scan_type.test
 test/sql/storage/prefetch/async_native_scan_positional.test
@@ -4345,6 +4372,7 @@ test/sql/storage/unicode_filename.test
 test/sql/storage/unzip.test
 test/sql/storage/update/dictionary_reset_updates.test
 test/sql/storage/update/dictionary_update_null.test
+test/sql/storage/update/noop_string_update_memory.test
 test/sql/storage/update/test_store_null_updates.test
 test/sql/storage/update/test_store_updates.test
 test/sql/storage/update/update_base_rows.test
@@ -4533,6 +4561,7 @@ test/sql/table_function/duckdb_dialects.test
 test/sql/table_function/duckdb_functions_window.test
 test/sql/table_function/duckdb_indexes.test
 test/sql/table_function/duckdb_keywords.test
+test/sql/table_function/duckdb_memory_convert_to_persistent.test
 test/sql/table_function/duckdb_optimizers.test
 test/sql/table_function/duckdb_schemas.test
 test/sql/table_function/duckdb_sequences.test
@@ -5194,6 +5223,7 @@ test/sql/types/variant/variant_to_array_try_cast.test
 test/sql/types/variant/variant_to_json_null.test
 test/sql/types/variant/variant_to_map_cast.test
 test/sql/unnest/list_constant_reference.test
+test/sql/update/compact_update_allocation.test
 test/sql/update/force_update_to_del_and_insert.test
 test/sql/update/issue_22392.test
 test/sql/update/null_update_merge.test
@@ -5221,6 +5251,7 @@ test/sql/update/test_update_mix.test
 test/sql/update/test_update_same_string_value.test
 test/sql/update/test_update_same_value.test
 test/sql/update/test_update_snapshot_versions.test
+test/sql/update/test_update_string_heap_compaction.test
 test/sql/update/test_update_with_non_regular_type.test
 test/sql/update/update_after_commit.test
 test/sql/update/update_default.test
