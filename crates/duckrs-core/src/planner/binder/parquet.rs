@@ -627,6 +627,7 @@ impl Binder<'_> {
         let bound = self.bind_select_statement(&select)?;
         let mut options = ParquetWriteOptions::default();
         options.writer.geoparquet_conversion = self.geoparquet_conversion();
+        options.writer.whole_chunks = !self.bool_setting("preserve_insertion_order", true);
         let writer = &mut options.writer;
         let mut compression = None;
         let mut level = None;

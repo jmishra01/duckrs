@@ -157,6 +157,9 @@ pub struct WriterOptions {
     pub version: i32,
     pub row_group_size: usize,
     pub row_group_size_bytes: Option<usize>,
+    /// without `preserve_insertion_order`, a row group takes all the chunks buffered when the rows reach
+    /// `row_group_size` (`ParquetWriteSink`), not exactly that many rows
+    pub whole_chunks: bool,
     pub dictionary_size_limit: Option<usize>,
     pub string_dictionary_page_size_limit: usize,
     pub data_page_size_limit: usize,
@@ -202,6 +205,7 @@ impl Default for WriterOptions {
             version: 1,
             row_group_size: DEFAULT_ROW_GROUP_SIZE,
             row_group_size_bytes: None,
+            whole_chunks: false,
             dictionary_size_limit: None,
             string_dictionary_page_size_limit: MAX_UNCOMPRESSED_DICT_PAGE_SIZE,
             data_page_size_limit: MAX_UNCOMPRESSED_PAGE_SIZE,
@@ -2233,6 +2237,9 @@ impl ParquetFileWriter {
             buffer.extend(column);
         }
         let row_group_size = self.options.row_group_size.max(1);
+        if self.options.whole_chunks && self.buffered_rows() >= row_group_size {
+            return self.flush_rows(self.buffered_rows());
+        }
         while self.buffered_rows() >= row_group_size {
             self.flush_rows(row_group_size)?;
         }
