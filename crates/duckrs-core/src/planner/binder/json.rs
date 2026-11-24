@@ -60,6 +60,8 @@ impl Binder<'_> {
         let mut maximum_sample_files = 32usize;
         // `geojson`: left to it, a file named `.geojson` or `.geojsonl` is GeoJSON
         let mut geojson: Option<bool> = None;
+        // `allow_empty`: a pattern no file matches reads no rows
+        let mut allow_empty = false;
         for argument in &args {
             let value = self.constant_argument(&argument.expr)?;
             if argument.name.is_empty() {
@@ -198,13 +200,23 @@ impl Binder<'_> {
                     formats.map_threshold = usize::try_from(threshold).ok();
                 }
                 "maximum_sample_files" => {
+                    if value.is_null() {
+                        return Err(binder_error("read_json \"maximum_sample_files\" parameter cannot be NULL"));
+                    }
                     let files = number()?;
+                    if files == 0 || files < -1 {
+                        return Err(binder_error(
+                            "read_json \"maximum_sample_files\" parameter must be positive, or -1 to remove the limit \
+                             on the number of files used to sample \"sample_size\" rows.",
+                        ));
+                    }
                     maximum_sample_files = if files < 0 { usize::MAX } else { files as usize };
                 }
                 "maximum_object_size" | "field_appearance_threshold" | "convert_strings_to_integers" => {}
                 "union_by_name" => union_by_name = is_true(&value, &option)?,
                 "case_insensitive_keys" => formats.case_insensitive = is_true(&value, &option)?,
                 "geojson" => geojson = Some(is_true(&value, &option)?),
+                "allow_empty" => allow_empty = is_true(&value, &option)?,
                 "hive_partitioning" | "hive_types" | "hive_type" | "hive_types_autocast" | "hive_type_autocast" => {
                     self.take_hive_option(&mut hive_options, &option, &value)?;
                 }
@@ -240,7 +252,7 @@ impl Binder<'_> {
             } else {
                 file_system::glob_or_directory(pattern, "json")
             };
-            if found.is_empty() {
+            if found.is_empty() && !allow_empty {
                 return Err(Error::new(
                     ErrorKind::Io,
                     format!("No files found that match the pattern \"{pattern}\""),
@@ -248,10 +260,10 @@ impl Binder<'_> {
             }
             files.extend(found);
         }
-        // columns given read the records as they are, whatever the file is called
+        // records='false' reads the values as they are, whatever the file is called
         let geojson = !objects
             && geojson.unwrap_or_else(|| {
-                columns.is_none() && files.iter().any(|f| crate::execution::json_scan::is_geojson_file(f))
+                records != Some(false) && files.iter().any(|f| crate::execution::json_scan::is_geojson_file(f))
             });
         let auto_detect = auto_detect.unwrap_or(columns.is_none());
         if !auto_detect && columns.is_none() && !objects {
