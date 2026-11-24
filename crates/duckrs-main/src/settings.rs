@@ -1374,6 +1374,17 @@ pub fn list_settings(global: &SettingValues, session: &SettingValues) -> Vec<Set
     rows
 }
 
+/// `StandardVectorSizeSetting::SetGlobal` and `ResetGlobal`: what the build fixed can't be set.
+fn read_only(name: &str) -> Result<()> {
+    if name == "standard_vector_size" {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "standard_vector_size is a read-only setting determined at compile time",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1531,15 +1542,4 @@ mod tests {
         )
         .unwrap();
     }
-}
-
-/// `StandardVectorSizeSetting::SetGlobal` and `ResetGlobal`: what the build fixed can't be set.
-fn read_only(name: &str) -> Result<()> {
-    if name == "standard_vector_size" {
-        return Err(Error::new(
-            ErrorKind::InvalidInput,
-            "standard_vector_size is a read-only setting determined at compile time",
-        ));
-    }
-    Ok(())
 }

@@ -5231,6 +5231,23 @@ impl ClientContext {
     }
 }
 
+/// `ForceVariantShredding::SetGlobal`'s `TypeVisitor::Contains`: the nested types of a shredding are LISTs and STRUCTs.
+fn check_shredding_type(ty: &duckrs_common::types::LogicalType) -> Result<()> {
+    use duckrs_common::types::LogicalTypeId;
+    match ty.id() {
+        LogicalTypeId::Struct => ty.struct_children().iter().try_for_each(|(_, child)| check_shredding_type(child)),
+        LogicalTypeId::List => ty.child_type().map_or(Ok(()), check_shredding_type),
+        _ if ty.is_nested() => Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "Shredding can consist of the nested types LIST (for ARRAY Variant values) or STRUCT (for OBJECT \
+                 Variant values), not {ty}"
+            ),
+        )),
+        _ => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9752,21 +9769,4 @@ fn stored_group_rows(source: &dyn duckrs_core::catalog::TableSource) -> Option<u
         return None;
     }
     ((1..groups - 1).all(|g| source.group_rows(g) == first) && source.group_rows(groups - 1) <= first).then_some(first)
-}
-
-/// `ForceVariantShredding::SetGlobal`'s `TypeVisitor::Contains`: the nested types of a shredding are LISTs and STRUCTs.
-fn check_shredding_type(ty: &duckrs_common::types::LogicalType) -> Result<()> {
-    use duckrs_common::types::LogicalTypeId;
-    match ty.id() {
-        LogicalTypeId::Struct => ty.struct_children().iter().try_for_each(|(_, child)| check_shredding_type(child)),
-        LogicalTypeId::List => ty.child_type().map_or(Ok(()), check_shredding_type),
-        _ if ty.is_nested() => Err(Error::new(
-            ErrorKind::InvalidInput,
-            format!(
-                "Shredding can consist of the nested types LIST (for ARRAY Variant values) or STRUCT (for OBJECT \
-                 Variant values), not {ty}"
-            ),
-        )),
-        _ => Ok(()),
-    }
 }
