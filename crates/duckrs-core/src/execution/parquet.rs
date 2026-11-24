@@ -97,6 +97,8 @@ pub struct ParquetScanData {
     pub page_pruning: PagePruning,
     /// `explicit_cardinality`: the rows the scan is estimated at
     pub explicit_cardinality: Option<u64>,
+    /// `parquet_metadata_cache`: the footers the scan reads are kept, and those kept describe the files
+    pub metadata_cache: bool,
 }
 
 /// `parquet_use_page_index`, and `can_have_nan` (or `parquet_can_have_nan`): how the statistics of a file may prune.
@@ -1895,6 +1897,9 @@ fn open_file(
     only: Option<usize>,
 ) -> Result<u64> {
     let typed = open_builder(path)?;
+    if scan.metadata_cache {
+        cache_metadata(path, Arc::clone(typed.metadata()));
+    }
     let strip = scan.utf8_validation.repairs() || has_interval(typed.parquet_schema().root_schema());
     let builder = if strip {
         open_builder_as_bytes(path, scan.utf8_validation.repairs())?
@@ -3404,6 +3409,11 @@ fn sql_number(number: Option<i64>) -> String {
 }
 
 fn read_metadata(path: &str) -> Result<(ParquetMetaData, u64)> {
+    if let Some(metadata) = cached_metadata(path)
+        && let Some((len, _)) = file_version(path)
+    {
+        return Ok((metadata.as_ref().clone(), len));
+    }
     let file = File::open(path).map_err(|e| Error::new(ErrorKind::Io, format!("Cannot open file \"{path}\": {e}")))?;
     let size = file.metadata().map(|m| m.len()).unwrap_or(0);
     let metadata = guarded(path, || {
@@ -3447,18 +3457,29 @@ fn statistics_text(stats: &Statistics) -> (Option<String>, Option<String>, Optio
     )
 }
 
-/// `ParquetReader::GetPartitionStats` of the one file of a scan: per row group, its rows, the zone of each column
+/// A row group's rows, the zones of its columns, and whether their bounds are exact.
+pub type PartitionStatistics = (u64, Vec<Option<crate::catalog::ColumnZone>>, bool);
+
+/// `ParquetReader::GetPartitionStats` of the files of a scan: per row group, its rows, the zone of each column
 /// of the file, and whether all the columns' bounds are exact (`ParquetPartitionRowGroup::MinMaxIsExact`).
-#[allow(
-    clippy::type_complexity,
-    reason = "per row group: its index, its zones and whether it is complete"
-)]
-pub fn partition_statistics(
-    scan: &ParquetScanData,
-) -> Option<Vec<(u64, Vec<Option<crate::catalog::ColumnZone>>, bool)>> {
-    let [file] = scan.files.as_slice() else {
+pub fn partition_statistics(scan: &ParquetScanData) -> Option<Vec<PartitionStatistics>> {
+    // one file, or several whose footers the metadata cache keeps
+    let cached = scan.metadata_cache && scan.files.iter().all(|file| cached_metadata(file).is_some());
+    if scan.files.len() != 1 && !cached {
         return None;
-    };
+    }
+    let mut groups = Vec::new();
+    for file in &scan.files {
+        groups.extend(file_partition_statistics(scan, file)?);
+    }
+    Some(groups)
+}
+
+/// [`partition_statistics`] of the row groups of one file.
+fn file_partition_statistics(
+    scan: &ParquetScanData,
+    file: &str,
+) -> Option<Vec<PartitionStatistics>> {
     let (metadata, _) = read_metadata(file).ok()?;
     let leaves: Vec<Option<usize>> = (0..scan.names.len())
         .map(|column| statistics_leaf(scan, &metadata, column, file))
@@ -3540,6 +3561,38 @@ fn all_files_opened(scan: &ParquetScanData) -> bool {
     scan.files.len() <= 1
         || scan.union_by_name
         || (scan.files_for_stats > 0 && scan.files.len() <= scan.files_for_stats)
+        || (scan.metadata_cache && scan.files.iter().all(|file| cached_metadata(file).is_some()))
+}
+
+/// `ParquetFileMetadataCache` in the `ObjectCache`: the footers of the files read with `parquet_metadata_cache`, by
+/// path, with the size and modification time they were read at.
+type MetadataCache = HashMap<String, (u64, Option<std::time::SystemTime>, Arc<ParquetMetaData>)>;
+static METADATA_CACHE: std::sync::LazyLock<Mutex<MetadataCache>> = std::sync::LazyLock::new(Default::default);
+
+/// The size and modification time of the file at `path`, which tell whether a kept footer is still its.
+fn file_version(path: &str) -> Option<(u64, Option<std::time::SystemTime>)> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some((metadata.len(), metadata.modified().ok()))
+}
+
+/// The file a path names, however it is spelled.
+fn cache_key(path: &str) -> String {
+    std::fs::canonicalize(path).map_or_else(|_| path.to_string(), |p| p.to_string_lossy().into_owned())
+}
+
+/// The footer kept of the file at `path`, if the file did not change since.
+fn cached_metadata(path: &str) -> Option<Arc<ParquetMetaData>> {
+    let (len, modified) = file_version(path)?;
+    let cache = METADATA_CACHE.lock();
+    let (cached_len, cached_modified, metadata) = cache.get(&cache_key(path))?;
+    (*cached_len == len && *cached_modified == modified).then(|| Arc::clone(metadata))
+}
+
+/// Keeps the footer of the file at `path`.
+fn cache_metadata(path: &str, metadata: Arc<ParquetMetaData>) {
+    if let Some((len, modified)) = file_version(path) {
+        METADATA_CACHE.lock().insert(cache_key(path), (len, modified, metadata));
+    }
 }
 
 /// `ParquetReader::ReadStatistics` over the files of a scan: what the footers say of each column from the

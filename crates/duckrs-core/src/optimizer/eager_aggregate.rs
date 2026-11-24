@@ -124,7 +124,8 @@ pub(super) fn try_execute(op: &LogicalOperator) -> Option<LogicalOperator> {
         }
         K::ParquetScan { table_index, scan } => {
             // one file: `union_by_name` reads it with its own types
-            if !scan.extracts.is_empty() || scan.files.len() != 1 || !scan.optional_filters.is_empty() {
+            // (several files when their footers are in the metadata cache: `partition_statistics` says)
+            if !scan.extracts.is_empty() || !scan.optional_filters.is_empty() || scan.files.is_empty() {
                 return None;
             }
             filters.extend(&scan.filters);
