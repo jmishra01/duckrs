@@ -940,6 +940,14 @@ const PRAGMA_FUNCTIONS: &[&str] = &[
     "tpcds",
 ];
 
+/// The no-op pragmas that warn they are deprecated (`WarnDeprecatedPragma`).
+const DEPRECATED_PRAGMAS: &[&str] = &[
+    "enable_verification",
+    "disable_verification",
+    "enable_object_cache",
+    "disable_object_cache",
+];
+
 const NO_OP_PRAGMAS: &[&str] = &[
     "force_checkpoint",
     "enable_verification",
@@ -3732,7 +3740,7 @@ impl ClientContext {
                 }
                 return Ok(Self::success());
             }
-            Statement::SetVariable { name, value, scope } if *scope == duckrs_parser::ast::SetScope::Variable => {
+            Statement::SetVariable { name, value, scope, .. } if *scope == duckrs_parser::ast::SetScope::Variable => {
                 // a query, because the value can be a subquery
                 let query = duckrs_parser::parse_ast(&format!("SELECT {value}"))?.remove(0);
                 let result = self.execute_statement(&query)?;
@@ -3781,7 +3789,23 @@ impl ClientContext {
                 self.detach(name, *if_exists)?;
                 return Ok(Self::success());
             }
-            Statement::SetVariable { name, value, scope } => {
+            Statement::SetVariable {
+                name,
+                value,
+                scope,
+                pragma,
+            } => {
+                // `TransformPragma`: a setting set with PRAGMA warns that it is deprecated
+                if *pragma {
+                    self.log(
+                        "",
+                        duckrs_core::logging::LogLevel::Warning,
+                        &format!(
+                            "Using \"PRAGMA {name}=...\" to set a setting is deprecated and will be removed in a future \
+                             release, use \"SET {name}=...\" instead."
+                        ),
+                    )?;
+                }
                 // `Binder::Bind(SetVariableStatement)` + `PhysicalSet`; the value binds with a
                 // `ConstantBinder`, where a name that is no SQL value function is refused
                 if duckrs_core::planner::binder::has_subquery(value) {
@@ -3933,7 +3957,21 @@ impl ClientContext {
                     settings::set_variable(name, *scope, &value, &mut checked, &mut session)?;
                     return Err(error);
                 }
-                settings::set_variable(name, *scope, &value, &mut global, &mut self.settings)?;
+                let deprecated = settings::find_setting(name)
+                    .filter(|(_, setting)| setting.is_deprecated)
+                    .map(|(_, setting)| setting.name);
+                let warning = |name: &str| format!("The '{name}' setting is deprecated and will be removed in a future release.");
+                if let Err(error) = settings::set_variable(name, *scope, &value, &mut global, &mut self.settings) {
+                    // a valid value of a deprecated setting duckrs does not honor yet: C++ warns before it applies it
+                    if let Some(name) = deprecated
+                        && error.kind == ErrorKind::NotImplemented
+                        && error.message.contains(&format!("the {name} setting"))
+                    {
+                        drop(global);
+                        self.log("", duckrs_core::logging::LogLevel::Warning, &warning(name))?;
+                    }
+                    return Err(error);
+                }
                 // `EnableExternalAccessSetting::OnSet`: the databases attached so far stay reachable
                 if turning_off_access && !settings::external_access_enabled(&global, &self.settings) {
                     let mut databases = vec![self.home.clone()];
@@ -3945,6 +3983,11 @@ impl ClientContext {
                             settings::add_allowed_path(&format!("{path}{suffix}"), &mut global);
                         }
                     }
+                }
+                drop(global);
+                // `SettingCallbackInfo::WarnDeprecated`, once the value is known to be valid
+                if let Some(name) = deprecated {
+                    self.log("", duckrs_core::logging::LogLevel::Warning, &warning(name))?;
                 }
                 return Ok(Self::success());
             }
@@ -3981,6 +4024,18 @@ impl ClientContext {
                     && named_parameters.is_empty()
                     && NO_OP_PRAGMAS.iter().any(|p| p.eq_ignore_ascii_case(name))
                 {
+                    // `WarnDeprecatedPragma`
+                    let lower = name.to_lowercase();
+                    if DEPRECATED_PRAGMAS.contains(&lower.as_str()) {
+                        self.log(
+                            "",
+                            duckrs_core::logging::LogLevel::Warning,
+                            &format!(
+                                "The '{lower}' pragma no longer has any effect; it is deprecated and will be removed \
+                                 in a future release."
+                            ),
+                        )?;
+                    }
                     return Ok(Self::success());
                 }
                 let lower = name.to_lowercase();

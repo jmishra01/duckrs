@@ -23,6 +23,7 @@ mod pivot;
 pub use pivot::has_subquery;
 pub mod read_duckdb;
 mod show;
+pub use show::human_readable_bytes;
 mod star;
 mod statements;
 mod table_constraints;

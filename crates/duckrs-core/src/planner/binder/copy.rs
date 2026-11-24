@@ -1726,7 +1726,7 @@ impl Binder<'_> {
             };
             // `BindCopyOption`; SHREDDING says itself what it takes
             // JSON's COPY says itself which of its options cannot be NULL (`ThrowJSONCopyNullException`)
-            if value.is_null() && !name.eq_ignore_ascii_case("shredding") && !self.copy_json {
+            if value.is_null() && !name.eq_ignore_ascii_case("shredding") && !self.copy_json && !is_bytes_option(name) {
                 return Err(binder_error(format!(
                     "NULL is not supported as a valid option for COPY option \"{name}\""
                 )));
@@ -1740,7 +1740,7 @@ impl Binder<'_> {
                 _ => return Err(crate::unported(format!("the COPY option {name} with several values"))),
             };
             // JSON's COPY says itself which of its options cannot be NULL (`ThrowJSONCopyNullException`)
-            if value.is_null() && !name.eq_ignore_ascii_case("shredding") && !self.copy_json {
+            if value.is_null() && !name.eq_ignore_ascii_case("shredding") && !self.copy_json && !is_bytes_option(name) {
                 return Err(binder_error(format!(
                     "NULL is not supported as a valid option for COPY option \"{name}\""
                 )));
@@ -3253,5 +3253,13 @@ pub(super) fn unrecognized_copy_option(option: &str, format: &str, own: &[&str])
             option.replace('"', "\"\""),
             duckrs_common::string_util::candidates_message(&candidates, "Candidate options")
         ),
+    )
+}
+
+/// The options `ParseBytesArg` reads, which say themselves that NULL is no size.
+fn is_bytes_option(name: &str) -> bool {
+    matches!(
+        name.to_lowercase().as_str(),
+        "file_size_bytes" | "row_group_size_bytes" | "bloom_filter_fallback_max_bytes"
     )
 }

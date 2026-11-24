@@ -547,6 +547,18 @@ fn on_set(setting: &SettingDefinition, value: Value) -> Result<Value> {
     let invalid = |message: String| Err(Error::new(ErrorKind::InvalidInput, message));
     let number = || value.try_to_string().ok().and_then(|s| s.parse::<f64>().ok());
     match setting.name {
+        // `ParseMemoryLimit` and `StringUtil::BytesToHumanReadableString`: a size, kept as its bytes; a negative
+        // one, `none` or `null` is no limit
+        "max_streaming_buffer_size" | "operator_memory_limit" | "write_buffer_row_group_memory_limit" => {
+            if value.is_null() {
+                return Ok(Value::null(LogicalType::VARCHAR));
+            }
+            let input = value.try_to_string()?.trim().to_lowercase();
+            return Ok(match duckrs_core::execution::temporary::parse_memory_limit(&input)? {
+                Some(bytes) => Value::varchar(duckrs_core::planner::binder::human_readable_bytes(bytes)),
+                None => Value::null(LogicalType::VARCHAR),
+            });
+        }
         // `RegexMatchOperatorSemanticsSetting::OnSet`
         "regex_match_operator_semantics" => {
             if value.is_null() {
@@ -844,6 +856,8 @@ fn default_value(setting: &SettingDefinition) -> Option<Value> {
         "profiling_coverage" => return Some(Value::varchar("SELECT")),
         "default_secret_storage" => return Some(Value::varchar("local_file")),
         "checkpoint_threshold" => return Some(Value::varchar("16.0 MiB")),
+        // `ClientConfig::streaming_buffer_size`
+        "max_streaming_buffer_size" => return Some(Value::varchar("10.0 MiB")),
         _ => {}
     }
     let text = setting.default_value?;
