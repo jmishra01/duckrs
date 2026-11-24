@@ -291,7 +291,7 @@ impl Binder<'_> {
                     .any(|record| matches!(record, Ok((Json::Object(_), _))));
             }
             // records left to it, one column and no objects sampled: the values themselves are the column
-            let use_records = records.unwrap_or(!(columns.len() == 1 && !sampled_objects));
+            let use_records = records.unwrap_or(columns.len() != 1 || sampled_objects);
             let (names, types): (Vec<_>, Vec<_>) = columns.into_iter().unzip();
             (names, types, use_records)
         } else {
