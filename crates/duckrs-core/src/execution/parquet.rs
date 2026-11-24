@@ -4297,14 +4297,44 @@ fn read_bloom_filter(
 pub fn file_metadata_row(path: &str) -> Result<String> {
     let (metadata, size) = read_metadata(path)?;
     let file = metadata.file_metadata();
+    // `ParquetFileMetadataCache::footer_size`: the length the file's last 8 bytes give the footer
+    let footer_size = footer_length(path).unwrap_or(0);
+    // `ConvertParquetElementToString` of each `ColumnOrder`, as Thrift prints it
+    let column_orders = match file.column_orders() {
+        Some(orders) => format!(
+            "[{}]::VARCHAR[]",
+            orders
+                .iter()
+                .map(|order| match order {
+                    parquet::basic::ColumnOrder::TYPE_DEFINED_ORDER(_) => {
+                        "'ColumnOrder(TYPE_ORDER=TypeDefinedOrder())'"
+                    }
+                    // the orders the C++ Thrift schema has no field for
+                    _ => "'ColumnOrder(TYPE_ORDER=<null>)'",
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        None => "NULL::VARCHAR[]".to_string(),
+    };
     Ok(format!(
-        "({}, {}, {}, {}, {}, NULL, NULL, {size}::UBIGINT, 0::UBIGINT, NULL::VARCHAR[])",
+        "({}, {}, {}, {}, {}, NULL, NULL, {size}::UBIGINT, {footer_size}::UBIGINT, {column_orders})",
         sql_text(path),
         sql_or_null(file.created_by().map(str::to_string)),
         file.num_rows(),
         metadata.num_row_groups(),
         file.version(),
     ))
+}
+
+/// The length of the footer of a Parquet file: the little-endian `u32` before the closing `PAR1`.
+fn footer_length(path: &str) -> Option<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = File::open(path).ok()?;
+    file.seek(SeekFrom::End(-8)).ok()?;
+    let mut tail = [0u8; 8];
+    file.read_exact(&mut tail).ok()?;
+    Some(u32::from_le_bytes([tail[0], tail[1], tail[2], tail[3]]) as u64)
 }
 
 /// The part of `ParquetScanFunction::ProjectionExpressionPushdown` that reads the file: whether the column of the
