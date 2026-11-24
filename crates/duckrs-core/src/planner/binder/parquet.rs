@@ -102,7 +102,9 @@ impl Binder<'_> {
         let name = call.name.name.to_lowercase();
         let args: Vec<_> = call.args.iter().map(named_argument).collect();
         let mut paths = None;
-        let (mut binary_as_string, mut union_by_name, mut file_row_number) = (false, false, false);
+        // `ParquetOptions::ParquetOptions`: the `binary_as_string` setting is the default of the option
+        let mut binary_as_string = self.bool_setting("binary_as_string", false);
+        let (mut union_by_name, mut file_row_number) = (false, false);
         let mut filename = None;
         let mut hive_options = super::copy::HiveOptions::default();
         let mut int96_as = crate::execution::parquet::Int96As::Timestamp;
@@ -344,7 +346,7 @@ impl Binder<'_> {
             }
         }
         let table_index = self.generate_table_index();
-        let (virtual_columns, bound_virtual) = crate::execution::multi_file::bind_virtual_columns(&output_names);
+        let (virtual_columns, bound_virtual) = crate::execution::multi_file::bind_parquet_virtual_columns(&output_names);
         self.bind_context.add_binding(Binding {
             alias,
             schema: None,
@@ -1124,14 +1126,19 @@ fn parse_field_ids(
 impl Binder<'_> {
     /// `GeoParquetFileMetadata::IsGeoParquetConversionEnabled`: the `enable_geoparquet_conversion` setting.
     fn geoparquet_conversion(&self) -> bool {
+        self.bool_setting("enable_geoparquet_conversion", true)
+    }
+
+    /// The BOOLEAN setting `name`, or `default` where it isn't set.
+    fn bool_setting(&self, name: &str, default: bool) -> bool {
         self.session
             .as_ref()
-            .and_then(|session| (session.setting)("enable_geoparquet_conversion").ok())
+            .and_then(|session| (session.setting)(name).ok())
             .and_then(|value| match value.data() {
                 ValueData::Bool(enabled) => Some(*enabled),
                 _ => None,
             })
-            .unwrap_or(true)
+            .unwrap_or(default)
     }
 }
 

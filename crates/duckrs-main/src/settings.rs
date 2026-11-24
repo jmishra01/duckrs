@@ -62,7 +62,6 @@ const UNHONORED: &[&str] = &[
     "disable_timestamptz_casts",
     "errors_as_json",
     "legacy_disable_null_type",
-    "binary_as_string",
     "schema",
     "search_path",
     "table_function_identifier_conversion",

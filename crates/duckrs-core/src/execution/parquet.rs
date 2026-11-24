@@ -116,6 +116,12 @@ impl ParquetScanData {
         }
     }
 
+    /// The virtual column that is the output column at `at`, if it is one.
+    pub fn virtual_column_at(&self, at: usize) -> Option<crate::execution::multi_file::VirtualColumn> {
+        let first = self.output_types().len() - self.extracts.len() - self.virtual_columns.len();
+        at.checked_sub(first).and_then(|i| self.virtual_columns.get(i)).copied()
+    }
+
     /// Whether the output column at `at` has one value for each file, which [`Self::known_value`] gives.
     pub fn is_known_per_file(&self, at: usize) -> bool {
         self.known_column(at).is_some()
@@ -1216,7 +1222,13 @@ fn row_groups_to_scan(
                     let zone = group_zone(metadata, group, (*leaf)?, &scan.types[at])?;
                     return (!zone.unknown).then_some(zone);
                 }
-                let value = scan.known_value(at, path)?;
+                // `RowGroupColumnReader`: the statistics of `file_row_group_number` are the row group's number
+                let value = match scan.virtual_column_at(at) {
+                    Some(crate::execution::multi_file::VirtualColumn::FileRowGroupNumber) => {
+                        Value::ubigint(*index as u64)
+                    }
+                    _ => scan.known_value(at, path)?,
+                };
                 Some(crate::catalog::ColumnZone {
                     has_null: value.is_null(),
                     min: (!value.is_null()).then(|| value.clone()),
@@ -1507,6 +1519,9 @@ fn open_file(
                 .sum::<u64>()
         })
         .sum();
+    state.virtual_rows.set_row_groups(
+        groups.iter().map(|&group| (group as u64, metadata.row_group(group).num_rows())).collect(),
+    );
     let builder = match selected {
         Some(selected) => builder.with_row_groups(selected),
         None => builder,
