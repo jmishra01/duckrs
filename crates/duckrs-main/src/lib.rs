@@ -1149,6 +1149,40 @@ fn strip_database(statement: &mut Statement, database: &str) {
     }
 }
 
+/// `RemotePushdownOptimizer::StripCatalogName`: `database` taken off the names of `query` that start with it.
+fn strip_view_catalog(query: &mut duckrs_parser::ast::SelectStatement, database: &str, catalog: &Catalog) {
+    // (a schema of the same name is what the name is, not the database)
+    if database.is_empty() || catalog.get_schema(database).is_some() {
+        return;
+    }
+    let names_database = |qualification: &[String]| {
+        qualification
+            .first()
+            .is_some_and(|first| first.eq_ignore_ascii_case(database))
+    };
+    duckrs_core::planner::statement_names::for_each_query_table_name(&mut query.node, &mut |name| {
+        if names_database(&name.qualification) {
+            name.qualification.remove(0);
+        }
+    });
+    let mut strip = |e: &mut Expr| match &mut e.kind {
+        // `db.t.c` and longer: a two-part name is a table's column or a struct's field
+        ExprKind::ColumnRef(names) if names.len() >= 3 && names_database(names) => {
+            names.remove(0);
+        }
+        ExprKind::Function(function) if names_database(&function.name.qualification) => {
+            function.name.qualification.remove(0);
+        }
+        ExprKind::Window(window) if names_database(&window.name.qualification) => {
+            window.name.qualification.remove(0);
+        }
+        _ => {}
+    };
+    duckrs_parser::transformer::visit_all_query_node_exprs_mut(&mut query.node, &mut |e: &mut Expr| {
+        duckrs_parser::transformer::visit_expr_mut(e, &mut strip);
+    });
+}
+
 /// A fully materialized result (`MaterializedQueryResult`).
 #[derive(Debug)]
 pub struct MaterializedQueryResult {
@@ -2614,9 +2648,15 @@ impl ClientContext {
                 })
             });
         }
+        // `ResolveCatalog`: the parent of a new schema is a database before it is a schema
+        let creates_schema = matches!(
+            statement,
+            Statement::Create(info) if matches!(info.kind, CreateKind::Schema { .. })
+        );
         let database_of = |name: &QualifiedName| {
             let first = name.qualification.first()?;
             let is_schema = name.qualification.len() == 1
+                && !(creates_schema && self.find_database(first).is_some())
                 && (self.catalog().get_schema(first).is_some() || first.eq_ignore_ascii_case(TEMP_SCHEMA));
             if is_schema {
                 return None;
@@ -4480,6 +4520,18 @@ impl ClientContext {
                     _ => {}
                 }
                 path.push(info.name.name.clone());
+                // `BindCreateSchema`: an older file has no place for a nested schema
+                if path.len() > 1
+                    && catalog
+                        .storage_version()
+                        .is_some_and(|version| version < duckrs_common::serializer::StorageVersion::V2_0_0)
+                {
+                    return Err(Error::new(
+                        ErrorKind::Binder,
+                        "Nested schemas are only supported for storage versions v2.0.0 and higher.\nUse an in-memory \
+                         database, or ATTACH with (STORAGE_VERSION 'v2.0.0')",
+                    ));
+                }
                 catalog.create_schema_path(&path, on_create_conflict(info.on_conflict))?;
                 return Ok(Self::success());
             }
@@ -4884,9 +4936,13 @@ impl ClientContext {
                 "CREATE OR REPLACE is not allowed to depend on itself",
             ));
         }
+        // `BindCreateViewInfo` (`StripCatalogName`): the view finds its own catalog's entries first anyway, and
+        // without the name it keeps working when the database is attached under another one
+        let mut query = (**query).clone();
+        strip_view_catalog(&mut query, &self.db.name, &catalog);
         schema.create_view(
             &info.name.name,
-            (**query).clone(),
+            query,
             aliases.clone(),
             on_conflict,
             dependencies,

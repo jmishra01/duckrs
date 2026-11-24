@@ -561,7 +561,12 @@ impl Binder<'_> {
     ) -> Result<LogicalOperator> {
         self.show_tables_matching(table_ref, &|_, listed| {
             listed.database.eq_ignore_ascii_case(database)
-                && schema.is_none_or(|schema| listed.schema.name.eq_ignore_ascii_case(schema))
+                && schema.is_none_or(|schema| {
+                    // a nested schema goes by its whole path
+                    let nested = listed.schema.path.len() > 1;
+                    let name = if nested { listed.schema.key() } else { listed.schema.name.clone() };
+                    name.eq_ignore_ascii_case(schema)
+                })
         })
     }
 
@@ -706,7 +711,12 @@ impl Binder<'_> {
                 }
                 catalog = current.clone();
             } else if !schema.is_empty() && (!is_database(&catalog) || !schema_exists(self, &catalog, &schema)) {
-                return Err(not_found(&catalog, &schema));
+                // "a.b" can also name a nested schema of the current database
+                let nested = crate::catalog::schema_key(&[catalog.clone(), schema.clone()]);
+                if !schema_exists(self, &current, &nested) {
+                    return Err(not_found(&catalog, &schema));
+                }
+                (catalog, schema) = (current.clone(), nested);
             }
             let schema = (!schema.is_empty()).then_some(schema);
             return self.show_tables_from(table_ref, &catalog, schema.as_deref());
@@ -1964,11 +1974,12 @@ impl Binder<'_> {
                 };
                 let mut entries: Vec<Entry> = builtins("system", 2, 0);
                 let mut oid = 3000;
-                for (schema_oid, schema) in self.catalog.schemas().iter().enumerate() {
-                    let temporary = schema.name.eq_ignore_ascii_case(TEMP_SCHEMA);
-                    let database = if temporary { "temp" } else { self.catalog.name.as_str() };
-                    let database_oid = if temporary { 3 } else { 1 };
-                    let schema_name = if temporary { "main" } else { schema.name.as_str() };
+                // the schemas of every database (`GetAllSchemas`)
+                for (schema_oid, listed) in self.listed_schemas().iter().enumerate() {
+                    let schema = &listed.schema;
+                    let database = listed.database.as_str();
+                    let database_oid = listed.database_oid;
+                    let schema_name = listed.display.as_str();
                     let schema_oid = schema_oid as i64 + 1;
                     if schema_name.eq_ignore_ascii_case("main") {
                         entries.extend(builtins(database, database_oid, schema_oid));

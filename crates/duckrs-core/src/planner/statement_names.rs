@@ -101,6 +101,15 @@ pub fn for_each_table_name(statement: &mut Statement, f: &mut impl FnMut(&mut Qu
     }
 }
 
+/// The names of the tables that `node` and its subqueries read.
+pub fn for_each_query_table_name(node: &mut QueryNode, f: &mut impl FnMut(&mut QualifiedName)) {
+    let mut statement = Statement::Select(duckrs_parser::ast::SelectStatement { node: node.clone() });
+    for_each_table_name(&mut statement, f);
+    if let Statement::Select(select) = statement {
+        *node = select.node;
+    }
+}
+
 /// The statement a trigger body is.
 pub fn body_statement(action: &QueryNode) -> Result<Statement> {
     Ok(match &action.kind {
