@@ -430,14 +430,20 @@ impl<'a> Evaluation<'a> {
             if !is_range(kind) {
                 return Ok(Boundary::Offsets(by_position(evaluate(expr, chunks)?)));
             }
+            // evaluated once: the offset may have effects, as `nextval` does
             let modifiers = window.orders[0].1;
-            let keys = order_keys(&[(expr, modifiers)], chunks, count)?;
-            let values = evaluate(expr, chunks)?;
+            let mut keys = Vec::with_capacity(count);
+            let mut valid = Vec::with_capacity(count);
+            for chunk in chunks {
+                let column = execute(expr, chunk)?;
+                keys.extend(create_sort_keys(&[(&column, modifiers)], chunk.len())?);
+                valid.extend((0..chunk.len()).map(|i| column.is_valid(i)));
+            }
             Ok(Boundary::RangeKeys(
                 sorted
                     .rows
                     .iter()
-                    .map(|r| (!values[*r].is_null()).then(|| keys[*r].clone()))
+                    .map(|r| valid[*r].then(|| keys[*r].clone()))
                     .collect(),
             ))
         };
