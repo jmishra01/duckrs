@@ -676,15 +676,6 @@ impl Binder<'_> {
                     .parse()
                     .map_err(|_| binder_error(format!("{name} must be an integer")))
             };
-            let bytes = || -> Result<usize> {
-                match value.as_i128() {
-                    Some(n) => Ok(n.max(0) as usize),
-                    None => Ok(
-                        crate::execution::temporary::parse_memory_limit(&value.try_to_string()?)?.unwrap_or(u64::MAX)
-                            as usize,
-                    ),
-                }
-            };
             match name.as_str() {
                 "format" | "use_tmp_file" | "preserve_order" | "order_by" => {}
                 "compression" | "codec" => {
@@ -729,7 +720,7 @@ impl Binder<'_> {
                     }
                     writer.row_group_size = number()?.max(1) as usize;
                 }
-                "row_group_size_bytes" => writer.row_group_size_bytes = Some(bytes()?),
+                "row_group_size_bytes" => writer.row_group_size_bytes = Some(parse_bytes_argument(&name, &value)?),
                 "bloom_filter_fallback_max_bytes" => {
                     writer.bloom_filter_fallback_max_bytes = parse_bytes_argument(&name, &value)?;
                 }

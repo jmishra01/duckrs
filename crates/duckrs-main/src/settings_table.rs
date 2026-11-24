@@ -915,6 +915,18 @@ pub(super) static SETTINGS: &[SettingDefinition] = &[
         is_deprecated: false,
     },
     SettingDefinition {
+        name: "default_grammar_extensions",
+        aliases: &[],
+        input_type: "VARCHAR[]",
+        scope: SettingScope::GlobalOnly,
+        default_value: None,
+        enum_name: None,
+        enum_values: &[],
+        description: "The grammar extensions sessions parse with when active_grammar_extensions is not set.",
+        is_debug: false,
+        is_deprecated: false,
+    },
+    SettingDefinition {
         name: "default_null_order",
         aliases: &["null_order"],
         input_type: "VARCHAR",

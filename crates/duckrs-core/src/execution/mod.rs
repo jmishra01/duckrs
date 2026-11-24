@@ -13,6 +13,7 @@ pub mod csv_state_machine;
 pub mod expression_executor;
 pub mod external_sort;
 pub mod file_system;
+pub mod interrupt;
 pub mod group_table;
 pub mod join;
 pub mod join_filter;
@@ -802,6 +803,7 @@ impl Pipeline<'_> {
         if chunk.is_empty() {
             return Ok(());
         }
+        interrupt::check()?;
         let profiler = profiler::current();
         let Some(op) = self.operators.get(index) else {
             let (result, time) = profiler::timed(profiler.as_deref(), || sink(&chunk));
@@ -849,6 +851,7 @@ impl Pipeline<'_> {
         let error = Mutex::new(None);
         let memory = temporary::current();
         let query_profiler = profiler::current();
+        let deadline = interrupt::current();
         let worker = || -> Result<()> {
             let mut local = self.sink.local_sink_state_input(self.input);
             let mut states: Vec<OperatorState> = self.operators.iter().map(|op| op.operator_state()).collect();
@@ -878,7 +881,9 @@ impl Pipeline<'_> {
         std::thread::scope(|scope| {
             for _ in 0..threads.min(morsels) {
                 scope.spawn(|| {
-                    let run = || temporary::with_memory(Arc::clone(&memory), worker);
+                    let run = || {
+                        interrupt::with_deadline(deadline, || temporary::with_memory(Arc::clone(&memory), worker))
+                    };
                     if let Err(failure) = profiler::with_profiler(query_profiler.clone(), run) {
                         failed.store(true, Ordering::Relaxed);
                         error.lock().get_or_insert(failure);

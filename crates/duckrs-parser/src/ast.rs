@@ -2287,6 +2287,8 @@ pub enum Statement {
         name: String,
         value: Box<Expr>,
         scope: SetScope,
+        /// written as `PRAGMA name=value`, which is deprecated
+        pragma: bool,
     },
     ResetVariable {
         name: String,
@@ -2370,7 +2372,7 @@ impl Display for Statement {
                 f.write_str(";")
             }
             Statement::Call(function) => write!(f, "CALL {function};"),
-            Statement::SetVariable { name, value, scope } => write!(f, "SET {} {name} TO {value};", scope.name()),
+            Statement::SetVariable { name, value, scope, .. } => write!(f, "SET {} {name} TO {value};", scope.name()),
             Statement::ResetVariable { name, scope } => write!(f, "RESET {} {name};", scope.name()),
             Statement::Pragma(info) => {
                 write!(f, "PRAGMA {}", sql_identifier(&info.name))?;

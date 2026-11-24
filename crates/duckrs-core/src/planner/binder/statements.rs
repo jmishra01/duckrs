@@ -2813,6 +2813,14 @@ impl Binder<'_> {
                     .collect::<Vec<_>>()
                     .join(".");
                 let lower = full_path.to_lowercase();
+                // a name a file reader would read is a file: with the local file system off, that is the error
+                if self.options.local_file_system_disabled
+                    && [".csv", ".tsv", ".json", ".jsonl", ".ndjson", ".parquet", ".geojson", ".geojsonl"]
+                        .iter()
+                        .any(|end| lower.trim_end_matches(".gz").trim_end_matches(".zst").ends_with(end))
+                {
+                    self.check_file_access(&full_path)?;
+                }
                 if [".csv", ".tsv", ".csv.gz", ".tsv.gz", ".csv.zst", ".tsv.zst"]
                     .iter()
                     .any(|end| lower.ends_with(end))

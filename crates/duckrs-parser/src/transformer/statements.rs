@@ -993,6 +993,7 @@ impl Transformer<'_> {
             name: "schema".into(),
             value: Box::new(Expr::constant(Literal::string(value))),
             scope: SetScope::Automatic,
+            pragma: false,
         })
     }
 
@@ -1557,6 +1558,7 @@ impl Transformer<'_> {
                 name: Self::text(self.req(node, "Identifier")?),
                 value: Box::new(self.expr(self.req(node, "Expression")?)?),
                 scope: SetScope::Variable,
+                pragma: false,
             });
         }
         let assignment = self.alt(self.req(node, "SetAssignmentOrTimeZone")?)?;
@@ -1571,6 +1573,7 @@ impl Transformer<'_> {
                     name: "schema".into(),
                     value: Box::new(Expr::constant(Literal::string(schema))),
                     scope,
+                    pragma: false,
                 })
             }
             "SetTimeZone" => {
@@ -1597,6 +1600,7 @@ impl Transformer<'_> {
                     name: "timezone".into(),
                     value: Box::new(value),
                     scope,
+                    pragma: false,
                 })
             }
             _ => {
@@ -1631,6 +1635,7 @@ impl Transformer<'_> {
                     name,
                     value: Box::new(value),
                     scope,
+                    pragma: false,
                 })
             }
         }
@@ -1676,6 +1681,7 @@ impl Transformer<'_> {
                 name,
                 value: Box::new(value),
                 scope: SetScope::Automatic,
+                pragma: true,
             });
         }
         let mut info = PragmaInfo {

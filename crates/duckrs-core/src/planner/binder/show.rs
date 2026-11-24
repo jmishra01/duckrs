@@ -140,7 +140,7 @@ fn base_table_column(op: &LogicalOperator, binding: ColumnBinding) -> Option<(Ar
 }
 
 /// `StringUtil::BytesToHumanReadableString`.
-fn human_readable_bytes(bytes: u64) -> String {
+pub fn human_readable_bytes(bytes: u64) -> String {
     const UNITS: [&str; 6] = ["bytes", "KiB", "MiB", "GiB", "TiB", "PiB"];
     let mut parts = [bytes, 0, 0, 0, 0, 0];
     for index in 1..parts.len() {

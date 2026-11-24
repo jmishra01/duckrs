@@ -425,6 +425,16 @@ impl DatabaseInstance {
             db.settings = settings.clone();
         }
         let buffer = storage::load_database(path, &db.catalog, read_only, options.encryption.as_ref())?;
+        // `SingleFileStorageManager::LoadDatabase`: a block size given has to be the file's
+        if let Some(size) = options.block_size {
+            let file_size = buffer.block_manager().block_alloc_size() as u64;
+            if size != file_size {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("block size parameter does not match the file's block size, got {size}, expected {file_size}"),
+                ));
+            }
+        }
         // `SingleFileBlockManager::Initialize`: an explicit version can go up, not down
         let file_version = buffer.block_manager().storage_version()?;
         let storage_version = match requested {
@@ -940,6 +950,37 @@ const PRAGMA_FUNCTIONS: &[&str] = &[
     "tpcds",
 ];
 
+/// The PRAGMAs that change the configuration, which `lock_configuration` refuses.
+const CONFIGURING_PRAGMAS: &[&str] = &[
+    "enable_profiling",
+    "enable_profile",
+    "disable_profiling",
+    "disable_profile",
+    "verify_parallelism",
+    "disable_verify_parallelism",
+    "force_checkpoint",
+    "enable_checkpoint_on_shutdown",
+    "disable_checkpoint_on_shutdown",
+];
+
+/// The table functions that change the configuration, which `lock_configuration` refuses.
+const CONFIGURING_CALLS: &[&str] = &[
+    "enable_profiling",
+    "disable_profiling",
+    "enable_logging",
+    "disable_logging",
+    "add_grammar_extension",
+    "remove_grammar_extension",
+];
+
+/// The no-op pragmas that warn they are deprecated (`WarnDeprecatedPragma`).
+const DEPRECATED_PRAGMAS: &[&str] = &[
+    "enable_verification",
+    "disable_verification",
+    "enable_object_cache",
+    "disable_object_cache",
+];
+
 const NO_OP_PRAGMAS: &[&str] = &[
     "force_checkpoint",
     "enable_verification",
@@ -950,10 +991,6 @@ const NO_OP_PRAGMAS: &[&str] = &[
     "disable_verify_serializer",
     "verify_parallelism",
     "disable_verify_parallelism",
-    "enable_progress_bar",
-    "disable_progress_bar",
-    "enable_print_progress_bar",
-    "disable_print_progress_bar",
     "enable_object_cache",
     "disable_object_cache",
 ];
@@ -1533,9 +1570,12 @@ impl ClientContext {
             variables: self.variables.clone(),
             setting: {
                 let (schema, search_path) = (self.default_schema_setting(), SearchEntry::list_text(&self.search_path));
+                let profiling = self.profiling;
                 Box::new(move |name| match name.to_lowercase().as_str() {
                     "schema" => Ok(Value::varchar(schema.clone())),
                     "search_path" => Ok(Value::varchar(search_path.clone())),
+                    // `EnableProfilingSetting::GetSetting`: nothing while profiling is off, which keeps the format
+                    "enable_profiling" | "enable_profile" if !profiling => Ok(Value::sql_null()),
                     _ => settings::get_setting(name, &db.settings.read(), &session),
                 })
             },
@@ -2215,6 +2255,18 @@ impl ClientContext {
     /// Runs one statement within the current transaction, or as a transaction of its own
     /// (`ClientContext::PendingStatementOrPreparedStatementInternal` + `CleanupInternal`).
     fn run_statement(&mut self, statement: &Statement) -> Result<MaterializedQueryResult> {
+        // `max_execution_time`: the deadline of the statement, which the statements it runs share
+        use duckrs_core::execution::interrupt;
+        if interrupt::current().is_some() {
+            return self.run_statement_inner(statement);
+        }
+        let limit = self.setting_text("max_execution_time").parse::<u64>().unwrap_or(0);
+        let deadline =
+            (limit > 0).then(|| std::time::Instant::now() + std::time::Duration::from_millis(limit));
+        interrupt::with_deadline(deadline, || self.run_statement_inner(statement))
+    }
+
+    fn run_statement_inner(&mut self, statement: &Statement) -> Result<MaterializedQueryResult> {
         // `FileSystem::GetHomeDirectory` of this connection
         duckrs_core::execution::file_system::set_home_directory(Some(self.setting_text("home_directory")));
         duckrs_core::execution::file_system::set_file_search_path(&self.setting_text("file_search_path"));
@@ -2827,9 +2879,28 @@ impl ClientContext {
                     options.storage_version = Some((given, version));
                 }
                 "block_size" => {
-                    let size = text
+                    let size: u64 = text
                         .parse()
                         .map_err(|_| Error::new(ErrorKind::InvalidInput, "BLOCK_SIZE is not a number"))?;
+                    // `Storage::VerifyBlockAllocSize`
+                    const MIN_BLOCK_ALLOC_SIZE: u64 = 16384;
+                    const MAX_BLOCK_ALLOC_SIZE: u64 = 262144;
+                    let invalid = |message: String| Error::new(ErrorKind::InvalidInput, message);
+                    if !size.is_power_of_two() {
+                        return Err(invalid(format!("the block size must be a power of two, got {size}")));
+                    }
+                    if size < MIN_BLOCK_ALLOC_SIZE {
+                        return Err(invalid(format!(
+                            "the block size must be greater or equal than the minimum block size of \
+                             {MIN_BLOCK_ALLOC_SIZE}, got {size}"
+                        )));
+                    }
+                    if size > MAX_BLOCK_ALLOC_SIZE {
+                        return Err(invalid(format!(
+                            "the block size must be lesser or equal than the maximum block size of \
+                             {MAX_BLOCK_ALLOC_SIZE}, got {size}"
+                        )));
+                    }
                     options.block_size = Some(size);
                 }
                 "row_group_size" => {
@@ -3019,6 +3090,23 @@ impl ClientContext {
                     on_conflict: Conflict::Error,
                     ..info.clone()
                 });
+            }
+            // `DatabaseFilePathManager::InsertDatabasePath` comes first: the same file is that conflict
+            if let Some(file) = &existing.file {
+                let same = match (std::fs::canonicalize(&file.path), std::fs::canonicalize(&path)) {
+                    (Ok(a), Ok(b)) => a == b,
+                    _ => file.path == Path::new(&path),
+                };
+                if same && !in_memory {
+                    return Err(Error::new(
+                        ErrorKind::ResourceInUse,
+                        format!(
+                            "Unique file handle conflict: Cannot attach {name} - the database file \"{path}\" is \
+                             already attached by database \"{}\"",
+                            existing.name
+                        ),
+                    ));
+                }
             }
             return Err(Error::new(
                 ErrorKind::Binder,
@@ -3732,7 +3820,7 @@ impl ClientContext {
                 }
                 return Ok(Self::success());
             }
-            Statement::SetVariable { name, value, scope } if *scope == duckrs_parser::ast::SetScope::Variable => {
+            Statement::SetVariable { name, value, scope, .. } if *scope == duckrs_parser::ast::SetScope::Variable => {
                 // a query, because the value can be a subquery
                 let query = duckrs_parser::parse_ast(&format!("SELECT {value}"))?.remove(0);
                 let result = self.execute_statement(&query)?;
@@ -3781,7 +3869,23 @@ impl ClientContext {
                 self.detach(name, *if_exists)?;
                 return Ok(Self::success());
             }
-            Statement::SetVariable { name, value, scope } => {
+            Statement::SetVariable {
+                name,
+                value,
+                scope,
+                pragma,
+            } => {
+                // `TransformPragma`: a setting set with PRAGMA warns that it is deprecated
+                if *pragma {
+                    self.log(
+                        "",
+                        duckrs_core::logging::LogLevel::Warning,
+                        &format!(
+                            "Using \"PRAGMA {name}=...\" to set a setting is deprecated and will be removed in a future \
+                             release, use \"SET {name}=...\" instead."
+                        ),
+                    )?;
+                }
                 // `Binder::Bind(SetVariableStatement)` + `PhysicalSet`; the value binds with a
                 // `ConstantBinder`, where a name that is no SQL value function is refused
                 if duckrs_core::planner::binder::has_subquery(value) {
@@ -3816,19 +3920,19 @@ impl ClientContext {
                          encrypted databases.",
                     ));
                 }
-                // `ForceVariantShredding::SetGlobal` (`UnboundType::TryParseAndDefaultBind`): a type it can parse
+                // `ForceVariantShredding::SetGlobal` (`UnboundType::TryParseAndDefaultBind`): a type it can parse, nested
+                // in LISTs and STRUCTs only
                 if (name.eq_ignore_ascii_case("force_variant_shredding")
                     || name.eq_ignore_ascii_case("debug_force_variant_shredding"))
                     && let Some(text) = (!value.is_null()).then(|| value.try_to_string()).transpose()?
                     && !text.is_empty()
-                    && duckrs_core::planner::binder::Binder::new(&self.catalog())
-                        .type_from_name(&text)
-                        .is_err()
                 {
-                    return Err(Error::new(
-                        ErrorKind::InvalidInput,
-                        format!("Could not parse type string '{text}'"),
-                    ));
+                    let ty = duckrs_core::planner::binder::Binder::new(&self.catalog())
+                        .type_from_name(&text)
+                        .map_err(|_| {
+                            Error::new(ErrorKind::InvalidInput, format!("Could not parse type string '{text}'"))
+                        })?;
+                    check_shredding_type(&ty)?;
                 }
                 // `ProfilingOutputSetting::SetLocal`: a file of the format the profile is in, or text
                 if name.eq_ignore_ascii_case("profiling_output") {
@@ -3933,7 +4037,21 @@ impl ClientContext {
                     settings::set_variable(name, *scope, &value, &mut checked, &mut session)?;
                     return Err(error);
                 }
-                settings::set_variable(name, *scope, &value, &mut global, &mut self.settings)?;
+                let deprecated = settings::find_setting(name)
+                    .filter(|(_, setting)| setting.is_deprecated)
+                    .map(|(_, setting)| setting.name);
+                let warning = |name: &str| format!("The '{name}' setting is deprecated and will be removed in a future release.");
+                if let Err(error) = settings::set_variable(name, *scope, &value, &mut global, &mut self.settings) {
+                    // a valid value of a deprecated setting duckrs does not honor yet: C++ warns before it applies it
+                    if let Some(name) = deprecated
+                        && error.kind == ErrorKind::NotImplemented
+                        && error.message.contains(&format!("the {name} setting"))
+                    {
+                        drop(global);
+                        self.log("", duckrs_core::logging::LogLevel::Warning, &warning(name))?;
+                    }
+                    return Err(error);
+                }
                 // `EnableExternalAccessSetting::OnSet`: the databases attached so far stay reachable
                 if turning_off_access && !settings::external_access_enabled(&global, &self.settings) {
                     let mut databases = vec![self.home.clone()];
@@ -3945,6 +4063,11 @@ impl ClientContext {
                             settings::add_allowed_path(&format!("{path}{suffix}"), &mut global);
                         }
                     }
+                }
+                drop(global);
+                // `SettingCallbackInfo::WarnDeprecated`, once the value is known to be valid
+                if let Some(name) = deprecated {
+                    self.log("", duckrs_core::logging::LogLevel::Warning, &warning(name))?;
                 }
                 return Ok(Self::success());
             }
@@ -3977,10 +4100,26 @@ impl ClientContext {
                 parameters,
                 named_parameters,
             }) => {
+                // `lock_configuration`: the PRAGMAs that change the configuration are refused, no-ops too
+                if parameters.is_empty() && CONFIGURING_PRAGMAS.iter().any(|p| p.eq_ignore_ascii_case(name)) {
+                    settings::check_lock(&name.to_lowercase(), &self.home.settings.read(), &self.settings)?;
+                }
                 if parameters.is_empty()
                     && named_parameters.is_empty()
                     && NO_OP_PRAGMAS.iter().any(|p| p.eq_ignore_ascii_case(name))
                 {
+                    // `WarnDeprecatedPragma`
+                    let lower = name.to_lowercase();
+                    if DEPRECATED_PRAGMAS.contains(&lower.as_str()) {
+                        self.log(
+                            "",
+                            duckrs_core::logging::LogLevel::Warning,
+                            &format!(
+                                "The '{lower}' pragma no longer has any effect; it is deprecated and will be removed \
+                                 in a future release."
+                            ),
+                        )?;
+                    }
                     return Ok(Self::success());
                 }
                 let lower = name.to_lowercase();
@@ -4039,6 +4178,11 @@ impl ClientContext {
                 let sql = match (lower.as_str(), parameters.as_slice()) {
                     ("enable_optimizer", []) => Some("SET enable_optimizer = true".to_string()),
                     ("disable_optimizer", []) => Some("SET enable_optimizer = false".to_string()),
+                    // `PragmaEnableProgressBar` and the rest: settings, under `lock_configuration` like a SET
+                    ("enable_progress_bar", []) => Some("SET enable_progress_bar = true".to_string()),
+                    ("disable_progress_bar", []) => Some("SET enable_progress_bar = false".to_string()),
+                    ("enable_print_progress_bar", []) => Some("SET enable_progress_bar_print = true".to_string()),
+                    ("disable_print_progress_bar", []) => Some("SET enable_progress_bar_print = false".to_string()),
                     ("show_tables", []) => Some("SHOW TABLES".to_string()),
                     ("show_tables_expanded", []) => Some("SHOW ALL TABLES".to_string()),
                     ("show_databases" | "database_list", []) => Some("SELECT * FROM duckdb_databases()".to_string()),
@@ -4182,6 +4326,22 @@ impl ClientContext {
             }
             Statement::Call(function) if checkpoint_call(function).is_some() => {
                 return self.checkpoint(function);
+            }
+            // `lock_configuration`: what changes the configuration is refused before it runs
+            Statement::Call(function)
+                if matches!(&function.kind, ExprKind::Function(call) if CONFIGURING_CALLS
+                    .iter()
+                    .any(|name| call.name.name.eq_ignore_ascii_case(name))) =>
+            {
+                let ExprKind::Function(call) = &function.kind else {
+                    unreachable!("matched above")
+                };
+                let name = call.name.name.to_lowercase();
+                settings::check_lock(&name, &self.home.settings.read(), &self.settings)?;
+                if logging::logging_call(function).is_some() {
+                    return self.run_logging_call(function);
+                }
+                return Err(duckrs_core::unported(format!("the table function {name}")));
             }
             Statement::Call(function) if logging::logging_call(function).is_some() => {
                 return self.run_logging_call(function);
@@ -5068,6 +5228,23 @@ impl ClientContext {
             types: vec![LogicalType::BOOLEAN],
             collection: ColumnDataCollection::new(vec![LogicalType::BOOLEAN]),
         }
+    }
+}
+
+/// `ForceVariantShredding::SetGlobal`'s `TypeVisitor::Contains`: the nested types of a shredding are LISTs and STRUCTs.
+fn check_shredding_type(ty: &duckrs_common::types::LogicalType) -> Result<()> {
+    use duckrs_common::types::LogicalTypeId;
+    match ty.id() {
+        LogicalTypeId::Struct => ty.struct_children().iter().try_for_each(|(_, child)| check_shredding_type(child)),
+        LogicalTypeId::List => ty.child_type().map_or(Ok(()), check_shredding_type),
+        _ if ty.is_nested() => Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "Shredding can consist of the nested types LIST (for ARRAY Variant values) or STRUCT (for OBJECT \
+                 Variant values), not {ty}"
+            ),
+        )),
+        _ => Ok(()),
     }
 }
 
