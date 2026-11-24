@@ -2418,6 +2418,83 @@ impl Binder<'_> {
     /// `BindContext::GenerateAllColumnExpressions` for one star.
     pub(super) fn generate_all_columns(&self, star: &ast::StarExpr) -> Result<Vec<Expr>> {
         let mut result = Vec::new();
+        // `t.*` of a table of a query around this one (a LATERAL's left side), or `s.*` of a STRUCT column of one:
+        // its columns or fields, as correlated columns, with the star's modifiers
+        if !star.relation_name.is_empty()
+            && !self
+                .bind_context
+                .bindings
+                .iter()
+                .any(|b| b.alias.eq_ignore_ascii_case(&star.relation_name))
+            && self.bind_context.matching_binding(&star.relation_name).ok().flatten().is_none()
+        {
+            let mut columns: Option<Vec<(String, Vec<String>)>> = None;
+            for context in self.outer_contexts.iter().rev() {
+                if let Some(binding) = context
+                    .bindings
+                    .iter()
+                    .find(|b| b.alias.eq_ignore_ascii_case(&star.relation_name))
+                {
+                    columns = Some(
+                        binding
+                            .names
+                            .iter()
+                            .map(|name| (name.clone(), vec![binding.alias.clone(), name.clone()]))
+                            .collect(),
+                    );
+                    break;
+                }
+                if let Some((binding, index)) = context.matching_binding(&star.relation_name)?
+                    && binding.types[index].id() == LogicalTypeId::Struct
+                {
+                    columns = Some(
+                        binding.types[index]
+                            .struct_children()
+                            .iter()
+                            .map(|(field, _)| {
+                                (
+                                    field.clone(),
+                                    vec![binding.alias.clone(), binding.names[index].clone(), field.clone()],
+                                )
+                            })
+                            .collect(),
+                    );
+                    break;
+                }
+            }
+            if let Some(columns) = columns {
+                let mut excluded = vec![false; star.exclude_list.len()];
+                for (name, path) in columns {
+                    if let Some(position) = star.exclude_list.iter().position(|e| e.column.eq_ignore_ascii_case(&name)) {
+                        excluded[position] = true;
+                        continue;
+                    }
+                    let mut column = Expr::column(path);
+                    column.alias = name.clone();
+                    if let Some((alias, replacement)) =
+                        star.replace_list.iter().find(|(n, _)| n.eq_ignore_ascii_case(&name))
+                    {
+                        column = replacement.clone();
+                        column.alias = alias.clone();
+                    }
+                    if let Some((_, alias)) = star
+                        .rename_list
+                        .iter()
+                        .find(|(n, _)| n.column.eq_ignore_ascii_case(&name))
+                    {
+                        column.alias = alias.clone();
+                    }
+                    result.push(column);
+                }
+                if let Some(position) = excluded.iter().position(|e| !e) {
+                    return Err(binder_error(format!(
+                        "Column \"{}\" in EXCLUDE list not found in FROM clause",
+                        star.exclude_list[position].column
+                    )));
+                }
+                return Ok(result);
+            }
+        }
         if self.bind_context.bindings.is_empty() {
             return Err(binder_error("SELECT * expression without FROM clause!"));
         }

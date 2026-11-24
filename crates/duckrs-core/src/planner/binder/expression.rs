@@ -1471,7 +1471,21 @@ impl Binder<'_> {
         let (table, qualification) = names.split_last()?;
         let schema =
             (!qualification.is_empty()).then(|| qualification.join(&crate::catalog::SCHEMA_PATH_SEPARATOR.to_string()));
-        let bindings = self.bind_context.bindings_of(schema.as_deref(), table).ok()?;
+        let own = self.bind_context.bindings_of(schema.as_deref(), table).ok();
+        // a table of a query around this one, when no scope has a column of that name (a LATERAL's left side)
+        let outer = || {
+            if schema.is_some() || self.outer_contexts.iter().any(|c| c.bind_column_ref(names).is_ok()) {
+                return None;
+            }
+            self.outer_contexts
+                .iter()
+                .rev()
+                .find_map(|context| context.bindings_of(None, table).ok())
+        };
+        let bindings = match own {
+            Some(bindings) => bindings,
+            None => outer()?,
+        };
         let [binding] = bindings.as_slice() else {
             return None;
         };
