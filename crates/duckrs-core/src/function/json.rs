@@ -254,41 +254,38 @@ pub fn parse_path(text: &str) -> Result<Path> {
     })
 }
 
+/// The values in `value` and below it, breadth first, as `GetWildcardPathInternal` visits them.
+fn breadth_first(value: &Json) -> Vec<&Json> {
+    let mut nodes = vec![value];
+    let mut at = 0;
+    while at < nodes.len() {
+        match nodes[at] {
+            Json::Array(items) => nodes.extend(items.iter()),
+            Json::Object(items) => nodes.extend(items.iter().map(|(_, item)| item)),
+            _ => {}
+        }
+        at += 1;
+    }
+    nodes
+}
+
+/// `..`: the rest of the path from each value at or below this one; the value itself only when a path follows.
 fn collect_recursive<'a>(value: &'a Json, rest: &[Step], out: &mut Vec<&'a Json>) {
-    walk(value, rest, out);
-    match value {
-        Json::Array(items) => {
-            for item in items {
-                collect_recursive(item, rest, out);
-            }
+    for (index, node) in breadth_first(value).into_iter().enumerate() {
+        if index > 0 || !rest.is_empty() {
+            walk(node, rest, out);
         }
-        Json::Object(items) => {
-            for (_, item) in items {
-                collect_recursive(item, rest, out);
-            }
-        }
-        _ => {}
     }
 }
 
+/// `..key`: the field `key` of each object at or below this one.
 fn collect_key<'a>(value: &'a Json, key: &str, rest: &[Step], out: &mut Vec<&'a Json>) {
-    if let Json::Object(items) = value
-        && let Some((_, found)) = items.iter().find(|(k, _)| k == key)
-    {
-        walk(found, rest, out);
-    }
-    match value {
-        Json::Array(items) => {
-            for item in items {
-                collect_key(item, key, rest, out);
-            }
+    for node in breadth_first(value) {
+        if let Json::Object(items) = node
+            && let Some((_, found)) = items.iter().find(|(k, _)| k == key)
+        {
+            walk(found, rest, out);
         }
-        Json::Object(items) => {
-            for (_, item) in items {
-                collect_key(item, key, rest, out);
-            }
-        }
-        _ => {}
     }
 }
 
@@ -1010,8 +1007,28 @@ pub fn json_cast(source: &Vector, result: &mut Vector, count: usize, mode: CastM
             // `JSONCommon::NumbersAsRaw`: a DECIMAL reads numbers from their text
             let raw = contains_decimal(&to);
             with_stack_for(&text, || {
-                let json = parse_with(&text, raw).map_err(|e| invalid(parse_error_text(&text, &e)))?;
-                transform(&json, &to, strict)
+                let json = match parse_with(&text, raw) {
+                    Ok(json) => json,
+                    // TRY_CAST: what is no JSON is NULL
+                    Err(_) if !strict => return Ok(Value::null(to.clone())),
+                    Err(e) => return Err(invalid(parse_error_text(&text, &e))),
+                };
+                // `TransformToJSON`: an element of a JSON[] is the JSON it is, a `null` too
+                if let (Json::Array(items), Some(child)) = (&json, to.child_type())
+                    && to.id() == LogicalTypeId::List
+                    && is_json_type(child)
+                {
+                    let items = items
+                        .iter()
+                        .map(|item| Value::varchar(item.text()).reinterpret(child))
+                        .collect::<Result<Vec<_>>>()?;
+                    return Value::list(child.clone(), items);
+                }
+                // `HandleCastError`: what the transform refuses is a conversion error of the cast
+                transform(&json, &to, strict).map_err(|error| match error.kind {
+                    ErrorKind::InvalidInput => Error::new(ErrorKind::Conversion, error.message),
+                    _ => error,
+                })
             })?
         };
         result.set_value(row, &converted)?;
@@ -1366,6 +1383,10 @@ fn with_path(
 fn each_found(json: &Json, path: &Path, ty: &LogicalType, f: impl Fn(Option<&Json>) -> Result<Value>) -> Result<Value> {
     if !path.is_wildcard() {
         return f(single(json, path));
+    }
+    // `JSONCommon::Get`: a path that is not constant reads one value, which a wildcard can't name
+    if ty.id() != LogicalTypeId::List {
+        return Err(Error::new(ErrorKind::InvalidInput, "JSON path error near '*'"));
     }
     let mut found = Vec::new();
     walk(json, &path.steps, &mut found);
@@ -2171,7 +2192,11 @@ fn path_argument(child: &BoundExpr) -> Result<Option<(bool, bool)>> {
     }
     if let ValueData::List(items) = value.data() {
         for item in items {
-            parse_path(&path_text(item)?).map_err(|e| binder_error(e.message))?;
+            let path = parse_path(&path_text(item)?).map_err(|e| binder_error(e.message))?;
+            // `JSONReadManyFunctionData::Bind`
+            if path.is_wildcard() {
+                return Err(binder_error("Cannot have wildcards in JSON path when supplying multiple paths"));
+            }
         }
         return Ok(Some((true, false)));
     }

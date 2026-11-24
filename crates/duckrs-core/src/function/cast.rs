@@ -1305,7 +1305,12 @@ pub fn cast_vector(source: &Vector, result: &mut Vector, count: usize, mode: Cas
         *result = Vector::constant_null(to);
         return Ok(());
     }
+    // a VARCHAR cast to JSON[] is read as one JSON document, as the JSON extension's cast does
+    let json_list = to.id() == LogicalTypeId::List
+        && to.child_type().is_some_and(super::json::is_json_type)
+        && from.id() == LogicalTypeId::Varchar;
     if super::json::is_json_type(&to)
+        || json_list
         || (super::json::is_json_type(&from) && to.alias().is_none() && to != LogicalType::VARCHAR)
     {
         return super::json::json_cast(source, result, count, mode);

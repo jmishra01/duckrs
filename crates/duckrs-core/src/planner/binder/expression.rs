@@ -1586,8 +1586,24 @@ impl Binder<'_> {
             ExprKind::Lambda {
                 lhs,
                 expr,
-                syntax: ast::LambdaSyntax::Arrow | ast::LambdaSyntax::StoredArrow,
+                syntax: syntax @ (ast::LambdaSyntax::Arrow | ast::LambdaSyntax::StoredArrow),
             } => {
+                // `RestructureArrowChain`: the grammar makes `A -> B ->> C` into `A -> (B ->> C)`, which is
+                // `(A -> B) ->> C`
+                if let ExprKind::Function(function) = &expr.kind
+                    && function.name.qualification.iter().all(String::is_empty)
+                    && function.name.name == "->>"
+                    && function.args.len() == 2
+                {
+                    let inner = ast::Expr::from(ExprKind::Lambda {
+                        lhs: lhs.clone(),
+                        expr: Box::new(function.args[0].expr.clone()),
+                        syntax: *syntax,
+                    });
+                    let mut outer = function.clone();
+                    outer.args[0].expr = inner;
+                    return self.bind_expression(&ast::Expr::from(ExprKind::Function(outer)));
+                }
                 let children = vec![self.bind_expression(lhs)?, self.bind_expression(expr)?];
                 let types = std::cell::RefCell::new(self.child_binder());
                 return crate::function::json::bind_function("->", children, &|name| types.borrow_mut().csv_type(name));
@@ -1848,6 +1864,33 @@ impl Binder<'_> {
                 let variant = bound
                     .first()
                     .is_some_and(|b| b.return_type.id() == LogicalTypeId::Variant);
+                // `BindOperatorExpression`: `[key]` of a JSON is its json_extract, of an array element (`$[i]`) or
+                // of a field (`$."key"`)
+                if *op == OperatorType::ArrayExtract
+                    && bound.len() == 2
+                    && crate::function::json::is_json_type(&bound[0].return_type)
+                {
+                    let mut bound = bound;
+                    if let BoundExprKind::Constant(value) = &bound[1].kind
+                        && !value.is_null()
+                    {
+                        let path = match crate::function::cast::cast_value(value, &LogicalType::UINTEGER) {
+                            Ok(index) => Some(format!("$[{}]", index.as_i128().unwrap_or(0))),
+                            Err(_) if value.logical_type().id() == LogicalTypeId::Varchar => {
+                                Some(format!("$.\"{}\"", value.try_to_string()?))
+                            }
+                            Err(_) => None,
+                        };
+                        if let Some(path) = path {
+                            bound[1] = BoundExpr::constant(Value::varchar(path));
+                        }
+                    }
+                    let key = bound.pop().expect("two children");
+                    let child = bound.pop().expect("two children");
+                    return crate::function::json::bind_function("json_extract", vec![child, key], &|_| {
+                        Ok(LogicalType::VARCHAR)
+                    });
+                }
                 let name = if *op == OperatorType::StructExtract && !variant {
                     "struct_extract"
                 } else {
