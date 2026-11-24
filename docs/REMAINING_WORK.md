@@ -470,8 +470,13 @@ Each item gives the number of failing files in `test/` that it should fix, where
     (`RecursiveCTERefCanReorder`; `test_recursive_join_order_guard`); a join that reads the CTE on one side
     probes with it, so the other side's hash table can be kept (`GetRecursiveProbeSidePreference`;
     `test_recursive_build_side_probe_side`); logical EXPLAIN shows the recursive part
-  - [ ] the columns of a recursive CTE nothing reads are not pruned (`recursive_cte_column_pruning`, which passed
-    only while EXPLAIN did not show the recursive part); LEFT joins reordered in the join graph
+  - [x] `TryPruneRecursiveCTE`: of a UNION ALL recursive CTE, the columns nothing reads and that its recursive part
+    needs only to compute themselves go (the fixed point of `ComputeRecursiveRequiredColumns`), from the anchor, the
+    recursive part (pruned in its binding form, then resolved again) and the working table
+    (`recursive_cte_column_pruning`)
+  - [ ] the build of a recursive CTE's invariant side kept across its iterations, and the `RuntimeMetrics` log of
+    `PhysicalRecursiveCTE` (`test_common_subplan_repeatability_logging`)
+  - [ ] LEFT joins reordered in the join graph
     (`left_join_cardinality_estimation`); join enumeration of a CTE under a cross product
     (`recursive_cte_projection_join_order`); semi joins' estimates (`current_domain_semi_anti`)
   - [x] LEFT join equality groups, `debug_force_no_cross_product`, `approximate_join_order_threshold`

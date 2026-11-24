@@ -14,14 +14,17 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 thread_local! {
-    /// The new places of the outputs of windows that lost some (`ClearUnusedExpressions`), when the
-    /// plan has no subquery plan that could refer to them without this pass seeing it.
+    /// The new places of the outputs of windows that lost some (`ClearUnusedExpressions`), and of recursive CTEs
+    /// that did, when the plan has no subquery plan that could refer to them without this pass seeing it.
     static WINDOW_RENUMBERING: RefCell<Option<HashMap<ColumnBinding, ColumnBinding>>> = const { RefCell::new(None) };
+    /// The next table index of the plan, for the projections a pruned recursive CTE gets.
+    static NEXT_TABLE_INDEX: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 pub fn remove_unused_columns(plan: &mut LogicalOperator) {
     let nested = has_nested_plan(plan);
     WINDOW_RENUMBERING.with(|r| *r.borrow_mut() = (!nested).then(HashMap::new));
+    NEXT_TABLE_INDEX.with(|next| next.set(super::common_subplan::max_table_index(plan) + 1));
     // the columns of the result are all read, by position
     visit(plan, true, &mut HashSet::new());
     let renumbering = WINDOW_RENUMBERING.with(|r| r.borrow_mut().take()).unwrap_or_default();
@@ -67,6 +70,9 @@ fn collect_columns(expr: &BoundExpr, used: &mut HashSet<ColumnBinding>) {
 /// `used` holds the columns that the operators above read. `by_position` says something above reads
 /// this operator's output by position and not through bindings.
 fn visit(op: &mut LogicalOperator, by_position: bool, used: &mut HashSet<ColumnBinding>) {
+    if !by_position && matches!(op.kind, K::RecursiveCte { .. }) {
+        prune_recursive_cte(op, used);
+    }
     // a scan of a CTE read by position has all of its columns read
     if let K::CteRef { .. } = &op.kind
         && by_position
@@ -404,4 +410,189 @@ fn count_star() -> BoundAggregate {
         .aggregate("count_star")
         .expect("count_star is a builtin aggregate");
     crate::function::binder::bind_aggregate_function(function, Vec::new(), None, false).expect("count_star() binds")
+}
+
+fn next_table_index() -> usize {
+    NEXT_TABLE_INDEX.with(|next| {
+        let index = next.get();
+        next.set(index + 1);
+        index
+    })
+}
+
+/// Whether anything in the plan is volatile, or has a plan of its own (`LogicalSubtreeIsRepeatable`, and no
+/// subquery that could read the working table without this pass seeing it).
+fn volatile_or_nested(op: &LogicalOperator) -> bool {
+    let mut copy = op.kind.clone();
+    let mut found = matches!(op.kind, K::LateralJoin { .. } | K::RecursiveCte { .. });
+    let mut probe = LogicalOperator::new(std::mem::replace(&mut copy, K::CrossProduct), Vec::new());
+    for expr in probe.expressions_mut() {
+        expr.walk_mut(&mut |e| found |= e.is_volatile() || matches!(e.kind, BoundExprKind::Subquery { .. }));
+    }
+    found || op.children.iter().any(volatile_or_nested)
+}
+
+/// The table indexes of the reads of the working (or recurring) table `tables` below `op`.
+fn working_reads(op: &LogicalOperator, tables: &[usize], found: &mut Vec<usize>) {
+    if let K::WorkingTable { table_index, working, .. } = &op.kind
+        && tables.contains(&(std::sync::Arc::as_ptr(working) as *const () as usize))
+    {
+        found.push(*table_index);
+    }
+    for child in &op.children {
+        working_reads(child, tables, found);
+    }
+}
+
+/// `TryPruneRecursiveCTE`: of a UNION ALL recursive CTE, the columns nothing above reads, and that the recursive part
+/// needs only to compute themselves, go: from the anchor, the recursive part and the working table. The columns that
+/// stay are the fixed point of those read above and those the recursive part reads to compute them
+/// (`ComputeRecursiveRequiredColumns`).
+fn prune_recursive_cte(op: &mut LogicalOperator, used: &mut HashSet<ColumnBinding>) {
+    // the readers above are renumbered at the end, which a subquery plan could escape
+    if WINDOW_RENUMBERING.with(|r| r.borrow().is_none()) {
+        return;
+    }
+    let K::RecursiveCte {
+        table_index,
+        types,
+        union_all,
+        working,
+        recurring,
+        key,
+        unresolved,
+        ..
+    } = &op.kind
+    else {
+        return;
+    };
+    if !*union_all || !key.is_empty() || volatile_or_nested(&op.children[0]) || volatile_or_nested(unresolved) {
+        return;
+    }
+    let (cte_index, width) = (*table_index, types.len());
+    let tables = [
+        std::sync::Arc::as_ptr(working) as *const () as usize,
+        std::sync::Arc::as_ptr(recurring) as *const () as usize,
+    ];
+    let mut reads = Vec::new();
+    working_reads(unresolved, &tables, &mut reads);
+    let outputs = unresolved.column_bindings();
+    if outputs.len() != width {
+        return;
+    }
+    let mut required: std::collections::BTreeSet<usize> =
+        (0..width).filter(|&i| used.contains(&ColumnBinding::new(cte_index, i))).collect();
+    if required.is_empty() {
+        required.insert(0);
+    }
+    // the fixed point: what the recursive part reads of the working table to compute the columns kept
+    loop {
+        let mut live: HashSet<ColumnBinding> = required.iter().map(|&i| outputs[i]).collect();
+        let mut copy = (**unresolved).clone();
+        visit(&mut copy, false, &mut live);
+        let before = required.len();
+        for binding in &live {
+            if reads.contains(&binding.table_index) && binding.column_index < width {
+                required.insert(binding.column_index);
+            }
+        }
+        if required.len() >= width {
+            return;
+        }
+        if required.len() == before {
+            break;
+        }
+    }
+    let kept: Vec<usize> = required.into_iter().collect();
+    let position: HashMap<usize, usize> = kept.iter().enumerate().map(|(new, &old)| (old, new)).collect();
+    let K::RecursiveCte {
+        types,
+        working,
+        recurring,
+        recursive,
+        unresolved,
+        ..
+    } = &mut op.kind
+    else {
+        unreachable!()
+    };
+    let new_types: Vec<_> = kept.iter().map(|&i| types[i].clone()).collect();
+    let fresh = |old: &std::sync::Arc<parking_lot::Mutex<duckrs_common::column_data::ColumnDataCollection>>| {
+        let _ = old;
+        std::sync::Arc::new(parking_lot::Mutex::new(duckrs_common::column_data::ColumnDataCollection::new(
+            new_types.clone(),
+        )))
+    };
+    let (new_working, new_recurring) = (fresh(working), fresh(recurring));
+    // `ApplyRecursiveProjections`: each side gives the columns kept, in order
+    let narrow = |child: LogicalOperator| {
+        let bindings = child.column_bindings();
+        let child_types = child.types();
+        let expressions = kept
+            .iter()
+            .map(|&i| BoundExpr::column_ref(bindings[i], child_types[i].clone(), String::new()))
+            .collect();
+        LogicalOperator::new(
+            K::Projection {
+                table_index: next_table_index(),
+                expressions,
+            },
+            vec![child],
+        )
+    };
+    // `CTERefPruner`: the reads of the working table have the columns kept, at their new places
+    let mut plan = narrow((**unresolved).clone());
+    fn rewrite_reads(
+        op: &mut LogicalOperator,
+        tables: &[usize],
+        reads: &[usize],
+        position: &HashMap<usize, usize>,
+        new_types: &[duckrs_common::types::LogicalType],
+        new_working: &std::sync::Arc<parking_lot::Mutex<duckrs_common::column_data::ColumnDataCollection>>,
+        new_recurring: &std::sync::Arc<parking_lot::Mutex<duckrs_common::column_data::ColumnDataCollection>>,
+    ) {
+        for child in &mut op.children {
+            rewrite_reads(child, tables, reads, position, new_types, new_working, new_recurring);
+        }
+        if let K::WorkingTable { types, working, .. } = &mut op.kind {
+            let address = std::sync::Arc::as_ptr(working) as *const () as usize;
+            if address == tables[0] {
+                *working = new_working.clone();
+                *types = new_types.to_vec();
+            } else if address == tables[1] {
+                *working = new_recurring.clone();
+                *types = new_types.to_vec();
+            }
+        }
+        super::common_subplan::visit_bindings(&mut op.kind, &mut |binding: &mut ColumnBinding, depth| {
+            if depth == 0
+                && reads.contains(&binding.table_index)
+                && let Some(&new) = position.get(&binding.column_index)
+            {
+                binding.column_index = new;
+            }
+        });
+    }
+    rewrite_reads(&mut plan, &tables, &reads, &position, &new_types, &new_working, &new_recurring);
+    // what the recursive part computes for the columns that went is not computed
+    visit(&mut plan, true, &mut HashSet::new());
+    let mut resolved = plan.clone();
+    if crate::planner::column_binding_resolver::resolve_column_bindings(&mut resolved).is_err() {
+        return;
+    }
+    **unresolved = plan;
+    **recursive = resolved;
+    *types = new_types;
+    *working = new_working;
+    *recurring = new_recurring;
+    let anchor = op.children.remove(0);
+    op.children.insert(0, narrow(anchor));
+    // the readers above read the columns kept at their new places
+    WINDOW_RENUMBERING.with(|r| {
+        if let Some(renumbering) = r.borrow_mut().as_mut() {
+            for (new, &old) in kept.iter().enumerate() {
+                renumbering.insert(ColumnBinding::new(cte_index, old), ColumnBinding::new(cte_index, new));
+            }
+        }
+    });
 }
