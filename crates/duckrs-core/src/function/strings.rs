@@ -783,9 +783,17 @@ fn overlay(args: &DataChunk, result: &mut Vector) -> Result<()> {
                 .nth((position - 1) as usize)
                 .map_or(input.len(), |(at, _)| at)
         };
-        let end = if count > 0 && start > i64::MAX - count { i64::MAX } else { start + count };
+        let end = if count > 0 && start > i64::MAX - count {
+            i64::MAX
+        } else {
+            start + count
+        };
         let (from, to) = (byte_of(start), byte_of(end));
-        Ok(Value::varchar(format!("{}{replacement}{}", &input[..from], &input[to..])))
+        Ok(Value::varchar(format!(
+            "{}{replacement}{}",
+            &input[..from],
+            &input[to..]
+        )))
     })
 }
 
@@ -1017,7 +1025,12 @@ pub fn string_functions() -> Vec<ScalarFunctionSet> {
         ("md5", vec![blob.clone()], v.clone(), md5),
         ("md5_number", vec![v.clone()], LogicalType::UHUGEINT, md5_number),
         ("md5_number", vec![blob.clone()], LogicalType::UHUGEINT, md5_number),
-        ("overlay", vec![v.clone(), v.clone(), LogicalType::BIGINT], v.clone(), overlay),
+        (
+            "overlay",
+            vec![v.clone(), v.clone(), LogicalType::BIGINT],
+            v.clone(),
+            overlay,
+        ),
         (
             "overlay",
             vec![v.clone(), v.clone(), LogicalType::BIGINT, LogicalType::BIGINT],

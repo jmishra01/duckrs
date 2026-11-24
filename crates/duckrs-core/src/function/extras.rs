@@ -686,7 +686,11 @@ fn fmod(args: &DataChunk, result: &mut Vector) -> Result<()> {
     let float = result.logical_type().id() == LogicalTypeId::Float;
     row_wise(args, result, |row| {
         let (Some(x), Some(y)) = (number(&row[0]), number(&row[1])) else {
-            return Ok(Value::null(if float { LogicalType::FLOAT } else { LogicalType::DOUBLE }));
+            return Ok(Value::null(if float {
+                LogicalType::FLOAT
+            } else {
+                LogicalType::DOUBLE
+            }));
         };
         if float {
             let (x, y) = (x as f32, y as f32);
@@ -1871,7 +1875,12 @@ pub fn bind_function(name: &str, names: &[String], mut children: Vec<BoundExpr>)
             }
             let mut set = super::ScalarFunctionSet::new("fmod");
             for ty in [LogicalType::FLOAT, d.clone()] {
-                set.add(super::ScalarFunction::new("fmod", vec![ty.clone(), ty.clone()], ty, fmod));
+                set.add(super::ScalarFunction::new(
+                    "fmod",
+                    vec![ty.clone(), ty.clone()],
+                    ty,
+                    fmod,
+                ));
             }
             super::binder::bind_scalar_function(
                 &set,

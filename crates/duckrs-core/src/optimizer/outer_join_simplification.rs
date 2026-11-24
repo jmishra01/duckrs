@@ -206,7 +206,9 @@ impl Simplification {
     }
 
     fn visit_inner_or_semi(&mut self, op: &mut LogicalOperator) {
-        let K::Join { conditions, .. } = &op.kind else { unreachable!() };
+        let K::Join { conditions, .. } = &op.kind else {
+            unreachable!()
+        };
         for condition in conditions.clone() {
             self.add_required(&condition.left);
             self.add_required(&condition.right);
@@ -255,7 +257,9 @@ impl Simplification {
             .iter()
             .map(|child| child.column_bindings().iter().any(|b| self.null_filtered.contains(b)))
             .collect();
-        let K::Join { join_type, .. } = &mut op.kind else { return };
+        let K::Join { join_type, .. } = &mut op.kind else {
+            return;
+        };
         let mut preserves = [
             matches!(join_type, JoinType::Left | JoinType::Outer),
             matches!(join_type, JoinType::Right | JoinType::Outer),
@@ -348,7 +352,9 @@ impl Simplification {
             }
         }
         self.visit_children(op);
-        let K::Projection { expressions, .. } = &mut op.kind else { unreachable!() };
+        let K::Projection { expressions, .. } = &mut op.kind else {
+            unreachable!()
+        };
         for (at, input) in direct {
             if !self.eliminated_null.contains(&input) {
                 continue;
@@ -360,13 +366,17 @@ impl Simplification {
     }
 
     fn visit_filter(&mut self, op: &mut LogicalOperator) {
-        let K::Filter { expressions } = &mut op.kind else { unreachable!() };
+        let K::Filter { expressions } = &mut op.kind else {
+            unreachable!()
+        };
         super::rewriter::split_predicates(expressions);
         for expr in expressions.clone() {
             self.handle_filter(&expr);
         }
         self.visit_children(op);
-        let K::Filter { expressions } = &mut op.kind else { unreachable!() };
+        let K::Filter { expressions } = &mut op.kind else {
+            unreachable!()
+        };
         let eliminated = &self.eliminated_null;
         expressions.retain(|expr| is_null_filter(expr).is_none_or(|binding| !eliminated.contains(&binding)));
         if expressions.is_empty() {

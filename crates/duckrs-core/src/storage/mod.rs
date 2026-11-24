@@ -10,15 +10,15 @@ pub mod checksum;
 pub mod compression;
 mod dict_fsst_analyze;
 mod dict_fsst_compress;
-mod float_codecs;
 pub mod encode;
 pub mod encryption;
+mod float_codecs;
 mod fsst;
 mod index_data;
-mod old_string_analyze;
 pub mod layered;
 pub mod log_writer;
 pub mod metadata;
+mod old_string_analyze;
 pub mod roaring;
 pub mod serialization;
 pub mod statistics;
@@ -32,7 +32,6 @@ use buffer_manager::BufferManager;
 use duckrs_common::{Error, ErrorKind, Result};
 use std::path::Path;
 use std::sync::Arc;
-
 
 /// Whether there is a database in the file: a new database starts as a missing or empty file.
 /// `DBPathAndType::CheckMagicBytes`: a file that is not a DuckDB (or SQLite) database but that one of

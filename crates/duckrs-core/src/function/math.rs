@@ -505,7 +505,10 @@ fn gcd(args: &DataChunk, result: &mut Vector) -> Result<()> {
     let (minimum, _) = integer_range(result);
     let ty = result.logical_type().clone();
     strict_rows(args, result, |row| {
-        let (a, b) = (row[0].as_i128().expect("an integer"), row[1].as_i128().expect("an integer"));
+        let (a, b) = (
+            row[0].as_i128().expect("an integer"),
+            row[1].as_i128().expect("an integer"),
+        );
         Ok(integer_value(&ty, typed_gcd(a, b, minimum)?))
     })
 }
@@ -515,7 +518,10 @@ fn lcm(args: &DataChunk, result: &mut Vector) -> Result<()> {
     let (minimum, maximum) = integer_range(result);
     let ty = result.logical_type().clone();
     strict_rows(args, result, |row| {
-        let (a, b) = (row[0].as_i128().expect("an integer"), row[1].as_i128().expect("an integer"));
+        let (a, b) = (
+            row[0].as_i128().expect("an integer"),
+            row[1].as_i128().expect("an integer"),
+        );
         if a == 0 || b == 0 {
             return Ok(integer_value(&ty, 0));
         }

@@ -146,9 +146,9 @@ impl Walk {
                 self.child(op, 0, ignores && deterministic, path);
                 self.child(op, 1, deterministic, path);
             }
-            K::Aggregate {
-                groups, aggregates, ..
-            } => self.child(op, 0, aggregate_ignores_duplicates(groups, aggregates), path),
+            K::Aggregate { groups, aggregates, .. } => {
+                self.child(op, 0, aggregate_ignores_duplicates(groups, aggregates), path)
+            }
             // its targets are expressions, so what it deduplicates on counts as read
             K::Distinct { .. } => self.child(op, 0, true, path),
             // the ORDER BY of a DISTINCT ON, which C++ keeps in the distinct: it changes no row
@@ -215,7 +215,10 @@ fn live_bindings(op: &LogicalOperator, readers: &HashMap<usize, Vec<usize>>, rea
             expressions,
         } if readers.contains_key(table_index) => {
             for (k, expr) in expressions.iter().enumerate() {
-                if readers[table_index].iter().any(|&r| read.contains(&ColumnBinding::new(r, k))) {
+                if readers[table_index]
+                    .iter()
+                    .any(|&r| read.contains(&ColumnBinding::new(r, k)))
+                {
                     collect(expr, read);
                 }
             }
@@ -356,7 +359,9 @@ fn rewrite(projection: &mut LogicalOperator, read: &[bool], next: &mut usize) ->
         ) else {
             return false;
         };
-        if left_column != right_column || lhs.return_type != rhs.return_type || !order_matches_equality(&lhs.return_type)
+        if left_column != right_column
+            || lhs.return_type != rhs.return_type
+            || !order_matches_equality(&lhs.return_type)
         {
             return false;
         }
@@ -406,7 +411,8 @@ fn rewrite(projection: &mut LogicalOperator, read: &[bool], next: &mut usize) ->
         }
     }
     let functions = BuiltinFunctions::get();
-    let column = |at: usize, ty: &LogicalType| BoundExpr::column_ref(ColumnBinding::new(left_index, at), ty.clone(), "");
+    let column =
+        |at: usize, ty: &LogicalType| BoundExpr::column_ref(ColumnBinding::new(left_index, at), ty.clone(), "");
     let mut bounds = Vec::new();
     for name in ["min", "max"] {
         let Some(set) = functions.aggregate(name) else {
@@ -419,7 +425,10 @@ fn rewrite(projection: &mut LogicalOperator, read: &[bool], next: &mut usize) ->
     }
 
     // scan WHERE keys IS NOT NULL GROUP BY keys HAVING min(x) <> max(x)
-    let mut join = std::mem::replace(&mut projection.children[0], LogicalOperator::new(K::CrossProduct, Vec::new()));
+    let mut join = std::mem::replace(
+        &mut projection.children[0],
+        LogicalOperator::new(K::CrossProduct, Vec::new()),
+    );
     let mut below = &mut join;
     while matches!(below.kind, K::Filter { .. }) {
         below = &mut below.children[0];

@@ -229,7 +229,10 @@ pub fn bind_scalar_function(
     for child in &mut children {
         if let BoundExprKind::Constant(value) = &child.kind {
             if value.is_null() {
-                return Ok(BoundExpr::constant(Value::null(folded_type(&function.return_type, &children))));
+                return Ok(BoundExpr::constant(Value::null(folded_type(
+                    &function.return_type,
+                    &children,
+                ))));
             }
             continue;
         }
@@ -239,7 +242,10 @@ pub fn bind_scalar_function(
         // an argument that cannot be evaluated stays, so that its error surfaces at execution
         if let Some(value) = fold(child) {
             if value.is_null() {
-                return Ok(BoundExpr::constant(Value::null(folded_type(&function.return_type, &children))));
+                return Ok(BoundExpr::constant(Value::null(folded_type(
+                    &function.return_type,
+                    &children,
+                ))));
             }
             let alias = std::mem::take(&mut child.alias);
             *child = BoundExpr::constant(value).with_alias(alias);
@@ -305,12 +311,17 @@ pub fn inside_try<T>(f: impl FnOnce() -> T) -> T {
 /// The type a call folded to NULL has: a VARCHAR keeps the collation of its arguments, as
 /// `PropagateReturnCollation` gives the call itself.
 fn folded_type(return_type: &LogicalType, children: &[BoundExpr]) -> LogicalType {
-    if return_type.id() != LogicalTypeId::Varchar || return_type.alias().is_some() || return_type.collation().is_some() {
+    if return_type.id() != LogicalTypeId::Varchar || return_type.alias().is_some() || return_type.collation().is_some()
+    {
         return return_type.clone();
     }
     children
         .iter()
-        .find_map(|c| (c.return_type.id() == LogicalTypeId::Varchar).then(|| c.return_type.collation()).flatten())
+        .find_map(|c| {
+            (c.return_type.id() == LogicalTypeId::Varchar)
+                .then(|| c.return_type.collation())
+                .flatten()
+        })
         .map_or_else(|| return_type.clone(), LogicalType::varchar_collation)
 }
 
@@ -427,7 +438,10 @@ fn check_constant_parameters(name: &str, children: &mut [BoundExpr]) -> Result<(
         (_, arguments @ [_]) | (_, arguments @ [_, _, _, ..])
             if name == "quantile_cont" || (arguments.len() > 2 && matches!(name, "quantile_disc" | "quantile")) =>
         {
-            let types: Vec<String> = arguments.iter().map(|c| expression_return_type(c).to_string()).collect();
+            let types: Vec<String> = arguments
+                .iter()
+                .map(|c| expression_return_type(c).to_string())
+                .collect();
             Err(binder_error(format!(
                 "No function matches the given name and argument types '{name}({})'. You might need to add \
                  explicit type casts.",

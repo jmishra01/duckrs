@@ -440,7 +440,6 @@ fn first_error(scan: &CsvScanData, error: Error) -> Error {
     }
 }
 
-
 /// The bytes of its files the scan read since this was last asked (`CSVFileScan::CountBytesScanned`).
 pub fn take_bytes_scanned(state: &mut CsvScanState) -> u64 {
     std::mem::take(&mut state.bytes_pending)
@@ -458,8 +457,8 @@ fn count_bytes(state: &mut CsvScanState, buffer_size: usize, done: bool) {
             (stream.base + data).min(state.file_bytes)
         }
         (Some(scanner), Some(data)) if !data.is_empty() => {
-            let at = (scanner.machine.position.min(data.len()) as f64 / data.len() as f64 * state.file_bytes as f64)
-                as u64;
+            let at =
+                (scanner.machine.position.min(data.len()) as f64 / data.len() as f64 * state.file_bytes as f64) as u64;
             let buffer = buffer_size.max(1) as u64;
             (at / buffer + 1).saturating_mul(buffer).min(state.file_bytes)
         }
@@ -1478,7 +1477,11 @@ fn typed_chunk(
     let mut bad: std::collections::BTreeSet<usize> = (0..count).filter(|&row| doomed[row]).collect();
     for (index, (ty, column)) in scan.types.iter().zip(&file.mapping).enumerate() {
         // a column nothing reads is not converted (`column_ids` of the scan)
-        if scan.projection.as_ref().is_some_and(|columns| !columns.contains(&index)) {
+        if scan
+            .projection
+            .as_ref()
+            .is_some_and(|columns| !columns.contains(&index))
+        {
             result.push(Vector::constant_null(ty.clone()));
             continue;
         }
@@ -1715,7 +1718,13 @@ fn flush_rejects(scan: &CsvScanData, state: &mut CsvScanState) -> Result<()> {
             .names
             .iter()
             .zip(&scan.types)
-            .map(|(name, ty)| format!("'{}': '{}'", name.replace('\'', "''"), ty.to_string().replace('\'', "''")))
+            .map(|(name, ty)| {
+                format!(
+                    "'{}': '{}'",
+                    name.replace('\'', "''"),
+                    ty.to_string().replace('\'', "''")
+                )
+            })
             .collect();
         let new_line = new_line_identifier(&file.dialect);
         scans.push(vec![

@@ -65,8 +65,10 @@ pub fn push_down_scalar_functions(plan: &mut LogicalOperator) {
         return;
     }
     replace_scans(plan, &pushed);
-    let pushed: HashMap<usize, HashSet<usize>> =
-        pushed.into_iter().map(|(table, (_, columns))| (table, columns)).collect();
+    let pushed: HashMap<usize, HashSet<usize>> = pushed
+        .into_iter()
+        .map(|(table, (_, columns))| (table, columns))
+        .collect();
     replace(plan, &pushed, &projections);
 }
 
@@ -110,8 +112,7 @@ fn references(expr: &BoundExpr, column: usize) -> bool {
         BoundExprKind::Reference(at) => *at == column,
         _ => false,
     };
-    reads
-        || expr.children().into_iter().any(|child| references(child, column))
+    reads || expr.children().into_iter().any(|child| references(child, column))
 }
 
 /// `FindGetsAndProjections`.
@@ -315,7 +316,10 @@ fn replace(op: &mut LogicalOperator, pushed: &HashMap<usize, HashSet<usize>>, pr
         let (table, column) = if pushed.contains_key(&binding.table_index) {
             (binding.table_index, binding.column_index)
         } else {
-            match projections.get(&binding.table_index).and_then(|p| p.get(binding.column_index)) {
+            match projections
+                .get(&binding.table_index)
+                .and_then(|p| p.get(binding.column_index))
+            {
                 Some(inner) => (inner.table_index, inner.column_index),
                 None => return false,
             }

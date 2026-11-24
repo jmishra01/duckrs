@@ -1029,7 +1029,7 @@ impl<'a> Replay<'a> {
                 comment,
             } => {
                 let schema = self.catalog.schema_for(Some(&schema))?;
-                schema.create_macro(&name, table_macro, macros, OnCreateConflict::Error)?;
+                schema.create_macro(&name, table_macro, macros, OnCreateConflict::Error, Vec::new())?;
                 if comment.is_some() {
                     schema.set_macro_comment(&name, table_macro, comment);
                 }
@@ -1042,7 +1042,9 @@ impl<'a> Replay<'a> {
             } => {
                 self.create_sequence(&schema, &name, data)?;
                 if comment.is_some() {
-                    self.catalog.schema_for(Some(&schema))?.set_sequence_comment(&name, comment);
+                    self.catalog
+                        .schema_for(Some(&schema))?
+                        .set_sequence_comment(&name, comment);
                 }
             }
             StoredEntry::Type {

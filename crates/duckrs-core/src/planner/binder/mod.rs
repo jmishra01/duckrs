@@ -82,9 +82,16 @@ pub(super) struct MaterializedCteState {
     pub data: Arc<Mutex<ColumnDataCollection>>,
     /// what the first reference bound: the plan, its names, types and column aliases
     #[allow(clippy::type_complexity, reason = "the parts of a bound statement")]
-    pub bound: Option<(LogicalOperator, Vec<String>, Vec<LogicalType>, Vec<(String, usize)>, StatementReturnType)>,
+    pub bound: Option<(
+        LogicalOperator,
+        Vec<String>,
+        Vec<LogicalType>,
+        Vec<(String, usize)>,
+        StatementReturnType,
+    )>,
     /// the CTE reads the queries around it: each reference binds it on its own
-    pub inline: bool,    /// `CTE_MATERIALIZE_ALWAYS`
+    pub inline: bool,
+    /// `CTE_MATERIALIZE_ALWAYS`
     pub always: bool,
 }
 
@@ -283,10 +290,7 @@ impl BindContext {
 
     /// `BindContext::GetMatchingBindings`.
     fn matching_bindings(&self, column: &str) -> Vec<&Binding> {
-        self.bindings
-            .iter()
-            .filter(|b| b.matches_column(column))
-            .collect()
+        self.bindings.iter().filter(|b| b.matches_column(column)).collect()
     }
 
     /// `BindContext::GetActualColumnName`: the column as its binding spells it.
@@ -543,9 +547,8 @@ impl BindContext {
                 }
             }
             if duplicate {
-                result = format!(
-                    "(duplicate alias \"{table}\", explicitly alias one of the tables using \"AS my_alias\""
-                );
+                result =
+                    format!("(duplicate alias \"{table}\", explicitly alias one of the tables using \"AS my_alias\"");
             } else {
                 result += &minimum;
             }
@@ -886,6 +889,9 @@ pub struct ParameterValues {
     pub values: Option<HashMap<String, Value>>,
     /// the parameters the statement refers to (`named_param_map`), in order of appearance
     pub seen: Mutex<Vec<String>>,
+    /// while a statement is prepared, the parameters in its text: one only inside the SQL text of
+    /// `query()` never gets a value
+    pub declared: Vec<String>,
 }
 
 /// How column references bind while a select list or HAVING clause is being bound.
@@ -987,6 +993,12 @@ pub struct Binder<'a> {
     foreign_databases: Vec<read_duckdb::ForeignDatabase>,
     /// the tables and views (schema and name) that what is bound reads, for the dependencies of a view
     read_entries: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    /// how many bodies of system macros are being bound
+    system_macro_depth: usize,
+    /// the table function being bound was called as `system.main.f`: no macro shadows it
+    system_table_function: bool,
+    /// the macros (schema, name and kind) that what is bound calls, for the dependencies of a macro
+    read_macros: Arc<std::sync::Mutex<Vec<(String, String, bool)>>>,
     /// the subquery being bound is the columns of another, as a row for `(a, b) IN (...)`
     row_subquery: bool,
     /// The table macros being bound, innermost last (`bound_macros`).
@@ -1002,7 +1014,12 @@ pub struct Binder<'a> {
     /// The CTEs in scope, innermost last, with how many outer contexts they can see, and for one
     /// that is materialized, what its references read.
     #[allow(clippy::type_complexity, reason = "a CTE in scope, as the comment above says")]
-    ctes: Vec<(String, Arc<ast::CteInfo>, usize, Option<Arc<Mutex<MaterializedCteState>>>)>,
+    ctes: Vec<(
+        String,
+        Arc<ast::CteInfo>,
+        usize,
+        Option<Arc<Mutex<MaterializedCteState>>>,
+    )>,
     /// The CTEs whose definition is being bound, which cannot refer to themselves.
     ctes_being_bound: Vec<String>,
     /// What the queries around a subquery can see, innermost last.
@@ -1096,6 +1113,9 @@ impl<'a> Binder<'a> {
             search_schema: None,
             foreign_databases: Vec::new(),
             read_entries: Arc::default(),
+            read_macros: Arc::default(),
+            system_table_function: false,
+            system_macro_depth: 0,
             row_subquery: false,
             bound_macros: Vec::new(),
             macro_arguments: Vec::new(),
@@ -1200,6 +1220,8 @@ impl<'a> Binder<'a> {
         binder.search_schema = self.search_schema.clone();
         binder.foreign_databases = self.foreign_databases.clone();
         binder.read_entries = self.read_entries.clone();
+        binder.read_macros = self.read_macros.clone();
+        binder.system_macro_depth = self.system_macro_depth;
         binder.parameters = self.parameters.clone();
         binder.ctes = self.ctes.clone();
         binder.ctes_being_bound = self.ctes_being_bound.clone();

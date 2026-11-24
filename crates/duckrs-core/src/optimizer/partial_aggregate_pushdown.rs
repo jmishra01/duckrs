@@ -479,9 +479,11 @@ impl Pass {
         else {
             return false;
         };
-        let (Some(owner_key), Some(group_key), Some(aggregate_key)) =
-            (column_of(owner_key_expr), column_of(&groups[0]), column_of(aggregate_key_expr))
-        else {
+        let (Some(owner_key), Some(group_key), Some(aggregate_key)) = (
+            column_of(owner_key_expr),
+            column_of(&groups[0]),
+            column_of(aggregate_key_expr),
+        ) else {
             return false;
         };
         if group_key != owner_key {
@@ -554,7 +556,11 @@ impl Pass {
         };
         let lower_group = std::mem::replace(
             key,
-            BoundExpr::column_ref(ColumnBinding::new(lower_group_index, 0), key.return_type.clone(), key.alias.clone()),
+            BoundExpr::column_ref(
+                ColumnBinding::new(lower_group_index, 0),
+                key.return_type.clone(),
+                key.alias.clone(),
+            ),
         );
         let input = std::mem::replace(&mut join.children[aggregate_side], placeholder());
         join.children[aggregate_side] = aggregate_operator(
@@ -594,17 +600,22 @@ impl Pass {
         else {
             unreachable!()
         };
-        self.replacements
-            .insert(ColumnBinding::new(group_index, 0), ColumnBinding::new(projection_index, 0));
-        self.replacements
-            .insert(ColumnBinding::new(aggregate_index, 0), ColumnBinding::new(projection_index, 1));
+        self.replacements.insert(
+            ColumnBinding::new(group_index, 0),
+            ColumnBinding::new(projection_index, 0),
+        );
+        self.replacements.insert(
+            ColumnBinding::new(aggregate_index, 0),
+            ColumnBinding::new(projection_index, 1),
+        );
         let expressions = vec![
             BoundExpr::column_ref(
                 ColumnBinding::new(upper_group_index, 0),
                 groups[0].return_type.clone(),
                 groups[0].alias.clone(),
             ),
-            BoundExpr::column_ref(ColumnBinding::new(upper_aggregate_index, 0), sum_type, "").cast_to(&count_type, false),
+            BoundExpr::column_ref(ColumnBinding::new(upper_aggregate_index, 0), sum_type, "")
+                .cast_to(&count_type, false),
         ];
         *op = LogicalOperator::new(
             K::Projection {
@@ -640,8 +651,10 @@ impl Pass {
         let projection_index = self.fresh();
         let mut expressions = Vec::new();
         for (i, group) in groups.iter().enumerate() {
-            self.replacements
-                .insert(ColumnBinding::new(group_index, i), ColumnBinding::new(projection_index, i));
+            self.replacements.insert(
+                ColumnBinding::new(group_index, i),
+                ColumnBinding::new(projection_index, i),
+            );
             expressions.push(BoundExpr::column_ref(
                 ColumnBinding::new(*upper_group_index, i),
                 group.return_type.clone(),
@@ -724,7 +737,10 @@ fn aggregate_operator(
 
 /// The binding of the lower aggregate `op` that groups by `original`.
 fn lower_binding(op: &LogicalOperator, original: ColumnBinding) -> ColumnBinding {
-    let K::Aggregate { group_index, groups, .. } = &op.kind else {
+    let K::Aggregate {
+        group_index, groups, ..
+    } = &op.kind
+    else {
         unreachable!()
     };
     let at = groups
@@ -842,13 +858,14 @@ fn collect_lower_groups(
 ) -> (Vec<BoundExpr>, HashMap<ColumnBinding, ColumnBinding>, usize) {
     let mut out = Vec::new();
     let mut map = HashMap::new();
-    let mut add = |map: &mut HashMap<ColumnBinding, ColumnBinding>, binding: ColumnBinding, ty: &LogicalType, alias: &str| {
-        if map.contains_key(&binding) {
-            return;
-        }
-        map.insert(binding, ColumnBinding::new(group_index, out.len()));
-        out.push(BoundExpr::column_ref(binding, ty.clone(), alias));
-    };
+    let mut add =
+        |map: &mut HashMap<ColumnBinding, ColumnBinding>, binding: ColumnBinding, ty: &LogicalType, alias: &str| {
+            if map.contains_key(&binding) {
+                return;
+            }
+            map.insert(binding, ColumnBinding::new(group_index, out.len()));
+            out.push(BoundExpr::column_ref(binding, ty.clone(), alias));
+        };
     for (key, ty) in keys {
         add(&mut map, *key, ty, "");
     }
@@ -986,7 +1003,10 @@ fn fuse_intervening_projections(op: &mut LogicalOperator) {
         return;
     }
     // inlining would run a volatile expression more often
-    if projections.iter().any(|(_, exprs)| exprs.iter().any(BoundExpr::is_volatile)) {
+    if projections
+        .iter()
+        .any(|(_, exprs)| exprs.iter().any(BoundExpr::is_volatile))
+    {
         return;
     }
     let inline = |expr: &mut BoundExpr| {

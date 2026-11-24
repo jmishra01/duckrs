@@ -106,7 +106,10 @@ fn auxiliary_filter(partition: &BoundExpr, filter: &BoundExpr) -> Option<BoundEx
         return None;
     }
     // `ArgProperties`: increasing, and strictly so for these
-    let strict = matches!(function.name.as_str(), "make_date" | "make_timestamp" | "make_timestamp_ns" | "+");
+    let strict = matches!(
+        function.name.as_str(),
+        "make_date" | "make_timestamp" | "make_timestamp_ns" | "+"
+    );
     if !strict && crate::execution::zone_map::unary_monotonicity(&function.name) != Some(true) {
         return None;
     }
@@ -236,7 +239,14 @@ fn dummy_rhs(op: &LogicalOperator) -> LogicalOperator {
             Some(left) => LogicalOperator::new(LogicalOperatorKind::CrossProduct, vec![left, projection]),
         });
     }
-    result.unwrap_or_else(|| LogicalOperator::new(LogicalOperatorKind::DummyScan { table_index: generate_table_index() }, Vec::new()))
+    result.unwrap_or_else(|| {
+        LogicalOperator::new(
+            LogicalOperatorKind::DummyScan {
+                table_index: generate_table_index(),
+            },
+            Vec::new(),
+        )
+    })
 }
 
 /// Whether a condition can hold for no row: it folds to false or NULL (`FilterResult::UNSATISFIABLE`).
@@ -469,7 +479,10 @@ impl FilterPushdown {
                     && children.len() == 1
                     && !partition.is_volatile()
                 {
-                    match partition_functions.iter_mut().find(|(p, _)| expressions_equal(p, partition)) {
+                    match partition_functions
+                        .iter_mut()
+                        .find(|(p, _)| expressions_equal(p, partition))
+                    {
                         Some((_, count)) => *count += 1,
                         None => partition_functions.push((partition.clone(), 1)),
                     }
@@ -757,7 +770,11 @@ impl FilterPushdown {
             combiner.add(f.filter.clone());
         }
         // only a comparison join (with conditions here) does this, not `LogicalAnyJoin`
-        let generated = if conditions.is_empty() { Vec::new() } else { combiner.generate() };
+        let generated = if conditions.is_empty() {
+            Vec::new()
+        } else {
+            combiner.generate()
+        };
         for generated in generated {
             let generated = Filter::new(generated);
             if join_side(&generated.tables, &left_tables, &right_tables) == JoinSide::Right {
@@ -790,7 +807,8 @@ impl FilterPushdown {
         };
         if predicate.as_ref().is_some_and(unsatisfiable) {
             let dummy = dummy_rhs(&right_child);
-            let product = LogicalOperator::new(LogicalOperatorKind::CrossProduct, vec![left.rewrite(left_child), dummy]);
+            let product =
+                LogicalOperator::new(LogicalOperatorKind::CrossProduct, vec![left.rewrite(left_child), dummy]);
             return add_filter_operator(product, remaining.into_iter().map(|f| f.filter).collect());
         }
         op.children = vec![left.rewrite(left_child), right.rewrite(right_child)];
@@ -1009,11 +1027,16 @@ fn coalesced_key_filters(filter: &BoundExpr, keys: &[(BoundExpr, BoundExpr)]) ->
         copy.walk_mut(&mut |e| e.alias.clear());
         format!("{copy:?}")
     };
-    let same = |a: &[&BoundExpr], b: &[&BoundExpr]| {
-        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| shape(x) == shape(y))
-    };
+    let same =
+        |a: &[&BoundExpr], b: &[&BoundExpr]| a.len() == b.len() && a.iter().zip(b).all(|(x, y)| shape(x) == shape(y));
     let key_of = |expr: &BoundExpr| -> Option<usize> {
-        if !matches!(expr.kind, BoundExprKind::Operator { op: BoundOperator::Coalesce, .. }) {
+        if !matches!(
+            expr.kind,
+            BoundExprKind::Operator {
+                op: BoundOperator::Coalesce,
+                ..
+            }
+        ) {
             return None;
         }
         let mut args = Vec::new();
@@ -1065,12 +1088,7 @@ fn coalesced_key_filters(filter: &BoundExpr, keys: &[(BoundExpr, BoundExpr)]) ->
 }
 
 /// `ReplaceIn`: the COALESCEs of the keys of condition `key` in `expr` become `with`.
-fn replace_coalesce(
-    expr: &mut BoundExpr,
-    key_of: &impl Fn(&BoundExpr) -> Option<usize>,
-    key: usize,
-    with: &BoundExpr,
-) {
+fn replace_coalesce(expr: &mut BoundExpr, key_of: &impl Fn(&BoundExpr) -> Option<usize>, key: usize, with: &BoundExpr) {
     if key_of(expr) == Some(key) {
         *expr = with.clone();
         return;
@@ -1133,7 +1151,10 @@ pub(super) fn only_ranks_without_arguments(windows: &[crate::planner::expression
 }
 
 /// `FilterPushdown::ComparesWindowPartitions`: `filter` compares a partition of every window with constants.
-pub(super) fn compares_window_partitions(windows: &[crate::planner::expression::BoundWindow], filter: &BoundExpr) -> bool {
+pub(super) fn compares_window_partitions(
+    windows: &[crate::planner::expression::BoundWindow],
+    filter: &BoundExpr,
+) -> bool {
     let Some(compared) = compared_expression(filter) else {
         return false;
     };
@@ -1161,9 +1182,7 @@ fn compared_expression(filter: &BoundExpr) -> Option<&BoundExpr> {
                 | ComparisonOp::GreaterThanOrEqual,
             left,
             right,
-        } => {
-            (vec![&**left, &**right], false)
-        }
+        } => (vec![&**left, &**right], false),
         BoundExprKind::Between { input, lower, upper } => (vec![&**input, &**lower, &**upper], true),
         BoundExprKind::Operator {
             op: BoundOperator::In,
@@ -1472,7 +1491,9 @@ fn plain_estimate(op: &LogicalOperator) -> u64 {
     match &op.kind {
         LogicalOperatorKind::Get { table, .. } => table.row_count() as u64,
         LogicalOperatorKind::ExpressionGet { expressions, .. } => expressions.len() as u64,
-        LogicalOperatorKind::SecureView { estimate: Some(rows), .. } => *rows,
+        LogicalOperatorKind::SecureView {
+            estimate: Some(rows), ..
+        } => *rows,
         _ if op.children.is_empty() => super::join_order::estimated_cardinality(op),
         _ => op.children.iter().map(plain_estimate).max().unwrap_or(1),
     }

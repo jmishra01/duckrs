@@ -217,7 +217,11 @@ fn find(
         return None;
     }
     // nothing outside of the join may read the inner side
-    let inner_tables: HashSet<usize> = op.children[inner].column_bindings().iter().map(|b| b.table_index).collect();
+    let inner_tables: HashSet<usize> = op.children[inner]
+        .column_bindings()
+        .iter()
+        .map(|b| b.table_index)
+        .collect();
     let mut read = HashSet::new();
     tables_read_outside(root, &mut Vec::new(), path, &mut read);
     if read.iter().any(|t| inner_tables.contains(t)) {

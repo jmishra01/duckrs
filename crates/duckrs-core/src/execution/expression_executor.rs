@@ -1025,7 +1025,10 @@ pub fn execute(expr: &BoundExpr, input: &DataChunk) -> Result<Vector> {
             columns.push(probe);
             let extended = DataChunk::from_columns(columns, input.len());
             let mut lowered = children.clone();
-            lowered[0] = BoundExpr::new(BoundExprKind::Reference(input.column_count()), children[0].return_type.clone());
+            lowered[0] = BoundExpr::new(
+                BoundExprKind::Reference(input.column_count()),
+                children[0].return_type.clone(),
+            );
             execute(
                 &crate::planner::expression::in_as_comparisons(*op == BoundOperator::NotIn, &lowered),
                 &extended,
@@ -1247,7 +1250,10 @@ pub fn select(expr: &BoundExpr, input: &DataChunk) -> Result<(SelectionVector, u
     }
     if let BoundExprKind::TopNFilter { child, filter } = &expr.kind {
         let Some(passes) = filter.expression() else {
-            return Ok((SelectionVector::from_vec((0..input.len() as u32).collect()), input.len()));
+            return Ok((
+                SelectionVector::from_vec((0..input.len() as u32).collect()),
+                input.len(),
+            ));
         };
         let values = execute(child, input)?;
         return select(&passes, &DataChunk::from_columns(vec![values], input.len()));

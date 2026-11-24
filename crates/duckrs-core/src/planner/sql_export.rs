@@ -774,7 +774,14 @@ impl Exporter<'_> {
                 table_index,
                 extracts,
                 ..
-            } => self.get(table, *table_index, column_ids, filters, projection.as_deref(), extracts)?,
+            } => self.get(
+                table,
+                *table_index,
+                column_ids,
+                filters,
+                projection.as_deref(),
+                extracts,
+            )?,
             Op::Range {
                 start,
                 increment,
@@ -1464,12 +1471,17 @@ impl Exporter<'_> {
             let mut expression = extract.expression.clone();
             expression.walk_mut(&mut |e| {
                 if matches!(e.kind, BoundExprKind::Reference(0)) {
-                    e.kind = BoundExprKind::ColumnRef { binding: base, depth: 0 };
+                    e.kind = BoundExprKind::ColumnRef {
+                        binding: base,
+                        depth: 0,
+                    };
                 }
             });
             let ty = expression.return_type.clone();
             let column = Column::plain(self.expr(&scope, &expression)?);
-            scope.columns.insert(ColumnBinding::new(table_index, position), (column, ty));
+            scope
+                .columns
+                .insert(ColumnBinding::new(table_index, position), (column, ty));
         }
         let positions: Vec<usize> = match projection {
             Some(p) => p.to_vec(),

@@ -8,9 +8,9 @@
 //! ahead of the filters that stay: nothing that can fail, unless it is the only filter.
 
 use super::rewriter::{can_throw, contains_barrier, split_conjuncts};
+use crate::planner::expression::BoundOperator;
 use crate::planner::expression::{BoundExpr, BoundExprKind, ColumnBinding};
 use crate::planner::logical::{LogicalOperator, LogicalOperatorKind as K};
-use crate::planner::expression::BoundOperator;
 use duckrs_common::types::LogicalType;
 use duckrs_common::value::Value;
 use duckrs_parser::ast::ComparisonOp;
@@ -66,10 +66,13 @@ fn prefix_bounds(expr: &BoundExpr) -> Option<[BoundExpr; 2]> {
     if !matches!(function.name.as_str(), "prefix" | "starts_with" | "^@") {
         return None;
     }
-    let [column, BoundExpr {
-        kind: BoundExprKind::Constant(value),
-        ..
-    }] = children.as_slice()
+    let [
+        column,
+        BoundExpr {
+            kind: BoundExprKind::Constant(value),
+            ..
+        },
+    ] = children.as_slice()
     else {
         return None;
     };
@@ -135,7 +138,11 @@ fn dense_range(column: &BoundExpr, values: &[Value]) -> Option<Vec<BoundExpr>> {
         numbers.push((value.as_i128()?, value));
     }
     numbers.sort_by_key(|(n, _)| *n);
-    if numbers.is_empty() || !numbers.windows(2).all(|pair| pair[1].0.checked_sub(pair[0].0) == Some(1)) {
+    if numbers.is_empty()
+        || !numbers
+            .windows(2)
+            .all(|pair| pair[1].0.checked_sub(pair[0].0) == Some(1))
+    {
         return None;
     }
     let min = numbers[0].1.clone();
@@ -179,14 +186,20 @@ fn like_pushdown(expr: &BoundExpr) -> Option<TablePushdown> {
     if function.name != "~~" && !insensitive {
         return None;
     }
-    let [column, BoundExpr {
-        kind: BoundExprKind::Constant(value),
-        ..
-    }] = children.as_slice()
+    let [
+        column,
+        BoundExpr {
+            kind: BoundExprKind::Constant(value),
+            ..
+        },
+    ] = children.as_slice()
     else {
         return None;
     };
-    if !matches!(column.kind, BoundExprKind::ColumnRef { .. }) || value.is_null() || column.return_type.collation().is_some() {
+    if !matches!(column.kind, BoundExprKind::ColumnRef { .. })
+        || value.is_null()
+        || column.return_type.collation().is_some()
+    {
         return None;
     }
     let pattern = value.try_to_string().ok()?;
@@ -206,7 +219,10 @@ fn like_pushdown(expr: &BoundExpr) -> Option<TablePushdown> {
         )
     };
     if end.is_none() && !insensitive {
-        return Some(TablePushdown::Fully(vec![compare(ComparisonOp::Equal, prefix.to_string())]));
+        return Some(TablePushdown::Fully(vec![compare(
+            ComparisonOp::Equal,
+            prefix.to_string(),
+        )]));
     }
     if insensitive {
         if !prefix.is_ascii() {
@@ -242,8 +258,11 @@ fn temporal_cast_margin(source: &LogicalType, target: &LogicalType) -> Option<i6
     const MICROS_PER_HOUR: i64 = 3_600 * MICROS_PER_SEC;
     const MICROS_PER_DAY: i64 = 24 * MICROS_PER_HOUR;
     if source.id() == target.id() {
-        return matches!(source.id(), Date | Timestamp | TimestampTz | TimestampNs | TimestampTzNs | TimestampMs | TimestampSec)
-            .then_some(0);
+        return matches!(
+            source.id(),
+            Date | Timestamp | TimestampTz | TimestampNs | TimestampTzNs | TimestampMs | TimestampSec
+        )
+        .then_some(0);
     }
     Some(match (source.id(), target.id()) {
         (Timestamp | TimestampTz, Timestamp | TimestampTz) => 2 * MICROS_PER_HOUR,
@@ -308,15 +327,35 @@ fn temporal_cast_pushdown(expr: &BoundExpr) -> Option<TablePushdown> {
     let margin = temporal_cast_margin(&child.return_type, &cast.return_type)?;
     let value = crate::execution::parquet::try_cast_value(constant, &child.return_type)?;
     let mut parts = Vec::new();
-    if matches!(op, ComparisonOp::GreaterThan | ComparisonOp::GreaterThanOrEqual | ComparisonOp::Equal) {
-        parts.push(compare(ComparisonOp::GreaterThanOrEqual, child, adjust_temporal(&value, -margin)?));
+    if matches!(
+        op,
+        ComparisonOp::GreaterThan | ComparisonOp::GreaterThanOrEqual | ComparisonOp::Equal
+    ) {
+        parts.push(compare(
+            ComparisonOp::GreaterThanOrEqual,
+            child,
+            adjust_temporal(&value, -margin)?,
+        ));
     }
-    if matches!(op, ComparisonOp::LessThan | ComparisonOp::LessThanOrEqual | ComparisonOp::Equal) {
-        parts.push(compare(ComparisonOp::LessThanOrEqual, child, adjust_temporal(&value, margin)?));
+    if matches!(
+        op,
+        ComparisonOp::LessThan | ComparisonOp::LessThanOrEqual | ComparisonOp::Equal
+    ) {
+        parts.push(compare(
+            ComparisonOp::LessThanOrEqual,
+            child,
+            adjust_temporal(&value, margin)?,
+        ));
     }
     let optional = match parts.len() {
         1 => parts.pop().expect("one"),
-        _ => BoundExpr::new(BoundExprKind::Conjunction { and: true, children: parts }, LogicalType::BOOLEAN),
+        _ => BoundExpr::new(
+            BoundExprKind::Conjunction {
+                and: true,
+                children: parts,
+            },
+            LogicalType::BOOLEAN,
+        ),
     };
     Some(TablePushdown::Optional(optional))
 }
@@ -558,7 +597,10 @@ fn push_into(
                     let mut columns = Vec::new();
                     let mut outer = false;
                     columns_of(filter, &mut columns, &mut outer);
-                    columns.first().copied().filter(|c| !outer && columns.iter().all(|other| other == c))
+                    columns
+                        .first()
+                        .copied()
+                        .filter(|c| !outer && columns.iter().all(|other| other == c))
                 })
                 .collect()
         })
@@ -567,7 +609,9 @@ fn push_into(
         let mut columns = Vec::new();
         let mut outer = false;
         columns_of(conjunct, &mut columns, &mut outer);
-        columns.first().is_some_and(|c| columns.iter().all(|other| other == c) && optionally_pushed.contains(c))
+        columns
+            .first()
+            .is_some_and(|c| columns.iter().all(|other| other == c) && optionally_pushed.contains(c))
     };
     let (barred, conjuncts): (Vec<BoundExpr>, Vec<BoundExpr>) = conjuncts.into_iter().partition(contains_barrier);
     // what went into the scan only as an optional filter, which stays here as well
@@ -695,7 +739,14 @@ impl FileList for crate::execution::csv::CsvScanData {
         self.files.iter().map(|file| file.path.clone()).collect()
     }
     fn known_value(&self, at: usize, path: &str) -> Option<Value> {
-        crate::execution::json_scan::known_value(&self.names, self.filename, &self.hive, &self.virtual_columns, at, path)
+        crate::execution::json_scan::known_value(
+            &self.names,
+            self.filename,
+            &self.hive,
+            &self.virtual_columns,
+            at,
+            path,
+        )
     }
     fn keep_files(&mut self, keep: &[bool], file_filters: &str, total: usize) {
         // the bytes sniffing read are of the first file

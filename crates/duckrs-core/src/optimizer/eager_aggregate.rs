@@ -64,7 +64,11 @@ pub(super) fn try_execute(op: &LogicalOperator) -> Option<LogicalOperator> {
     }
     // skip any projections
     let mut child = &op.children[0];
-    while let K::Projection { table_index, expressions } = &child.kind {
+    while let K::Projection {
+        table_index,
+        expressions,
+    } = &child.kind
+    {
         for want in &mut wanted {
             let (Wanted::Min(column) | Wanted::Max(column)) = want else {
                 continue;
@@ -107,7 +111,9 @@ pub(super) fn try_execute(op: &LogicalOperator) -> Option<LogicalOperator> {
                 (binding.table_index == *table_index)
                     .then(|| column_ids.get(binding.column_index).copied())
                     .flatten()
-                    .filter(|&column| column != COLUMN_IDENTIFIER_ROW_ID && !table.is_generated(&table.columns[column].name))
+                    .filter(|&column| {
+                        column != COLUMN_IDENTIFIER_ROW_ID && !table.is_generated(&table.columns[column].name)
+                    })
             };
             for want in &wanted {
                 if let Wanted::Min(column) | Wanted::Max(column) = want {
@@ -118,8 +124,7 @@ pub(super) fn try_execute(op: &LogicalOperator) -> Option<LogicalOperator> {
         }
         K::ParquetScan { table_index, scan } => {
             // one file: `union_by_name` reads it with its own types
-            if !scan.extracts.is_empty() || scan.files.len() != 1 || !scan.optional_filters.is_empty()
-            {
+            if !scan.extracts.is_empty() || scan.files.len() != 1 || !scan.optional_filters.is_empty() {
                 return None;
             }
             filters.extend(&scan.filters);
@@ -337,7 +342,10 @@ fn table_filter(filter: &BoundExpr, scan_index: usize) -> bool {
     if other || columns.len() != 1 || filter.is_volatile() {
         return false;
     }
-    !matches!(table_pushdown(filter), TablePushdown::Optional(_) | TablePushdown::Partially(_))
+    !matches!(
+        table_pushdown(filter),
+        TablePushdown::Optional(_) | TablePushdown::Partially(_)
+    )
 }
 
 /// Whether C++'s statistics can tell a filter is always true (`NumericStats::CheckZonemap`): a comparison,
@@ -345,7 +353,10 @@ fn table_filter(filter: &BoundExpr, scan_index: usize) -> bool {
 fn decidable(filter: &BoundExpr) -> bool {
     let numeric_column = |e: &BoundExpr| {
         matches!(e.kind, BoundExprKind::Reference(_))
-            && !matches!(e.return_type.id(), LogicalTypeId::Varchar | LogicalTypeId::Blob | LogicalTypeId::Bit)
+            && !matches!(
+                e.return_type.id(),
+                LogicalTypeId::Varchar | LogicalTypeId::Blob | LogicalTypeId::Bit
+            )
             && has_comparator(&e.return_type)
     };
     let constant = |e: &BoundExpr| matches!(e.kind, BoundExprKind::Constant(_));
@@ -354,7 +365,10 @@ fn decidable(filter: &BoundExpr) -> bool {
         match &e.kind {
             BoundExprKind::Function { function, children, .. } => {
                 matches!(function.name.as_str(), "+" | "-" | "*" | "abs")
-                    && !matches!(e.return_type.id(), LogicalTypeId::Varchar | LogicalTypeId::Blob | LogicalTypeId::Bit)
+                    && !matches!(
+                        e.return_type.id(),
+                        LogicalTypeId::Varchar | LogicalTypeId::Blob | LogicalTypeId::Bit
+                    )
                     && has_comparator(&e.return_type)
                     && children
                         .iter()
@@ -411,7 +425,11 @@ fn extreme(partitions: &[&Partition], column: &Column, keep: Ordering) -> Option
             return None;
         }
         let zone = partition.zones.get(column.binding.column_index)?.as_ref()?;
-        let bound = if keep == Ordering::Less { zone.min.as_ref() } else { zone.max.as_ref() }?;
+        let bound = if keep == Ordering::Less {
+            zone.min.as_ref()
+        } else {
+            zone.max.as_ref()
+        }?;
         // string statistics are exact when the string fits in what they keep
         if let ValueData::Bytes(bytes) = bound.data()
             && bytes.len() > zone_map::STRING_STATISTICS_BYTES

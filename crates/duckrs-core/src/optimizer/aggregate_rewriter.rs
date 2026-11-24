@@ -146,8 +146,10 @@ impl Rewriter<'_> {
         }
         let expr = &aggregates[at];
         let child = &expr.children[0];
-        let (Some(sum), Some(count)) = (bind_aggregate("sum", child.clone()), bind_aggregate("count", child.clone()))
-        else {
+        let (Some(sum), Some(count)) = (
+            bind_aggregate("sum", child.clone()),
+            bind_aggregate("count", child.clone()),
+        ) else {
             return false;
         };
         let is_not_null = |input: &BoundExpr| match &input.kind {
@@ -233,7 +235,10 @@ impl Rewriter<'_> {
                 let constant = additional.pop()?;
                 let multiply = bind_scalar(
                     "*",
-                    vec![count.cast_to(aggregate_type, false), constant.cast_to(aggregate_type, false)],
+                    vec![
+                        count.cast_to(aggregate_type, false),
+                        constant.cast_to(aggregate_type, false),
+                    ],
                 )?;
                 bind_scalar("+", vec![aggregate_ref, multiply])
             }
@@ -379,7 +384,9 @@ fn sum_addition(aggregate: &BoundAggregate) -> Option<(BoundExpr, BoundExpr)> {
                 | LogicalTypeId::UBigInt
         )
     };
-    let constant_at = children.iter().position(|c| matches!(c.kind, BoundExprKind::Constant(_)))?;
+    let constant_at = children
+        .iter()
+        .position(|c| matches!(c.kind, BoundExprKind::Constant(_)))?;
     let (constant, main) = (&children[constant_at], &children[1 - constant_at]);
     (small(&constant.return_type) && small(&main.return_type) && !main.is_volatile())
         .then(|| (constant.clone(), main.clone()))
@@ -417,7 +424,10 @@ pub(super) fn aggregate_equals(a: &BoundAggregate, b: &BoundAggregate) -> bool {
         && a.filter.is_none() == b.filter.is_none()
         && a.filter.iter().zip(&b.filter).all(|(x, y)| equals(x, y))
         && a.order_by.len() == b.order_by.len()
-        && a.order_by.iter().zip(&b.order_by).all(|((x, m), (y, n))| m == n && equals(x, y))
+        && a.order_by
+            .iter()
+            .zip(&b.order_by)
+            .all(|((x, m), (y, n))| m == n && equals(x, y))
 }
 
 /// `FilterRejectsNull`: whether rows `filter` keeps have `expr` not NULL.
@@ -510,9 +520,7 @@ pub(super) fn is_not_null(op: &LogicalOperator, expr: &BoundExpr, root: &Logical
                 .is_some_and(|stats| stats.can_be_valid && !stats.can_be_null)
         }
         K::CteRef {
-            table_index,
-            cte_index,
-            ..
+            table_index, cte_index, ..
         } => {
             let Some(binding) = column_binding(expr) else {
                 return false;
@@ -526,7 +534,11 @@ pub(super) fn is_not_null(op: &LogicalOperator, expr: &BoundExpr, root: &Logical
             let Some(source) = definition.column_bindings().get(binding.column_index).copied() else {
                 return false;
             };
-            is_not_null(definition, &BoundExpr::column_ref(source, expr.return_type.clone(), ""), root)
+            is_not_null(
+                definition,
+                &BoundExpr::column_ref(source, expr.return_type.clone(), ""),
+                root,
+            )
         }
         _ => false,
     }

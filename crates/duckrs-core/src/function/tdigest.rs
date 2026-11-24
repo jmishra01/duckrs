@@ -191,7 +191,10 @@ impl Default for TDigest {
     }
 }
 
-#[allow(dead_code, reason = "the whole API of C++'s `TDigest`, of which the quantile functions use a part")]
+#[allow(
+    dead_code,
+    reason = "the whole API of C++'s `TDigest`, of which the quantile functions use a part"
+)]
 impl TDigest {
     /// `TDigest(allocator, compression)` (DuckDB's `approx_quantile` uses compression 100).
     pub fn new(compression: f64) -> Self {

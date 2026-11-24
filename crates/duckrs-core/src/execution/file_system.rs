@@ -357,7 +357,11 @@ thread_local! {
 
 /// Sets the directories of `file_search_path` on this thread, for the statement that starts.
 pub fn set_file_search_path(setting: &str) {
-    let paths = setting.split(',').filter(|p| !p.is_empty()).map(str::to_string).collect();
+    let paths = setting
+        .split(',')
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect();
     FILE_SEARCH_PATH.with(|current| *current.borrow_mut() = paths);
 }
 

@@ -39,7 +39,13 @@ struct Pass {
     next: usize,
     replacements: Replacements,
     /// `cte_definitions`: what each materialized CTE runs, with its table
-    ctes: HashMap<usize, (LogicalOperator, Arc<parking_lot::Mutex<duckrs_common::column_data::ColumnDataCollection>>)>,
+    ctes: HashMap<
+        usize,
+        (
+            LogicalOperator,
+            Arc<parking_lot::Mutex<duckrs_common::column_data::ColumnDataCollection>>,
+        ),
+    >,
 }
 
 /// `TableColumnOrigin`: a column of a table.
@@ -158,8 +164,10 @@ impl Pass {
                 group.return_type.clone(),
                 group.alias.clone(),
             ));
-            self.replacements
-                .insert(ColumnBinding::new(*group_index, i), ColumnBinding::new(projection_index, i));
+            self.replacements.insert(
+                ColumnBinding::new(*group_index, i),
+                ColumnBinding::new(projection_index, i),
+            );
         }
         expressions.push(finalized);
         self.replacements.insert(
@@ -203,10 +211,7 @@ struct Candidate {
 /// `GetCandidate`: one aggregate of a column of one side of an INNER join on one key, grouped by
 /// columns of the other side.
 fn candidate(op: &LogicalOperator) -> Option<Candidate> {
-    let K::Aggregate {
-        groups, aggregates, ..
-    } = &op.kind
-    else {
+    let K::Aggregate { groups, aggregates, .. } = &op.kind else {
         return None;
     };
     let [join] = op.children.as_slice() else {
@@ -537,7 +542,9 @@ impl Reuse<'_> {
             || groups.len() != 1
             || grouping_sets.len() > 1
             || !grouping_functions.is_empty()
-            || grouping_sets.first().is_some_and(|set| set.len() != 1 || !set.contains(&0))
+            || grouping_sets
+                .first()
+                .is_some_and(|set| set.len() != 1 || !set.contains(&0))
         {
             return None;
         }
@@ -589,7 +596,12 @@ impl Reuse<'_> {
 
 /// `FinalizeAggregateConsumers`: the projections and filters above the aggregate `depth` below
 /// `op` read `binding` finalized.
-fn finalize_consumers(op: &mut LogicalOperator, depth: usize, binding: ColumnBinding, state: &LogicalType) -> Option<()> {
+fn finalize_consumers(
+    op: &mut LogicalOperator,
+    depth: usize,
+    binding: ColumnBinding,
+    state: &LogicalType,
+) -> Option<()> {
     if depth == 0 {
         return Some(());
     }
@@ -618,7 +630,12 @@ fn finalize_references(expr: &mut BoundExpr, binding: ColumnBinding, state: &Log
 }
 
 /// `PromoteAggregateBinding`: `binding` of the aggregate `depth` below `op` in the output of `op`.
-fn promote_binding(op: &mut LogicalOperator, depth: usize, binding: ColumnBinding, state: &LogicalType) -> ColumnBinding {
+fn promote_binding(
+    op: &mut LogicalOperator,
+    depth: usize,
+    binding: ColumnBinding,
+    state: &LogicalType,
+) -> ColumnBinding {
     if depth == 0 {
         return binding;
     }

@@ -78,7 +78,11 @@ fn compare_info(left: &ValueInfo, right: &ValueInfo) -> Pruning {
             Op::NotEqual => holds(Op::NotEqual, l, r),
             _ => holds(Op::Equal, l, r),
         };
-        return if prune_right { Pruning::PruneRight } else { Pruning::Unsatisfiable };
+        return if prune_right {
+            Pruning::PruneRight
+        } else {
+            Pruning::Unsatisfiable
+        };
     }
     if right.op == Op::Equal {
         return invert(compare_info(right, left));
@@ -91,7 +95,11 @@ fn compare_info(left: &ValueInfo, right: &ValueInfo) -> Pruning {
             Op::GreaterThanOrEqual => holds(Op::LessThan, l, r),
             _ => holds(Op::Equal, l, r),
         };
-        return if prune_left { Pruning::PruneLeft } else { Pruning::Nothing };
+        return if prune_left {
+            Pruning::PruneLeft
+        } else {
+            Pruning::Nothing
+        };
     }
     if right.op == Op::NotEqual {
         return invert(compare_info(right, left));
@@ -221,8 +229,9 @@ impl FilterCombiner {
         }
         match &expr.kind {
             BoundExprKind::Between { input, lower, upper } if lower.is_foldable() || upper.is_foldable() => {
-                let lower_comparison = comparison(ComparisonOp::GreaterThanOrEqual, (**input).clone(), (**lower).clone())
-                    .with_alias(expr.alias.clone());
+                let lower_comparison =
+                    comparison(ComparisonOp::GreaterThanOrEqual, (**input).clone(), (**lower).clone())
+                        .with_alias(expr.alias.clone());
                 let result = self.add_bound_comparison(&lower_comparison);
                 if result != FilterResult::Success {
                     return result;
@@ -422,13 +431,17 @@ impl FilterCombiner {
         });
         for column in &columns {
             let Some(set) = set_of_column(column) else { continue };
-            let Some((members, _)) = self.sets.get(&set) else { continue };
+            let Some((members, _)) = self.sets.get(&set) else {
+                continue;
+            };
             for &member in members {
                 let other = &self.nodes[member].0;
                 // an expression of the column itself (`c - 0 = c`) would only nest the filter in itself, deeper
                 // each time the filters are combined
                 let mut contains = false;
-                other.clone().walk_mut(&mut |e| contains |= expressions_equal(e, column));
+                other
+                    .clone()
+                    .walk_mut(&mut |e| contains |= expressions_equal(e, column));
                 if contains {
                     continue;
                 }
@@ -446,14 +459,19 @@ impl FilterCombiner {
     /// `GenerateFilters`: the remaining filters, then each set's equalities and bounds.
     pub(super) fn generate(self) -> Vec<BoundExpr> {
         let bound = |info: &ValueInfo, entry: &BoundExpr| {
-            comparison(info.op, entry.clone(), BoundExpr::constant(info.constant.clone())).with_alias(info.alias.clone())
+            comparison(info.op, entry.clone(), BoundExpr::constant(info.constant.clone()))
+                .with_alias(info.alias.clone())
         };
         let mut result = self.remaining.clone();
         for (members, constants) in self.sets.values() {
             for (i, &member) in members.iter().enumerate() {
                 let entry = &self.nodes[member].0;
                 for &other in &members[i + 1..] {
-                    result.push(comparison(ComparisonOp::Equal, entry.clone(), self.nodes[other].0.clone()));
+                    result.push(comparison(
+                        ComparisonOp::Equal,
+                        entry.clone(),
+                        self.nodes[other].0.clone(),
+                    ));
                 }
                 let (mut lower, mut upper) = (None, None);
                 for info in constants {
@@ -472,9 +490,13 @@ impl FilterCombiner {
                 }
                 match (lower, upper) {
                     (Some(lower), Some(upper)) => {
-                        let inclusive = lower.op == ComparisonOp::GreaterThanOrEqual
-                            && upper.op == ComparisonOp::LessThanOrEqual;
-                        let alias = if lower.alias == upper.alias { lower.alias.clone() } else { String::new() };
+                        let inclusive =
+                            lower.op == ComparisonOp::GreaterThanOrEqual && upper.op == ComparisonOp::LessThanOrEqual;
+                        let alias = if lower.alias == upper.alias {
+                            lower.alias.clone()
+                        } else {
+                            String::new()
+                        };
                         if inclusive && lower.constant == upper.constant {
                             result.push(
                                 comparison(

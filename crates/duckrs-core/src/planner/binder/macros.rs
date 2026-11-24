@@ -9,7 +9,7 @@
 
 use super::expression::checked_cast;
 use super::{Binder, binder_error};
-use crate::catalog::MacroCatalogEntry;
+use crate::catalog::{MacroCatalogEntry, MacroDependency};
 use crate::function::binder::expression_return_type;
 use crate::function::cast_rules::implicit_cast;
 use crate::planner::expression::BoundExpr;
@@ -210,6 +210,115 @@ pub(super) fn has_parameter(expr: &Expr) -> bool {
     found
 }
 
+
+/// The schema of the system catalog with a function `name` (`FindSystemFunctionSchema`): a scalar, aggregate,
+/// window or table function, or one of its macros.
+fn system_function(name: &str) -> Option<&'static str> {
+    let functions = crate::function::BuiltinFunctions::get();
+    let lower = name.to_lowercase();
+    if functions.scalar(name).is_some()
+        || functions.aggregate(name).is_some()
+        || super::window::window_function(&lower).is_some()
+        || super::lambda::is_lambda_function(name)
+        || super::statements::CPP_TABLE_FUNCTIONS.contains(&lower.as_str())
+        // the constructors the binder makes itself
+        || matches!(lower.as_str(), "struct_pack" | "row" | "list_value" | "map" | "union_value")
+    {
+        return Some(crate::catalog::DEFAULT_SCHEMA);
+    }
+    [crate::catalog::DEFAULT_SCHEMA, "pg_catalog"].into_iter().find(|schema| {
+        crate::catalog::defaults::default_macro(Some(schema), name, false).is_some()
+            || crate::catalog::defaults::default_macro(Some(schema), name, true).is_some()
+    })
+}
+
+/// `ExpressionBinder::QualifySystemMacroReferences` for one expression: an unqualified call of a function of
+/// the system catalog, or a bare SQL value function, names the system catalog, so no session macro shadows it.
+fn qualify_system_reference(expr: &mut Expr, excluded: &[String]) {
+    let system = |schema: &str, name: &str| QualifiedName {
+        qualification: vec!["system".to_string(), schema.to_string()],
+        name: name.to_string(),
+    };
+    match &mut expr.kind {
+        ExprKind::Function(function)
+            if function.name.qualification.iter().all(String::is_empty)
+                && !function.name.name.eq_ignore_ascii_case("unnest") =>
+        {
+            if let Some(schema) = system_function(&function.name.name) {
+                function.name = system(schema, &function.name.name);
+            }
+        }
+        // `main.f`: the schema of the system catalog, not of the session's database
+        ExprKind::Function(function)
+            if matches!(function.name.qualification.as_slice(), [schema]
+                if schema.eq_ignore_ascii_case(crate::catalog::DEFAULT_SCHEMA) || schema.eq_ignore_ascii_case("pg_catalog"))
+                && system_function(&function.name.name).is_some() =>
+        {
+            function.name.qualification.insert(0, "system".to_string());
+        }
+        ExprKind::Window(window) if window.name.qualification.iter().all(String::is_empty) => {
+            if let Some(schema) = system_function(&window.name.name) {
+                window.name = system(schema, &window.name.name);
+            }
+        }
+        ExprKind::ColumnRef(names)
+            if names.len() == 1 && !excluded.iter().any(|e| e.eq_ignore_ascii_case(&names[0])) =>
+        {
+            if let Some(value_function) = super::expression::sql_value_function(&names[0])
+                && let Some(schema) = system_function(value_function)
+            {
+                let alias = std::mem::take(&mut expr.alias);
+                let mut function = FunctionExpr::new(value_function, Vec::new());
+                function.name = system(schema, value_function);
+                *expr = Expr::from(ExprKind::Function(function));
+                expr.alias = alias;
+            }
+        }
+        _ => {}
+    }
+}
+
+/// [`qualify_system_reference`] for every expression in `expr`, subqueries included.
+pub(super) fn qualify_system_expr(expr: &mut Expr, excluded: &[String]) {
+    visit_expr_mut(expr, &mut |e| {
+        qualify_system_reference(e, excluded);
+        if let ExprKind::Subquery { subquery, .. } = &mut e.kind {
+            qualify_system_query(&mut subquery.node, excluded);
+        }
+    });
+}
+
+/// [`qualify_system_expr`] for a query.
+pub(super) fn qualify_system_query(node: &mut QueryNode, excluded: &[String]) {
+    duckrs_parser::transformer::visit_all_query_node_exprs_mut(node, &mut |e| {
+        qualify_system_reference(e, excluded);
+        if let ExprKind::Subquery { subquery, .. } = &mut e.kind {
+            qualify_system_query(&mut subquery.node, excluded);
+        }
+    });
+}
+
+/// The names a system macro's body keeps as they are: its parameters and the parameters of its lambdas.
+pub(super) fn system_macro_excluded(function: &MacroFunction) -> Vec<String> {
+    let mut excluded = parameter_names(function);
+    let mut collect = |e: &mut Expr| {
+        if let ExprKind::Lambda { lhs, .. } = &e.kind {
+            visit_expr_mut(&mut lhs.clone(), &mut |p| {
+                if let ExprKind::ColumnRef(names) = &p.kind {
+                    excluded.extend(names.iter().cloned());
+                }
+            });
+        }
+    };
+    match &function.body {
+        MacroBody::Scalar(body) => visit_expr_mut(&mut (**body).clone(), &mut collect),
+        MacroBody::Table(body) => {
+            duckrs_parser::transformer::visit_all_query_node_exprs_mut(&mut (**body).clone(), &mut collect)
+        }
+    }
+    excluded
+}
+
 impl Binder<'_> {
     /// The user's macro this name refers to, of the kind wanted if there are both. Macros come
     /// before the built-in functions on the search path, and a qualification that does not name
@@ -229,11 +338,23 @@ impl Binder<'_> {
             return Ok(None);
         }
         let search_first = self.search_schema.as_deref();
-        let wanted = self.catalog.get_macro(schema, search_first, &name.name, table_macro)?;
-        match wanted {
-            Some(entry) => Ok(Some(entry)),
-            None => self.catalog.get_macro(schema, search_first, &name.name, !table_macro),
-        }
+        let found = match self
+            .catalog
+            .get_macro_in(schema, search_first, &name.name, table_macro)?
+        {
+            Some(found) => Some(found),
+            None => self
+                .catalog
+                .get_macro_in(schema, search_first, &name.name, !table_macro)?,
+        };
+        Ok(found.map(|(schema, entry)| {
+            let mut read = self.read_macros.lock().expect("not poisoned");
+            let noted = (schema, entry.name.clone(), entry.table_macro);
+            if !read.contains(&noted) {
+                read.push(noted);
+            }
+            entry
+        }))
     }
 
     /// `MacroFunction::BindMacroFunction`: picks the overload, and returns it with an argument
@@ -255,8 +376,13 @@ impl Binder<'_> {
         let mut named: Vec<(&str, &Expr, LogicalType)> = Vec::new();
         for argument in &call.args {
             let ty = if requires_bind {
-                self.bind_expression(&argument.expr)
-                    .map_or(unknown.clone(), |bound| expression_return_type(&bound))
+                // bound for its type alone: the correlation it notes is the body's to note, if the body uses it
+                let correlated = self.correlated.lock().len();
+                let ty = self
+                    .bind_expression(&argument.expr)
+                    .map_or(unknown.clone(), |bound| expression_return_type(&bound));
+                self.correlated.lock().truncate(correlated);
+                ty
             } else {
                 unknown.clone()
             };
@@ -398,9 +524,15 @@ impl Binder<'_> {
             unreachable!("a scalar macro has a scalar body");
         };
         let mut body = (**body).clone();
+        // a system macro's body is pinned to the system catalog before the caller's arguments go in
+        if entry.internal {
+            qualify_system_expr(&mut body, &system_macro_excluded(function));
+        }
         replace_in_expr(&mut body, &parameter_names(function), &arguments);
         self.macro_depth += 1;
+        self.system_macro_depth += usize::from(entry.internal);
         let bound = self.bind_expression(&body);
+        self.system_macro_depth -= usize::from(entry.internal);
         self.macro_depth -= 1;
         let bound = bound?;
         match &function.return_type {
@@ -430,10 +562,14 @@ impl Binder<'_> {
             unreachable!("a table macro has a query");
         };
         let mut body = (**body).clone();
+        if entry.internal {
+            qualify_system_query(&mut body, &system_macro_excluded(function));
+        }
         replace_in_query(&mut body, &parameter_names(function), &arguments);
         let mut binder = self.child_binder();
         binder.left_of_join = std::mem::take(&mut self.left_of_join);
         binder.bound_macros.push(entry.clone());
+        binder.system_macro_depth += usize::from(entry.internal);
         let bound = binder.bind_select_statement(&SelectStatement { node: body });
         self.left_of_join = std::mem::take(&mut binder.left_of_join);
         self.next_table_index = binder.next_table_index;
@@ -454,7 +590,7 @@ impl Binder<'_> {
         macros: &[MacroFunction],
         table_macro: bool,
         schema: &str,
-    ) -> Result<()> {
+    ) -> Result<Vec<MacroDependency>> {
         let mut signatures: Vec<Vec<Option<LogicalType>>> = Vec::with_capacity(macros.len());
         for function in macros {
             let mut signature = Vec::with_capacity(function.parameters.len());
@@ -494,6 +630,8 @@ impl Binder<'_> {
                 .collect();
             let mut binder = Binder::with_options(self.catalog, self.options.clone());
             binder.search_schema = Some(schema.to_string());
+            binder.read_entries = self.read_entries.clone();
+            binder.read_macros = self.read_macros.clone();
             // a body that reads a setting reads that of the session (`current_setting`)
             binder.session = self.session.clone();
             let parameters = parameter_names(function);
@@ -576,7 +714,23 @@ impl Binder<'_> {
                 }
             }
         }
-        Ok(())
+        // `BindCreateFunctionInfo`'s catalog lookup callback: the entries the bodies read
+        let mut dependencies: Vec<MacroDependency> = Vec::new();
+        for (schema, name) in self.read_entries.lock().expect("not poisoned").iter() {
+            dependencies.push(MacroDependency {
+                schema: schema.clone(),
+                name: name.clone(),
+                table_macro: None,
+            });
+        }
+        for (schema, name, table_macro) in self.read_macros.lock().expect("not poisoned").iter() {
+            dependencies.push(MacroDependency {
+                schema: schema.clone(),
+                name: name.clone(),
+                table_macro: Some(*table_macro),
+            });
+        }
+        Ok(dependencies)
     }
 
     /// A default value has to be a constant the parameter's type accepts.

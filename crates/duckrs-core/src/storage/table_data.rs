@@ -3,7 +3,6 @@
 //!
 //! Turns the row groups of a table in a file into chunks.
 
-use std::collections::HashMap;
 use super::block_manager::{corrupt, corrupted};
 use super::buffer_manager::BufferManager;
 use super::checkpoint::StoredTable;
@@ -20,6 +19,7 @@ use duckrs_common::vector::{DataChunk, SelectionVector, Vector};
 use duckrs_common::{Error, Result};
 use duckrs_parser::ast::ComparisonOp;
 use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1044,7 +1044,6 @@ impl DiskTable {
         }
         Ok(result)
     }
-
 }
 
 /// A bound of a column of type `ty`, from the bytes the file has of it.
@@ -1053,7 +1052,10 @@ fn bound(ty: &LogicalType, bytes: Option<&[u8; 16]>) -> Result<Option<Value>> {
     // UUIDs and ENUMs keep the statistics of the integers they are stored as; INTERVAL bounds are of the
     // normalized intervals, as `interval_t` orders them
     let ordered = has_ordered_statistics(ty)
-        || matches!(ty.id(), LogicalTypeId::Uuid | LogicalTypeId::Enum | LogicalTypeId::Interval);
+        || matches!(
+            ty.id(),
+            LogicalTypeId::Uuid | LogicalTypeId::Enum | LogicalTypeId::Interval
+        );
     let (Some(bytes), Some(width)) = (bytes, width.filter(|_| ordered)) else {
         return Ok(None);
     };
@@ -1288,11 +1290,16 @@ impl TableSource for DiskTable {
             for pointer in &stored.pointers {
                 let rows = pointer.tuple_count;
                 let has_null = stored.validity.is_none()
-                    || validity.iter().any(|&(s, n, null)| null && s < start + rows && start < s + n);
+                    || validity
+                        .iter()
+                        .any(|&(s, n, null)| null && s < start + rows && start < s + n);
                 let (min, max) = if varchar {
                     string_bounds(pointer.statistics.strings.as_ref())
                 } else {
-                    (bound(&ty, pointer.statistics.min.as_ref())?, bound(&ty, pointer.statistics.max.as_ref())?)
+                    (
+                        bound(&ty, pointer.statistics.min.as_ref())?,
+                        bound(&ty, pointer.statistics.max.as_ref())?,
+                    )
                 };
                 let zone = ColumnZone {
                     unknown: min.is_none() && pointer.statistics.has_no_null,
@@ -1503,14 +1510,19 @@ impl TableSource for DiskTable {
     }
     fn variant_group_shredded(&self, group: usize, column: usize) -> bool {
         self.table.columns[column].ty.id() == LogicalTypeId::Variant
-            && self.persistent_column(group, column).is_ok_and(|stored| stored.shredded_type.is_some())
+            && self
+                .persistent_column(group, column)
+                .is_ok_and(|stored| stored.shredded_type.is_some())
     }
     fn all_variant_shredding(&self, columns: &[usize]) -> HashMap<(u64, usize, usize), Option<LogicalType>> {
         let mut result = HashMap::new();
         for (index, group) in self.table.row_groups.iter().enumerate() {
             for &column in columns {
                 if let Ok(stored) = self.persistent_column(index, column) {
-                    result.insert((group.row_start, group.tuple_count as usize, column), stored.shredded_type.clone());
+                    result.insert(
+                        (group.row_start, group.tuple_count as usize, column),
+                        stored.shredded_type.clone(),
+                    );
                 }
             }
         }

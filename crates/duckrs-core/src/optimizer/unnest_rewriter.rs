@@ -40,9 +40,7 @@ fn has_subquery(op: &LogicalOperator) -> bool {
     for expr in op.expressions_mut() {
         expr.walk_mut(&mut |e| found |= matches!(e.kind, BoundExprKind::Subquery { .. }));
     }
-    found
-        || matches!(op.kind, K::RecursiveCte { .. })
-        || op.children.iter().any(has_subquery)
+    found || matches!(op.kind, K::RecursiveCte { .. }) || op.children.iter().any(has_subquery)
 }
 
 fn visit(op: &mut LogicalOperator, next: &mut usize, replacements: &mut HashMap<ColumnBinding, ColumnBinding>) {
@@ -119,7 +117,13 @@ fn try_rewrite(
     else {
         return None;
     };
-    if !matches!(unnest.children.as_slice(), [LogicalOperator { kind: K::DummyScan { .. }, .. }]) {
+    if !matches!(
+        unnest.children.as_slice(),
+        [LogicalOperator {
+            kind: K::DummyScan { .. },
+            ..
+        }]
+    ) {
         return None;
     }
     // the columns of the dummy scan stand for nothing on the left side

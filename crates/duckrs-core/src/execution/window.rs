@@ -158,8 +158,15 @@ pub fn plan(
     }
     let expressions = (0..types.len())
         .map(|column| {
-            let source = if column < input_width { column } else { position[column - input_width] };
-            BoundExpr::new(crate::planner::expression::BoundExprKind::Reference(source), types[column].clone())
+            let source = if column < input_width {
+                column
+            } else {
+                position[column - input_width]
+            };
+            BoundExpr::new(
+                crate::planner::expression::BoundExprKind::Reference(source),
+                types[column].clone(),
+            )
         })
         .collect();
     Box::new(super::physical::PhysicalProjection {
@@ -862,8 +869,10 @@ impl<'a> Evaluation<'a> {
         }
         // `FillValueFunction`: a value counts if it is there and finite
         let finite = |v: &Value| number(v).filter(|n| n.is_finite());
-        let points: Vec<(usize, Option<f64>, Option<f64>)> =
-            rows.iter().map(|p| (*p, finite(&along[*p]), finite(&values[*p]))).collect();
+        let points: Vec<(usize, Option<f64>, Option<f64>)> = rows
+            .iter()
+            .map(|p| (*p, finite(&along[*p]), finite(&values[*p])))
+            .collect();
         let start = result.len();
         result.extend(values[begin..end].iter().cloned());
         // the neighbours with values, up to an order value that does not count
@@ -929,7 +938,11 @@ impl<'a> Evaluation<'a> {
                 };
                 Value::new(window.return_type.clone(), ValueData::Int128(interpolated))?
             } else if integral && (0.0..=1.0).contains(&along_line) {
-                let ((low, low_at), (high, high_at)) = if y0 <= y1 { ((y0, p0), (y1, p1)) } else { ((y1, p1), (y0, p0)) };
+                let ((low, low_at), (high, high_at)) = if y0 <= y1 {
+                    ((y0, p0), (y1, p1))
+                } else {
+                    ((y1, p1), (y0, p0))
+                };
                 if filled <= low {
                     values[low_at].clone()
                 } else if filled >= high {

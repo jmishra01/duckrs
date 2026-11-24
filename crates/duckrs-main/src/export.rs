@@ -249,7 +249,9 @@ fn schema_statements(
         }
         for table_macro in [false, true] {
             for entry in schema.macro_entries(table_macro) {
-                macros.push(
+                macros.push((
+                    schema.ident(),
+                    entry.clone(),
                     CreateInfo {
                         name: qualified(schema, &entry.name),
                         on_conflict: OnCreateConflict::Error,
@@ -260,7 +262,7 @@ fn schema_statements(
                         },
                     }
                     .to_string(),
-                );
+                ));
             }
         }
         for entry in schema.tables_and_views() {
@@ -275,14 +277,32 @@ fn schema_statements(
             }
         }
     }
-    // `DependencyManager::ReorderEntries`: a table's defaults and generated columns can call macros
+    // `PhysicalExport::ExtractEntries`: tables, then macros; `DependencyManager::ReorderEntries` puts a macro that
+    // a table's defaults or generated columns call before the tables
+    let mut table_sql = Vec::with_capacity(tables.len());
+    for (schema, table) in tables {
+        table_sql.push(duckrs_core::storage::table_create_sql(schema, table)?);
+    }
+    let called_by_tables = |entry: &duckrs_core::catalog::MacroCatalogEntry| {
+        let name = entry.name.to_lowercase();
+        let quoted = format!("\"{name}\"(");
+        let bare = format!("{name}(");
+        !entry.table_macro
+            && table_sql.iter().any(|sql| {
+                let sql = sql.to_lowercase();
+                sql.contains(&quoted)
+                    || sql.match_indices(&bare).any(|(at, _)| {
+                        at == 0 || !sql[..at].ends_with(|c: char| c.is_alphanumeric() || c == '_')
+                    })
+            })
+    };
+    let (early, late): (Vec<_>, Vec<_>) = macros.into_iter().partition(|(_, entry, _)| called_by_tables(entry));
     let mut statements = schema_sql;
     statements.extend(sequences);
     statements.extend(types);
-    statements.extend(macros);
-    for (schema, table) in tables {
-        statements.push(duckrs_core::storage::table_create_sql(schema, table)?);
-    }
+    statements.extend(order_macros(early));
+    statements.extend(table_sql);
+    statements.extend(order_macros(late));
     statements.extend(views);
     statements.extend(indexes);
     Ok(statements)
@@ -687,4 +707,28 @@ fn load_statements(
         out += &line;
     }
     out
+}
+
+/// `DependencyManager::ReorderEntries` for macros: one that calls another comes after it.
+fn order_macros(mut pending: Vec<(String, Arc<duckrs_core::catalog::MacroCatalogEntry>, String)>) -> Vec<String> {
+    let mut ordered = Vec::with_capacity(pending.len());
+    while !pending.is_empty() {
+        let waits = |entry: &duckrs_core::catalog::MacroCatalogEntry,
+                     pending: &[(String, Arc<duckrs_core::catalog::MacroCatalogEntry>, String)]| {
+            entry.dependencies.iter().any(|d| {
+                d.table_macro.is_some_and(|kind| {
+                    pending.iter().any(|(schema, other, _)| {
+                        !std::ptr::eq(&**other, entry)
+                            && other.table_macro == kind
+                            && schema.eq_ignore_ascii_case(&d.schema)
+                            && other.name.eq_ignore_ascii_case(&d.name)
+                    })
+                })
+            })
+        };
+        // a cycle can't be ordered: what is left goes in the order it was found
+        let at = (0..pending.len()).find(|&i| !waits(&pending[i].1, &pending)).unwrap_or(0);
+        ordered.push(pending.remove(at).2);
+    }
+    ordered
 }

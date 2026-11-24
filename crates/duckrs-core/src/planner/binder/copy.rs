@@ -159,17 +159,63 @@ pub(super) fn strings(value: &Value) -> Result<Vec<String>> {
 /// and the `force_match` of `sniff_csv`: an option outside them is not one of the function's.
 fn is_csv_named_parameter(function: &str, option: &str) -> bool {
     const CSV: &[&str] = &[
-        "sep", "delim", "separator", "delimiter", "null", "date_format", "timestamp_format", "quote", "new_line",
-        "escape", "nullstr", "columns", "auto_type_candidates", "header", "auto_detect", "sample_size",
-        "all_varchar", "dateformat", "timestampformat", "normalize_names", "compression", "skip", "max_line_size",
-        "maximum_line_size", "ignore_errors", "store_rejects", "rejects_table", "rejects_scan", "rejects_limit",
-        "rejects_line_size_limit", "force_not_null", "buffer_size", "decimal_separator", "parallel",
-        "null_padding", "allow_quoted_nulls", "column_types", "dtypes", "types", "names", "column_names",
-        "comment", "encoding", "strict_mode", "thousands", "files_to_sniff",
+        "sep",
+        "delim",
+        "separator",
+        "delimiter",
+        "null",
+        "date_format",
+        "timestamp_format",
+        "quote",
+        "new_line",
+        "escape",
+        "nullstr",
+        "columns",
+        "auto_type_candidates",
+        "header",
+        "auto_detect",
+        "sample_size",
+        "all_varchar",
+        "dateformat",
+        "timestampformat",
+        "normalize_names",
+        "compression",
+        "skip",
+        "max_line_size",
+        "maximum_line_size",
+        "ignore_errors",
+        "store_rejects",
+        "rejects_table",
+        "rejects_scan",
+        "rejects_limit",
+        "rejects_line_size_limit",
+        "force_not_null",
+        "buffer_size",
+        "decimal_separator",
+        "parallel",
+        "null_padding",
+        "allow_quoted_nulls",
+        "column_types",
+        "dtypes",
+        "types",
+        "names",
+        "column_names",
+        "comment",
+        "encoding",
+        "strict_mode",
+        "thousands",
+        "files_to_sniff",
     ];
     const MULTI_FILE: &[&str] = &[
-        "filename", "hive_partitioning", "union_by_name", "hive_types", "hive_types_autocast", "schema",
-        "file_row_number", "column_statistics", "allow_empty",
+        "filename",
+        "hive_partitioning",
+        "union_by_name",
+        "hive_types",
+        "hive_types_autocast",
+        "schema",
+        "file_row_number",
+        "column_statistics",
+        "allow_empty",
     ];
     CSV.contains(&option) || MULTI_FILE.contains(&option) || (function == "sniff_csv" && option == "force_match")
 }
@@ -838,7 +884,10 @@ impl Binder<'_> {
         }
         // `MultiFileReader::CreateFileList`: an empty list names no file
         if result.files.is_empty() && !result.allow_empty {
-            return Err(Error::new(ErrorKind::Io, format!("{name} needs at least one file to read")));
+            return Err(Error::new(
+                ErrorKind::Io,
+                format!("{name} needs at least one file to read"),
+            ));
         }
         result.options.auto_detect = result.auto_detect.unwrap_or(true);
         Ok(result)
@@ -959,7 +1008,9 @@ impl Binder<'_> {
         let name = call.name.name.to_lowercase();
         let mut arguments = self.csv_arguments(&name, call)?;
         match arguments.schema.take() {
-            Some(schema) if !arguments.files.is_empty() => self.bind_csv_with_schema(&name, arguments, &schema, table_ref),
+            Some(schema) if !arguments.files.is_empty() => {
+                self.bind_csv_with_schema(&name, arguments, &schema, table_ref)
+            }
             _ => self.bind_csv_arguments(&name, arguments, table_ref),
         }
     }

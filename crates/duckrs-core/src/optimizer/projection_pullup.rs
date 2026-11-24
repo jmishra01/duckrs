@@ -106,7 +106,9 @@ pub(super) fn child_layout_free(op: &LogicalOperator, at: usize, free: bool) -> 
         | K::MarkJoin { .. }
         | K::AsOfJoin { .. } => free,
         K::Join { join_type, .. } => match (join_type, at) {
-            (JoinType::Semi | JoinType::Anti | JoinType::Mark, 1) | (JoinType::RightSemi | JoinType::RightAnti, 0) => true,
+            (JoinType::Semi | JoinType::Anti | JoinType::Mark, 1) | (JoinType::RightSemi | JoinType::RightAnti, 0) => {
+                true
+            }
             _ => free,
         },
         K::MaterializedCte { .. } => at == 1 && free,
@@ -117,13 +119,7 @@ pub(super) fn child_layout_free(op: &LogicalOperator, at: usize, free: bool) -> 
 /// Finds the first projection that can move, depth first. `chain` holds the paths of the
 /// operators directly above `op` that a projection can be pulled through, nearest last; with
 /// `free`, the columns of `op` may change their order and number.
-fn find(
-    root: &LogicalOperator,
-    op: &LogicalOperator,
-    path: &mut Path,
-    chain: &[Path],
-    free: bool,
-) -> Option<Step> {
+fn find(root: &LogicalOperator, op: &LogicalOperator, path: &mut Path, chain: &[Path], free: bool) -> Option<Step> {
     if free && let Some(step) = consider(root, op, path, chain) {
         return Some(step);
     }
@@ -137,7 +133,13 @@ fn find(
             Vec::new()
         };
         path.push(at);
-        let step = find(root, &op.children[at], path, &child_chain, child_layout_free(op, at, free));
+        let step = find(
+            root,
+            &op.children[at],
+            path,
+            &child_chain,
+            child_layout_free(op, at, free),
+        );
         path.pop();
         if step.is_some() {
             return step;

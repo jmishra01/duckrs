@@ -9,12 +9,12 @@
 //! as rows are appended, and samples a chunk only when it is a full vector.
 
 use crate::catalog::TableCatalogEntry;
+use duckrs_common::STANDARD_VECTOR_SIZE;
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::hash::hash_vector;
 use duckrs_common::serializer::BinarySerializer;
 use duckrs_common::types::{LogicalType, PhysicalType};
 use duckrs_common::vector::Vector;
-use duckrs_common::STANDARD_VECTOR_SIZE;
 use std::sync::OnceLock;
 
 /// `pcg32` (`setseq_xsh_rr_64_32`) with its default stream.
@@ -162,7 +162,11 @@ const INTEGRAL_SAMPLE_RATE: f64 = 0.3;
 const BASE_SAMPLE_RATE: f64 = 0.1;
 
 fn sample_size(integral: bool) -> usize {
-    let rate = if integral { INTEGRAL_SAMPLE_RATE } else { BASE_SAMPLE_RATE };
+    let rate = if integral {
+        INTEGRAL_SAMPLE_RATE
+    } else {
+        BASE_SAMPLE_RATE
+    };
     ((rate * STANDARD_VECTOR_SIZE as f64) as usize).max(1)
 }
 

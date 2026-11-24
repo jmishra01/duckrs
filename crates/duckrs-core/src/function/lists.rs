@@ -400,9 +400,9 @@ fn list_aggr(args: &DataChunk, result: &mut Vector) -> Result<()> {
         // `BindMinMax`: a collated string compares by its collated key (`arg_min`/`arg_max`)
         if matches!(set.name.as_str(), "min" | "max")
             && row.len() == 2
-            && let Some(declared) = declared.as_ref().filter(|d| {
-                d.id() == LogicalTypeId::Varchar && d.collation().is_some()
-            })
+            && let Some(declared) = declared
+                .as_ref()
+                .filter(|d| d.id() == LogicalTypeId::Varchar && d.collation().is_some())
         {
             return collated_extreme(values, declared, set.name == "max", &ty);
         }
@@ -523,8 +523,14 @@ fn bind_list_aggr(name: &str, aggregate: Option<&str>, children: Vec<BoundExpr>)
     let return_type = bind_aggregate_function(set, probe, None, false)
         .map_err(|error| {
             if error.message.starts_with("No function matches") {
-                Error::new(ErrorKind::Binder, format!("No matching aggregate function
-{}", error.message))
+                Error::new(
+                    ErrorKind::Binder,
+                    format!(
+                        "No matching aggregate function
+{}",
+                        error.message
+                    ),
+                )
             } else {
                 error
             }
@@ -561,8 +567,7 @@ fn bind_search(
     };
     // a VARCHAR next to a type that is not a string deduces no `T`
     let varchar = |t: &LogicalType| t.id() == LogicalTypeId::Varchar;
-    if (varchar(&element) || varchar(&needle_type))
-        && super::nested::deduce_template(&element, &needle_type).is_none()
+    if (varchar(&element) || varchar(&needle_type)) && super::nested::deduce_template(&element, &needle_type).is_none()
     {
         let error = no_match(name, &[list.clone(), needle.clone()]);
         return Err(Error::new(

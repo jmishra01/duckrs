@@ -203,7 +203,10 @@ fn visit(op: &mut LogicalOperator, by_position: bool, used: &mut HashSet<ColumnB
                         continue;
                     }
                     if kept.len() != index {
-                        renumbering.insert(ColumnBinding::new(table_index, index), ColumnBinding::new(table_index, kept.len()));
+                        renumbering.insert(
+                            ColumnBinding::new(table_index, index),
+                            ColumnBinding::new(table_index, kept.len()),
+                        );
                     }
                     kept.push(window);
                 }
@@ -400,7 +403,11 @@ fn window_is_volatile(window: &BoundWindow) -> bool {
 
 /// An aggregate that changes state as it runs.
 fn aggregate_is_volatile(aggregate: &BoundAggregate) -> bool {
-    aggregate.children.iter().chain(aggregate.filter.iter()).any(BoundExpr::is_volatile)
+    aggregate
+        .children
+        .iter()
+        .chain(aggregate.filter.iter())
+        .any(BoundExpr::is_volatile)
         || aggregate.order_by.iter().any(|(e, _)| e.is_volatile())
 }
 
@@ -434,7 +441,9 @@ fn volatile_or_nested(op: &LogicalOperator) -> bool {
 
 /// The table indexes of the reads of the working (or recurring) table `tables` below `op`.
 fn working_reads(op: &LogicalOperator, tables: &[usize], found: &mut Vec<usize>) {
-    if let K::WorkingTable { table_index, working, .. } = &op.kind
+    if let K::WorkingTable {
+        table_index, working, ..
+    } = &op.kind
         && tables.contains(&(std::sync::Arc::as_ptr(working) as *const () as usize))
     {
         found.push(*table_index);
@@ -480,8 +489,9 @@ fn prune_recursive_cte(op: &mut LogicalOperator, used: &mut HashSet<ColumnBindin
     if outputs.len() != width {
         return;
     }
-    let mut required: std::collections::BTreeSet<usize> =
-        (0..width).filter(|&i| used.contains(&ColumnBinding::new(cte_index, i))).collect();
+    let mut required: std::collections::BTreeSet<usize> = (0..width)
+        .filter(|&i| used.contains(&ColumnBinding::new(cte_index, i)))
+        .collect();
     if required.is_empty() {
         required.insert(0);
     }
@@ -519,9 +529,9 @@ fn prune_recursive_cte(op: &mut LogicalOperator, used: &mut HashSet<ColumnBindin
     let new_types: Vec<_> = kept.iter().map(|&i| types[i].clone()).collect();
     let fresh = |old: &std::sync::Arc<parking_lot::Mutex<duckrs_common::column_data::ColumnDataCollection>>| {
         let _ = old;
-        std::sync::Arc::new(parking_lot::Mutex::new(duckrs_common::column_data::ColumnDataCollection::new(
-            new_types.clone(),
-        )))
+        std::sync::Arc::new(parking_lot::Mutex::new(
+            duckrs_common::column_data::ColumnDataCollection::new(new_types.clone()),
+        ))
     };
     let (new_working, new_recurring) = (fresh(working), fresh(recurring));
     // `ApplyRecursiveProjections`: each side gives the columns kept, in order
@@ -573,7 +583,15 @@ fn prune_recursive_cte(op: &mut LogicalOperator, used: &mut HashSet<ColumnBindin
             }
         });
     }
-    rewrite_reads(&mut plan, &tables, &reads, &position, &new_types, &new_working, &new_recurring);
+    rewrite_reads(
+        &mut plan,
+        &tables,
+        &reads,
+        &position,
+        &new_types,
+        &new_working,
+        &new_recurring,
+    );
     // what the recursive part computes for the columns that went is not computed
     visit(&mut plan, true, &mut HashSet::new());
     let mut resolved = plan.clone();

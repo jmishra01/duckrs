@@ -14,7 +14,7 @@ use duckrs_common::value::Value;
 use duckrs_common::{ErrorKind, Result};
 use duckrs_parser::ast::{Expr, ExprKind, FunctionExpr, LambdaSyntax};
 
-const DEPRECATED_ARROW: &str = "Deprecated lambda arrow (->) detected. Please transition to the new lambda syntax, \
+pub(super) const DEPRECATED_ARROW: &str = "Deprecated lambda arrow (->) detected. Please transition to the new lambda syntax, \
                                 i.e.., lambda x, i: x + i, before DuckDB's next release.\nUse SET \
                                 lambda_syntax='ENABLE_SINGLE_ARROW' to revert to the deprecated behavior.\nFor more \
                                 information, see https://duckdb.org/docs/current/sql/functions/lambda.html.";

@@ -48,18 +48,39 @@ pub(super) fn parse_select(sql: &str, message: &str) -> Result<SelectStatement> 
 }
 
 /// `TableReference` of `query_function.cpp`, without the file paths, which come with Phase 11.
-fn table_reference(name: &str) -> String {
-    if name.contains(['"', '.']) {
-        name.to_string()
-    } else {
-        sql_identifier(name)
+fn table_reference(name: &str) -> Result<String> {
+    // `IsFilePath`: a path separator outside of quotes makes it a file, read as `FROM 'file'`
+    let mut quoted = false;
+    let mut path = false;
+    for c in name.chars() {
+        match c {
+            '"' => quoted = !quoted,
+            '/' | '\\' if !quoted => path = true,
+            _ => {}
+        }
     }
+    if path {
+        return Ok(format!("'{}'", name.replace('\'', "''")));
+    }
+    // `QualifiedName::TryParse`
+    let parts = crate::catalog::parse_qualified_name(name)?;
+    if parts.is_empty() || parts.iter().any(String::is_empty) {
+        return Err(Error::new(
+            ErrorKind::Parser,
+            format!("Zero-length identifier in qualified name! (input: {name})"),
+        ));
+    }
+    Ok(parts
+        .iter()
+        .map(|part| sql_identifier(part))
+        .collect::<Vec<_>>()
+        .join("."))
 }
 
 /// `UnionTablesQuery`: `FROM` the tables that `tables` names, one after the other.
 fn union_tables_query(tables: &Value, by_name: bool) -> Result<String> {
     if tables.logical_type().id() == LogicalTypeId::Varchar {
-        return Ok(format!("FROM {}", table_reference(&tables.try_to_string()?)));
+        return Ok(format!("FROM {}", table_reference(&tables.try_to_string()?)?));
     }
     let ValueData::List(items) = tables.data() else {
         return Err(Error::new(
@@ -75,7 +96,7 @@ fn union_tables_query(tables: &Value, by_name: bool) -> Result<String> {
         if item.is_null() {
             return Err(binder_error("Cannot use NULL as function argument"));
         }
-        froms.push(format!("FROM {}", table_reference(&item.try_to_string()?)));
+        froms.push(format!("FROM {}", table_reference(&item.try_to_string()?)?));
     }
     let separator = if by_name { " UNION ALL BY NAME " } else { " UNION ALL " };
     Ok(froms.join(separator))
@@ -92,13 +113,17 @@ impl Binder<'_> {
         if subquery {
             return Err(binder_error("Table function cannot contain subqueries"));
         }
-        // a parameter of a table macro being created: its value is known when the macro is used
+        // a parameter of a macro being created: its value is known when the macro is used
         let mut macro_parameter = false;
         duckrs_parser::transformer::visit_expr_mut(&mut expr.clone(), &mut |e: &mut Expr| {
-            macro_parameter |= matches!(
-                &e.kind,
-                duckrs_parser::ast::ExprKind::Constant(literal) if literal.text == super::macros::CREATE_PARAMETER_MARK
-            );
+            // in a scalar macro's body it is a column under the mark
+            macro_parameter |= match &e.kind {
+                duckrs_parser::ast::ExprKind::Constant(literal) => literal.text == super::macros::CREATE_PARAMETER_MARK,
+                duckrs_parser::ast::ExprKind::ColumnRef(names) => {
+                    names.len() == 2 && names[0] == super::macros::CREATE_PARAMETER_MARK
+                }
+                _ => false,
+            };
         });
         if macro_parameter {
             return Err(Error::new(
@@ -165,9 +190,7 @@ impl Binder<'_> {
         let sql = match name.as_str() {
             "unnest" => {
                 // `UnnestBind`: a NULL is no list (its type is not one)
-                let null = |e: &Expr| {
-                    matches!(&e.kind, duckrs_parser::ast::ExprKind::Constant(literal) if literal.kind == duckrs_parser::ast::LiteralKind::Null)
-                };
+                let null = |e: &Expr| matches!(&e.kind, duckrs_parser::ast::ExprKind::Constant(literal) if literal.kind == duckrs_parser::ast::LiteralKind::Null);
                 if call.args.len() != 1 || null(&call.args[0].expr) {
                     return Err(binder_error("UNNEST requires a single list or array as input"));
                 }
@@ -208,9 +231,11 @@ impl Binder<'_> {
                     return Err(binder_error("duckdb_logs_parsed takes a log type"));
                 };
                 let t = &log_type.expr;
+                // the body calls what the system catalog has, whatever macro shadows it
                 format!(
-                    "SELECT * EXCLUDE (message), UNNEST(CASE WHEN type ILIKE {t} THEN parse_duckdb_log_message({t}, \
-                     message) END) FROM duckdb_logs(denormalized_table=1) WHERE type ILIKE {t}"
+                    "SELECT * EXCLUDE (message), UNNEST(CASE WHEN system.main.\"~~*\"(type, {t}) THEN \
+                     parse_duckdb_log_message({t}, message) END) FROM duckdb_logs(denormalized_table=1) \
+                     WHERE system.main.\"~~*\"(type, {t})"
                 )
             }
             "repeat" => {
@@ -290,19 +315,71 @@ impl Binder<'_> {
                 let mut statements = duckrs_parser::parse_ast_with(&query.try_to_string()?, &self.options.parser)?;
                 let select = match (statements.pop(), statements.is_empty()) {
                     (Some(Statement::Select(select)), true) => select,
+                    // `ParseSubquery`: a PIVOT that finds its values first is more than one statement
+                    (Some(Statement::Multi(_)), true) => {
+                        return Err(Error::new(
+                            ErrorKind::Parser,
+                            "PIVOT statements without explicit IN clauses are not supported in query() function. \
+                             Please specify the pivot values explicitly, e.g.: PIVOT ... ON col IN (val1, val2, ...)",
+                        ));
+                    }
                     _ => return Err(Error::new(ErrorKind::Parser, "Expected a single SELECT statement")),
                 };
+                // `ParseSubquery`: a parameter only inside the string never gets a value when prepared
+                if let Some(parameters) = self.parameters.as_ref().filter(|p| p.values.is_none()) {
+                    {
+                        let mut inner = Vec::new();
+                        let mut node = select.node.clone();
+                        duckrs_parser::transformer::visit_all_query_node_exprs_mut(&mut node, &mut |e: &mut Expr| {
+                            if let duckrs_parser::ast::ExprKind::Parameter(identifier) = &e.kind {
+                                inner.push(identifier.to_lowercase());
+                            }
+                        });
+                        if let Some(missing) = inner.iter().find(|name| !parameters.declared.contains(name)) {
+                            return Err(binder_error(format!(
+                                "Prepared statement parameter \"${missing}\" only appears inside query(): declare it \
+                                 in the outer statement as well, or use getvariable() to read a variable"
+                            )));
+                        }
+                    }
+                }
                 return self.bind_rewritten(&select, table_ref, &name).map(Some);
             }
             "query_table" => {
-                let (tables, by_name) = match args.as_slice() {
-                    [tables] => (self.constant_argument(&tables.expr)?, Value::boolean(false)),
-                    [tables, by_name] => (
-                        self.constant_argument(&tables.expr)?,
-                        self.constant_argument(&by_name.expr)?,
-                    ),
-                    _ => return Err(binder_error("query_table requires a table or a list of tables")),
+                let mut values = Vec::with_capacity(args.len());
+                for argument in &args {
+                    values.push(self.constant_argument(&argument.expr)?);
+                }
+                // the overloads take VARCHAR or VARCHAR[], and then a BOOLEAN
+                let fits =
+                    |value: &Value, ids: &[LogicalTypeId]| value.is_null() || ids.contains(&value.logical_type().id());
+                let matches = match values.as_slice() {
+                    [tables] => fits(tables, &[LogicalTypeId::Varchar, LogicalTypeId::List]),
+                    [tables, by_name] => {
+                        fits(tables, &[LogicalTypeId::Varchar, LogicalTypeId::List])
+                            && fits(by_name, &[LogicalTypeId::Boolean])
+                    }
+                    _ => false,
                 };
+                if !matches {
+                    let types: Vec<String> = values
+                        .iter()
+                        .map(|value| {
+                            if value.logical_type().id() == LogicalTypeId::Varchar {
+                                "STRING_LITERAL".to_string()
+                            } else {
+                                value.logical_type().to_string()
+                            }
+                        })
+                        .collect();
+                    return Err(binder_error(format!(
+                        "No function matches the given name and argument types 'query_table({})'.",
+                        types.join(", ")
+                    )));
+                }
+                let mut values = values.into_iter();
+                let tables = values.next().expect("checked above");
+                let by_name = values.next().unwrap_or_else(|| Value::boolean(false));
                 if tables.is_null() || by_name.is_null() {
                     return Err(binder_error("Cannot use NULL as function argument"));
                 }

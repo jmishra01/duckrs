@@ -1329,7 +1329,10 @@ fn is_inner_join(op: &LogicalOperator) -> bool {
 
 /// The filters of a scan with its own table index made 0, to compare them with another's.
 fn filters_text(op: &LogicalOperator) -> String {
-    let K::Get { table_index, filters, .. } = &op.kind else {
+    let K::Get {
+        table_index, filters, ..
+    } = &op.kind
+    else {
         return String::new();
     };
     let mut filters = filters.clone();
@@ -1500,7 +1503,10 @@ impl CommonJoinFilters {
         let mut predicates = Vec::new();
         let mut table_indexes = Vec::new();
         for &c in &group.candidates {
-            let K::Get { table_index, filters, .. } = &node(plan, &self.candidates[c].scans[differing]).kind else {
+            let K::Get {
+                table_index, filters, ..
+            } = &node(plan, &self.candidates[c].scans[differing]).kind
+            else {
                 unreachable!("a scan")
             };
             predicates.push(if filters.is_empty() {
@@ -1542,9 +1548,11 @@ impl CommonJoinFilters {
                 .collect();
             filters.clear();
             // all its columns go on, but the row ids the binder reads for nothing
-            *projection = column_ids
-                .contains(&COLUMN_IDENTIFIER_ROW_ID)
-                .then(|| (0..column_ids.len()).filter(|&p| column_ids[p] != COLUMN_IDENTIFIER_ROW_ID).collect());
+            *projection = column_ids.contains(&COLUMN_IDENTIFIER_ROW_ID).then(|| {
+                (0..column_ids.len())
+                    .filter(|&p| column_ids[p] != COLUMN_IDENTIFIER_ROW_ID)
+                    .collect()
+            });
             let get = std::mem::replace(scan, LogicalOperator::new(K::CrossProduct, Vec::new()));
             *scan = LogicalOperator::new(
                 K::Filter {

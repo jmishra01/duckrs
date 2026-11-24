@@ -385,7 +385,8 @@ impl Binder<'_> {
             }
         }
         let table_index = self.generate_table_index();
-        let (virtual_columns, bound_virtual) = crate::execution::multi_file::bind_parquet_virtual_columns(&output_names);
+        let (virtual_columns, bound_virtual) =
+            crate::execution::multi_file::bind_parquet_virtual_columns(&output_names);
         self.bind_context.add_binding(Binding {
             alias,
             schema: None,
@@ -1231,7 +1232,9 @@ impl Binder<'_> {
         };
         crate::execution::parquet::PagePruning {
             use_page_index: setting("parquet_use_page_index").unwrap_or(true),
-            can_have_nan: can_have_nan.or_else(|| setting("parquet_can_have_nan")).unwrap_or(false),
+            can_have_nan: can_have_nan
+                .or_else(|| setting("parquet_can_have_nan"))
+                .unwrap_or(false),
         }
     }
 

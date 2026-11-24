@@ -10,8 +10,8 @@
 
 use super::conjunction_of;
 use crate::execution::expression_executor::try_evaluate_scalar;
-use crate::function::{date_part_call_of, ScalarFunction};
 use crate::function::aggregates::AggregateFunction;
+use crate::function::{ScalarFunction, date_part_call_of};
 use crate::planner::expression::{BoundExpr, BoundExprKind, BoundOperator, BoundWindow, ColumnBinding, WindowFunction};
 use crate::planner::logical::{LogicalOperator, LogicalOperatorKind};
 use duckrs_common::types::{LogicalType, LogicalTypeId};
@@ -197,7 +197,11 @@ fn enum_compare_simplification(expr: &mut BoundExpr) -> bool {
     *expr = match enum_value {
         Some(enum_value) => {
             let enum_value = BoundExpr::constant(enum_value);
-            let (left, right) = if cast_left { (probe, enum_value) } else { (enum_value, probe) };
+            let (left, right) = if cast_left {
+                (probe, enum_value)
+            } else {
+                (enum_value, probe)
+            };
             BoundExpr::new(
                 BoundExprKind::Comparison {
                     op,
@@ -208,8 +212,12 @@ fn enum_compare_simplification(expr: &mut BoundExpr) -> bool {
             )
         }
         None => match op {
-            ComparisonOp::Equal => crate::function::constant_or_null(vec![BoundExpr::constant(Value::boolean(false)), probe]),
-            ComparisonOp::NotEqual => crate::function::constant_or_null(vec![BoundExpr::constant(Value::boolean(true)), probe]),
+            ComparisonOp::Equal => {
+                crate::function::constant_or_null(vec![BoundExpr::constant(Value::boolean(false)), probe])
+            }
+            ComparisonOp::NotEqual => {
+                crate::function::constant_or_null(vec![BoundExpr::constant(Value::boolean(true)), probe])
+            }
             ComparisonOp::NotDistinctFrom => BoundExpr::constant(Value::boolean(false)),
             _ => BoundExpr::constant(Value::boolean(true)),
         },
@@ -253,7 +261,11 @@ fn enum_in_simplification(expr: &mut BoundExpr) -> bool {
                 if value.logical_type() != &ty {
                     changed = true;
                 }
-                if let Some(position) = ty.enum_values().iter().position(|v| Some(v.as_str()) == value.try_to_string().ok().as_deref()) {
+                if let Some(position) = ty
+                    .enum_values()
+                    .iter()
+                    .position(|v| Some(v.as_str()) == value.try_to_string().ok().as_deref())
+                {
                     matched.insert(position);
                 }
                 list.push(BoundExpr::constant(enum_value));
@@ -288,12 +300,20 @@ fn enum_full_domain(expr: &mut BoundExpr) -> bool {
         return false;
     };
     let and = *and;
-    let wanted = if and { ComparisonOp::NotEqual } else { ComparisonOp::Equal };
+    let wanted = if and {
+        ComparisonOp::NotEqual
+    } else {
+        ComparisonOp::Equal
+    };
     let mut probe: Option<&BoundExpr> = None;
     let mut matched = std::collections::BTreeSet::new();
     for child in children {
         // `constant_or_null(c, e)` of a value it has none of: of no consequence here
-        if let BoundExprKind::Function { function, children: args, .. } = &child.kind
+        if let BoundExprKind::Function {
+            function,
+            children: args,
+            ..
+        } = &child.kind
             && function.name == "constant_or_null"
             && args.len() == 2
             && matches!(&args[0].kind, BoundExprKind::Constant(v) if *v == Value::boolean(and))
@@ -322,7 +342,10 @@ fn enum_full_domain(expr: &mut BoundExpr) -> bool {
         if constant.is_null() {
             continue;
         }
-        let Some(position) = constant.try_to_string().ok().and_then(|t| side.return_type.enum_values().iter().position(|v| *v == t))
+        let Some(position) = constant
+            .try_to_string()
+            .ok()
+            .and_then(|t| side.return_type.enum_values().iter().position(|v| *v == t))
         else {
             return false;
         };
@@ -421,13 +444,20 @@ fn list_comprehension_rewrite(expr: &mut BoundExpr) -> bool {
         return false;
     }
     let fields = inner_body.return_type.struct_children();
-    let field = |name: &str| fields.iter().position(|(n, _)| n == name).and_then(|at| children.get(at));
+    let field = |name: &str| {
+        fields
+            .iter()
+            .position(|(n, _)| n == name)
+            .and_then(|at| children.get(at))
+    };
     let (Some(filter), Some(result)) = (field("filter"), field("result")) else {
         return false;
     };
     // the index, which the rewritten apply does not have
     let mut reads_index = false;
-    result.clone().walk_mut(&mut |e| reads_index |= matches!(e.kind, BoundExprKind::Reference(1)));
+    result
+        .clone()
+        .walk_mut(&mut |e| reads_index |= matches!(e.kind, BoundExprKind::Reference(1)));
     if reads_index || result.is_volatile() {
         return false;
     }
@@ -789,7 +819,11 @@ fn bind_call(name: &str, children: Vec<BoundExpr>) -> Option<BoundExpr> {
 
 /// The expression as `ty`, folded if it is constant (`AddDefaultCastToType` and `TryEvaluateScalar`).
 fn cast_and_fold(expr: BoundExpr, ty: &LogicalType) -> BoundExpr {
-    let expr = if expr.return_type.id() == ty.id() { expr } else { expr.cast_to(ty, true) };
+    let expr = if expr.return_type.id() == ty.id() {
+        expr
+    } else {
+        expr.cast_to(ty, true)
+    };
     if expr.is_foldable()
         && let Some(value) = try_evaluate_scalar(&expr)
     {
@@ -800,7 +834,10 @@ fn cast_and_fold(expr: BoundExpr, ty: &LogicalType) -> BoundExpr {
 
 /// `DateTruncSimplificationRule::CreateTrunc`.
 fn create_trunc(part: &BoundExpr, constant: &BoundExpr, ty: &LogicalType) -> Option<BoundExpr> {
-    Some(cast_and_fold(bind_call("date_trunc", vec![part.clone(), constant.clone()])?, ty))
+    Some(cast_and_fold(
+        bind_call("date_trunc", vec![part.clone(), constant.clone()])?,
+        ty,
+    ))
 }
 
 /// `DateTruncSimplificationRule::CreateTruncAdd`: `date_trunc(part, constant + INTERVAL 1 part)`.
@@ -847,7 +884,11 @@ fn date_trunc_simplification(expr: &mut BoundExpr) -> bool {
     if !(column_is_left || (is_trunc(right) && matches!(left.kind, BoundExprKind::Constant(_)))) {
         return false;
     }
-    let (trunc, constant) = if column_is_left { (&**left, &**right) } else { (&**right, &**left) };
+    let (trunc, constant) = if column_is_left {
+        (&**left, &**right)
+    } else {
+        (&**right, &**left)
+    };
     let BoundExprKind::Function { children, .. } = &trunc.kind else {
         return false;
     };
@@ -861,13 +902,25 @@ fn date_trunc_simplification(expr: &mut BoundExpr) -> bool {
     let value = value.clone();
     let constant = constant.clone();
     // as if the constant were on the right
-    let comparison = if column_is_left { *op } else { super::statistics::flip(*op) };
+    let comparison = if column_is_left {
+        *op
+    } else {
+        super::statistics::flip(*op)
+    };
     let column_type = column.return_type.clone();
     let rebuild = |op: ComparisonOp, constant: BoundExpr| {
-        let (left, right) = if column_is_left { (column.clone(), constant) } else { (constant, column.clone()) };
+        let (left, right) = if column_is_left {
+            (column.clone(), constant)
+        } else {
+            (constant, column.clone())
+        };
         BoundExpr::new(
             BoundExprKind::Comparison {
-                op: if column_is_left { op } else { super::statistics::flip(op) },
+                op: if column_is_left {
+                    op
+                } else {
+                    super::statistics::flip(op)
+                },
                 left: Box::new(left),
                 right: Box::new(right),
             },
@@ -912,7 +965,9 @@ fn date_trunc_simplification(expr: &mut BoundExpr) -> bool {
         return true;
     }
     // decades, centuries and millennia round the years before the common era towards zero
-    let part_name = try_evaluate_scalar(&part).and_then(|v| v.try_to_string().ok()).unwrap_or_default();
+    let part_name = try_evaluate_scalar(&part)
+        .and_then(|v| v.try_to_string().ok())
+        .unwrap_or_default();
     let towards_zero = !matches!(P::parse(&part_name), Some(p) if !matches!(p, P::Decade | P::Century | P::Millennium));
     if towards_zero {
         let after_first_year = value.is_null()
@@ -1311,7 +1366,10 @@ fn decimal_digits(ty: &LogicalType) -> Option<(i32, i32)> {
 pub(super) fn cast_is_invertible(source: &LogicalType, target: &LogicalType) -> bool {
     use LogicalTypeId::*;
     let ids = (source.id(), target.id());
-    if [ids.0, ids.1].iter().any(|id| matches!(id, Boolean | Float | Double | Variant | Enum)) {
+    if [ids.0, ids.1]
+        .iter()
+        .any(|id| matches!(id, Boolean | Float | Double | Variant | Enum))
+    {
         return false;
     }
     if source.id() == Decimal || target.id() == Decimal {
@@ -1325,8 +1383,16 @@ pub(super) fn cast_is_invertible(source: &LogicalType, target: &LogicalType) -> 
             return false;
         }
         // an integer type does not hold all numbers of its width
-        let target_digits = if target.id() == Decimal { target_digits } else { target_digits - 1 };
-        let source_digits = if matches!(source.id(), HugeInt | UHugeInt) { source_digits + 1 } else { source_digits };
+        let target_digits = if target.id() == Decimal {
+            target_digits
+        } else {
+            target_digits - 1
+        };
+        let source_digits = if matches!(source.id(), HugeInt | UHugeInt) {
+            source_digits + 1
+        } else {
+            source_digits
+        };
         return source_digits <= target_digits;
     }
     match ids {
@@ -1345,7 +1411,10 @@ pub(super) fn cast_is_invertible(source: &LogicalType, target: &LogicalType) -> 
 fn lossless_integral_to_floating(source: &LogicalType, target: &LogicalType) -> bool {
     use LogicalTypeId::*;
     match target.id() {
-        Double => matches!(source.id(), TinyInt | SmallInt | Integer | UTinyInt | USmallInt | UInteger),
+        Double => matches!(
+            source.id(),
+            TinyInt | SmallInt | Integer | UTinyInt | USmallInt | UInteger
+        ),
         Float => matches!(source.id(), TinyInt | SmallInt | UTinyInt | USmallInt),
         _ => false,
     }
@@ -1360,7 +1429,11 @@ fn cast_comparison_simplification(expr: &mut BoundExpr) -> bool {
         return false;
     };
     let cast_left = matches!(right.kind, BoundExprKind::Constant(_));
-    let (cast, constant) = if cast_left { (&mut *left, &mut *right) } else { (&mut *right, &mut *left) };
+    let (cast, constant) = if cast_left {
+        (&mut *left, &mut *right)
+    } else {
+        (&mut *right, &mut *left)
+    };
     let (BoundExprKind::Cast { child, try_cast: false }, BoundExprKind::Constant(value)) = (&cast.kind, &constant.kind)
     else {
         return false;
@@ -1378,8 +1451,8 @@ fn cast_comparison_simplification(expr: &mut BoundExpr) -> bool {
     let round_trip = || try_evaluate_scalar(&BoundExpr::constant(new_value.clone()).cast_to(&target, false));
     let invertible = cast_is_invertible(&target, &source)
         || (target.is_integral() && source.is_integral())
-        || ((lossless_integral_to_floating(&source, &target) || (target.id() == LogicalTypeId::Decimal
-            && source.id() == LogicalTypeId::Decimal))
+        || ((lossless_integral_to_floating(&source, &target)
+            || (target.id() == LogicalTypeId::Decimal && source.id() == LogicalTypeId::Decimal))
             && round_trip().as_ref() == Some(value));
     let mut new_value = new_value.clone();
     if !invertible {
@@ -1466,8 +1539,10 @@ fn not_conjunction_simplification(expr: &mut BoundExpr) -> bool {
     else {
         return false;
     };
-    if !matches!(children[0].kind, BoundExprKind::Conjunction { .. } | BoundExprKind::Between { .. })
-        || children[0].is_volatile()
+    if !matches!(
+        children[0].kind,
+        BoundExprKind::Conjunction { .. } | BoundExprKind::Between { .. }
+    ) || children[0].is_volatile()
         || can_throw(&children[0])
     {
         return false;
@@ -1640,51 +1715,308 @@ pub(crate) fn expressions_equal(a: &BoundExpr, b: &BoundExpr) -> bool {
 /// that are `list_aggr` macros in C++ fail as it does. Every other function cannot fail, as C++'s
 /// default `FunctionErrors::CANNOT_ERROR` has it.
 const FALLIBLE_FUNCTIONS: &[&str] = &[
-    "!__postfix", "%", "&", "*", "**", "+", "-", "->>", "/", "//", "<<", ">>", "@", "__internal_barrier",
-    "__internal_try_rethrow", "abs", "acos", "add", "age", "aggregate", "apply", "array_aggr", "array_aggregate",
-    "array_apply", "array_cosine_distance", "array_cosine_similarity", "array_cross_product", "array_distance",
-    "array_dot_product", "array_filter", "array_inner_product", "array_length", "array_negative_dot_product",
-    "array_negative_inner_product", "array_reduce", "array_resize", "array_select", "array_slice", "array_to_json",
-    "array_transform", "array_value", "array_where", "asin", "atanh", "bar", "binom", "bitstring", "century", "chr",
-    "cos", "cot", "currval", "date_diff", "date_part", "date_sub", "date_trunc", "datediff", "datepart", "datesub",
-    "datetrunc", "day", "dayofmonth", "dayofweek", "dayofyear", "decade", "decimal_division", "decode", "divide",
-    "epoch_ms", "epoch_ns", "epoch_us", "equi_width_bins", "era", "error", "factorial", "filter", "fmod", "format",
-    "from_base64", "from_binary", "from_hex", "from_json", "from_json_strict", "gamma", "gcd", "generate_series",
-    "get_bit", "get_current_time", "greatest_common_divisor", "hamming", "ilike_escape", "invoke", "isodow",
-    "isoyear", "jaccard", "json_array", "json_array_length", "json_contains", "json_deep_merge",
-    "json_deserialize_sql", "json_exists", "json_extract", "json_extract_path", "json_extract_path_text",
-    "json_extract_string", "json_insert", "json_keys", "json_merge_patch_diff", "json_object", "json_quote",
-    "json_remove", "json_replace", "json_set", "json_structure", "json_transform", "json_transform_strict",
-    "json_type", "json_value", "last_day", "lcm", "least_common_multiple", "left", "left_grapheme", "lgamma",
-    "like_escape", "list_aggr", "list_aggregate", "list_any_value", "list_apply", "list_approx_count_distinct",
-    "list_avg", "list_bit_and", "list_bit_or", "list_bit_xor", "list_bool_and", "list_bool_or",
-    "list_cosine_distance", "list_cosine_similarity", "list_count", "list_distance", "list_dot_product",
-    "list_entropy", "list_filter", "list_first", "list_histogram", "list_inner_product", "list_kurtosis",
-    "list_kurtosis_pop", "list_last", "list_mad", "list_max", "list_median", "list_min", "list_mode",
-    "list_negative_dot_product", "list_negative_inner_product", "list_product", "list_reduce", "list_resize",
-    "list_select", "list_sem", "list_skewness", "list_slice", "list_stddev_pop", "list_stddev_samp",
-    "list_string_agg", "list_sum", "list_transform", "list_var_pop", "list_var_samp", "list_where", "ln", "log",
-    "log10", "log2", "lpad", "make_date", "make_time", "make_timestamp", "make_timestamp_ms", "make_timestamp_ns",
-    "make_timestamptz", "map", "map_from_entries", "map_keys", "map_values", "millennium", "mismatches", "mod",
-    "month", "multiply", "nextval", "not_ilike_escape", "not_like_escape", "parse_formatted_bytes", "path_join",
-    "pow", "power", "printf", "quarter", "range", "reduce", "regexp_extract", "regexp_extract_all",
-    "regexp_full_match", "regexp_matches", "regexp_replace", "regexp_split_to_array", "repeat", "right",
-    "right_grapheme", "round", "round_even", "roundbankers", "row_to_json", "rpad", "set_bit", "setseed", "setval",
-    "sin", "sqrt", "st_asgeojson", "st_geomfromgeojson", "st_geomfromwkb", "str_split_regex", "strftime",
-    "string_split_regex", "strptime", "subtract", "tan", "time_bucket", "timezone", "timezone_hour",
-    "timezone_minute", "to_base", "to_centuries", "to_days", "to_decades", "to_hours", "to_json", "to_microseconds",
-    "to_millennia", "to_milliseconds", "to_minutes", "to_months", "to_quarters", "to_seconds", "to_timestamp",
-    "to_weeks", "to_years", "translate", "unbin", "unhex", "url_decode", "uuid_extract_timestamp",
-    "variant_extract_string", "variant_normalize", "week", "weekday", "weekofyear", "write_log", "xor", "year",
-    "yearweek", "|", "~",
+    "!__postfix",
+    "%",
+    "&",
+    "*",
+    "**",
+    "+",
+    "-",
+    "->>",
+    "/",
+    "//",
+    "<<",
+    ">>",
+    "@",
+    "__internal_barrier",
+    "__internal_try_rethrow",
+    "abs",
+    "acos",
+    "add",
+    "age",
+    "aggregate",
+    "apply",
+    "array_aggr",
+    "array_aggregate",
+    "array_apply",
+    "array_cosine_distance",
+    "array_cosine_similarity",
+    "array_cross_product",
+    "array_distance",
+    "array_dot_product",
+    "array_filter",
+    "array_inner_product",
+    "array_length",
+    "array_negative_dot_product",
+    "array_negative_inner_product",
+    "array_reduce",
+    "array_resize",
+    "array_select",
+    "array_slice",
+    "array_to_json",
+    "array_transform",
+    "array_value",
+    "array_where",
+    "asin",
+    "atanh",
+    "bar",
+    "binom",
+    "bitstring",
+    "century",
+    "chr",
+    "cos",
+    "cot",
+    "currval",
+    "date_diff",
+    "date_part",
+    "date_sub",
+    "date_trunc",
+    "datediff",
+    "datepart",
+    "datesub",
+    "datetrunc",
+    "day",
+    "dayofmonth",
+    "dayofweek",
+    "dayofyear",
+    "decade",
+    "decimal_division",
+    "decode",
+    "divide",
+    "epoch_ms",
+    "epoch_ns",
+    "epoch_us",
+    "equi_width_bins",
+    "era",
+    "error",
+    "factorial",
+    "filter",
+    "fmod",
+    "format",
+    "from_base64",
+    "from_binary",
+    "from_hex",
+    "from_json",
+    "from_json_strict",
+    "gamma",
+    "gcd",
+    "generate_series",
+    "get_bit",
+    "get_current_time",
+    "greatest_common_divisor",
+    "hamming",
+    "ilike_escape",
+    "invoke",
+    "isodow",
+    "isoyear",
+    "jaccard",
+    "json_array",
+    "json_array_length",
+    "json_contains",
+    "json_deep_merge",
+    "json_deserialize_sql",
+    "json_exists",
+    "json_extract",
+    "json_extract_path",
+    "json_extract_path_text",
+    "json_extract_string",
+    "json_insert",
+    "json_keys",
+    "json_merge_patch_diff",
+    "json_object",
+    "json_quote",
+    "json_remove",
+    "json_replace",
+    "json_set",
+    "json_structure",
+    "json_transform",
+    "json_transform_strict",
+    "json_type",
+    "json_value",
+    "last_day",
+    "lcm",
+    "least_common_multiple",
+    "left",
+    "left_grapheme",
+    "lgamma",
+    "like_escape",
+    "list_aggr",
+    "list_aggregate",
+    "list_any_value",
+    "list_apply",
+    "list_approx_count_distinct",
+    "list_avg",
+    "list_bit_and",
+    "list_bit_or",
+    "list_bit_xor",
+    "list_bool_and",
+    "list_bool_or",
+    "list_cosine_distance",
+    "list_cosine_similarity",
+    "list_count",
+    "list_distance",
+    "list_dot_product",
+    "list_entropy",
+    "list_filter",
+    "list_first",
+    "list_histogram",
+    "list_inner_product",
+    "list_kurtosis",
+    "list_kurtosis_pop",
+    "list_last",
+    "list_mad",
+    "list_max",
+    "list_median",
+    "list_min",
+    "list_mode",
+    "list_negative_dot_product",
+    "list_negative_inner_product",
+    "list_product",
+    "list_reduce",
+    "list_resize",
+    "list_select",
+    "list_sem",
+    "list_skewness",
+    "list_slice",
+    "list_stddev_pop",
+    "list_stddev_samp",
+    "list_string_agg",
+    "list_sum",
+    "list_transform",
+    "list_var_pop",
+    "list_var_samp",
+    "list_where",
+    "ln",
+    "log",
+    "log10",
+    "log2",
+    "lpad",
+    "make_date",
+    "make_time",
+    "make_timestamp",
+    "make_timestamp_ms",
+    "make_timestamp_ns",
+    "make_timestamptz",
+    "map",
+    "map_from_entries",
+    "map_keys",
+    "map_values",
+    "millennium",
+    "mismatches",
+    "mod",
+    "month",
+    "multiply",
+    "nextval",
+    "not_ilike_escape",
+    "not_like_escape",
+    "parse_formatted_bytes",
+    "path_join",
+    "pow",
+    "power",
+    "printf",
+    "quarter",
+    "range",
+    "reduce",
+    "regexp_extract",
+    "regexp_extract_all",
+    "regexp_full_match",
+    "regexp_matches",
+    "regexp_replace",
+    "regexp_split_to_array",
+    "repeat",
+    "right",
+    "right_grapheme",
+    "round",
+    "round_even",
+    "roundbankers",
+    "row_to_json",
+    "rpad",
+    "set_bit",
+    "setseed",
+    "setval",
+    "sin",
+    "sqrt",
+    "st_asgeojson",
+    "st_geomfromgeojson",
+    "st_geomfromwkb",
+    "str_split_regex",
+    "strftime",
+    "string_split_regex",
+    "strptime",
+    "subtract",
+    "tan",
+    "time_bucket",
+    "timezone",
+    "timezone_hour",
+    "timezone_minute",
+    "to_base",
+    "to_centuries",
+    "to_days",
+    "to_decades",
+    "to_hours",
+    "to_json",
+    "to_microseconds",
+    "to_millennia",
+    "to_milliseconds",
+    "to_minutes",
+    "to_months",
+    "to_quarters",
+    "to_seconds",
+    "to_timestamp",
+    "to_weeks",
+    "to_years",
+    "translate",
+    "unbin",
+    "unhex",
+    "url_decode",
+    "uuid_extract_timestamp",
+    "variant_extract_string",
+    "variant_normalize",
+    "week",
+    "weekday",
+    "weekofyear",
+    "write_log",
+    "xor",
+    "year",
+    "yearweek",
+    "|",
+    "~",
 ];
 
 /// ICU's date parts: the overloads of TIMESTAMP WITH TIME ZONE are fallible (`ICUDatePart`).
 const ICU_DATE_PARTS: &[&str] = &[
-    "century", "date_part", "datepart", "day", "dayname", "dayofmonth", "dayofweek", "dayofyear", "decade", "epoch",
-    "era", "hour", "isodow", "isoyear", "julian", "last_day", "microsecond", "millennium", "millisecond", "minute",
-    "month", "monthname", "quarter", "second", "timezone", "timezone_hour", "timezone_minute", "week", "weekday",
-    "weekofyear", "year", "yearweek",
+    "century",
+    "date_part",
+    "datepart",
+    "day",
+    "dayname",
+    "dayofmonth",
+    "dayofweek",
+    "dayofyear",
+    "decade",
+    "epoch",
+    "era",
+    "hour",
+    "isodow",
+    "isoyear",
+    "julian",
+    "last_day",
+    "microsecond",
+    "millennium",
+    "millisecond",
+    "minute",
+    "month",
+    "monthname",
+    "quarter",
+    "second",
+    "timezone",
+    "timezone_hour",
+    "timezone_minute",
+    "week",
+    "weekday",
+    "weekofyear",
+    "year",
+    "yearweek",
 ];
 
 /// `BoundAggregateExpression::CanThrow` of the aggregate itself: the aggregates C++ declares
@@ -1696,8 +2028,19 @@ pub(crate) fn aggregate_can_throw(function: &AggregateFunction, children: &[Boun
     // the DECIMALs whose sum is a HUGEINT, which throws on overflow
     let wide = first.is_some_and(|t| t.id() == Decimal && t.decimal_properties().is_some_and(|(w, _)| w > 18));
     match function.name.as_str() {
-        "approx_top_k" | "lttb" | "mad" | "kurtosis" | "kurtosis_pop" | "skewness" | "string_agg" | "group_concat"
-        | "listagg" | "sum_no_overflow" | "variant_group_object" | "bitstring_agg" | "combine_aggr" => true,
+        "approx_top_k"
+        | "lttb"
+        | "mad"
+        | "kurtosis"
+        | "kurtosis_pop"
+        | "skewness"
+        | "string_agg"
+        | "group_concat"
+        | "listagg"
+        | "sum_no_overflow"
+        | "variant_group_object"
+        | "bitstring_agg"
+        | "combine_aggr" => true,
         "sum" => id == Some(HugeInt) || wide,
         "avg" | "mean" => matches!(id, Some(HugeInt | Interval)) || wide,
         "bit_and" | "bit_or" | "bit_xor" => id == Some(Bit),
@@ -1748,11 +2091,13 @@ fn function_can_throw(function: &ScalarFunction, children: &[BoundExpr], return_
         "-" if children.len() == 1 => !matches!(first, Some(Decimal | Bignum)),
         "-" if children.iter().all(|c| c.return_type.id() == Bignum) => false,
         // `ListValueResolveTypes`: the arguments are cast to the child type when it runs
-        "list_value" | "list_pack" => return_type.child_type().is_some_and(|child| {
-            children.iter().any(|c| cast_can_throw(&c.return_type, child))
-        }),
+        "list_value" | "list_pack" => return_type
+            .child_type()
+            .is_some_and(|child| children.iter().any(|c| cast_can_throw(&c.return_type, child))),
         _ if ICU_DATE_PARTS.contains(&name)
-            && children.iter().any(|c| matches!(c.return_type.id(), TimestampTz | TimestampTzNs)) =>
+            && children
+                .iter()
+                .any(|c| matches!(c.return_type.id(), TimestampTz | TimestampTzNs)) =>
         {
             true
         }
@@ -1844,7 +2189,10 @@ pub(crate) fn cast_can_throw_of(source: &LogicalType, target: &LogicalType, try_
         return !decimal_holds_every_value(source, target);
     }
     // a DATE far in the future does not fit in a TIMESTAMP
-    if matches!(target.id(), Timestamp | TimestampMs | TimestampNs | TimestampSec | TimestampTz | TimestampTzNs) {
+    if matches!(
+        target.id(),
+        Timestamp | TimestampMs | TimestampNs | TimestampSec | TimestampTz | TimestampTzNs
+    ) {
         return true;
     }
     // the target must hold every value of the source: be the larger of the two types
@@ -2101,7 +2449,11 @@ fn move_unary_minus(
     );
     let negated = BoundExpr::constant(try_evaluate_scalar(&negate)?);
     // both sides change sign, so the comparison turns around; each keeps its side
-    let (left, right) = if negation_left { (input.clone(), negated) } else { (negated, input.clone()) };
+    let (left, right) = if negation_left {
+        (input.clone(), negated)
+    } else {
+        (negated, input.clone())
+    };
     let comparison = BoundExpr::new(
         BoundExprKind::Comparison {
             op: super::statistics::flip(op),
@@ -2204,7 +2556,10 @@ fn regex_optimization(expr: &mut BoundExpr) -> bool {
     if function.name != "regexp_matches" || !(2..=3).contains(&children.len()) {
         return false;
     }
-    if children[..2].iter().any(|c| c.return_type.collation().is_some_and(|c| !c.is_empty())) {
+    if children[..2]
+        .iter()
+        .any(|c| c.return_type.collation().is_some_and(|c| !c.is_empty()))
+    {
         return false;
     }
     let string = |e: &BoundExpr| match &e.kind {
@@ -2296,7 +2651,11 @@ fn instr_prefix(expr: &mut BoundExpr) -> bool {
     else {
         return false;
     };
-    let (call, one) = if matches!(right.kind, BoundExprKind::Constant(_)) { (left, right) } else { (right, left) };
+    let (call, one) = if matches!(right.kind, BoundExprKind::Constant(_)) {
+        (left, right)
+    } else {
+        (right, left)
+    };
     if integer_constant(one) != Some(1) {
         return false;
     }
@@ -2325,7 +2684,11 @@ fn string_prefix(expr: &mut BoundExpr) -> bool {
     else {
         return false;
     };
-    let (call, constant) = if matches!(right.kind, BoundExprKind::Constant(_)) { (left, right) } else { (right, left) };
+    let (call, constant) = if matches!(right.kind, BoundExprKind::Constant(_)) {
+        (left, right)
+    } else {
+        (right, left)
+    };
     let BoundExprKind::Constant(constant_value) = &constant.kind else {
         return false;
     };
@@ -2450,7 +2813,9 @@ fn identity_string_functions(expr: &mut BoundExpr) -> bool {
         return false;
     };
     let text = |e: &BoundExpr| match &e.kind {
-        BoundExprKind::Constant(v) if !v.is_null() && e.return_type.id() == LogicalTypeId::Varchar => v.try_to_string().ok(),
+        BoundExprKind::Constant(v) if !v.is_null() && e.return_type.id() == LogicalTypeId::Varchar => {
+            v.try_to_string().ok()
+        }
         _ => None,
     };
     let input = match (function.name.as_str(), children.as_slice()) {

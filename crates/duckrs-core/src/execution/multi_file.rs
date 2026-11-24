@@ -24,7 +24,12 @@ pub enum VirtualColumn {
 impl VirtualColumn {
     pub const ALL: [Self; 3] = [Self::Filename, Self::FileIndex, Self::FileRowNumber];
     /// `ParquetMultiFileInfo::GetVirtualColumns`: those of every multi-file scan, and the row group
-    pub const PARQUET: [Self; 4] = [Self::Filename, Self::FileIndex, Self::FileRowNumber, Self::FileRowGroupNumber];
+    pub const PARQUET: [Self; 4] = [
+        Self::Filename,
+        Self::FileIndex,
+        Self::FileRowNumber,
+        Self::FileRowGroupNumber,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -80,7 +85,9 @@ impl VirtualRows {
 
     /// The row group that row `row` of the file is in.
     fn row_group_of(&self, row: i64) -> u64 {
-        self.row_group_starts.partition_point(|&start| start <= row).saturating_sub(1) as u64
+        self.row_group_starts
+            .partition_point(|&start| start <= row)
+            .saturating_sub(1) as u64
     }
 
     /// `file_row_group_number` of the `count` rows from row `first` of the file.

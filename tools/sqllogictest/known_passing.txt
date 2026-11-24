@@ -1352,10 +1352,16 @@ test/sql/catalog/dependency/drop_recreate_schema_dependency.test
 test/sql/catalog/did_you_mean.test
 test/sql/catalog/did_you_mean_default_entries.test
 test/sql/catalog/drop_create_rollback.test
+test/sql/catalog/function/attached_macro.test
 test/sql/catalog/function/builtin_macro_parser_settings.test
+test/sql/catalog/function/default_macro_shadowing_logging.test
+test/sql/catalog/function/default_table_macro_shadowing.test
 test/sql/catalog/function/information_schema_macro.test
+test/sql/catalog/function/macro_query_table.test
 test/sql/catalog/function/macro_typed_parameter_rendering.test
 test/sql/catalog/function/python_style_macro_parameters.test
+test/sql/catalog/function/query_function.test
+test/sql/catalog/function/query_table_file_paths.test
 test/sql/catalog/function/struct_extract_macro.test
 test/sql/catalog/function/test_complex_macro.test
 test/sql/catalog/function/test_cross_catalog_macros.test
@@ -1363,14 +1369,17 @@ test/sql/catalog/function/test_cte_macro.test
 test/sql/catalog/function/test_drop_macro.test
 test/sql/catalog/function/test_macro_correlated_cte.test
 test/sql/catalog/function/test_macro_default_arg.test
+test/sql/catalog/function/test_macro_default_arg_with_dependencies.test
 test/sql/catalog/function/test_macro_issue_13104.test
 test/sql/catalog/function/test_macro_issue_18927.test
 test/sql/catalog/function/test_macro_issue_19119.test
 test/sql/catalog/function/test_macro_overloads.test
 test/sql/catalog/function/test_macro_parameter_named_argument.test
+test/sql/catalog/function/test_macro_positional_reference.test
 test/sql/catalog/function/test_macro_relpersistence_conflict.test
 test/sql/catalog/function/test_macro_type_overloads.test
 test/sql/catalog/function/test_macro_with_unknown_types.test
+test/sql/catalog/function/test_recursive_macro.test
 test/sql/catalog/function/test_recursive_macro_no_dependency.test
 test/sql/catalog/function/test_recursive_table_macro.test
 test/sql/catalog/function/test_sequence_macro.test
@@ -1379,6 +1388,7 @@ test/sql/catalog/function/test_subquery_macro.test
 test/sql/catalog/function/test_table_macro.test
 test/sql/catalog/function/test_table_macro_args.test
 test/sql/catalog/function/test_table_macro_complex.test
+test/sql/catalog/function/test_table_macro_copy.test
 test/sql/catalog/function/test_table_macro_groups.test
 test/sql/catalog/function/test_window_macro.test
 test/sql/catalog/identifier_embedded_nul.test
@@ -2240,6 +2250,7 @@ test/sql/export/export_external_access.test
 test/sql/export/export_hive_path.test
 test/sql/export/export_indexes.test
 test/sql/export/export_legacy_options.test
+test/sql/export/export_macros.test
 test/sql/export/export_quoted_enum.test
 test/sql/export/export_quoted_structs.test
 test/sql/export/export_quoted_union.test
@@ -3612,6 +3623,7 @@ test/sql/prepared/prepare_list_functions.test
 test/sql/prepared/prepare_mixed_types.test
 test/sql/prepared/prepare_nested_unresolved_parameter.test
 test/sql/prepared/prepare_offset_first.test
+test/sql/prepared/prepare_query_function_parameters.test
 test/sql/prepared/prepare_summarize.test
 test/sql/prepared/prepare_window_functions.test
 test/sql/prepared/prepared_named_param.test
@@ -4398,6 +4410,7 @@ test/sql/subquery/lateral/lateral_fuzzer_5984_23.test
 test/sql/subquery/lateral/lateral_grouping_sets.test
 test/sql/subquery/lateral/lateral_join_generated_columns.test
 test/sql/subquery/lateral/lateral_join_macro.test
+test/sql/subquery/lateral/lateral_join_typed_macro.test
 test/sql/subquery/lateral/lateral_large_lists.test
 test/sql/subquery/lateral/lateral_left_join.test
 test/sql/subquery/lateral/lateral_null_propagation_shortcut.test
@@ -5210,6 +5223,8 @@ test/sql/upsert/upsert_shorthand.test
 test/sql/upsert/upsert_transaction.test
 test/sql/upsert/upsert_unique_null.test
 test/sql/vacuum/vacuum_nested_types.test
+test/sql/variables/test_variable_assignment.test
+test/sql/variables/test_variable_syntax.test
 test/sql/variant/variant_comparator.test
 test/sql/variant/variant_nested_arrays.test
 test/sql/vector_types/list_vector_types.test

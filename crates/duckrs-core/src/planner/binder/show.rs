@@ -201,23 +201,41 @@ pub(crate) fn platform() -> String {
 /// `internal_extensions` of `extension_helper.cpp`.
 const DEFAULT_EXTENSIONS: [(&str, &str); 30] = [
     ("core_functions", "Core function library"),
-    ("icu", "Adds support for time zones and collations using the ICU library"),
+    (
+        "icu",
+        "Adds support for time zones and collations using the ICU library",
+    ),
     ("excel", "Adds support for Excel-like format strings"),
     ("parquet", "Adds support for reading and writing parquet files"),
     ("tpch", "Adds TPC-H data generation and query support"),
     ("tpcds", "Adds TPC-DS data generation and query support"),
-    ("httpfs", "Adds support for reading and writing files over a HTTP(S) connection"),
+    (
+        "httpfs",
+        "Adds support for reading and writing files over a HTTP(S) connection",
+    ),
     ("json", "Adds support for JSON operations"),
     ("autocomplete", "Adds support for autocomplete in the shell"),
     ("motherduck", "Enables motherduck integration with the system"),
     ("mysql_scanner", "Adds support for connecting to a MySQL database"),
-    ("odbc_scanner", "Adds support for connecting to remote databases over ODBC"),
-    ("sqlite_scanner", "Adds support for reading and writing SQLite database files"),
+    (
+        "odbc_scanner",
+        "Adds support for connecting to remote databases over ODBC",
+    ),
+    (
+        "sqlite_scanner",
+        "Adds support for reading and writing SQLite database files",
+    ),
     ("postgres_scanner", "Adds support for connecting to a Postgres database"),
     ("inet", "Adds support for IP-related data types and functions"),
-    ("spatial", "Geospatial extension that adds support for working with spatial data and functions"),
+    (
+        "spatial",
+        "Geospatial extension that adds support for working with spatial data and functions",
+    ),
     ("aws", "Provides features that depend on the AWS SDK"),
-    ("azure", "Adds a filesystem abstraction for Azure blob storage to DuckDB"),
+    (
+        "azure",
+        "Adds a filesystem abstraction for Azure blob storage to DuckDB",
+    ),
     ("encodings", "All unicode encodings to UTF-8"),
     ("iceberg", "Adds support for Apache Iceberg"),
     ("vss", "Adds indexing support to accelerate Vector Similarity Search"),
@@ -226,7 +244,10 @@ const DEFAULT_EXTENSIONS: [(&str, &str); 30] = [
     ("ui", "Adds local UI for DuckDB"),
     ("ducklake", "Adds support for DuckLake, SQL as a Lakehouse Format"),
     ("quack", "The DuckDB 'Quack' Client/Server Protocol"),
-    ("vortex", "Adds support for reading and writing files using the Vortex file format"),
+    (
+        "vortex",
+        "Adds support for reading and writing files using the Vortex file format",
+    ),
     ("lance", "Adds support for querying Lance datasets"),
     ("avro", "Adds support for reading Avro files"),
     ("unity_catalog", "Adds support for connecting to Unity Catalog"),
@@ -843,7 +864,11 @@ impl Binder<'_> {
         let native_table = !(name.qualification.is_empty()
             && self.ctes.iter().any(|(n, ..)| n.eq_ignore_ascii_case(&name.name)))
             && matches!(
-                self.catalog.get_entry(super::schema_of(name)?.as_deref(), self.search_schema.as_deref(), &name.name),
+                self.catalog.get_entry(
+                    super::schema_of(name)?.as_deref(),
+                    self.search_schema.as_deref(),
+                    &name.name
+                ),
                 Ok(TableOrView::Table(_))
             );
         let described = self.describe_entry(name)?;
@@ -1464,7 +1489,11 @@ impl Binder<'_> {
             _ => {
                 // `DuckDBWhichSecretFunction`: `Value::ToString` of the inputs
                 let text_of = |value: &Value| -> Result<String> {
-                    if value.is_null() { Ok("NULL".to_string()) } else { value.try_to_string() }
+                    if value.is_null() {
+                        Ok("NULL".to_string())
+                    } else {
+                        value.try_to_string()
+                    }
                 };
                 let (path, secret_type) = (text_of(&values[0])?, text_of(&values[1])?);
                 (
@@ -1805,13 +1834,11 @@ impl Binder<'_> {
                         macro_rows("system", 2, schema, &entry, true)?;
                     }
                 }
-                for schema in self.catalog.schemas().iter() {
-                    let temporary = schema.name.eq_ignore_ascii_case(TEMP_SCHEMA);
-                    let database = if temporary { "temp" } else { self.catalog.name.as_str() };
-                    let schema_name = if temporary { "main" } else { schema.name.as_str() };
+                // the macros of every attached database (`GetAllSchemas`)
+                for listed in self.listed_schemas() {
                     for table_macro in [false, true] {
-                        for entry in schema.macro_entries(table_macro) {
-                            macro_rows(database, if temporary { 3 } else { 1 }, schema_name, &entry, false)?;
+                        for entry in listed.schema.macro_entries(table_macro) {
+                            macro_rows(&listed.database, listed.database_oid, &listed.display, &entry, false)?;
                         }
                     }
                 }

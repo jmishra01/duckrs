@@ -149,9 +149,7 @@ impl Pass<'_> {
     /// `CompressOrder`: every column passes through the sort, so every one it does not order by an
     /// expression can be compressed.
     fn compress_order(&mut self, op: &mut LogicalOperator) -> HashMap<ColumnBinding, ColumnBinding> {
-        let K::Order { orders } = &op.kind else {
-            unreachable!()
-        };
+        let K::Order { orders } = &op.kind else { unreachable!() };
         let mut referenced = HashSet::new();
         for order in orders {
             if !matches!(order.expr.kind, BoundExprKind::ColumnRef { depth: 0, .. }) {
@@ -159,7 +157,11 @@ impl Pass<'_> {
             }
         }
         let child = &op.children[0];
-        let can: Vec<bool> = child.column_bindings().iter().map(|b| !referenced.contains(b)).collect();
+        let can: Vec<bool> = child
+            .column_bindings()
+            .iter()
+            .map(|b| !referenced.contains(b))
+            .collect();
         self.create_projections(op, &[can], &HashMap::new())
     }
 
@@ -193,7 +195,12 @@ impl Pass<'_> {
         }
         // what the aggregates read stays
         for aggregate in aggregates {
-            for child in aggregate.children.iter().chain(&aggregate.filter).chain(&aggregate.distinct_key) {
+            for child in aggregate
+                .children
+                .iter()
+                .chain(&aggregate.filter)
+                .chain(&aggregate.distinct_key)
+            {
                 collect(child, &mut referenced);
             }
             for (order, _) in &aggregate.order_by {
@@ -258,7 +265,13 @@ impl Pass<'_> {
                 })
                 .collect();
             let aggregate = std::mem::replace(op, LogicalOperator::new(K::CrossProduct, Vec::new()));
-            *op = LogicalOperator::new(K::Projection { table_index: index, expressions }, vec![aggregate]);
+            *op = LogicalOperator::new(
+                K::Projection {
+                    table_index: index,
+                    expressions,
+                },
+                vec![aggregate],
+            );
             for (at, before) in outputs.iter().enumerate() {
                 let after = ColumnBinding::new(index, at);
                 self.statistics.copy(*before, after);
@@ -351,7 +364,10 @@ impl Pass<'_> {
         overrides: &HashMap<ColumnBinding, ColumnStatistics>,
     ) -> HashMap<ColumnBinding, ColumnBinding> {
         // per child: its compressing projection's index, and how each column is compressed
-        #[allow(clippy::type_complexity, reason = "per child: its table index, compressions and types")]
+        #[allow(
+            clippy::type_complexity,
+            reason = "per child: its table index, compressions and types"
+        )]
         let mut children: Vec<Option<(usize, Vec<Option<Compression>>, Vec<LogicalType>)>> = Vec::new();
         let outputs_before = op.column_bindings();
         let mut below: HashMap<ColumnBinding, (ColumnBinding, LogicalType)> = HashMap::new();
@@ -363,8 +379,12 @@ impl Pass<'_> {
             let mut ranges = Vec::new();
             for (i, (&binding, ty)) in bindings.iter().zip(&types).enumerate() {
                 let input = BoundExpr::column_ref(binding, ty.clone(), "");
-                let stats = child_can[i]
-                    .then(|| overrides.get(&binding).cloned().unwrap_or_else(|| self.statistics.get(binding)));
+                let stats = child_can[i].then(|| {
+                    overrides
+                        .get(&binding)
+                        .cloned()
+                        .unwrap_or_else(|| self.statistics.get(binding))
+                });
                 let compress = |s: &ColumnStatistics| {
                     integral_compress(input.clone(), s)
                         .or_else(|| string_compress(input.clone(), s))
@@ -418,13 +438,15 @@ impl Pass<'_> {
         let output_types = op.types();
         let mut restore_of: HashMap<ColumnBinding, (Compression, LogicalType)> = HashMap::new();
         let compressed_column = |binding: ColumnBinding| {
-            children.iter().flatten().find(|(index, ..)| *index == binding.table_index).and_then(
-                |(_, how, types)| {
+            children
+                .iter()
+                .flatten()
+                .find(|(index, ..)| *index == binding.table_index)
+                .and_then(|(_, how, types)| {
                     how[binding.column_index]
                         .clone()
                         .map(|h| (h, types[binding.column_index].clone()))
-                },
-            )
+                })
         };
         match &op.kind {
             K::Aggregate {
@@ -489,7 +511,13 @@ impl Pass<'_> {
                 collect(target, &mut referenced);
             }
         }
-        let can = vec![op.children[0].column_bindings().iter().map(|b| !referenced.contains(b)).collect()];
+        let can = vec![
+            op.children[0]
+                .column_bindings()
+                .iter()
+                .map(|b| !referenced.contains(b))
+                .collect(),
+        ];
         self.create_projections(op, &can, &HashMap::new())
     }
 
@@ -499,7 +527,10 @@ impl Pass<'_> {
     fn compress_comparison_join(&mut self, op: &mut LogicalOperator) -> HashMap<ColumnBinding, ColumnBinding> {
         // `TryCompressVariantComparisonJoinKey`: a join of two VARIANTs fully shredded on integral types
         // compares them as integers of a type both fit in
-        let has_variant = op.children.iter().any(|c| c.types().iter().any(|t| t.id() == LogicalTypeId::Variant));
+        let has_variant = op
+            .children
+            .iter()
+            .any(|c| c.types().iter().any(|t| t.id() == LogicalTypeId::Variant));
         let mut lowered = HashSet::new();
         if let K::Join { conditions, .. } = &mut op.kind
             && conditions.len() == 1
@@ -514,9 +545,10 @@ impl Pass<'_> {
                 let (shredded, _) = super::variant_statistics::compress_info(&statistics.get(binding))?;
                 shredded.is_integral().then_some((binding, shredded))
             };
-            if let (Some((l, left)), Some((r, right))) =
-                (key(&condition.left, self.statistics), key(&condition.right, self.statistics))
-                && let Some(target) = crate::function::combine_types::try_max_logical_type(&left, &right)
+            if let (Some((l, left)), Some((r, right))) = (
+                key(&condition.left, self.statistics),
+                key(&condition.right, self.statistics),
+            ) && let Some(target) = crate::function::combine_types::try_max_logical_type(&left, &right)
                 && target.is_integral()
             {
                 let cast = |expr: &BoundExpr, shredded: &LogicalType| {
@@ -524,7 +556,11 @@ impl Pass<'_> {
                         unreachable!("a wrapper")
                     };
                     let cast = children[0].clone().cast_to(shredded, false);
-                    if *shredded == target { cast } else { cast.cast_to(&target, false) }
+                    if *shredded == target {
+                        cast
+                    } else {
+                        cast.cast_to(&target, false)
+                    }
                 };
                 condition.left = cast(&condition.left, &left);
                 condition.right = cast(&condition.right, &right);
@@ -581,8 +617,16 @@ impl Pass<'_> {
             collect(&condition.left, &mut referenced);
             collect(&condition.right, &mut referenced);
         }
-        let probe: Vec<bool> = op.children[0].column_bindings().iter().map(|b| probe_keys.contains(b)).collect();
-        let build: Vec<bool> = op.children[1].column_bindings().iter().map(|b| !referenced.contains(b)).collect();
+        let probe: Vec<bool> = op.children[0]
+            .column_bindings()
+            .iter()
+            .map(|b| probe_keys.contains(b))
+            .collect();
+        let build: Vec<bool> = op.children[1]
+            .column_bindings()
+            .iter()
+            .map(|b| !referenced.contains(b))
+            .collect();
         self.create_projections(op, &[probe, build], &overrides)
     }
 }
@@ -601,12 +645,28 @@ fn merge(a: &ColumnStatistics, b: &ColumnStatistics) -> ColumnStatistics {
         // a side without values does not bound the other
         _ if !valid_x => y.clone(),
         _ if !valid_y => x.clone(),
-        (Some(x), Some(y)) => Some(if compare_values(op, x, y) == Some(true) { x.clone() } else { y.clone() }),
+        (Some(x), Some(y)) => Some(if compare_values(op, x, y) == Some(true) {
+            x.clone()
+        } else {
+            y.clone()
+        }),
         _ => None,
     };
     let mut merged = a.clone();
-    merged.min = pick(&a.min, &b.min, ComparisonOp::LessThanOrEqual, a.can_be_valid, b.can_be_valid);
-    merged.max = pick(&a.max, &b.max, ComparisonOp::GreaterThanOrEqual, a.can_be_valid, b.can_be_valid);
+    merged.min = pick(
+        &a.min,
+        &b.min,
+        ComparisonOp::LessThanOrEqual,
+        a.can_be_valid,
+        b.can_be_valid,
+    );
+    merged.max = pick(
+        &a.max,
+        &b.max,
+        ComparisonOp::GreaterThanOrEqual,
+        a.can_be_valid,
+        b.can_be_valid,
+    );
     merged.can_be_null = a.can_be_null || b.can_be_null;
     merged.can_be_valid = a.can_be_valid || b.can_be_valid;
     merged.strings = match (&a.strings, &b.strings) {
@@ -639,7 +699,11 @@ fn same_width(size: usize, signed: bool) -> Option<LogicalType> {
 fn is_signed(ty: &LogicalType) -> bool {
     matches!(
         ty.id(),
-        LogicalTypeId::TinyInt | LogicalTypeId::SmallInt | LogicalTypeId::Integer | LogicalTypeId::BigInt | LogicalTypeId::HugeInt
+        LogicalTypeId::TinyInt
+            | LogicalTypeId::SmallInt
+            | LogicalTypeId::Integer
+            | LogicalTypeId::BigInt
+            | LogicalTypeId::HugeInt
     )
 }
 
@@ -707,9 +771,7 @@ fn integral_compress_with(input: BoundExpr, stats: &ColumnStatistics, offset_onl
     if offset_size >= size {
         return None;
     }
-    let fits = |target: &LogicalType| {
-        all_null || bounds(target).is_some_and(|(lo, hi)| lo <= min && max <= hi)
-    };
+    let fits = |target: &LogicalType| all_null || bounds(target).is_some_and(|(lo, hi)| lo <= min && max <= hi);
     let preferred = same_width(offset_size, is_signed(&ty))?;
     let alternate = same_width(offset_size, !is_signed(&ty))?;
     for target in [preferred, alternate] {
@@ -722,15 +784,15 @@ fn integral_compress_with(input: BoundExpr, stats: &ColumnStatistics, offset_onl
         }
     }
     let target = same_width(offset_size, false)?;
-    let min = if all_null { Value::null(ty.clone()) } else { integral_value(&ty, min) };
+    let min = if all_null {
+        Value::null(ty.clone())
+    } else {
+        integral_value(&ty, min)
+    };
     let callback = compress_callback(&ty, &target)?;
     let name = format!("__internal_compress_integral_{}", type_name(&target));
-    let expression = crate::function::nested::bound_function(
-        &name,
-        vec![input, BoundExpr::constant(min.clone())],
-        target,
-        callback,
-    );
+    let expression =
+        crate::function::nested::bound_function(&name, vec![input, BoundExpr::constant(min.clone())], target, callback);
     Some(Compressed {
         expression,
         how: Compression::Offset(min),

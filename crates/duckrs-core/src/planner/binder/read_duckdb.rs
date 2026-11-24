@@ -114,7 +114,9 @@ impl Binder<'_> {
             match option.as_str() {
                 "schema_name" | "table_name" => {
                     if value.is_null() {
-                        return Err(binder_error(format!("read_duckdb parameter \"{option}\" cannot be NULL")));
+                        return Err(binder_error(format!(
+                            "read_duckdb parameter \"{option}\" cannot be NULL"
+                        )));
                     }
                     let text = value.try_to_string()?;
                     if option == "schema_name" {

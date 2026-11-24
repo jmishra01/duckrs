@@ -49,9 +49,22 @@ impl Spec {
         use Spec::*;
         match self {
             WeekdayDecimal | WeekdayIso => 1,
-            DayOfMonthPadded | DayOfMonth | MonthDecimalPadded | MonthDecimal | YearWithoutCenturyPadded
-            | YearWithoutCentury | Hour24Padded | Hour24Decimal | Hour12Padded | Hour12Decimal | MinutePadded
-            | MinuteDecimal | SecondPadded | SecondDecimal | WeekNumberPaddedSunFirst | WeekNumberPaddedMonFirst
+            DayOfMonthPadded
+            | DayOfMonth
+            | MonthDecimalPadded
+            | MonthDecimal
+            | YearWithoutCenturyPadded
+            | YearWithoutCentury
+            | Hour24Padded
+            | Hour24Decimal
+            | Hour12Padded
+            | Hour12Decimal
+            | MinutePadded
+            | MinuteDecimal
+            | SecondPadded
+            | SecondDecimal
+            | WeekNumberPaddedSunFirst
+            | WeekNumberPaddedMonFirst
             | WeekNumberIso => 2,
             MillisecondPadded | DayOfYearPadded | DayOfYearDecimal => 3,
             YearDecimal | YearIso => 4,
@@ -99,12 +112,8 @@ fn parse_specifiers(format: &[u8]) -> Result<(Vec<Vec<u8>>, Vec<Spec>), String> 
             i += 1;
             continue;
         }
-        let unrecognized = |prefix: &str, c: u8| {
-            format!(
-                "Unrecognized format for strftime/strptime: %{prefix}{}",
-                char::from(c)
-            )
-        };
+        let unrecognized =
+            |prefix: &str, c: u8| format!("Unrecognized format for strftime/strptime: %{prefix}{}", char::from(c));
         let spec = if c == b'-' && i + 1 < format.len() {
             i += 1;
             c = format[i];
@@ -280,7 +289,15 @@ fn utc_offset(data: &[u8], pos: &mut usize) -> Option<(i32, i32, i32)> {
     Some((negate(hh), negate(mm), negate(ss)))
 }
 
-const DAY_NAMES: [&str; 7] = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+const DAY_NAMES: [&str; 7] = [
+    "Sunday",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+];
 const MONTH_NAMES: [&str; 12] = [
     "January",
     "February",
@@ -299,15 +316,15 @@ const MONTH_NAMES: [&str; 12] = [
 /// `StrpTimeFormat::TryParseCollection`
 fn collection(data: &[u8], pos: &mut usize, names: &[&str], abbreviated: bool) -> Option<usize> {
     for (index, name) in names.iter().enumerate() {
-        let entry = if abbreviated { &name.as_bytes()[..3] } else { name.as_bytes() };
+        let entry = if abbreviated {
+            &name.as_bytes()[..3]
+        } else {
+            name.as_bytes()
+        };
         if *pos + entry.len() > data.len() {
             continue;
         }
-        if entry
-            .iter()
-            .zip(&data[*pos..])
-            .all(|(a, b)| a.eq_ignore_ascii_case(b))
-        {
+        if entry.iter().zip(&data[*pos..]).all(|(a, b)| a.eq_ignore_ascii_case(b)) {
             *pos += entry.len();
             return Some(index);
         }
@@ -473,7 +490,11 @@ impl StrpFormat {
                             );
                             return None;
                         }
-                        r[0] = if number >= 69 { 1900 + number as i32 } else { 2000 + number as i32 };
+                        r[0] = if number >= 69 {
+                            1900 + number as i32
+                        } else {
+                            2000 + number as i32
+                        };
                     }
                     YearDecimal => {
                         if matches!(offset_specifier, YearIso | WeekNumberIso | WeekdayDecimal) {
@@ -486,8 +507,13 @@ impl StrpFormat {
                     }
                     YearIso => {
                         match offset_specifier {
-                            DayOfMonthPadded | DayOfMonth | MonthDecimalPadded | MonthDecimal
-                            | YearWithoutCenturyPadded | YearWithoutCentury | YearDecimal => {}
+                            DayOfMonthPadded
+                            | DayOfMonth
+                            | MonthDecimalPadded
+                            | MonthDecimal
+                            | YearWithoutCenturyPadded
+                            | YearWithoutCentury
+                            | YearDecimal => {}
                             WeekdayDecimal => offset_specifier = spec,
                             YearIso | WeekNumberIso => {
                                 if iso_year <= 9999 {
@@ -697,7 +723,8 @@ impl StrpFormat {
                         }
                         let begin = pos;
                         while pos < size
-                            && (data[pos].is_ascii_alphanumeric() || matches!(data[pos], b'_' | b'/' | b'+' | b'-' | b':'))
+                            && (data[pos].is_ascii_alphanumeric()
+                                || matches!(data[pos], b'_' | b'/' | b'+' | b'-' | b':'))
                         {
                             pos += 1;
                         }

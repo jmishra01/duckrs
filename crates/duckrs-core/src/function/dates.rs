@@ -1127,8 +1127,8 @@ fn make_timestamp(args: &DataChunk, result: &mut Vector) -> Result<()> {
         let part = |at: usize| row[at].as_i128().expect("a BIGINT");
         let (year, month, day) = (part(0), part(1), part(2));
         let (y, m, d) = (int32_part(year)?, int32_part(month)?, int32_part(day)?);
-        let date = Date::from_ymd(y, m, d)
-            .ok_or_else(|| conversion(format!("Date out of range: {year}-{month}-{day}")))?;
+        let date =
+            Date::from_ymd(y, m, d).ok_or_else(|| conversion(format!("Date out of range: {year}-{month}-{day}")))?;
         let time = time_micros(part(3), part(4), seconds_of(&row[5]))?;
         let micros = i64::from(date.0)
             .checked_mul(MICROS_PER_DAY)
@@ -1217,7 +1217,12 @@ to_interval!(to_millennia, "millennia", n, months_interval(n * 12000));
 to_interval!(to_weeks, "weeks", n, days_interval(n * 7));
 to_interval!(to_days, "days", n, days_interval(n));
 to_interval!(to_hours, "hours", n, micros_interval(n * i128::from(MICROS_PER_HOUR)));
-to_interval!(to_minutes, "minutes", n, micros_interval(n * i128::from(MICROS_PER_MINUTE)));
+to_interval!(
+    to_minutes,
+    "minutes",
+    n,
+    micros_interval(n * i128::from(MICROS_PER_MINUTE))
+);
 to_interval!(to_microseconds, "microseconds", n, micros_interval(n));
 
 fn to_seconds(args: &DataChunk, result: &mut Vector) -> Result<()> {

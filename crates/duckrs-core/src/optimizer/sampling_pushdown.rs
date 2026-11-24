@@ -33,7 +33,11 @@ fn optimize(op: &mut LogicalOperator) {
         let rate = match rows {
             Some(rows) => {
                 let estimated = super::join_order::estimate_plan(child).cardinality;
-                if estimated > 0 { rows as f64 / estimated as f64 } else { 1.0 }
+                if estimated > 0 {
+                    rows as f64 / estimated as f64
+                } else {
+                    1.0
+                }
             }
             None => 0.0,
         };

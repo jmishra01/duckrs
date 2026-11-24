@@ -221,7 +221,10 @@ impl SymbolTable {
     }
 
     /// `finalize`: the codes renumbered by length, 2 to 8 and then 1, for a table that isn't zero terminated.
-    #[allow(clippy::needless_range_loop, reason = "the loops index the symbols and the new codes together, as C++'s `Finalize` does")]
+    #[allow(
+        clippy::needless_range_loop,
+        reason = "the loops index the symbols and the new codes together, as C++'s `Finalize` does"
+    )]
     fn finalize(&mut self) {
         let n = usize::from(self.n_symbols);
         let mut new_code = [0u8; 256];

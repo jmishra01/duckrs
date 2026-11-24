@@ -7,60 +7,60 @@
 //! Plans reach the optimizer before `resolve_column_bindings`. A subquery has a plan of its own,
 //! which the binder resolves, so it runs the optimizer on that plan itself.
 
-pub mod build_side;
+mod aggregate_reuse;
 mod aggregate_rewriter;
+pub mod build_side;
 mod common_aggregate;
-mod cse;
 mod common_subplan;
+mod compressed_materialization;
+mod cse;
+mod cte_filter_pusher;
 mod cte_inlining;
-mod eager_aggregate;
-mod join_elimination;
-mod outer_join_simplification;
-mod projection_pullup;
-mod projection_placement;
 mod deliminator;
 mod disjunctive_join;
 pub mod distinct_statistics;
+mod duplicate_groups;
+mod eager_aggregate;
 pub mod empty_result_pullup;
+mod extract_pushdown;
 mod filter_combiner;
 mod filter_pullup;
-mod grouping_sets;
-mod partial_aggregate_pushdown;
-mod aggregate_reuse;
-mod cte_filter_pusher;
-mod materialized_aggregate_reuse;
 pub mod filter_pushdown;
+mod grouping_sets;
 pub mod in_clause_rewriter;
 mod index_scan;
+mod join_elimination;
 pub mod join_order;
+mod late_materialization;
+mod materialized_aggregate_reuse;
+pub mod monotone_preimage;
+pub mod or_range_merge;
+mod outer_join_simplification;
+mod partial_aggregate_pushdown;
+mod partitioned_execution;
+mod projection_placement;
+mod projection_pullup;
 pub mod range_joins;
 mod redundant_order_keys;
 mod relation_statistics;
-mod sampling_pushdown;
 mod remove_redundant_order;
-pub mod rewriter;
-pub mod scan_filters;
-pub mod statistics;
-pub(crate) mod variant_statistics;
-pub mod top_n;
-pub mod row_number_rewriter;
-pub mod type_pushdown;
-pub mod scalar_fn_pushdown;
-pub mod monotone_preimage;
-pub mod or_range_merge;
 pub mod reorder_filter;
-mod late_materialization;
-mod compressed_materialization;
-mod partitioned_execution;
+pub mod rewriter;
+pub mod row_number_rewriter;
+mod sampling_pushdown;
 mod scalar_aggregate_merger;
+pub mod scalar_fn_pushdown;
+pub mod scan_filters;
 mod self_join_aggregate;
+pub mod statistics;
+pub mod top_n;
 mod topn_window_elimination;
-mod window_join_pushdown;
-mod window_self_join;
+pub mod type_pushdown;
 pub mod unnest_rewriter;
 pub mod unused_columns;
-mod duplicate_groups;
-mod extract_pushdown;
+pub(crate) mod variant_statistics;
+mod window_join_pushdown;
+mod window_self_join;
 
 use crate::planner::expression::{BoundExpr, BoundExprKind};
 use crate::planner::logical::LogicalOperator;
@@ -376,7 +376,9 @@ pub fn optimize_timed(
     }
     if options.scalar_aggregate_merge {
         let threshold = options.scalar_aggregate_merge_threshold;
-        plan = run("scalar_aggregate_merge", plan, &mut |plan| scalar_aggregate_merger::merge(plan, threshold));
+        plan = run("scalar_aggregate_merge", plan, &mut |plan| {
+            scalar_aggregate_merger::merge(plan, threshold)
+        });
     }
     if options.aggregate_function_rewriter {
         let (common, statistics) = (options.common_aggregate, options.statistics_propagation);
@@ -451,7 +453,11 @@ pub fn optimize_timed(
         plan = run("window_join_pushdown", plan, &mut window_join_pushdown::optimize);
     }
     if options.outer_join_simplification {
-        plan = run("outer_join_simplification", plan, &mut outer_join_simplification::simplify);
+        plan = run(
+            "outer_join_simplification",
+            plan,
+            &mut outer_join_simplification::simplify,
+        );
     }
     if options.join_order {
         if options.build_side_probe_side {
@@ -468,7 +474,11 @@ pub fn optimize_timed(
         plan = run("aggregate_reuse", plan, &mut aggregate_reuse::reuse);
     }
     if options.partial_aggregate_pushdown {
-        plan = run("partial_aggregate_pushdown", plan, &mut partial_aggregate_pushdown::push_down);
+        plan = run(
+            "partial_aggregate_pushdown",
+            plan,
+            &mut partial_aggregate_pushdown::push_down,
+        );
     }
     if options.join_elimination {
         plan = run("join_elimination", plan, &mut join_elimination::eliminate);
@@ -492,7 +502,8 @@ pub fn optimize_timed(
     let mut statistics_map = None;
     if options.statistics_propagation {
         plan = run("statistics_propagation", plan, &mut |mut plan| {
-            statistics_map = statistics::propagate_statistics(&mut plan, options.perfect_ht_threshold, options.side_effects);
+            statistics_map =
+                statistics::propagate_statistics(&mut plan, options.perfect_ht_threshold, options.side_effects);
             plan
         });
     }
@@ -579,7 +590,9 @@ pub fn optimize_timed(
     // parts of a large aggregate, ORDER BY or window, by ranges of a column
     if options.partitioned_execution {
         let threads = options.threads;
-        plan = run("partitioned_execution", plan, &mut |plan| partitioned_execution::optimize(plan, threads));
+        plan = run("partitioned_execution", plan, &mut |plan| {
+            partitioned_execution::optimize(plan, threads)
+        });
     }
     // shared subplans run once, as materialized CTEs
     if options.common_subplan {
@@ -667,7 +680,10 @@ fn analyze_secure_views(op: &mut LogicalOperator) {
     use crate::planner::logical::LogicalOperatorKind as K;
     if matches!(op.kind, K::SecureView { .. }) {
         let emits = emits_all_rows(&op.children[0]);
-        if let K::SecureView { propagate_statistics, .. } = &mut op.kind {
+        if let K::SecureView {
+            propagate_statistics, ..
+        } = &mut op.kind
+        {
             *propagate_statistics = emits;
         }
     }
@@ -682,7 +698,11 @@ fn emits_all_rows(op: &LogicalOperator) -> bool {
     let own = match &op.kind {
         // a nested secure view applies the same rule to its own contents
         K::SecureView { .. } => return true,
-        K::Projection { .. } | K::Order { .. } | K::ExpressionGet { .. } | K::DummyScan { .. } | K::ColumnSelect { .. } => true,
+        K::Projection { .. }
+        | K::Order { .. }
+        | K::ExpressionGet { .. }
+        | K::DummyScan { .. }
+        | K::ColumnSelect { .. } => true,
         K::Get {
             filters,
             optional_filters,

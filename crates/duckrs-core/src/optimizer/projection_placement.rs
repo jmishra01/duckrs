@@ -165,7 +165,10 @@ fn operator_references_any(op: &LogicalOperator, bindings: &HashSet<ColumnBindin
 
 /// `RetainedBindings`.
 fn retained(op: &LogicalOperator, bindings: &HashSet<ColumnBinding>) -> HashSet<ColumnBinding> {
-    op.column_bindings().into_iter().filter(|b| bindings.contains(b)).collect()
+    op.column_bindings()
+        .into_iter()
+        .filter(|b| bindings.contains(b))
+        .collect()
 }
 
 /// `BindingsBelongToChild`: `expr` reads columns, all of them columns of `op`.
@@ -203,7 +206,13 @@ fn rewrite_through_projection(expr: &mut BoundExpr, table_index: usize, expressi
                 return;
             }
             match expressions.get(binding.column_index).map(|s| (&s.kind, &s.return_type)) {
-                Some((BoundExprKind::ColumnRef { binding: source, depth: 0 }, source_type)) if *source_type == ty => {
+                Some((
+                    BoundExprKind::ColumnRef {
+                        binding: source,
+                        depth: 0,
+                    },
+                    source_type,
+                )) if *source_type == ty => {
                     *binding = *source;
                 }
                 _ => valid = false,
@@ -510,7 +519,13 @@ impl Placer<'_> {
             }
             can_credit_input_transport = false;
             let evaluation = self.cardinality(&op.children[child]);
-            candidates.push((steps.clone(), current_expression.clone(), evaluation, transport, savings));
+            candidates.push((
+                steps.clone(),
+                current_expression.clone(),
+                evaluation,
+                transport,
+                savings,
+            ));
             current.push(child);
         }
 
@@ -679,7 +694,14 @@ impl Placer<'_> {
         let mut current: HashSet<ColumnBinding> = HashSet::from([source_binding]);
         let mut steps: Vec<LiftStep> = Vec::new();
         // (steps, evaluation, input transport, result bindings, target bindings, target types)
-        type LiftOption = (usize, f64, f64, HashSet<ColumnBinding>, Vec<ColumnBinding>, Vec<LogicalType>);
+        type LiftOption = (
+            usize,
+            f64,
+            f64,
+            HashSet<ColumnBinding>,
+            Vec<ColumnBinding>,
+            Vec<LogicalType>,
+        );
         let mut options: Vec<LiftOption> = Vec::new();
         let mut transport = 0.0;
         for (ancestor_path, _) in ancestors.iter().rev() {
@@ -743,7 +765,14 @@ impl Placer<'_> {
             }
             let rows = self.cardinality(op);
             transport += rows;
-            options.push((steps.len(), rows, transport, current.clone(), op.column_bindings(), op.types()));
+            options.push((
+                steps.len(),
+                rows,
+                transport,
+                current.clone(),
+                op.column_bindings(),
+                op.types(),
+            ));
         }
         if options.is_empty() {
             return None;
@@ -767,8 +796,9 @@ impl Placer<'_> {
         let mut best = None;
         for (at, option) in options.iter().enumerate() {
             let remaining_output_transport = transport - option.2;
-            let cost =
-                option.1 * evaluation_width + option.2 * exclusive_width as f64 + remaining_output_transport * output_width;
+            let cost = option.1 * evaluation_width
+                + option.2 * exclusive_width as f64
+                + remaining_output_transport * output_width;
             if cost < best_cost {
                 best_cost = cost;
                 best = Some(at);
@@ -828,7 +858,11 @@ impl Placer<'_> {
         for (dependency, at) in dependencies.iter().zip(dependency_indexes.iter_mut()) {
             if at.is_none() {
                 *at = Some(kept.len());
-                kept.push(BoundExpr::column_ref(dependency.current, dependency.ty.clone(), String::new()));
+                kept.push(BoundExpr::column_ref(
+                    dependency.current,
+                    dependency.ty.clone(),
+                    String::new(),
+                ));
             }
         }
         let table_index = self.generate_table_index();
@@ -938,7 +972,11 @@ impl Placer<'_> {
                 Some(at) => at,
                 None => {
                     inputs.push(current);
-                    compute.push(BoundExpr::column_ref(current, current_types[position].clone(), String::new()));
+                    compute.push(BoundExpr::column_ref(
+                        current,
+                        current_types[position].clone(),
+                        String::new(),
+                    ));
                     inputs.len() - 1
                 }
             };

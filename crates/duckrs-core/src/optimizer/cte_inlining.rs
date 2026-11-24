@@ -37,7 +37,9 @@ fn count_cte_references(op: &LogicalOperator, cte: usize) -> usize {
 /// recursive CTE or a lateral join, which C++ has flattened. Those the inlining does not reach.
 pub(super) fn has_nested_reference(op: &LogicalOperator, cte: usize) -> bool {
     let nested = match &op.kind {
-        K::RecursiveCte { recursive, .. } => count_cte_references(recursive, cte) > 0 || has_nested_reference(recursive, cte),
+        K::RecursiveCte { recursive, .. } => {
+            count_cte_references(recursive, cte) > 0 || has_nested_reference(recursive, cte)
+        }
         K::LateralJoin { right, .. } => count_cte_references(right, cte) > 0 || has_nested_reference(right, cte),
         _ => false,
     };

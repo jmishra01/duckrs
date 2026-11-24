@@ -91,7 +91,9 @@ fn visit_operator(op: &mut LogicalOperator, next_table_index: &mut usize, binds:
             }
         }
         let child = std::mem::replace(&mut op.children[0], LogicalOperator::new(K::CrossProduct, Vec::new()));
-        let scan = matches!(op.kind, K::Filter { .. }).then_some(&child).filter(|c| matches!(c.kind, K::Get { .. }));
+        let scan = matches!(op.kind, K::Filter { .. })
+            .then_some(&child)
+            .filter(|c| matches!(c.kind, K::Get { .. }));
         // `PushdownGet` had put a dense list of integers into the scan as a range, and the list of
         // a column with an index into the scan for an index scan (an optional filter in C++, which
         // duckrs does not have)
@@ -178,7 +180,9 @@ fn is_scan_not_in(expr: &BoundExpr, scan: &[ColumnBinding]) -> bool {
     columns_of(expr, &mut columns);
     matches!(children[0].kind, BoundExprKind::ColumnRef { .. })
         && !columns.is_empty()
-        && columns.iter().all(|c| c.1 == 0 && c.0 == columns[0].0 && scan.contains(&c.0))
+        && columns
+            .iter()
+            .all(|c| c.1 == 0 && c.0 == columns[0].0 && scan.contains(&c.0))
         && !expr.is_volatile()
         && !super::rewriter::can_throw(expr)
 }

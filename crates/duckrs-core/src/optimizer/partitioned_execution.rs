@@ -118,7 +118,10 @@ fn get_columns(op: &LogicalOperator) -> Option<Vec<Column>> {
             let first = windows.first()?;
             for window in &windows[1..] {
                 let same = window.partitions.len() == first.partitions.len()
-                    && window.partitions.iter().all(|p| first.partitions.iter().any(|q| expressions_equal(p, q)));
+                    && window
+                        .partitions
+                        .iter()
+                        .all(|p| first.partitions.iter().any(|q| expressions_equal(p, q)));
                 if !same {
                     return None;
                 }
@@ -233,7 +236,11 @@ fn grow(
         if node.count > 0 {
             *count += node.count as u64;
         }
-        *ratio = if *count == 0 { 1.0 } else { *overlap as f64 / *count as f64 };
+        *ratio = if *count == 0 {
+            1.0
+        } else {
+            *overlap as f64 / *count as f64
+        };
         update(*i, *ratio);
     }
 }
@@ -261,9 +268,25 @@ fn compute_ranges(mut nodes: Vec<Node>, threads: usize) -> Vec<Range> {
         let mut count = 0u64;
         let mut ratio = 1.0;
         // at least `min_count` rows
-        grow(&nodes, &mut i, &mut overlap, &mut count, &mut ratio, &mut |_, c, _| c >= min_count, &mut nothing);
+        grow(
+            &nodes,
+            &mut i,
+            &mut overlap,
+            &mut count,
+            &mut ratio,
+            &mut |_, c, _| c >= min_count,
+            &mut nothing,
+        );
         // until the overlap is small enough
-        grow(&nodes, &mut i, &mut overlap, &mut count, &mut ratio, &mut |_, _, r| r <= MAX_OVERLAP_RATIO, &mut nothing);
+        grow(
+            &nodes,
+            &mut i,
+            &mut overlap,
+            &mut count,
+            &mut ratio,
+            &mut |_, _, r| r <= MAX_OVERLAP_RATIO,
+            &mut nothing,
+        );
         if ratio != 0.0 {
             // look ahead for at most half of `min_count` for a point with less overlap
             let (mut temp_i, mut temp_overlap, mut temp_count, mut temp_ratio) = (i, overlap, count, ratio);
@@ -284,7 +307,15 @@ fn compute_ranges(mut nodes: Vec<Node>, threads: usize) -> Vec<Range> {
                 },
             );
             if lowest_i != i {
-                grow(&nodes, &mut i, &mut overlap, &mut count, &mut ratio, &mut |at, _, _| at == lowest_i, &mut nothing);
+                grow(
+                    &nodes,
+                    &mut i,
+                    &mut overlap,
+                    &mut count,
+                    &mut ratio,
+                    &mut |at, _, _| at == lowest_i,
+                    &mut nothing,
+                );
             }
             // until the next node starts a row group
             if ratio != 0.0 {
@@ -301,7 +332,15 @@ fn compute_ranges(mut nodes: Vec<Node>, threads: usize) -> Vec<Range> {
         }
         // no remainder of less than half of `min_row_groups`
         if nodes.len() - i < min_row_groups / 2 {
-            grow(&nodes, &mut i, &mut overlap, &mut count, &mut ratio, &mut |_, _, _| false, &mut nothing);
+            grow(
+                &nodes,
+                &mut i,
+                &mut overlap,
+                &mut count,
+                &mut ratio,
+                &mut |_, _, _| false,
+                &mut nothing,
+            );
         }
         ranges.push(Range {
             min: (start != 0).then(|| nodes[start].value.clone()),
@@ -349,10 +388,16 @@ fn visit(op: &mut LogicalOperator, threads: usize, next: &mut usize, replacement
             continue;
         }
         let constant = zones.iter().all(|z| {
-            compare_values(ComparisonOp::Equal, z.min.as_ref().expect("can_use"), zones[0].min.as_ref().expect("can_use"))
-                == Some(true)
-                && compare_values(ComparisonOp::Equal, z.max.as_ref().expect("can_use"), zones[0].min.as_ref().expect("can_use"))
-                    == Some(true)
+            compare_values(
+                ComparisonOp::Equal,
+                z.min.as_ref().expect("can_use"),
+                zones[0].min.as_ref().expect("can_use"),
+            ) == Some(true)
+                && compare_values(
+                    ComparisonOp::Equal,
+                    z.max.as_ref().expect("can_use"),
+                    zones[0].min.as_ref().expect("can_use"),
+                ) == Some(true)
         });
         if constant {
             columns.remove(at);
@@ -407,7 +452,13 @@ fn visit(op: &mut LogicalOperator, threads: usize, next: &mut usize, replacement
 }
 
 /// `PartitionedExecutionSplitPipeline`.
-fn split(op: &mut LogicalOperator, column: &Column, ranges: &[Range], next: &mut usize, replacements: &mut Replacements) {
+fn split(
+    op: &mut LogicalOperator,
+    column: &Column,
+    ranges: &[Range],
+    next: &mut usize,
+    replacements: &mut Replacements,
+) {
     let mut parts = Vec::new();
     for range in ranges {
         let mut copy = deep_copy(op, next);
@@ -437,7 +488,8 @@ fn split(op: &mut LogicalOperator, column: &Column, ranges: &[Range], next: &mut
             filters.push(compare(ComparisonOp::LessThan, max));
         }
         let child = copy.children.pop().expect("one child");
-        copy.children.push(LogicalOperator::new(K::Filter { expressions: filters }, vec![child]));
+        copy.children
+            .push(LogicalOperator::new(K::Filter { expressions: filters }, vec![child]));
         let copy = super::filter_pushdown::push_down(copy);
         // a range the filters there leave nothing of
         let mut leaf = &copy;

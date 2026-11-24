@@ -21,7 +21,12 @@ enum IndexChoice {
 
 /// `EvaluateIndexKeyPath`.
 fn evaluate_path(path: &Value) -> Result<(Option<String>, String, String, IndexChoice)> {
-    let field_names: Vec<String> = path.logical_type().struct_children().iter().map(|(n, _)| n.clone()).collect();
+    let field_names: Vec<String> = path
+        .logical_type()
+        .struct_children()
+        .iter()
+        .map(|(n, _)| n.clone())
+        .collect();
     let ValueData::Struct(values) = path.data() else {
         return Err(binder_error("index_key: path parameter cannot be NULL"));
     };
@@ -36,14 +41,18 @@ fn evaluate_path(path: &Value) -> Result<(Option<String>, String, String, IndexC
         if lower == "columns" {
             let ty = value.logical_type();
             if ty.id() != LogicalTypeId::List || ty.child_type().is_none_or(|c| c.id() != LogicalTypeId::Varchar) {
-                return Err(binder_error(format!("index_key: path field {quoted} must be VARCHAR[]")));
+                return Err(binder_error(format!(
+                    "index_key: path field {quoted} must be VARCHAR[]"
+                )));
             }
             let ValueData::List(items) = value.data() else {
                 unreachable!("a list")
             };
             for item in items {
                 if item.is_null() {
-                    return Err(binder_error(format!("index_key: path field {quoted} cannot contain NULL")));
+                    return Err(binder_error(format!(
+                        "index_key: path field {quoted} cannot contain NULL"
+                    )));
                 }
                 columns.push(item.try_to_string()?);
             }
@@ -72,7 +81,9 @@ fn evaluate_path(path: &Value) -> Result<(Option<String>, String, String, IndexC
     let choice = match (index, constraint) {
         (Some(index), None) => {
             if !columns.is_empty() {
-                return Err(binder_error("index_key: path field 'columns' requires a 'constraint' field"));
+                return Err(binder_error(
+                    "index_key: path field 'columns' requires a 'constraint' field",
+                ));
             }
             IndexChoice::Named(index)
         }
@@ -192,9 +203,9 @@ impl Binder<'_> {
                 let mut found: Vec<Vec<usize>> = Vec::new();
                 for constraint in &table.constraints {
                     let (constraint_kind, keys) = match constraint {
-                        TableConstraint::Unique { columns, primary_key, .. } => {
-                            (if *primary_key { "PRIMARY" } else { "UNIQUE" }, columns.clone())
-                        }
+                        TableConstraint::Unique {
+                            columns, primary_key, ..
+                        } => (if *primary_key { "PRIMARY" } else { "UNIQUE" }, columns.clone()),
                         TableConstraint::ForeignKey(key) => ("FOREIGN", key.columns.clone()),
                         TableConstraint::Check { .. } | TableConstraint::NotNull(_) => continue,
                     };

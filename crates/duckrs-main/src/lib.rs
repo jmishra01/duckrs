@@ -1504,6 +1504,17 @@ impl ClientContext {
         let (list_db, list_session) = (self.home.clone(), self.settings.clone());
         let files_db = self.home.clone();
         let attached_db = self.home.clone();
+        let transaction_catalogs: Vec<(Arc<Catalog>, Arc<Catalog>)> = self
+            .transaction
+            .as_ref()
+            .map(|transaction| {
+                transaction
+                    .forks
+                    .iter()
+                    .map(|(database, fork)| (database.catalog.clone(), fork.catalog.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
         Arc::new(SessionValues {
             database: self.db.name.clone(),
             default_database: self.routed_from.clone().unwrap_or_else(|| self.db.name.clone()),
@@ -1582,14 +1593,22 @@ impl ClientContext {
                     .collect()
             }),
             attached_catalog: Box::new(move |name: &str| {
-                if name.eq_ignore_ascii_case(&attached_db.name) && !attached_db.is_detached() {
-                    return Some(attached_db.catalog.clone());
-                }
-                attached_db
-                    .attached
-                    .read()
-                    .get(&name.to_lowercase())
-                    .map(|database| database.catalog.clone())
+                let catalog = if name.eq_ignore_ascii_case(&attached_db.name) && !attached_db.is_detached() {
+                    attached_db.catalog.clone()
+                } else {
+                    attached_db
+                        .attached
+                        .read()
+                        .get(&name.to_lowercase())
+                        .map(|database| database.catalog.clone())?
+                };
+                // a database the transaction changed is read as the transaction sees it
+                Some(
+                    transaction_catalogs
+                        .iter()
+                        .find(|(database, _)| Arc::ptr_eq(database, &catalog))
+                        .map_or(catalog, |(_, fork)| fork.clone()),
+                )
             }),
         })
     }
@@ -1827,7 +1846,10 @@ impl ClientContext {
     }
 
     fn prepare_statement(&mut self, statement: Statement) -> Result<Arc<PreparedStatementData>> {
-        let parameters = Arc::new(ParameterValues::default());
+        let parameters = Arc::new(ParameterValues {
+            declared: parameter_names(&statement.to_string()),
+            ..ParameterValues::default()
+        });
         // these run without the binder, and have no parameters
         let client_statement = matches!(
             statement,
@@ -1910,6 +1932,8 @@ impl ClientContext {
             .parameters
             .iter()
             .filter(|p| !values.contains_key(*p))
+            // `MissingValuesException`: a user variable of that name stands in
+            .filter(|p| p.starts_with(|c: char| c.is_ascii_digit()) || !self.variables.contains_key(*p))
             .map(String::as_str)
             .collect();
         if !missing.is_empty() {
@@ -1923,7 +1947,7 @@ impl ClientContext {
         }
         self.parameters = Some(Arc::new(ParameterValues {
             values: Some(values),
-            seen: Default::default(),
+            ..ParameterValues::default()
         }));
         let result = self.run_statement(&prepared.statement);
         self.parameters = None;
@@ -4715,14 +4739,22 @@ impl ClientContext {
         let CreateKind::Macro { table_macro, macros } = &info.kind else {
             unreachable!("checked by the caller");
         };
-        if self.setting_text("enable_macro_dependencies") == "true" {
-            return Err(duckrs_core::unported("macro dependencies"));
-        }
+        let with_dependencies = self.setting_text("enable_macro_dependencies") == "true";
         let catalog = self.catalog();
         let schema = catalog.schema_for(create_schema_of(info)?.as_deref())?;
         let mut binder = Binder::with_options(&catalog, self.bind_options());
         binder.session = Some(self.session_values());
-        binder.bind_create_macro(&info.name.name, macros, *table_macro, &schema.ident())?;
+        let read = binder.bind_create_macro(&info.name.name, macros, *table_macro, &schema.ident())?;
+        let dependencies = if with_dependencies { read } else { Vec::new() };
+        // `DependencyManager::CreateObject`: a replacement may not read what it replaces, nor what reads it
+        if on_create_conflict(info.on_conflict) == OnCreateConflict::Replace
+            && macro_reaches(&catalog, &dependencies, &schema.ident(), &info.name.name, *table_macro)
+        {
+            return Err(Error::new(
+                ErrorKind::Catalog,
+                "CREATE OR REPLACE is not allowed to depend on itself",
+            ));
+        }
         // `CheckMacroStorageVersion` and `BindCreateFunctionInfo`: what an older file can't hold
         if let Some(version) = catalog.storage_version().filter(|_| !info.temporary) {
             use duckrs_common::serializer::StorageVersion;
@@ -4778,6 +4810,7 @@ impl ClientContext {
             *table_macro,
             macros,
             on_create_conflict(info.on_conflict),
+            dependencies,
         )
     }
 
@@ -4896,6 +4929,7 @@ impl ClientContext {
                         if schema.get_entry(&info.name.name).is_some() {
                             self.drop_trigger_dependents(&catalog, &info.name.name, kind, info.cascade)?;
                             drop_view_dependents(&catalog, &schema.ident(), &info.name.name, kind, info.cascade)?;
+                            drop_macro_dependents(&catalog, &schema.ident(), &info.name.name, None, kind, info.cascade)?;
                         }
                         let dropped = schema.drop_entry(&info.name.name, type_name)?;
                         if dropped && kind == "TABLE" {
@@ -4926,6 +4960,21 @@ impl ClientContext {
                     // DROP MACRO also drops a table macro, if there is no scalar one
                     Ok(schema) => {
                         macro_is_free(&schema, &info.name.name)?;
+                        let kind = if schema.get_macro(&info.name.name, table_macro).is_some() {
+                            Some(table_macro)
+                        } else {
+                            (!table_macro && schema.get_macro(&info.name.name, true).is_some()).then_some(true)
+                        };
+                        if let Some(kind) = kind {
+                            drop_macro_dependents(
+                                &catalog,
+                                &schema.ident(),
+                                &info.name.name,
+                                Some(kind),
+                                macro_type_name(kind),
+                                info.cascade,
+                            )?;
+                        }
                         schema.drop_macro(&info.name.name, table_macro)
                             || (!table_macro && schema.drop_macro(&info.name.name, true))
                     }
@@ -9418,6 +9467,104 @@ fn drop_view_dependents(catalog: &Catalog, schema: &str, name: &str, kind: &str,
     }
     for (schema, view) in dependents {
         schema.drop_entry(&view, "View")?;
+    }
+    Ok(())
+}
+
+/// The macros that read the entry `name` of `schema` (a table or view for `None`, else a macro of that
+/// kind), and those that call them in turn.
+fn macro_dependents(
+    catalog: &Catalog,
+    schema: &str,
+    name: &str,
+    kind: Option<bool>,
+) -> Vec<(Arc<duckrs_core::catalog::SchemaCatalogEntry>, Arc<duckrs_core::catalog::MacroCatalogEntry>)> {
+    let mut found: Vec<(Arc<duckrs_core::catalog::SchemaCatalogEntry>, Arc<duckrs_core::catalog::MacroCatalogEntry>)> =
+        Vec::new();
+    let mut pending = vec![(schema.to_string(), name.to_string(), kind)];
+    while let Some((schema, name, kind)) = pending.pop() {
+        for entry_schema in catalog.schemas() {
+            for table_macro in [false, true] {
+                for entry in entry_schema.macro_entries(table_macro) {
+                    let reads = match kind {
+                        None => entry.depends_on_entry(&schema, &name),
+                        Some(kind) => entry.depends_on_macro(&schema, &name, kind),
+                    };
+                    if reads
+                        && !found.iter().any(|(s, e)| {
+                            s.ident() == entry_schema.ident() && e.name == entry.name && e.table_macro == table_macro
+                        })
+                    {
+                        pending.push((entry_schema.ident(), entry.name.clone(), Some(table_macro)));
+                        found.push((entry_schema.clone(), entry));
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Whether `dependencies`, or what they call in turn, include the macro `name` of `schema`.
+fn macro_reaches(
+    catalog: &Catalog,
+    dependencies: &[duckrs_core::catalog::MacroDependency],
+    schema: &str,
+    name: &str,
+    table_macro: bool,
+) -> bool {
+    let mut seen: Vec<(String, String, bool)> = Vec::new();
+    let mut pending: Vec<duckrs_core::catalog::MacroDependency> = dependencies.to_vec();
+    while let Some(dependency) = pending.pop() {
+        let Some(kind) = dependency.table_macro else { continue };
+        if dependency.schema.eq_ignore_ascii_case(schema) && dependency.name.eq_ignore_ascii_case(name) && kind == table_macro
+        {
+            return true;
+        }
+        let key = (dependency.schema.to_lowercase(), dependency.name.to_lowercase(), kind);
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        if let Some(entry) = catalog
+            .get_schema(&dependency.schema)
+            .and_then(|s| s.get_macro(&dependency.name, kind))
+        {
+            pending.extend(entry.dependencies.iter().cloned());
+        }
+    }
+    false
+}
+
+/// `DependencyManager::DropObject` for the macros that read what is dropped: dropped with CASCADE, an error
+/// without.
+fn drop_macro_dependents(
+    catalog: &Catalog,
+    schema: &str,
+    name: &str,
+    kind: Option<bool>,
+    type_name: &str,
+    cascade: bool,
+) -> Result<()> {
+    let dependents = macro_dependents(catalog, schema, name, kind);
+    if dependents.is_empty() {
+        return Ok(());
+    }
+    if !cascade {
+        let mut message = format!("Cannot drop entry \"{name}\" because there are entries that depend on it.\n");
+        for (_, entry) in &dependents {
+            message += &format!(
+                "{} \"{}\" depends on {} \"{name}\".\n",
+                entry.type_name().to_lowercase(),
+                entry.name,
+                type_name.to_lowercase()
+            );
+        }
+        message += "Use DROP...CASCADE to drop all dependents.";
+        return Err(Error::new(ErrorKind::Dependency, message));
+    }
+    for (schema, entry) in dependents {
+        schema.drop_macro(&entry.name, entry.table_macro);
     }
     Ok(())
 }

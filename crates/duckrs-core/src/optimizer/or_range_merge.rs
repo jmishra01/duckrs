@@ -59,7 +59,9 @@ fn supports_range_merge(expr: &BoundExpr) -> bool {
 /// the same (`v + INTERVAL '1 month'` and `v + INTERVAL '30 days'`).
 fn is_mergeable_input(input: &BoundExpr) -> bool {
     let mut constant = false;
-    input.clone().walk_mut(&mut |e| constant |= matches!(e.kind, BoundExprKind::Constant(_)));
+    input
+        .clone()
+        .walk_mut(&mut |e| constant |= matches!(e.kind, BoundExprKind::Constant(_)));
     !input.is_volatile() && !constant
 }
 
@@ -81,7 +83,10 @@ fn comparison_range(expr: &BoundExpr, lower: &mut RangeBound, upper: &mut RangeB
     };
     if !matches!(
         op,
-        ComparisonOp::LessThan | ComparisonOp::LessThanOrEqual | ComparisonOp::GreaterThan | ComparisonOp::GreaterThanOrEqual
+        ComparisonOp::LessThan
+            | ComparisonOp::LessThanOrEqual
+            | ComparisonOp::GreaterThan
+            | ComparisonOp::GreaterThanOrEqual
     ) {
         return None;
     }
@@ -115,7 +120,11 @@ fn comparison_range(expr: &BoundExpr, lower: &mut RangeBound, upper: &mut RangeB
 fn range(expr: &BoundExpr) -> Option<(BoundExpr, RangeBound, RangeBound)> {
     let (mut lower, mut upper) = (RangeBound::default(), RangeBound::default());
     match &expr.kind {
-        BoundExprKind::Between { input, lower: low, upper: high } => {
+        BoundExprKind::Between {
+            input,
+            lower: low,
+            upper: high,
+        } => {
             let lower = bound(low, input, true)?;
             let upper = bound(high, input, true)?;
             Some(((**input).clone(), lower, upper))
@@ -126,8 +135,11 @@ fn range(expr: &BoundExpr) -> Option<(BoundExpr, RangeBound, RangeBound)> {
             };
             let input = comparison_range(first, &mut lower, &mut upper)?;
             let second_input = comparison_range(second, &mut lower, &mut upper)?;
-            (lower.value.is_some() && upper.value.is_some() && super::rewriter::expressions_equal(&input, &second_input) && is_mergeable_input(&input))
-                .then_some((input, lower, upper))
+            (lower.value.is_some()
+                && upper.value.is_some()
+                && super::rewriter::expressions_equal(&input, &second_input)
+                && is_mergeable_input(&input))
+            .then_some((input, lower, upper))
         }
         _ => {
             let input = comparison_range(expr, &mut lower, &mut upper)?;
@@ -213,8 +225,16 @@ fn comparison(op: ComparisonOp, input: &BoundExpr, bound: &RangeBound) -> BoundE
 
 /// `MakeRange`: the comparisons of a column, otherwise a BETWEEN when both bounds are there.
 fn make_range(input: &BoundExpr, lower: &RangeBound, upper: &RangeBound) -> BoundExpr {
-    let lower_op = if lower.inclusive { ComparisonOp::GreaterThanOrEqual } else { ComparisonOp::GreaterThan };
-    let upper_op = if upper.inclusive { ComparisonOp::LessThanOrEqual } else { ComparisonOp::LessThan };
+    let lower_op = if lower.inclusive {
+        ComparisonOp::GreaterThanOrEqual
+    } else {
+        ComparisonOp::GreaterThan
+    };
+    let upper_op = if upper.inclusive {
+        ComparisonOp::LessThanOrEqual
+    } else {
+        ComparisonOp::LessThan
+    };
     match (&lower.value, &upper.value) {
         (None, _) => comparison(upper_op, input, upper),
         (_, None) => comparison(lower_op, input, lower),

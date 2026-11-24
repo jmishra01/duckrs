@@ -91,6 +91,9 @@ impl Binder<'_> {
             return Ok(None);
         };
         let mut body = (**body).clone();
+        if entry.internal {
+            super::macros::qualify_system_expr(&mut body, &super::macros::system_macro_excluded(function));
+        }
         super::macros::replace_in_expr(&mut body, &super::macros::parameter_names(function), &arguments);
         // `RETURNS`: the result of the macro is cast to its type
         if let Some(ty) = &function.return_type {
