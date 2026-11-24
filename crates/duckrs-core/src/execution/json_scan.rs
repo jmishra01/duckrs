@@ -35,6 +35,8 @@ pub struct JsonScanData {
     pub records: bool,
     /// the records as text, as `read_json_objects` gives them
     pub objects: bool,
+    /// `geojson`: Features are rows of a geometry and their properties (`JSONReader::ReadGeoJSON`)
+    pub geojson: bool,
     pub names: Vec<String>,
     pub types: Vec<LogicalType>,
     pub ignore_errors: bool,
@@ -381,11 +383,119 @@ pub fn infer(records: &[&Json]) -> Structure {
 
 /// `infer`, with `case_insensitive_keys`.
 pub fn infer_with(records: &[&Json], case_insensitive: bool) -> Structure {
+    infer_options(records, case_insensitive, false)
+}
+
+/// `infer_with`, with `geojson` its geometries GEOMETRY.
+pub fn infer_options(records: &[&Json], case_insensitive: bool, geojson: bool) -> Structure {
     let mut structure = Structure::Null;
     for record in records {
-        structure = structure.merge_with(Structure::of_with(record, case_insensitive), case_insensitive);
+        structure =
+            structure.merge_with(Structure::of_options(record, case_insensitive, geojson), case_insensitive);
     }
     structure
+}
+
+/// Whether a file is GeoJSON by its name (`.geojson`, `.geojsonl`, compressed or not).
+pub fn is_geojson_file(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let lower = lower
+        .strip_suffix(".gz")
+        .or_else(|| lower.strip_suffix(".zst"))
+        .unwrap_or(&lower);
+    lower.ends_with(".geojson") || lower.ends_with(".geojsonl")
+}
+
+fn member<'a>(object: &'a [(String, Json)], key: &str) -> Option<&'a Json> {
+    object.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+}
+
+fn has_type(object: &[(String, Json)], name: &str) -> bool {
+    matches!(member(object, "type"), Some(Json::Str(t)) if t == name)
+}
+
+/// `JSONReader::ReadGeoJSON`: a FeatureCollection is a record per Feature; a Feature its geometry, then its own `id`
+/// and `bbox`, then its properties (one whose name is taken gets a suffix, as the names of columns do); a bare
+/// geometry a record of it alone. Other records are as they are.
+pub fn geojson_records(records: Vec<Record>) -> Vec<Record> {
+    let mut result = Vec::with_capacity(records.len());
+    for record in records {
+        let (mut json, span) = match record {
+            Ok(found) => found,
+            Err(error) => {
+                result.push(Err(error));
+                continue;
+            }
+        };
+        let kind = match &json {
+            Json::Object(object)
+                if has_type(object, "FeatureCollection") && matches!(member(object, "features"), Some(Json::Array(_))) =>
+            {
+                1
+            }
+            Json::Object(object) if has_type(object, "Feature") => 2,
+            json if duckrs_common::geojson::is_geojson_geometry(json) => 3,
+            _ => 0,
+        };
+        match kind {
+            1 => {
+                if let Json::Object(object) = &mut json
+                    && let Some((_, Json::Array(features))) = object.iter_mut().find(|(k, _)| k == "features")
+                {
+                    for feature in std::mem::take(features) {
+                        result.push(Ok((feature_record(feature), span.clone())));
+                    }
+                }
+            }
+            2 => result.push(Ok((feature_record(json), span))),
+            3 => result.push(Ok((Json::Object(vec![("geometry".to_string(), json)]), span))),
+            _ => result.push(Ok((json, span))),
+        }
+    }
+    result
+}
+
+/// A Feature as a record: `geometry`, `id`, `bbox` and the properties.
+fn feature_record(mut feature: Json) -> Json {
+    let members = match &mut feature {
+        Json::Object(members) => std::mem::take(members),
+        _ => return feature,
+    };
+    let mut geometry = Json::Null;
+    let mut id = None;
+    let mut bbox = None;
+    let mut properties = Vec::new();
+    for (key, value) in members {
+        match key.as_str() {
+            "geometry" => geometry = value,
+            "id" => id = Some(value),
+            "bbox" => bbox = Some(value),
+            "properties" => {
+                let mut value = value;
+                if let Json::Object(items) = &mut value {
+                    properties = std::mem::take(items);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut fields = vec![("geometry".to_string(), geometry)];
+    if let Some(id) = id {
+        fields.push(("id".to_string(), id));
+    }
+    if let Some(bbox) = bbox {
+        fields.push(("bbox".to_string(), bbox));
+    }
+    for (key, value) in properties {
+        let mut name = key.clone();
+        let mut suffix = 1;
+        while fields.iter().any(|(k, _)| k.eq_ignore_ascii_case(&name)) {
+            name = format!("{key}_{suffix}");
+            suffix += 1;
+        }
+        fields.push((name, value));
+    }
+    Json::Object(fields)
 }
 
 /// A string that is a date, a timestamp or a UUID everywhere: `JSONSchema::TryStringToType`.
@@ -762,7 +872,10 @@ impl PhysicalOperator for PhysicalJsonScan {
                 }
                 // `JSONCommon::NumbersAsRaw`: a DECIMAL reads numbers from their text
                 let raw = scan.types.iter().any(crate::function::json::contains_decimal);
-                let (records, format) = read_records_with(&state.data, scan.format, raw);
+                let (mut records, format) = read_records_with(&state.data, scan.format, raw);
+                if scan.geojson {
+                    records = geojson_records(records);
+                }
                 state.records = Some(records.into_iter());
                 state.format = format;
                 state.record = 0;

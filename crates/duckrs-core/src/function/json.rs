@@ -657,6 +657,15 @@ pub fn transform_with(json: &Json, ty: &LogicalType, strict: bool, formats: &For
         let node = json_to_variant(json)?;
         return Value::new(ty.clone(), ValueData::Bytes(node.encode()));
     }
+    // `TransformToGeometry`: an object is GeoJSON (no WKT is one), a string WKT
+    if ty.id() == LogicalTypeId::Geometry && matches!(json, Json::Object(_)) {
+        let wkb = duckrs_common::geojson::from_geojson(json).and_then(|wkb| duckrs_common::geometry::from_wkb(&wkb));
+        return match wkb {
+            Ok(wkb) => Value::new(ty.clone(), ValueData::Bytes(wkb)),
+            Err(error) if strict => Err(error),
+            Err(_) => Ok(Value::null(ty.clone())),
+        };
+    }
     match (ty.id(), json) {
         (LogicalTypeId::SqlNull, _) => Ok(Value::null(ty.clone())),
         (LogicalTypeId::Varchar, Json::Str(text)) => Ok(Value::varchar(text.as_str())),
@@ -1107,6 +1116,14 @@ impl Structure {
     /// `JSONStructure::ExtractStructure`, with `case_insensitive` keys that differ in case one key,
     /// named by its first spelling (`case_insensitive_keys`).
     pub fn of_with(json: &Json, case_insensitive: bool) -> Structure {
+        Self::of_options(json, case_insensitive, false)
+    }
+
+    /// [`Self::of_with`], with `geojson` a GeoJSON geometry at any depth a GEOMETRY (`geojson`).
+    pub fn of_options(json: &Json, case_insensitive: bool, geojson: bool) -> Structure {
+        if geojson && duckrs_common::geojson::is_geojson_geometry(json) {
+            return Structure::Scalar("GEOMETRY");
+        }
         let same = |a: &str, b: &str| {
             if case_insensitive {
                 a.eq_ignore_ascii_case(b)
@@ -1124,14 +1141,15 @@ impl Structure {
             Json::Array(items) => {
                 let mut element = Structure::Null;
                 for item in items {
-                    element = element.merge_with(Structure::of_with(item, case_insensitive), case_insensitive);
+                    element =
+                        element.merge_with(Structure::of_options(item, case_insensitive, geojson), case_insensitive);
                 }
                 Structure::List(Box::new(element))
             }
             Json::Object(items) => {
                 let mut fields: Vec<(String, Structure)> = Vec::with_capacity(items.len());
                 for (key, value) in items {
-                    let structure = Structure::of_with(value, case_insensitive);
+                    let structure = Structure::of_options(value, case_insensitive, geojson);
                     match fields.iter_mut().find(|(k, _)| same(k, key)) {
                         Some((_, existing)) => *existing = existing.clone().merge_with(structure, case_insensitive),
                         None => fields.push((key.clone(), structure)),
@@ -1210,6 +1228,7 @@ impl Structure {
             // `refine_type` makes those that don't fit a HUGEINT
             Structure::Scalar("UBIGINT" | "BIGINT") => LogicalType::BIGINT,
             Structure::Scalar("DOUBLE") => LogicalType::DOUBLE,
+            Structure::Scalar("GEOMETRY") => LogicalType::new(LogicalTypeId::Geometry),
             Structure::Scalar(_) => LogicalType::VARCHAR,
             Structure::List(element) => LogicalType::list(element.logical_type_with(depth - 1, maps)),
             // `StructureToTypeObject`: an empty object is a MAP of what it could hold
