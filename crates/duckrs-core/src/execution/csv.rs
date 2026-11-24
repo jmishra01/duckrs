@@ -1074,6 +1074,34 @@ fn reject(scan: &CsvScanData, state: &mut CsvScanState, reject: Reject) {
     }
 }
 
+/// The types the scanner parses from the bytes of a value (`StringValueResult::AddValueToVector`); the others are
+/// read as text and cast from it.
+fn parsed_directly(ty: &LogicalType) -> bool {
+    use LogicalTypeId as T;
+    matches!(
+        ty.id(),
+        T::Boolean
+            | T::TinyInt
+            | T::SmallInt
+            | T::Integer
+            | T::BigInt
+            | T::HugeInt
+            | T::UTinyInt
+            | T::USmallInt
+            | T::UInteger
+            | T::UBigInt
+            | T::UHugeInt
+            | T::Bignum
+            | T::Double
+            | T::Float
+            | T::Date
+            | T::Time
+            | T::Timestamp
+            | T::TimestampTz
+            | T::Decimal
+    )
+}
+
 /// The scan of one row that didn't parse: a line of its own in the rejects, or the error.
 #[allow(clippy::too_many_arguments)] // each says something else of the row
 fn bad_line(
@@ -1148,6 +1176,8 @@ fn read_rows(
         let mut rows: Vec<Vec<Field<'_>>> = Vec::with_capacity(CHUNK_ROWS);
         let mut spans = Vec::with_capacity(CHUNK_ROWS);
         let mut doomed = Vec::with_capacity(CHUNK_ROWS);
+        // the errors of these rows go in by line, those of a line together, as the scanner meets them
+        let rejects_start = state.rejects.len();
         while rows.len() < CHUNK_ROWS {
             let scanner = state.scanner.as_mut().expect("a scan has a scanner");
             let before = scanner.machine.position;
@@ -1226,6 +1256,7 @@ fn read_rows(
             };
             state.line += count_lines(&data[before..position]);
             let line_size = position.saturating_sub(span.start);
+            let mut doomed_row = false;
             if line_size > scan.options.maximum_line_size() {
                 // `CSVError::LineSizeError` of the scanner: the size of the line without its new line
                 let text = span.text(data);
@@ -1237,7 +1268,6 @@ fn read_rows(
                     scan.options.maximum_line_size(),
                     text.len()
                 );
-                drop(row_fields);
                 reject(
                     scan,
                     state,
@@ -1253,9 +1283,13 @@ fn read_rows(
                         message,
                     },
                 );
-                continue;
+                // what the line has is still checked: its other errors are reported too
+                doomed_row = true;
             }
-            if let Some(field) = row_fields.iter().position(|f| std::str::from_utf8(&f.text).is_err()) {
+            let invalid: Vec<usize> = (0..row_fields.len())
+                .filter(|&f| std::str::from_utf8(&row_fields[f].text).is_err())
+                .collect();
+            if !invalid.is_empty() {
                 let message = "Invalid unicode (byte sequence mismatch) detected. This file is not utf-8 encoded.";
                 if !ignore {
                     return Err(csv_error(
@@ -1270,23 +1304,41 @@ fn read_rows(
                          this row\n",
                     ));
                 }
-                let (position, text) = (row_fields[field].offset + 1, span.text(data));
-                reject(
-                    scan,
-                    state,
-                    Reject {
-                        file: state.file,
-                        line: span.line,
-                        row_position: span.start + 1,
-                        position: Some(position),
-                        column: Some(field + 1),
-                        column_name: scan.names.get(field).cloned(),
-                        kind: "INVALID ENCODING",
-                        text,
-                        message: message.to_string(),
-                    },
-                );
-                continue;
+                // a report per value of a column read as text (`ParseTypeInfo`: VARCHAR, and what is cast from it, such
+                // as the nested types); one of a type the scanner parses fails that parse, which is reported then
+                let text = span.text(data);
+                for field in invalid {
+                    let column = file.mapping.iter().position(|m| *m == Some(field));
+                    let varchar = column.is_none_or(|c| scan.types.get(c).is_none_or(|ty| !parsed_directly(ty)));
+                    if varchar {
+                        // (reported once: what is left of the value reads as NULL, and is not cast again)
+                        if let Some(null) = scan.options.null_strs.first().filter(|n| !n.starts_with('\\')) {
+                            row_fields[field].text = std::borrow::Cow::Owned(null.as_bytes().to_vec());
+                            row_fields[field].quoted = false;
+                            row_fields[field].escaped = false;
+                        }
+                        reject(
+                            scan,
+                            state,
+                            Reject {
+                                file: state.file,
+                                line: span.line,
+                                row_position: span.start + 1,
+                                position: Some(row_fields[field].offset + 1),
+                                column: Some(field + 1),
+                                column_name: column.and_then(|c| scan.names.get(c)).cloned(),
+                                kind: "INVALID ENCODING",
+                                text: text.clone(),
+                                message: message.to_string(),
+                            },
+                        );
+                    }
+                    if std::str::from_utf8(&row_fields[field].text).is_err() {
+                        let valid = make_valid(&row_fields[field].text, '?');
+                        row_fields[field].text = std::borrow::Cow::Owned(valid.into_bytes());
+                    }
+                }
+                doomed_row = true;
             }
             // a NULL as the first value too many is no value (`HandleTooManyColumnsError`)
             let trailing = row_fields.len() == file.columns + 1
@@ -1354,14 +1406,17 @@ fn read_rows(
             }
             rows.push(row_fields);
             spans.push(span);
-            doomed.push(false);
+            doomed.push(doomed_row);
         }
         if rows.is_empty() {
             return Ok(None);
         }
         loop {
             match typed_chunk(data, &rows, scan, file, &spans, &doomed, state)? {
-                Typed::Chunk(chunk) => return Ok(Some(chunk)),
+                Typed::Chunk(chunk) => {
+                    state.rejects[rejects_start..].sort_by_key(|reject| (reject.file, reject.line));
+                    return Ok(Some(chunk));
+                }
                 Typed::Reject(bad) => {
                     for &row in bad.iter().rev() {
                         rows.remove(row);
@@ -1369,6 +1424,7 @@ fn read_rows(
                         doomed.remove(row);
                     }
                     if rows.is_empty() {
+                        state.rejects[rejects_start..].sort_by_key(|reject| (reject.file, reject.line));
                         break;
                     }
                 }

@@ -1391,8 +1391,9 @@ impl Binder<'_> {
         let (scans, errors) = (table(scans_name), table(errors_name));
         let (scans_ok, errors_ok) = (ours(&scans, "file_path"), ours(&errors, "error_message"));
         // `CSVRejectsTable::GetOrCreate`: tables of these names are reused only as the pair they were made as
-        let partial = scans.is_some() != errors.is_some();
-        if !scans_ok || !errors_ok || partial {
+        let pair = (scans_name.to_uppercase(), errors_name.to_uppercase());
+        let made = self.catalog.rejects_pairs.lock().contains(&pair);
+        if !scans_ok || !errors_ok || ((scans.is_some() || errors.is_some()) && !made) {
             let mut message = String::new();
             if scans.is_some() {
                 message += &format!("Reject Scan Table name \"{scans_name}\" is already in use. ");
@@ -1418,6 +1419,7 @@ impl Binder<'_> {
             .map(str::to_string)
             .to_vec(),
         )?;
+        self.catalog.rejects_pairs.lock().insert(pair);
         let create = |name: &str, columns: Vec<ColumnDefinition>| -> Result<Arc<TableCatalogEntry>> {
             temp.create_table(name, columns, Vec::new(), Vec::new(), OnCreateConflict::Ignore)?;
             table(name).ok_or_else(|| binder_error("The rejects tables could not be created"))
@@ -1456,8 +1458,9 @@ impl Binder<'_> {
             ],
         )?;
         // `CSVRejectsTable`: one scan id for the scans of a query, whose files are numbered on from one another
-        static LAST: std::sync::Mutex<Option<(u64, u64, usize)>> = std::sync::Mutex::new(None);
-        let query = self.session.as_ref().map(|session| session.query_id);
+        // (a query of one connection: query ids of others are numbered on their own)
+        static LAST: std::sync::Mutex<Option<((u64, u64), u64, usize)>> = std::sync::Mutex::new(None);
+        let query = self.session.as_ref().map(|session| (session.connection_id, session.query_id));
         let (scan_id, file_offset) = {
             let mut last = LAST.lock().expect("not poisoned");
             let (scan_id, file_offset) = match (*last, query) {

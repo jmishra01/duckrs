@@ -533,6 +533,7 @@ impl Catalog {
         let transaction = start;
         let mut catalog = Catalog::new(&self.name);
         catalog.row_group_rows = self.row_group_rows.clone();
+        catalog.rejects_pairs = self.rejects_pairs.clone();
         catalog.forked = true;
         let catalog = Arc::new(catalog);
         *catalog.database_list.write() = self.database_list.read().clone();

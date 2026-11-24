@@ -2839,6 +2839,9 @@ pub struct Catalog {
     /// `DEFAULT_TABLE`: the table, by its schema (if given) and name, that the name of the database stands for in a
     /// query (`Catalog::SetDefaultTable`)
     default_table: RwLock<Option<(Option<String>, String)>>,
+    /// `CSVRejectsTable` in the `ObjectCache`: the (scan, error) names of the rejects tables made so far, which
+    /// tables of those names may be reused as (shared with the transactions' copies)
+    pub rejects_pairs: Arc<Mutex<std::collections::HashSet<(String, String)>>>,
 }
 
 thread_local! {
@@ -3091,6 +3094,7 @@ impl Catalog {
             row_group_rows: Arc::new(std::sync::atomic::AtomicUsize::new(ROW_GROUP_ROWS)),
             ahead: AheadSlot::default(),
             default_table: RwLock::new(None),
+            rejects_pairs: Arc::default(),
         };
         for name in [DEFAULT_SCHEMA, TEMP_SCHEMA] {
             // temporary tables aren't in the file
