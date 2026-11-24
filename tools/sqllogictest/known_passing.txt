@@ -7,6 +7,9 @@
 #   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
 # Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
 # stop passing. Regenerate with:
+#   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
+# Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
+# stop passing. Regenerate with:
 test/common/test_cast_hugeint.test
 test/common/test_cast_struct.test
 test/common/test_local_file_urls.test
@@ -1856,6 +1859,7 @@ test/sql/copy/filename_pattern_serialization.test
 test/sql/copy/hive_partition_null_overwrite.test
 test/sql/copy/parquet/allow_empty.test
 test/sql/copy/parquet/alltypes-dictionaries.test
+test/sql/copy/parquet/attach_parquet.test
 test/sql/copy/parquet/auto_glob_directory.test
 test/sql/copy/parquet/aws2.test
 test/sql/copy/parquet/aws_kinesis.test
@@ -1872,6 +1876,7 @@ test/sql/copy/parquet/byte_stream_split.test
 test/sql/copy/parquet/byte_stream_split_flba.test
 test/sql/copy/parquet/case_insensitive_replacement.test
 test/sql/copy/parquet/copy_ninf_stats.test
+test/sql/copy/parquet/copy_option_non_foldable.test
 test/sql/copy/parquet/copy_option_prepared.test
 test/sql/copy/parquet/copy_option_suggestion.test
 test/sql/copy/parquet/copy_option_validation.test
@@ -1958,6 +1963,8 @@ test/sql/copy/parquet/parquet_filter_dictionary_materialize.test
 test/sql/copy/parquet/parquet_filter_narrowing_cast.test
 test/sql/copy/parquet/parquet_fixed_length_blob_dict.test
 test/sql/copy/parquet/parquet_footer_size_option.test
+test/sql/copy/parquet/parquet_glob_cache.test
+test/sql/copy/parquet/parquet_glob_cache_list.test
 test/sql/copy/parquet/parquet_go.test
 test/sql/copy/parquet/parquet_hive.test
 test/sql/copy/parquet/parquet_hive2.test
@@ -1986,6 +1993,7 @@ test/sql/copy/parquet/parquet_prefetch_overlapping_ranges.test
 test/sql/copy/parquet/parquet_pruned_first_file_cardinality.test
 test/sql/copy/parquet/parquet_read_options.test
 test/sql/copy/parquet/parquet_row_group_row_count.test
+test/sql/copy/parquet/parquet_row_number.test
 test/sql/copy/parquet/parquet_schema_duckdb_type.test
 test/sql/copy/parquet/parquet_schema_evolution.test
 test/sql/copy/parquet/parquet_schema_hive_partitioning.test
@@ -2035,6 +2043,7 @@ test/sql/copy/parquet/test_parquet_gzip.test
 test/sql/copy/parquet/test_parquet_nested.test
 test/sql/copy/parquet/test_parquet_null.test
 test/sql/copy/parquet/test_parquet_scan.test
+test/sql/copy/parquet/test_parquet_stats.test
 test/sql/copy/parquet/timestamp_ms_stats.test
 test/sql/copy/parquet/timestamp_s.test
 test/sql/copy/parquet/timetz_parquet.test
