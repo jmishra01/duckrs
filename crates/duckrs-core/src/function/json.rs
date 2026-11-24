@@ -1054,7 +1054,7 @@ pub fn json_cast(source: &Vector, result: &mut Vector, count: usize, mode: CastM
 
 /// Parsing, transforming and dropping a document recurse once per level it nests, so a deep one runs
 /// on a thread whose stack is as deep as the document (yyjson and `ConvertJSON` take no stack per level).
-fn with_stack_for<T: Send>(text: &str, work: impl FnOnce() -> Result<T> + Send) -> Result<T> {
+pub(crate) fn with_stack_for<T: Send>(text: &str, work: impl FnOnce() -> Result<T> + Send) -> Result<T> {
     const SHALLOW: usize = 512;
     let mut depth = 0usize;
     let mut deepest = 0usize;

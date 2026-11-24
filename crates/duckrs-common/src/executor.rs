@@ -364,6 +364,30 @@ pub fn unary_str_to_str(input: &Vector, result: &mut Vector, count: usize, mut f
     });
 }
 
+/// Like [`unary_str_to_str`], but `f` may fail; the first error stops execution.
+pub fn unary_str_to_str_fallible(
+    input: &Vector,
+    result: &mut Vector,
+    count: usize,
+    mut f: impl FnMut(&[u8], &mut Vec<u8>) -> Result<()>,
+) -> Result<()> {
+    let u = input.to_unified(count);
+    let mut error = None;
+    write_strings(input.vector_type() == VectorType::Constant, result, count, |i, buf| {
+        if error.is_some() || !u.is_valid(i) {
+            return false;
+        }
+        match f(u.str_at(i), buf) {
+            Ok(()) => true,
+            Err(e) => {
+                error = Some(e);
+                false
+            }
+        }
+    });
+    error.map_or(Ok(()), Err)
+}
+
 /// Shared driver for string-producing executors: `produce(i, buf)` fills `buf` with row `i`'s
 /// bytes and returns false for NULL.
 fn write_strings(

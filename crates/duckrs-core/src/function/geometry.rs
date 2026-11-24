@@ -131,6 +131,37 @@ fn st_astext(args: &DataChunk, result: &mut Vector) -> Result<()> {
     })
 }
 
+/// `AsGeoJSONFunction`.
+fn st_asgeojson(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    let mut text = String::new();
+    duckrs_common::executor::unary_str_to_str_fallible(args.column(0), result, args.len(), |wkb, out| {
+        text.clear();
+        duckrs_common::geojson::to_geojson(wkb, &mut text)?;
+        out.extend_from_slice(text.as_bytes());
+        Ok(())
+    })
+}
+
+/// `GeomFromGeoJSONFunction`: the GeoJSON read, made WKB, and checked as `Geometry::FromBinary` checks it.
+fn st_geomfromgeojson(args: &DataChunk, result: &mut Vector) -> Result<()> {
+    duckrs_common::executor::unary_str_to_str_fallible(args.column(0), result, args.len(), |input, out| {
+        out.extend_from_slice(&geometry_of_geojson(input)?);
+        Ok(())
+    })
+}
+
+/// The GEOMETRY of a GeoJSON text (`JSONGeometry::FromGeoJSON`).
+pub(crate) fn geometry_of_geojson(input: &[u8]) -> Result<Vec<u8>> {
+    let text = String::from_utf8_lossy(input);
+    // a document nested deeply is read on a stack as deep as it
+    super::json::with_stack_for(&text, || {
+        let json = duckrs_common::json::parse(&text)
+            .map_err(|e| Error::new(ErrorKind::InvalidInput, duckrs_common::json::parse_error_text(&text, &e)))?;
+        let wkb = duckrs_common::geojson::from_geojson(&json)?;
+        geometry::from_wkb(&wkb)
+    })
+}
+
 /// `IntersectsExtentFunction`: whether the bounding boxes meet, in X and Y.
 fn st_intersects_extent(args: &DataChunk, result: &mut Vector) -> Result<()> {
     strict_rows(args, result, |row| {
@@ -192,6 +223,20 @@ pub(super) fn geometry_functions() -> Vec<ScalarFunctionSet> {
         ("st_aswkb", vec![geometry.clone()], LogicalType::BLOB, st_aswkb),
         ("st_asbinary", vec![geometry.clone()], LogicalType::BLOB, st_aswkb),
         ("st_astext", vec![geometry.clone()], LogicalType::VARCHAR, st_astext),
+        // the JSON extension's `ST_AsGeoJSON` and `ST_GeomFromGeoJSON` (`json_geojson.cpp`)
+        ("st_asgeojson", vec![geometry.clone()], super::json::json_type(), st_asgeojson),
+        (
+            "st_geomfromgeojson",
+            vec![LogicalType::VARCHAR],
+            geometry.clone(),
+            st_geomfromgeojson,
+        ),
+        (
+            "st_geomfromgeojson",
+            vec![super::json::json_type()],
+            geometry.clone(),
+            st_geomfromgeojson,
+        ),
         ("st_aswkt", vec![geometry.clone()], LogicalType::VARCHAR, st_astext),
         (
             "st_intersects_extent",

@@ -6,6 +6,7 @@ pub mod column_data;
 pub mod comparison;
 mod error;
 pub mod executor;
+pub mod geojson;
 mod fmt_float;
 pub mod geometry;
 pub mod geometry_crs;
