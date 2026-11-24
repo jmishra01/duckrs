@@ -2931,6 +2931,7 @@ test/sql/join/mark/distinct_comparison.test
 test/sql/join/mark/explicit_conditions.test
 test/sql/join/mark/group_reconstruction_limits.test
 test/sql/join/mark/hash_nested_operator_semantics.test
+test/sql/join/mark/nested_operator_semantics.test
 test/sql/join/mark/residual_predicate.test
 test/sql/join/mark/residual_vector_reuse.test
 test/sql/join/mark/test_null_safe_semi_uncommitted_stats.test
@@ -4328,6 +4329,7 @@ test/sql/subquery/any_all/test_correlated_in_left_join_mark.test
 test/sql/subquery/any_all/test_correlated_mark_row_identity.test
 test/sql/subquery/any_all/test_correlated_tuple_in.test
 test/sql/subquery/any_all/test_row_comparison_any_all.test
+test/sql/subquery/any_all/test_row_not_equal_any_null_semantics.test
 test/sql/subquery/any_all/test_scalar_any_all.test
 test/sql/subquery/any_all/test_scalar_in.test
 test/sql/subquery/any_all/test_simple_not_in.test

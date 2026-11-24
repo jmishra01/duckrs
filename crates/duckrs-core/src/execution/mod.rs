@@ -690,12 +690,9 @@ fn create_physical(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             predicate,
             children,
         )),
-        LogicalOperatorKind::MarkJoin { predicate, .. } => Box::new(special_joins::PhysicalMarkJoin {
-            types,
-            predicate,
-            children,
-            rows: Mutex::default(),
-        }),
+        LogicalOperatorKind::MarkJoin { predicate, .. } => {
+            Box::new(special_joins::PhysicalMarkJoin::new(types, predicate, children))
+        }
         LogicalOperatorKind::Insert {
             table,
             column_index_map,

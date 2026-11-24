@@ -300,16 +300,64 @@ impl PhysicalOperator for PhysicalPositionalJoin {
 pub struct PhysicalMarkJoin {
     pub types: Vec<LogicalType>,
     pub predicate: Option<BoundExpr>,
+    /// How a pair of rows reads `predicate`.
+    pub semantics: MarkSemantics,
     pub children: Vec<Box<dyn PhysicalOperator>>,
     pub rows: Mutex<Vec<DataChunk>>,
 }
 
+/// How `PhysicalMarkJoin` reads its predicate for a pair of rows: TRUE is a match, and where no
+/// pair matches, NULL makes the marker NULL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkSemantics {
+    /// a join condition: a UNION compares as the whole value, as the hash join's row matcher does
+    JoinCondition,
+    /// an SQL comparison: a UNION compares by `UnionComparator`, where a NULL member is NULL
+    Sql,
+    /// `JoinHashTable::ConstructMarkJoinResult` of an uncorrelated multi-column `=` MARK join: the
+    /// pairs match as a join condition, and a left row without a match is refined with
+    /// `MarkJoinRowComparison::CompareEquality`, the SQL comparison
+    RowEquality,
+}
+
 impl PhysicalMarkJoin {
-    fn mark(&self, input: &DataChunk, row: usize, right: &[DataChunk]) -> Result<Value> {
+    /// `PhysicalNestedLoopJoin` and `PhysicalHashJoin` of a MARK join: picks how to read `predicate`
+    /// the way the C++ plan's operator would.
+    pub fn new(
+        types: Vec<LogicalType>,
+        predicate: Option<BoundExpr>,
+        children: Vec<Box<dyn PhysicalOperator>>,
+    ) -> Self {
+        let (predicate, semantics) = match predicate {
+            Some(predicate) => {
+                let (predicate, semantics) = mark_semantics(predicate);
+                (Some(predicate), semantics)
+            }
+            None => (None, MarkSemantics::JoinCondition),
+        };
+        Self {
+            types,
+            predicate,
+            semantics,
+            children,
+            rows: Mutex::default(),
+        }
+    }
+
+    /// Whether `predicate` finds a right row for `row`: `None` for NULL.
+    fn mark(&self, input: &DataChunk, row: usize, right: &[DataChunk]) -> Result<Option<bool>> {
         let Some(predicate) = &self.predicate else {
-            return Ok(Value::boolean(right.iter().any(|c| !c.is_empty())));
+            return Ok(Some(right.iter().any(|c| !c.is_empty())));
+        };
+        let evaluate = |pairs: &DataChunk, sql: bool| -> Result<Vector> {
+            if sql {
+                execute(predicate, pairs)
+            } else {
+                super::expression_executor::as_join_condition(|| execute(predicate, pairs))
+            }
         };
         let mut has_null = false;
+        let mut refine = Vec::new();
         for chunk in right {
             if chunk.is_empty() {
                 continue;
@@ -320,21 +368,136 @@ impl PhysicalMarkJoin {
             let mut columns = left.columns().to_vec();
             columns.extend_from_slice(chunk.columns());
             let pairs = DataChunk::from_columns(columns, count);
-            let result = super::expression_executor::as_join_condition(|| execute(predicate, &pairs))?;
-            for i in 0..count {
-                match result.get_value(i).data() {
-                    ValueData::Bool(true) => return Ok(Value::boolean(true)),
-                    ValueData::Bool(false) => {}
-                    _ => has_null = true,
+            let result = evaluate(&pairs, self.semantics == MarkSemantics::Sql)?;
+            let (found, null) = mark_pairs(&result, count);
+            if found {
+                return Ok(Some(true));
+            }
+            has_null |= null;
+            if self.semantics == MarkSemantics::RowEquality {
+                refine.push(pairs);
+            }
+        }
+        // `MarkJoinChunkHasUnknown`: the SQL comparison decides whether a pair is UNKNOWN
+        if !has_null {
+            for pairs in &refine {
+                if mark_pairs(&evaluate(pairs, true)?, pairs.len()).1 {
+                    has_null = true;
+                    break;
                 }
             }
         }
-        Ok(if has_null {
-            Value::null(LogicalType::BOOLEAN)
-        } else {
-            Value::boolean(false)
-        })
+        Ok((!has_null).then_some(false))
     }
+}
+
+/// Whether a BOOLEAN result of `count` pairs has a TRUE, and whether it has a NULL.
+fn mark_pairs(result: &Vector, count: usize) -> (bool, bool) {
+    let format = result.to_unified(count);
+    let data = format.data::<bool>();
+    let mut null = false;
+    for i in 0..count {
+        if !format.is_valid(i) {
+            null = true;
+        } else if data[format.sel.get(i)] {
+            return (true, null);
+        }
+    }
+    (false, null)
+}
+
+/// How the C++ plan's operator compares the rows of a MARK join's predicate.
+///
+/// `<>` of a row is planned as a nested loop join, whose `MarkJoinNested` compares a TUPLE with
+/// `MarkJoinRowComparison::CompareEquality`: unequal if a field is, else UNKNOWN if a field is NULL.
+/// That is `a <> x OR b <> y`, by field and into nested rows, as SQL comparisons.
+///
+/// `=` of several columns is planned as a hash join with `InitializeUncorrelatedMarkJoin`, which
+/// refines a left row without a match with the SQL comparison. The two only differ for a UNION,
+/// whose NULL member is UNKNOWN in SQL but a value to the row matcher.
+fn mark_semantics(predicate: BoundExpr) -> (BoundExpr, MarkSemantics) {
+    use crate::planner::expression::BoundExprKind;
+    use duckrs_common::types::LogicalTypeId;
+    if let BoundExprKind::Comparison {
+        op: ComparisonOp::NotEqual,
+        left,
+        right,
+    } = &predicate.kind
+        && left.return_type.id() == LogicalTypeId::Tuple
+        && let Some(row) = row_not_equal(left, right)
+    {
+        return (row, MarkSemantics::Sql);
+    }
+    let mut comparisons = Vec::new();
+    and_children(&predicate, &mut comparisons);
+    let union_equality = comparisons.len() > 1
+        && comparisons.iter().all(|c| {
+            matches!(
+                &c.kind,
+                BoundExprKind::Comparison {
+                    op: ComparisonOp::Equal,
+                    ..
+                }
+            )
+        })
+        && comparisons.iter().any(|c| {
+            c.children()
+                .iter()
+                .any(|operand| operand.return_type.id() == LogicalTypeId::Union)
+        });
+    let semantics = if union_equality {
+        MarkSemantics::RowEquality
+    } else {
+        MarkSemantics::JoinCondition
+    };
+    (predicate, semantics)
+}
+
+/// The operands of a conjunction of ANDs, flattened.
+fn and_children<'a>(expr: &'a BoundExpr, out: &mut Vec<&'a BoundExpr>) {
+    match &expr.kind {
+        crate::planner::expression::BoundExprKind::Conjunction { and: true, children } => {
+            for child in children {
+                and_children(child, out);
+            }
+        }
+        _ => out.push(expr),
+    }
+}
+
+/// `CompareRowEqualityInternal` as `<>`: the fields of two rows of the same width compared
+/// pairwise, ORed, into fields that are rows themselves.
+fn row_not_equal(left: &BoundExpr, right: &BoundExpr) -> Option<BoundExpr> {
+    use crate::planner::expression::BoundExprKind;
+    use duckrs_common::types::LogicalTypeId;
+    if left.return_type.id() != LogicalTypeId::Tuple {
+        return Some(BoundExpr::new(
+            BoundExprKind::Comparison {
+                op: ComparisonOp::NotEqual,
+                left: Box::new(left.clone()),
+                right: Box::new(right.clone()),
+            },
+            LogicalType::BOOLEAN,
+        ));
+    }
+    let width = left.return_type.struct_children().len();
+    if right.return_type.id() != LogicalTypeId::Tuple
+        || right.return_type.struct_children().len() != width
+        || width == 0
+    {
+        return None;
+    }
+    let children = (0..width)
+        .map(|i| {
+            let l = crate::function::nested::struct_extract_at_index(left.clone(), i)?;
+            let r = crate::function::nested::struct_extract_at_index(right.clone(), i)?;
+            row_not_equal(&l, &r)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(BoundExpr::new(
+        BoundExprKind::Conjunction { and: false, children },
+        LogicalType::BOOLEAN,
+    ))
 }
 
 impl PhysicalOperator for PhysicalMarkJoin {
@@ -365,7 +528,10 @@ impl PhysicalOperator for PhysicalMarkJoin {
         let mut output = DataChunk::new(&self.types);
         for row in 0..input.len() {
             let mut values = row_values(input, row);
-            values.push(self.mark(input, row, &rows)?);
+            values.push(match self.mark(input, row, &rows)? {
+                Some(found) => Value::boolean(found),
+                None => Value::null(LogicalType::BOOLEAN),
+            });
             output.append_row(&values)?;
         }
         Ok((output, OperatorResult::NeedMoreInput))

@@ -961,6 +961,19 @@ impl Binder<'_> {
                 let Some(child) = child else {
                     return Err(crate::unported("ANY without a value to compare"));
                 };
+                // `IsMultiColumnComparison`: other than `=`, a correlated comparison of rows of
+                // several fields is not planned (`<`, `>` and friends are rewritten to MIN/MAX first)
+                let multi_column_row = |ty: &LogicalType| {
+                    ty.id() == LogicalTypeId::Tuple && ty.struct_children().len() > 1
+                };
+                if !bindings.is_empty()
+                    && comparison == ComparisonOp::NotEqual
+                    && (multi_column_row(&child.return_type) || multi_column_row(&bound.types[0]))
+                {
+                    return Err(crate::error_not_implemented(
+                        "Correlated IN/ANY/ALL with multiple columns not yet supported",
+                    ));
+                }
                 let child_type = expression_return_type(&child);
                 let Some(compare_type) = try_max_logical_type(&child_type, &bound.types[0]) else {
                     return Err(binder_error(format!(
