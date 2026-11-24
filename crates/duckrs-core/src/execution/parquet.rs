@@ -3551,12 +3551,14 @@ pub fn scan_statistics(scan: &ParquetScanData) -> Vec<Option<crate::catalog::Col
     }
     let mut result: Vec<Option<crate::catalog::ColumnStatistics>> = Vec::new();
     let mut first = true;
+    let mut most_rows: i64 = 0;
     for path in &scan.files {
         let Ok((metadata, _)) = read_metadata(path) else {
             return unknown;
         };
         // an empty file of several has no statistics, and no values the merged bounds must cover
         let rows: i64 = metadata.row_groups().iter().map(|group| group.num_rows()).sum();
+        most_rows = most_rows.max(rows);
         if scan.files.len() > 1 && rows == 0 {
             continue;
         }
@@ -3733,6 +3735,21 @@ pub fn scan_statistics(scan: &ParquetScanData) -> Vec<Option<crate::catalog::Col
     }
     if result.len() != scan.names.len() {
         return unknown;
+    }
+    // `file_row_number`: the positions of the rows of the longest file
+    if scan.file_row_number && most_rows > 0 {
+        result.push(Some(crate::catalog::ColumnStatistics {
+            lists: None,
+            variant: None,
+            min: Some(Value::bigint(0)),
+            max: Some(Value::bigint(most_rows - 1)),
+            can_be_null: false,
+            can_be_valid: true,
+            geometry: None,
+            strings: None,
+            distinct: None,
+            children: Vec::new(),
+        }));
     }
     result
 }

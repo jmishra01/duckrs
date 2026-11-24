@@ -1386,7 +1386,13 @@ impl JoinOrderOptimizer {
                 let mut stats = RelationStats::uniform(op.column_bindings(), base);
                 stats.retention = if base == 0.0 { 0.0 } else { 1.0 };
                 // the range of an integral column's values bounds how many distinct ones it has
-                for (column, column_stats) in crate::execution::parquet::scan_statistics(scan).into_iter().enumerate() {
+                // (the columns of the files; `file_row_number` comes after them)
+                let file_columns = scan.types.len();
+                for (column, column_stats) in crate::execution::parquet::scan_statistics(scan)
+                    .into_iter()
+                    .take(file_columns)
+                    .enumerate()
+                {
                     let Some(column_stats) = column_stats else {
                         continue;
                     };

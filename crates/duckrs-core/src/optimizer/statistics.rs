@@ -3177,6 +3177,12 @@ impl StatisticsPropagator {
                         self.aliases.insert(ColumnBinding::new(*group_index, index), *binding);
                     }
                 }
+                // `PropagateStatistics(LogicalAggregate)`: the arguments of the aggregates are expressions too
+                for aggregate in aggregates.iter_mut() {
+                    for child in &mut aggregate.children {
+                        self.expression(child, false);
+                    }
+                }
                 let (aggregate_index, aggregates) = (*aggregate_index, aggregates.clone());
                 let rows = self.max_rows(&op.children[0]);
                 let mut no_overflow = Vec::new();
