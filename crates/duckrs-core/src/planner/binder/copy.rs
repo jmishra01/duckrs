@@ -270,6 +270,8 @@ fn new_line(value: &str) -> Result<String> {
 #[derive(Default)]
 struct CsvArguments {
     files: Vec<String>,
+    /// what `BaseCSVData::Finalize` finds wrong with the options, which C++ checks once the file is sniffed
+    finalize_error: Option<Error>,
     options: CsvReadOptions,
     auto_detect: Option<bool>,
     columns: Option<Vec<(String, LogicalType)>>,
@@ -862,7 +864,7 @@ impl Binder<'_> {
                 result.types_by_name.clear();
             }
         }
-        csv_finalize(&result.options)?;
+        result.finalize_error = csv_finalize(&result.options).err();
         // `CSVReaderOptions::SetRejectsOptions`
         let named = result.rejects_table.is_some() || result.rejects_scan.is_some();
         if named && result.store_rejects == Some(false) {
@@ -949,6 +951,9 @@ impl Binder<'_> {
                 (sniff_of(&data)?, Some(data))
             }
         };
+        if let Some(error) = &arguments.finalize_error {
+            return Err(error.clone());
+        }
         if let Some(names) = &arguments.names {
             // more names than columns: with null_padding, VARCHAR columns the rows are padded with
             if names.len() > sniffed.names.len() && arguments.options.null_padding {

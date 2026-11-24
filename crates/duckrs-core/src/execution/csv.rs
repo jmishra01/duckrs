@@ -289,10 +289,13 @@ struct Reject {
     message: String,
 }
 
-fn count_lines(bytes: &[u8]) -> usize {
+/// The lines that end in `data[start..end]`: a `\r\n` is one, even when the range ends between its two bytes (the
+/// `\r` counts, and the `\n` after it does not).
+fn count_lines(data: &[u8], start: usize, end: usize) -> usize {
     let mut count = 0;
-    for (i, &c) in bytes.iter().enumerate() {
-        count += usize::from(c == b'\n' || (c == b'\r' && bytes.get(i + 1) != Some(&b'\n')));
+    for i in start..end {
+        let c = data[i];
+        count += usize::from(c == b'\r' || (c == b'\n' && (i == 0 || data[i - 1] != b'\r')));
     }
     count
 }
@@ -934,7 +937,7 @@ fn scan_file_chunk(scan: &CsvScanData, state: &mut CsvScanState) -> Result<Optio
                 state.whole = false;
                 return result;
             }
-            state.line = count_lines(&data[..begin]);
+            state.line = count_lines(&data, 0, begin);
             let mut machine = machine;
             machine.position = begin;
             state.scanner = Some(ValueScanner::new(machine));
@@ -1146,7 +1149,7 @@ fn bad_line(
     let scanner = state.scanner.as_mut().expect("a scan has a scanner");
     scanner.skip_line(data);
     let position = scanner.machine.position;
-    state.line += count_lines(&data[before..position]);
+    state.line += count_lines(data, before, position);
     reject(
         scan,
         state,
@@ -1238,7 +1241,7 @@ fn read_rows(
                 Some(Scanned::Row(row)) => row,
                 Some(Scanned::EmptyLine) => {
                     let position = scanner.machine.position;
-                    state.line += count_lines(&data[before..position]);
+                    state.line += count_lines(data, before, position);
                     if file.columns == 1 && empty_is_null {
                         let field = Field {
                             text: std::borrow::Cow::Borrowed(&[]),
@@ -1299,11 +1302,11 @@ fn read_rows(
             let position = scanner.machine.position;
             let mut row_fields = row.fields;
             let span = RowSpan {
-                line: state.line + count_lines(&data[before..row.start.max(before)]) + 1,
+                line: state.line + count_lines(data, before, row.start.max(before)) + 1,
                 start: row.start,
                 end: row.end,
             };
-            state.line += count_lines(&data[before..position]);
+            state.line += count_lines(data, before, position);
             let line_size = position.saturating_sub(span.start);
             let mut doomed_row = false;
             if line_size > scan.options.maximum_line_size() {
