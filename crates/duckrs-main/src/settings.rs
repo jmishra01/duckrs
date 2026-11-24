@@ -605,6 +605,24 @@ fn on_set(setting: &SettingDefinition, value: Value) -> Result<Value> {
                 }
             }
         }
+        // `DefaultBlockSizeSetting::SetGlobal` (`Storage::VerifyBlockAllocSize`)
+        "default_block_size" if !value.is_null() => {
+            if let Ok(size) = value.try_to_string()?.trim().parse::<u64>() {
+                if !size.is_power_of_two() {
+                    return invalid(format!("the block size must be a power of two, got {size}"));
+                }
+                if size < 16384 {
+                    return invalid(format!(
+                        "the block size must be greater or equal than the minimum block size of 16384, got {size}"
+                    ));
+                }
+                if size > 262144 {
+                    return invalid(format!(
+                        "the block size must be lesser or equal than the maximum block size of 262144, got {size}"
+                    ));
+                }
+            }
+        }
         // `ExternalFileCacheLocalMaxBlockSizeSetting::OnSet`
         "external_file_cache_local_max_block_size" => {
             if value.as_i128() == Some(0) {

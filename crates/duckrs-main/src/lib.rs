@@ -425,6 +425,16 @@ impl DatabaseInstance {
             db.settings = settings.clone();
         }
         let buffer = storage::load_database(path, &db.catalog, read_only, options.encryption.as_ref())?;
+        // `SingleFileStorageManager::LoadDatabase`: a block size given has to be the file's
+        if let Some(size) = options.block_size {
+            let file_size = buffer.block_manager().block_alloc_size() as u64;
+            if size != file_size {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("block size parameter does not match the file's block size, got {size}, expected {file_size}"),
+                ));
+            }
+        }
         // `SingleFileBlockManager::Initialize`: an explicit version can go up, not down
         let file_version = buffer.block_manager().storage_version()?;
         let storage_version = match requested {
@@ -2869,9 +2879,28 @@ impl ClientContext {
                     options.storage_version = Some((given, version));
                 }
                 "block_size" => {
-                    let size = text
+                    let size: u64 = text
                         .parse()
                         .map_err(|_| Error::new(ErrorKind::InvalidInput, "BLOCK_SIZE is not a number"))?;
+                    // `Storage::VerifyBlockAllocSize`
+                    const MIN_BLOCK_ALLOC_SIZE: u64 = 16384;
+                    const MAX_BLOCK_ALLOC_SIZE: u64 = 262144;
+                    let invalid = |message: String| Error::new(ErrorKind::InvalidInput, message);
+                    if !size.is_power_of_two() {
+                        return Err(invalid(format!("the block size must be a power of two, got {size}")));
+                    }
+                    if size < MIN_BLOCK_ALLOC_SIZE {
+                        return Err(invalid(format!(
+                            "the block size must be greater or equal than the minimum block size of \
+                             {MIN_BLOCK_ALLOC_SIZE}, got {size}"
+                        )));
+                    }
+                    if size > MAX_BLOCK_ALLOC_SIZE {
+                        return Err(invalid(format!(
+                            "the block size must be lesser or equal than the maximum block size of \
+                             {MAX_BLOCK_ALLOC_SIZE}, got {size}"
+                        )));
+                    }
                     options.block_size = Some(size);
                 }
                 "row_group_size" => {
@@ -3061,6 +3090,23 @@ impl ClientContext {
                     on_conflict: Conflict::Error,
                     ..info.clone()
                 });
+            }
+            // `DatabaseFilePathManager::InsertDatabasePath` comes first: the same file is that conflict
+            if let Some(file) = &existing.file {
+                let same = match (std::fs::canonicalize(&file.path), std::fs::canonicalize(&path)) {
+                    (Ok(a), Ok(b)) => a == b,
+                    _ => file.path == Path::new(&path),
+                };
+                if same && !in_memory {
+                    return Err(Error::new(
+                        ErrorKind::ResourceInUse,
+                        format!(
+                            "Unique file handle conflict: Cannot attach {name} - the database file \"{path}\" is \
+                             already attached by database \"{}\"",
+                            existing.name
+                        ),
+                    ));
+                }
             }
             return Err(Error::new(
                 ErrorKind::Binder,

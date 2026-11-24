@@ -324,6 +324,14 @@ impl Binder<'_> {
     /// before the built-in functions on the search path, and a qualification that does not name
     /// a schema of theirs means a built-in.
     pub(super) fn find_macro(&self, name: &QualifiedName, table_macro: bool) -> Result<Option<Arc<MacroCatalogEntry>>> {
+        // `db.schema.f`: a macro of another attached database
+        if let Some((catalog, schema)) = self.other_database_of(name) {
+            let found = match catalog.get_macro_in(schema.as_deref(), None, &name.name, table_macro)? {
+                Some(found) => Some(found),
+                None => catalog.get_macro_in(schema.as_deref(), None, &name.name, !table_macro)?,
+            };
+            return Ok(found.map(|(_, entry)| entry));
+        }
         let Ok(schema) = self.schema_of(name) else {
             return Ok(None);
         };
