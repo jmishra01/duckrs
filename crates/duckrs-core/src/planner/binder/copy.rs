@@ -1844,6 +1844,20 @@ impl Binder<'_> {
         let mut arguments = vec![string_literal(path), format!("columns := {{{}}}", fields.join(", "))];
         let options = self.copy_options(info)?;
         Self::check_copy_options(&options, true)?;
+        // `read_json`'s format parameters are VARCHARs: an option given without a value is none
+        if self.copy_json
+            && let Some((name, value)) = options.iter().find(|(name, value)| {
+                matches!(
+                    name.as_str(),
+                    "dateformat" | "date_format" | "timestampformat" | "timestamp_format"
+                ) && value.logical_type().id() != LogicalTypeId::Varchar
+            })
+        {
+            return Err(binder_error(format!(
+                "COPY (FORMAT JSON) parameter {name} expects a VARCHAR argument, but got {}.",
+                value.logical_type()
+            )));
+        }
         // `BindCopyOptions`: the CSV COPY function has its own list of options
         if !self.copy_json
             && let Some((name, _)) = options.iter().find(|(name, _)| !is_copy_option(CSV_COPY_OPTIONS, name))

@@ -7,7 +7,7 @@ use super::table_functions::{named_argument, parse_select};
 use super::{Binder, Binding, binder_error};
 use crate::execution::file_system::{self, Compression, read_file};
 use crate::execution::json_scan::{
-    Formats, JsonFormat, JsonScanData, infer_with, read_records, record_error, refine_type,
+    Formats, JsonFormat, JsonScanData, infer_options, read_records, record_error, refine_type,
 };
 use crate::function::json::{Json, TABLE_IN_OUT_COLUMNS, json_type};
 use crate::planner::logical::{LogicalOperator, LogicalOperatorKind};
@@ -58,6 +58,10 @@ impl Binder<'_> {
         let mut union_by_name = false;
         // `maximum_sample_files`: the files `DetectStructure` samples
         let mut maximum_sample_files = 32usize;
+        // `geojson`: left to it, a file named `.geojson` or `.geojsonl` is GeoJSON
+        let mut geojson: Option<bool> = None;
+        // `allow_empty`: a pattern no file matches reads no rows
+        let mut allow_empty = false;
         for argument in &args {
             let value = self.constant_argument(&argument.expr)?;
             if argument.name.is_empty() {
@@ -82,6 +86,33 @@ impl Binder<'_> {
                 continue;
             }
             let option = argument.name.to_lowercase();
+            // `AddReadJSONParameters` and `AddAutoDetectParameters`: what read_json_objects does not take
+            if objects
+                && matches!(
+                    option.as_str(),
+                    "columns"
+                        | "auto_detect"
+                        | "geojson"
+                        | "sample_size"
+                        | "dateformat"
+                        | "date_format"
+                        | "timestampformat"
+                        | "timestamp_format"
+                        | "records"
+                        | "array"
+                        | "maximum_sample_files"
+                        | "case_insensitive_keys"
+                        | "maximum_depth"
+                        | "field_appearance_threshold"
+                        | "map_inference_threshold"
+                        | "convert_strings_to_integers"
+                )
+            {
+                return Err(binder_error(format!(
+                    "Invalid named parameter \"{}\" for function {name}",
+                    argument.name
+                )));
+            }
             let number = || -> Result<i64> {
                 value
                     .try_to_string()?
@@ -163,21 +194,45 @@ impl Binder<'_> {
                 "timestampformat" | "timestamp_format" => formats.timestamp = Some(value.try_to_string()?),
                 "compression" => compression = Compression::parse(&value.try_to_string()?)?,
                 // -1 (`DConstants::INVALID_INDEX`): no objects become MAPs
-                "map_inference_threshold" => map_inference = number()? != -1,
+                "map_inference_threshold" => {
+                    let threshold = number()?;
+                    map_inference = threshold != -1;
+                    formats.map_threshold = usize::try_from(threshold).ok();
+                }
                 "maximum_sample_files" => {
+                    if value.is_null() {
+                        return Err(binder_error("read_json \"maximum_sample_files\" parameter cannot be NULL"));
+                    }
                     let files = number()?;
+                    if files == 0 || files < -1 {
+                        return Err(binder_error(
+                            "read_json \"maximum_sample_files\" parameter must be positive, or -1 to remove the limit \
+                             on the number of files used to sample \"sample_size\" rows.",
+                        ));
+                    }
                     maximum_sample_files = if files < 0 { usize::MAX } else { files as usize };
                 }
                 "maximum_object_size" | "field_appearance_threshold" | "convert_strings_to_integers" => {}
                 "union_by_name" => union_by_name = is_true(&value, &option)?,
                 "case_insensitive_keys" => formats.case_insensitive = is_true(&value, &option)?,
+                "geojson" => geojson = Some(is_true(&value, &option)?),
+                "allow_empty" => allow_empty = is_true(&value, &option)?,
                 "hive_partitioning" | "hive_types" | "hive_type" | "hive_types_autocast" | "hive_type_autocast" => {
                     self.take_hive_option(&mut hive_options, &option, &value)?;
                 }
                 "filename" => {
                     filename = super::copy::filename_option(&value, &option)?;
                 }
-                _ => return Err(crate::unported(format!("the {name} option {option}"))),
+                // `TableFunctionBinder::BindNamedParameters`: what C++ has is not ported yet, the rest is no option
+                _ if READ_JSON_OPTIONS.contains(&option.as_str()) => {
+                    return Err(crate::unported(format!("the {name} option {option}")));
+                }
+                _ => {
+                    return Err(binder_error(format!(
+                        "Invalid named parameter \"{}\" for function {name}",
+                        argument.name
+                    )));
+                }
             }
         }
         let patterns = paths.ok_or_else(|| binder_error(format!("{name} requires a file name")))?;
@@ -197,7 +252,7 @@ impl Binder<'_> {
             } else {
                 file_system::glob_or_directory(pattern, "json")
             };
-            if found.is_empty() {
+            if found.is_empty() && !allow_empty {
                 return Err(Error::new(
                     ErrorKind::Io,
                     format!("No files found that match the pattern \"{pattern}\""),
@@ -205,6 +260,11 @@ impl Binder<'_> {
             }
             files.extend(found);
         }
+        // records='false' reads the values as they are, whatever the file is called
+        let geojson = !objects
+            && geojson.unwrap_or_else(|| {
+                records != Some(false) && files.iter().any(|f| crate::execution::json_scan::is_geojson_file(f))
+            });
         let auto_detect = auto_detect.unwrap_or(columns.is_none());
         if !auto_detect && columns.is_none() && !objects {
             return Err(binder_error(
@@ -216,6 +276,7 @@ impl Binder<'_> {
             (vec!["json".to_string()], vec![json_type()], false)
         } else if let Some(columns) = columns {
             // `JSONScan::AutoDetect` still samples the first file when the format or `records` is left to it
+            let mut sampled_objects = true;
             if (format == JsonFormat::Auto || records.is_none())
                 && let Some(path) = files.first()
             {
@@ -224,9 +285,15 @@ impl Binder<'_> {
                 let size = std::fs::metadata(path).map_or(data.len() as u64, |m| m.len());
                 cardinality_per_file =
                     crate::execution::json_scan::estimate_per_file(&data, &found, detected, size, sample_size);
+                sampled_objects = found
+                    .iter()
+                    .take(sample_size)
+                    .any(|record| matches!(record, Ok((Json::Object(_), _))));
             }
+            // records left to it, one column and no objects sampled: the values themselves are the column
+            let use_records = records.unwrap_or(columns.len() != 1 || sampled_objects);
             let (names, types): (Vec<_>, Vec<_>) = columns.into_iter().unzip();
-            (names, types, records.unwrap_or(true))
+            (names, types, use_records)
         } else {
             let mut sampled: Vec<Json> = Vec::new();
             // `DetectStructure`: up to `sample_size` records of each of the first files
@@ -239,6 +306,11 @@ impl Binder<'_> {
                     cardinality_per_file =
                         crate::execution::json_scan::estimate_per_file(&data, &found, detected, size, sample_size);
                 }
+                let found = if geojson {
+                    crate::execution::json_scan::geojson_records(found)
+                } else {
+                    found
+                };
                 for record in found {
                     match record {
                         Ok((record, _)) => sampled.push(record),
@@ -254,9 +326,15 @@ impl Binder<'_> {
             // the schema of the sampled files is combined either way; union_by_name changes how files are read
             let _ = union_by_name;
             let references: Vec<&Json> = sampled.iter().collect();
-            let structure = infer_with(&references, formats.case_insensitive);
+            let structure = infer_options(&references, formats.case_insensitive, geojson);
             let ty = structure.logical_type_with(maximum_depth, map_inference);
             let ty = refine_type(ty, &references, &formats);
+            if formats.date.is_none() {
+                formats.date = formats.detected_date.get().map(str::to_string);
+            }
+            if formats.timestamp.is_none() {
+                formats.timestamp = formats.detected_timestamp.get().map(str::to_string);
+            }
             let is_object = ty.id() == LogicalTypeId::Struct;
             let use_records = records.unwrap_or(is_object);
             if use_records && !is_object {
@@ -326,6 +404,7 @@ impl Binder<'_> {
             compression,
             records: use_records,
             objects,
+            geojson,
             names,
             types,
             ignore_errors,
@@ -428,3 +507,37 @@ fn remove_duplicate_struct_keys(ty: &LogicalType, ignore_errors: bool) -> Result
         _ => ty.clone(),
     })
 }
+
+/// The named parameters of C++'s `read_json` (`AddReadJSONParameters`, `AddAutoDetectParameters`,
+/// `TableFunctionDefaults` and `MultiFileReader::AddParameters`).
+const READ_JSON_OPTIONS: &[&str] = &[
+    "columns",
+    "auto_detect",
+    "geojson",
+    "sample_size",
+    "dateformat",
+    "date_format",
+    "timestampformat",
+    "timestamp_format",
+    "records",
+    "array",
+    "maximum_sample_files",
+    "case_insensitive_keys",
+    "maximum_depth",
+    "field_appearance_threshold",
+    "map_inference_threshold",
+    "convert_strings_to_integers",
+    "maximum_object_size",
+    "ignore_errors",
+    "format",
+    "compression",
+    "filename",
+    "hive_partitioning",
+    "union_by_name",
+    "hive_types",
+    "hive_types_autocast",
+    "schema",
+    "file_row_number",
+    "column_statistics",
+    "allow_empty",
+];

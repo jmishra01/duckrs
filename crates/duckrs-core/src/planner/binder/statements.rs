@@ -2743,6 +2743,12 @@ impl Binder<'_> {
                     ".json.zst",
                     ".jsonl.zst",
                     ".ndjson.zst",
+                    ".geojson",
+                    ".geojsonl",
+                    ".geojson.gz",
+                    ".geojsonl.gz",
+                    ".geojson.zst",
+                    ".geojsonl.zst",
                 ]
                 .iter()
                 .any(|end| lower.ends_with(end))

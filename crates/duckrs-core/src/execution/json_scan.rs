@@ -35,6 +35,8 @@ pub struct JsonScanData {
     pub records: bool,
     /// the records as text, as `read_json_objects` gives them
     pub objects: bool,
+    /// `geojson`: Features are rows of a geometry and their properties (`JSONReader::ReadGeoJSON`)
+    pub geojson: bool,
     pub names: Vec<String>,
     pub types: Vec<LogicalType>,
     pub ignore_errors: bool,
@@ -381,11 +383,119 @@ pub fn infer(records: &[&Json]) -> Structure {
 
 /// `infer`, with `case_insensitive_keys`.
 pub fn infer_with(records: &[&Json], case_insensitive: bool) -> Structure {
+    infer_options(records, case_insensitive, false)
+}
+
+/// `infer_with`, with `geojson` its geometries GEOMETRY.
+pub fn infer_options(records: &[&Json], case_insensitive: bool, geojson: bool) -> Structure {
     let mut structure = Structure::Null;
     for record in records {
-        structure = structure.merge_with(Structure::of_with(record, case_insensitive), case_insensitive);
+        structure =
+            structure.merge_with(Structure::of_options(record, case_insensitive, geojson), case_insensitive);
     }
     structure
+}
+
+/// Whether a file is GeoJSON by its name (`.geojson`, `.geojsonl`, compressed or not).
+pub fn is_geojson_file(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let lower = lower
+        .strip_suffix(".gz")
+        .or_else(|| lower.strip_suffix(".zst"))
+        .unwrap_or(&lower);
+    lower.ends_with(".geojson") || lower.ends_with(".geojsonl")
+}
+
+fn member<'a>(object: &'a [(String, Json)], key: &str) -> Option<&'a Json> {
+    object.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+}
+
+fn has_type(object: &[(String, Json)], name: &str) -> bool {
+    matches!(member(object, "type"), Some(Json::Str(t)) if t == name)
+}
+
+/// `JSONReader::ReadGeoJSON`: a FeatureCollection is a record per Feature; a Feature its geometry, then its own `id`
+/// and `bbox`, then its properties (one whose name is taken gets a suffix, as the names of columns do); a bare
+/// geometry a record of it alone. Other records are as they are.
+pub fn geojson_records(records: Vec<Record>) -> Vec<Record> {
+    let mut result = Vec::with_capacity(records.len());
+    for record in records {
+        let (mut json, span) = match record {
+            Ok(found) => found,
+            Err(error) => {
+                result.push(Err(error));
+                continue;
+            }
+        };
+        let kind = match &json {
+            Json::Object(object)
+                if has_type(object, "FeatureCollection") && matches!(member(object, "features"), Some(Json::Array(_))) =>
+            {
+                1
+            }
+            Json::Object(object) if has_type(object, "Feature") => 2,
+            json if duckrs_common::geojson::is_geojson_geometry(json) => 3,
+            _ => 0,
+        };
+        match kind {
+            1 => {
+                if let Json::Object(object) = &mut json
+                    && let Some((_, Json::Array(features))) = object.iter_mut().find(|(k, _)| k == "features")
+                {
+                    for feature in std::mem::take(features) {
+                        result.push(Ok((feature_record(feature), span.clone())));
+                    }
+                }
+            }
+            2 => result.push(Ok((feature_record(json), span))),
+            3 => result.push(Ok((Json::Object(vec![("geometry".to_string(), json)]), span))),
+            _ => result.push(Ok((json, span))),
+        }
+    }
+    result
+}
+
+/// A Feature as a record: `geometry`, `id`, `bbox` and the properties.
+fn feature_record(mut feature: Json) -> Json {
+    let members = match &mut feature {
+        Json::Object(members) => std::mem::take(members),
+        _ => return feature,
+    };
+    let mut geometry = Json::Null;
+    let mut id = None;
+    let mut bbox = None;
+    let mut properties = Vec::new();
+    for (key, value) in members {
+        match key.as_str() {
+            "geometry" => geometry = value,
+            "id" => id = Some(value),
+            "bbox" => bbox = Some(value),
+            "properties" => {
+                let mut value = value;
+                if let Json::Object(items) = &mut value {
+                    properties = std::mem::take(items);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut fields = vec![("geometry".to_string(), geometry)];
+    if let Some(id) = id {
+        fields.push(("id".to_string(), id));
+    }
+    if let Some(bbox) = bbox {
+        fields.push(("bbox".to_string(), bbox));
+    }
+    for (key, value) in properties {
+        let mut name = key.clone();
+        let mut suffix = 1;
+        while fields.iter().any(|(k, _)| k.eq_ignore_ascii_case(&name)) {
+            name = format!("{key}_{suffix}");
+            suffix += 1;
+        }
+        fields.push((name, value));
+    }
+    Json::Object(fields)
 }
 
 /// A string that is a date, a timestamp or a UUID everywhere: `JSONSchema::TryStringToType`.
@@ -413,10 +523,49 @@ pub fn refine_type(ty: LogicalType, values: &[&Json], formats: &Formats) -> Logi
                 return ty;
             }
             let zoned = LogicalType::new(Id::TimestampTz);
-            for candidate in [LogicalType::DATE, LogicalType::TIMESTAMP, zoned, LogicalType::UUID] {
-                if texts.iter().all(|text| string_fits(text, &candidate, formats)) {
-                    return candidate;
+            if formats.date.is_some() && texts.iter().all(|text| string_fits(text, &LogicalType::DATE, formats)) {
+                return LogicalType::DATE;
+            }
+            // `DateFormatMap`: without a format given, the first template every value fits; one format for all
+            // columns
+            if formats.date.is_none() {
+                let candidates: Vec<&'static str> = match formats.detected_date.get() {
+                    Some(found) => vec![found],
+                    None => DATE_TEMPLATES.to_vec(),
+                };
+                if let Some(found) = candidates
+                    .into_iter()
+                    .find(|format| texts.iter().all(|text| strptime_micros(text, format).is_ok()))
+                {
+                    formats.detected_date.set(Some(found));
+                    return LogicalType::DATE;
                 }
+            }
+            // `EliminateCandidateFormats`: without a format given, the first template every value fits, a special
+            // (`infinity`, `epoch`) fitting any; a template with an offset makes it a TIMESTAMPTZ, and values with and
+            // without one fit none
+            if formats.timestamp.is_none() {
+                let special = |text: &str| {
+                    matches!(text.to_ascii_lowercase().as_str(), "infinity" | "-infinity" | "epoch")
+                };
+                if let Some(found) = TIMESTAMP_TEMPLATES.into_iter().find(|format| {
+                    texts.iter().all(|text| special(text) || strptime_micros(text, format).is_ok())
+                }) {
+                    if found.contains('Z') || found.contains("%z") {
+                        return zoned;
+                    }
+                    // the scan reads a form no cast reads with the format found; one such format for the file
+                    if !found.contains('T') && formats.detected_timestamp.get().is_none_or(|known| known == found) {
+                        formats.detected_timestamp.set(Some(found));
+                    }
+                    return LogicalType::TIMESTAMP;
+                }
+            } else if texts.iter().all(|text| string_fits(text, &LogicalType::TIMESTAMP, formats)) {
+                // a format given makes only TIMESTAMPs, read with it
+                return LogicalType::TIMESTAMP;
+            }
+            if texts.iter().all(|text| string_fits(text, &LogicalType::UUID, formats)) {
+                return LogicalType::UUID;
             }
             ty
         }
@@ -438,7 +587,7 @@ pub fn refine_type(ty: LogicalType, values: &[&Json], formats: &Formats) -> Logi
                 .collect();
             if formats
                 .map_threshold
-                .is_some_and(|threshold| children.len() > threshold)
+                .is_some_and(|threshold| children.len() >= threshold)
             {
                 let first = children[0].1.clone();
                 let same = children.iter().all(|(_, child)| *child == first);
@@ -471,9 +620,33 @@ pub struct Formats {
     pub case_insensitive: bool,
     /// `error_duplicate_key`: an object with a key twice is an error (the scan's, unless it ignores errors)
     pub error_duplicate_key: bool,
-    /// objects with more keys than this are MAPs (`map_inference_threshold`); `None` turns that off
+    /// objects with at least this many keys are MAPs (`map_inference_threshold`); `None` turns that off
     pub map_threshold: Option<usize>,
+    /// the date format auto-detection settled on (`DateFormatMap`), which the scan then reads with
+    pub detected_date: std::cell::Cell<Option<&'static str>>,
+    /// the timestamp format it settled on
+    pub detected_timestamp: std::cell::Cell<Option<&'static str>>,
 }
+
+/// The timestamp formats of `FORMAT_TEMPLATES`, from the last, as they are tried; the ISO ones a cast reads too.
+const TIMESTAMP_TEMPLATES: [&str; 12] = [
+    "%Y-%m-%dT%H:%M:%S.%f%z",
+    "%Y-%m-%dT%H:%M:%S%z",
+    "%Y-%m-%dT%H:%M:%S.%fZ",
+    "%Y-%m-%dT%H:%M:%SZ",
+    "%Y-%m-%dT%H:%M:%S",
+    "%y-%m-%d %H:%M:%S",
+    "%Y-%m-%d %H:%M:%S",
+    "%d-%m-%y %H:%M:%S",
+    "%d-%m-%Y %H:%M:%S",
+    "%m-%d-%y %I:%M:%S %p",
+    "%m-%d-%Y %I:%M:%S %p",
+    "%Y-%m-%d %H:%M:%S.%f",
+];
+
+/// `FORMAT_TEMPLATES` of `JSONScanData::InitializeFormats`, in the order `EliminateCandidateFormats` tries them: from
+/// the last.
+const DATE_TEMPLATES: [&str; 6] = ["%y-%m-%d", "%Y-%m-%d", "%d-%m-%y", "%d-%m-%Y", "%m-%d-%y", "%m-%d-%Y"];
 
 fn string_fits(text: &str, ty: &LogicalType, formats: &Formats) -> bool {
     let format = match ty.id() {
@@ -592,8 +765,9 @@ fn record_row(
         return Ok(Some(vec![value]));
     }
     let Json::Object(items) = record else {
+        // `TransformObject`: with errors ignored, what is no object is a row of NULLs
         if scan.ignore_errors {
-            return Ok(None);
+            return Ok(Some(scan.types.iter().map(|ty| Value::null(ty.clone())).collect()));
         }
         return Err(Error::new(
             ErrorKind::InvalidInput,
@@ -678,6 +852,8 @@ impl PhysicalOperator for PhysicalJsonScan {
             case_insensitive: scan.case_insensitive,
             error_duplicate_key: !scan.ignore_errors,
             map_threshold: None,
+            detected_date: Default::default(),
+            detected_timestamp: Default::default(),
         };
         let strict = !scan.ignore_errors;
         let wanted: Vec<bool> = (0..scan.types.len())
@@ -696,7 +872,10 @@ impl PhysicalOperator for PhysicalJsonScan {
                 }
                 // `JSONCommon::NumbersAsRaw`: a DECIMAL reads numbers from their text
                 let raw = scan.types.iter().any(crate::function::json::contains_decimal);
-                let (records, format) = read_records_with(&state.data, scan.format, raw);
+                let (mut records, format) = read_records_with(&state.data, scan.format, raw);
+                if scan.geojson {
+                    records = geojson_records(records);
+                }
                 state.records = Some(records.into_iter());
                 state.format = format;
                 state.record = 0;

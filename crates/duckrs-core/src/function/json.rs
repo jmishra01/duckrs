@@ -254,41 +254,38 @@ pub fn parse_path(text: &str) -> Result<Path> {
     })
 }
 
+/// The values in `value` and below it, breadth first, as `GetWildcardPathInternal` visits them.
+fn breadth_first(value: &Json) -> Vec<&Json> {
+    let mut nodes = vec![value];
+    let mut at = 0;
+    while at < nodes.len() {
+        match nodes[at] {
+            Json::Array(items) => nodes.extend(items.iter()),
+            Json::Object(items) => nodes.extend(items.iter().map(|(_, item)| item)),
+            _ => {}
+        }
+        at += 1;
+    }
+    nodes
+}
+
+/// `..`: the rest of the path from each value at or below this one; the value itself only when a path follows.
 fn collect_recursive<'a>(value: &'a Json, rest: &[Step], out: &mut Vec<&'a Json>) {
-    walk(value, rest, out);
-    match value {
-        Json::Array(items) => {
-            for item in items {
-                collect_recursive(item, rest, out);
-            }
+    for (index, node) in breadth_first(value).into_iter().enumerate() {
+        if index > 0 || !rest.is_empty() {
+            walk(node, rest, out);
         }
-        Json::Object(items) => {
-            for (_, item) in items {
-                collect_recursive(item, rest, out);
-            }
-        }
-        _ => {}
     }
 }
 
+/// `..key`: the field `key` of each object at or below this one.
 fn collect_key<'a>(value: &'a Json, key: &str, rest: &[Step], out: &mut Vec<&'a Json>) {
-    if let Json::Object(items) = value
-        && let Some((_, found)) = items.iter().find(|(k, _)| k == key)
-    {
-        walk(found, rest, out);
-    }
-    match value {
-        Json::Array(items) => {
-            for item in items {
-                collect_key(item, key, rest, out);
-            }
+    for node in breadth_first(value) {
+        if let Json::Object(items) = node
+            && let Some((_, found)) = items.iter().find(|(k, _)| k == key)
+        {
+            walk(found, rest, out);
         }
-        Json::Object(items) => {
-            for (_, item) in items {
-                collect_key(item, key, rest, out);
-            }
-        }
-        _ => {}
     }
 }
 
@@ -554,10 +551,26 @@ pub fn transform(json: &Json, ty: &LogicalType, strict: bool) -> Result<Value> {
 
 /// [`transform`], with the formats of dates and timestamps.
 pub fn transform_with(json: &Json, ty: &LogicalType, strict: bool, formats: &Formats) -> Result<Value> {
-    if let Json::Str(text) = json
-        && let Some(value) = formatted_value(text, ty, formats)
-    {
-        return Ok(value);
+    if let Json::Str(text) = json {
+        if let Some(value) = formatted_value(text, ty, formats) {
+            return Ok(value);
+        }
+        // `TransformFromStringWithFormat`: a string that the given format does not read is an error, not a cast
+        let format = match ty.id() {
+            LogicalTypeId::Date => formats.date.as_deref(),
+            LogicalTypeId::Timestamp => formats.timestamp.as_deref(),
+            _ => None,
+        };
+        // the specials (`infinity`, `epoch`) are read whatever the format
+        let special = matches!(text.to_ascii_lowercase().as_str(), "infinity" | "-infinity" | "epoch");
+        if let Some(format) = format.filter(|_| !special) {
+            if !strict {
+                return Ok(Value::null(ty.clone()));
+            }
+            return Err(invalid(format!(
+                "Could not parse string \"{text}\" according to format specifier \"{format}\""
+            )));
+        }
     }
     let transform = |json: &Json, ty: &LogicalType, strict: bool| transform_with(json, ty, strict, formats);
     let fail = |json: &Json| -> Result<Value> {
@@ -643,6 +656,15 @@ pub fn transform_with(json: &Json, ty: &LogicalType, strict: bool, formats: &For
     if ty.id() == LogicalTypeId::Variant {
         let node = json_to_variant(json)?;
         return Value::new(ty.clone(), ValueData::Bytes(node.encode()));
+    }
+    // `TransformToGeometry`: an object is GeoJSON (no WKT is one), a string WKT
+    if ty.id() == LogicalTypeId::Geometry && matches!(json, Json::Object(_)) {
+        let wkb = duckrs_common::geojson::from_geojson(json).and_then(|wkb| duckrs_common::geometry::from_wkb(&wkb));
+        return match wkb {
+            Ok(wkb) => Value::new(ty.clone(), ValueData::Bytes(wkb)),
+            Err(error) if strict => Err(error),
+            Err(_) => Ok(Value::null(ty.clone())),
+        };
     }
     match (ty.id(), json) {
         (LogicalTypeId::SqlNull, _) => Ok(Value::null(ty.clone())),
@@ -1010,8 +1032,28 @@ pub fn json_cast(source: &Vector, result: &mut Vector, count: usize, mode: CastM
             // `JSONCommon::NumbersAsRaw`: a DECIMAL reads numbers from their text
             let raw = contains_decimal(&to);
             with_stack_for(&text, || {
-                let json = parse_with(&text, raw).map_err(|e| invalid(parse_error_text(&text, &e)))?;
-                transform(&json, &to, strict)
+                let json = match parse_with(&text, raw) {
+                    Ok(json) => json,
+                    // TRY_CAST: what is no JSON is NULL
+                    Err(_) if !strict => return Ok(Value::null(to.clone())),
+                    Err(e) => return Err(invalid(parse_error_text(&text, &e))),
+                };
+                // `TransformToJSON`: an element of a JSON[] is the JSON it is, a `null` too
+                if let (Json::Array(items), Some(child)) = (&json, to.child_type())
+                    && to.id() == LogicalTypeId::List
+                    && is_json_type(child)
+                {
+                    let items = items
+                        .iter()
+                        .map(|item| Value::varchar(item.text()).reinterpret(child))
+                        .collect::<Result<Vec<_>>>()?;
+                    return Value::list(child.clone(), items);
+                }
+                // `HandleCastError`: what the transform refuses is a conversion error of the cast
+                transform(&json, &to, strict).map_err(|error| match error.kind {
+                    ErrorKind::InvalidInput => Error::new(ErrorKind::Conversion, error.message),
+                    _ => error,
+                })
             })?
         };
         result.set_value(row, &converted)?;
@@ -1021,7 +1063,7 @@ pub fn json_cast(source: &Vector, result: &mut Vector, count: usize, mode: CastM
 
 /// Parsing, transforming and dropping a document recurse once per level it nests, so a deep one runs
 /// on a thread whose stack is as deep as the document (yyjson and `ConvertJSON` take no stack per level).
-fn with_stack_for<T: Send>(text: &str, work: impl FnOnce() -> Result<T> + Send) -> Result<T> {
+pub(crate) fn with_stack_for<T: Send>(text: &str, work: impl FnOnce() -> Result<T> + Send) -> Result<T> {
     const SHALLOW: usize = 512;
     let mut depth = 0usize;
     let mut deepest = 0usize;
@@ -1074,6 +1116,14 @@ impl Structure {
     /// `JSONStructure::ExtractStructure`, with `case_insensitive` keys that differ in case one key,
     /// named by its first spelling (`case_insensitive_keys`).
     pub fn of_with(json: &Json, case_insensitive: bool) -> Structure {
+        Self::of_options(json, case_insensitive, false)
+    }
+
+    /// [`Self::of_with`], with `geojson` a GeoJSON geometry at any depth a GEOMETRY (`geojson`).
+    pub fn of_options(json: &Json, case_insensitive: bool, geojson: bool) -> Structure {
+        if geojson && duckrs_common::geojson::is_geojson_geometry(json) {
+            return Structure::Scalar("GEOMETRY");
+        }
         let same = |a: &str, b: &str| {
             if case_insensitive {
                 a.eq_ignore_ascii_case(b)
@@ -1091,14 +1141,15 @@ impl Structure {
             Json::Array(items) => {
                 let mut element = Structure::Null;
                 for item in items {
-                    element = element.merge_with(Structure::of_with(item, case_insensitive), case_insensitive);
+                    element =
+                        element.merge_with(Structure::of_options(item, case_insensitive, geojson), case_insensitive);
                 }
                 Structure::List(Box::new(element))
             }
             Json::Object(items) => {
                 let mut fields: Vec<(String, Structure)> = Vec::with_capacity(items.len());
                 for (key, value) in items {
-                    let structure = Structure::of_with(value, case_insensitive);
+                    let structure = Structure::of_options(value, case_insensitive, geojson);
                     match fields.iter_mut().find(|(k, _)| same(k, key)) {
                         Some((_, existing)) => *existing = existing.clone().merge_with(structure, case_insensitive),
                         None => fields.push((key.clone(), structure)),
@@ -1177,6 +1228,7 @@ impl Structure {
             // `refine_type` makes those that don't fit a HUGEINT
             Structure::Scalar("UBIGINT" | "BIGINT") => LogicalType::BIGINT,
             Structure::Scalar("DOUBLE") => LogicalType::DOUBLE,
+            Structure::Scalar("GEOMETRY") => LogicalType::new(LogicalTypeId::Geometry),
             Structure::Scalar(_) => LogicalType::VARCHAR,
             Structure::List(element) => LogicalType::list(element.logical_type_with(depth - 1, maps)),
             // `StructureToTypeObject`: an empty object is a MAP of what it could hold
@@ -1366,6 +1418,10 @@ fn with_path(
 fn each_found(json: &Json, path: &Path, ty: &LogicalType, f: impl Fn(Option<&Json>) -> Result<Value>) -> Result<Value> {
     if !path.is_wildcard() {
         return f(single(json, path));
+    }
+    // `JSONCommon::Get`: a path that is not constant reads one value, which a wildcard can't name
+    if ty.id() != LogicalTypeId::List {
+        return Err(Error::new(ErrorKind::InvalidInput, "JSON path error near '*'"));
     }
     let mut found = Vec::new();
     walk(json, &path.steps, &mut found);
@@ -2171,7 +2227,11 @@ fn path_argument(child: &BoundExpr) -> Result<Option<(bool, bool)>> {
     }
     if let ValueData::List(items) = value.data() {
         for item in items {
-            parse_path(&path_text(item)?).map_err(|e| binder_error(e.message))?;
+            let path = parse_path(&path_text(item)?).map_err(|e| binder_error(e.message))?;
+            // `JSONReadManyFunctionData::Bind`
+            if path.is_wildcard() {
+                return Err(binder_error("Cannot have wildcards in JSON path when supplying multiple paths"));
+            }
         }
         return Ok(Some((true, false)));
     }
