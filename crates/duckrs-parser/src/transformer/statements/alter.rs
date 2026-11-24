@@ -486,6 +486,7 @@ impl Transformer<'_> {
             show.show_type = ShowType::ShowSpecial;
         };
         match self.name(form) {
+            "ShowExternalResources" => return self.show_external_resources(form),
             "ShowTables" => {
                 let name = self.qualified_name(self.req(form, "QualifiedName")?)?;
                 if name.qualification.len() > 1 {

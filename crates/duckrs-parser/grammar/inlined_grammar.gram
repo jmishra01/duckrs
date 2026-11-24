@@ -1490,7 +1490,7 @@ TargetOptAlias <- BaseTableName TargetAlias?
 TargetAlias <- 'AS'? ColId
 DeleteUsingClause <- 'USING' List(TableRef)
 
-DescribeStatement <- ShowTables / ShowDeprecatedSelect / DescribeSelect / ShowAllTables / ShowByName / DescribeByName
+DescribeStatement <- ShowExternalResources / ShowTables / ShowDeprecatedSelect / DescribeSelect / ShowAllTables / ShowByName / DescribeByName
 
 # "DESCRIBE (query)" and "SUMMARIZE (query)" describe the query's columns. "SHOW (query)" does too but is deprecated,
 # so ShowDeprecatedSelect is parsed yet suppressed from autocomplete (matcher_factory.cpp) - SHOW won't offer to complete a query.
@@ -1992,7 +1992,9 @@ ExternalResourceStatement <- CreateExternalResourceStmt / RegisterExternalResour
 CreateExternalResourceStmt <- 'CREATE' ExternalResourceKeyword StringLiteral AttachAlias? ExternalResourceCreationOptions?
 RegisterExternalResourceStmt <- 'REGISTER' ExternalResourceKeyword StringLiteral AttachAlias? 'FROM' Expression
 DestroyExternalResourceStmt <- 'DESTROY' ExternalResourceKeyword ColId
-ShowExternalResourcesStmt <- 'SHOW' ShowAllModifier? 'EXTERNAL' 'RESOURCES'
+ShowExternalResourcesStmt <- 'SHOW' ShowAllModifier? 'EXTERNAL' 'RESOURCES' ShowExternalResourcesType?
+ShowExternalResourcesType <- 'WITH' 'TYPE' ColIdOrString
+ShowExternalResources <- ShowRule ShowAllModifier? 'EXTERNAL' 'RESOURCES' ShowExternalResourcesType?
 ShowAllModifier <- 'ALL'
 
 # Syntax only: the keyword pair every singular form repeats. The plural in SHOW cannot share it.

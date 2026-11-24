@@ -8,6 +8,8 @@ mod alter_fields;
 mod copy;
 mod create_index;
 mod expression;
+mod external_resources;
+pub use external_resources::{EXTERNAL_RESOURCE_FUNCTIONS, ExternalResourceRows, ExternalResourceTables};
 mod generated;
 mod index_key;
 mod join;
@@ -705,6 +707,9 @@ pub struct SessionValues {
     /// the secret manager of the database, for `duckdb_secrets()` and the other secret table
     /// functions (`SecretManager::Get(context)`); `None` where the client has none
     pub secrets: Option<Arc<dyn SecretTables>>,
+    /// the external resource registries of the instance and the connections their callbacks run on, for the
+    /// external resource table functions; `None` where the client has none
+    pub external_resources: Option<Arc<dyn ExternalResourceTables>>,
     /// `CatalogSearchPath::GetSetPaths`: the schemas of the search path that was set
     pub search_path: Vec<String>,
     /// `CatalogSearchPath::GetSetPaths` as (catalog, schema), the catalog empty where it is not given
@@ -951,6 +956,9 @@ pub struct Binder<'a> {
     copy_json: bool,
     /// Binding what a table function was given: `TableFunctionBinder` reads a name as its text.
     table_function_argument: bool,
+    /// binding the body of a macro or view being created: what binding would run (the external resource
+    /// functions) only gives its columns
+    pub(super) defining: bool,
     /// Numbers the subqueries in FROM without an alias.
     unnamed_subquery_index: usize,
     /// The grouping of the select node being bound; `None` where aggregates are not allowed.
@@ -1095,6 +1103,7 @@ impl<'a> Binder<'a> {
             column_orders: std::collections::HashMap::new(),
             copy_json: false,
             table_function_argument: false,
+            defining: false,
             unnamed_subquery_index: 1,
             aggregates: None,
             aggregate_error: "Aggregate functions are not supported here",
@@ -1177,6 +1186,7 @@ impl<'a> Binder<'a> {
             }
         }
         self.search_schema = Some(schema.to_string());
+        self.defining = true;
         let bound = self.bind_select_statement(query)?;
         if aliases.len() > bound.names.len() {
             return Err(binder_error("More VIEW aliases than columns in query result"));
@@ -1227,6 +1237,7 @@ impl<'a> Binder<'a> {
         binder.read_macros = self.read_macros.clone();
         binder.system_macro_depth = self.system_macro_depth;
         binder.table_function_name = self.table_function_name.clone();
+        binder.defining = self.defining;
         binder.parameters = self.parameters.clone();
         binder.ctes = self.ctes.clone();
         binder.ctes_being_bound = self.ctes_being_bound.clone();

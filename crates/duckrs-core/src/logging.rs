@@ -1300,6 +1300,63 @@ pub fn log_file_system_to(target: Option<&Arc<LogTarget>>, path: &str, op: &str,
     let _ = manager.write_global(name, level, &message, false);
 }
 
+/// `DUCKDB_LOG(context, ExternalResourceLogType, ...)`: one lifecycle operation of an external resource, `error`
+/// empty when it succeeded (`ExternalResourceLogType::ConstructLogMessage`).
+pub fn log_external_resource(
+    target: Option<&Arc<LogTarget>>,
+    resource_type: &str,
+    resource_name: &str,
+    operation: &str,
+    error: &str,
+    extra_info: &[(&str, &str)],
+) {
+    let Some(target) = target else {
+        return;
+    };
+    let (name, level) = ("ExternalResource", LogLevel::Info);
+    let logger = target.logger.lock().expect("not poisoned").clone();
+    if !logger.should_log(name, level) {
+        return;
+    }
+    use duckrs_common::types::LogicalType;
+    use duckrs_common::value::{Value, ValueData};
+    let nullable = |text: &str| {
+        if text.is_empty() {
+            Value::null(LogicalType::VARCHAR)
+        } else {
+            Value::varchar(text)
+        }
+    };
+    let entries = extra_info
+        .iter()
+        .map(|(key, value)| {
+            Value::struct_value(vec![
+                ("key".to_string(), Value::varchar(*key)),
+                ("value".to_string(), Value::varchar(*value)),
+            ])
+        })
+        .collect();
+    let Ok(extra) = Value::new(
+        LogicalType::map(LogicalType::VARCHAR, LogicalType::VARCHAR),
+        ValueData::List(entries),
+    ) else {
+        return;
+    };
+    // `Value::STRUCT(...).ToString()`
+    let message = Value::struct_value(vec![
+        ("resource_type".to_string(), nullable(resource_type)),
+        ("resource_name".to_string(), nullable(resource_name)),
+        ("operation".to_string(), Value::varchar(operation)),
+        ("outcome".to_string(), Value::varchar(if error.is_empty() { "ok" } else { "error" })),
+        ("error".to_string(), nullable(error)),
+        ("extra_info".to_string(), extra),
+    ]);
+    let Ok(message) = message.try_to_string() else {
+        return;
+    };
+    let _ = logger.log(&target.manager, name, level, &message, false);
+}
+
 /// `PhysicalOperatorLogType::ConstructLogMessage` of a table scan: `class` and `event` with the pairs of `info`.
 fn physical_operator_message(class: &str, event: &str, info: &[(&str, String)]) -> String {
     let info = info

@@ -638,6 +638,7 @@ impl Binder<'_> {
                 .collect();
             let mut binder = Binder::with_options(self.catalog, self.options.clone());
             binder.search_schema = Some(schema.to_string());
+            binder.defining = true;
             binder.read_entries = self.read_entries.clone();
             binder.read_macros = self.read_macros.clone();
             // a body that reads a setting reads that of the session (`current_setting`)

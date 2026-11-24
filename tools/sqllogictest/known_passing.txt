@@ -10,6 +10,9 @@
 #   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
 # Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
 # stop passing. Regenerate with:
+#   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
+# Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
+# stop passing. Regenerate with:
 test/common/test_cast_hugeint.test
 test/common/test_cast_struct.test
 test/common/test_local_file_urls.test
@@ -1235,6 +1238,14 @@ test/sql/attach/attach_wal_alter.test
 test/sql/attach/attach_wal_alter_sequence.test
 test/sql/attach/detach_keyword.test
 test/sql/attach/detach_manager_default_database.test
+test/sql/attach/external_resource_attach_failure.test
+test/sql/attach/external_resource_discovery.test
+test/sql/attach/external_resource_null_handle.test
+test/sql/attach/external_resource_option_collision.test
+test/sql/attach/external_resource_show_subquery.test
+test/sql/attach/external_resource_show_with_type.test
+test/sql/attach/external_resource_statements.test
+test/sql/attach/external_resource_type_autoload.test
 test/sql/attach/in_memory_attach.test
 test/sql/attach/reattach_schema.test
 test/sql/attach/show_databases.test
@@ -3511,6 +3522,7 @@ test/sql/parser/dollar_quotes_internal_issue2224.test
 test/sql/parser/drop_qualified_names.test
 test/sql/parser/empty_quoted_identifier.test
 test/sql/parser/expression_depth_limit.test
+test/sql/parser/external_resource_roundtrip.test
 test/sql/parser/fetch_first.test
 test/sql/parser/from_first.test
 test/sql/parser/function_chaining.test
@@ -4564,6 +4576,7 @@ test/sql/subquery/table/test_table_subquery.test
 test/sql/subquery/table/test_unnamed_subquery.test
 test/sql/subquery/test_neumann.test
 test/sql/subquery/test_offset.test
+test/sql/table_function/create_external_resource.test
 test/sql/table_function/database_oid.test
 test/sql/table_function/duckdb_constraints.test
 test/sql/table_function/duckdb_constraints_fk.test
@@ -4584,6 +4597,13 @@ test/sql/table_function/duckdb_settings_extension.test
 test/sql/table_function/duckdb_tables.test
 test/sql/table_function/duckdb_types.test
 test/sql/table_function/duckdb_views.test
+test/sql/table_function/external_resource_callback_recursion.test
+test/sql/table_function/external_resource_discovery.test
+test/sql/table_function/external_resource_discovery_error.test
+test/sql/table_function/external_resource_logging.test
+test/sql/table_function/external_resource_types.test
+test/sql/table_function/external_resources_type_pruning.test
+test/sql/table_function/external_resources_where_pruning.test
 test/sql/table_function/glob_prepared.test
 test/sql/table_function/information_schema.test
 test/sql/table_function/information_schema_fkey_constraint_names.test
@@ -4595,6 +4615,7 @@ test/sql/table_function/range_cardinality_extremes.test
 test/sql/table_function/range_function_different_iterators.test
 test/sql/table_function/range_timestamp.test
 test/sql/table_function/range_timestamp_lateral_empty.test
+test/sql/table_function/register_external_resource.test
 test/sql/table_function/sqlite_master.test
 test/sql/table_function/sqlite_master_connections.test
 test/sql/table_function/sqlite_master_quotes.test
