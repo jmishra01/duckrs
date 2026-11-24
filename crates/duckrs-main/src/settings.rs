@@ -559,6 +559,20 @@ fn on_set(setting: &SettingDefinition, value: Value) -> Result<Value> {
                 None => Value::null(LogicalType::VARCHAR),
             });
         }
+        // `ExternalFileCacheLocalMaxBlockSizeSetting::OnSet`
+        "external_file_cache_local_max_block_size" => {
+            if value.as_i128() == Some(0) {
+                return invalid(format!("Invalid option for {}: value must be positive", setting.name));
+            }
+            if let Some(size) = value.as_i128()
+                && (size < 0 || (size & (size - 1)) != 0)
+            {
+                return invalid(format!(
+                    "Invalid option for {}: block size must be a power of two, got {size}",
+                    setting.name
+                ));
+            }
+        }
         // `RegexMatchOperatorSemanticsSetting::OnSet`
         "regex_match_operator_semantics" => {
             if value.is_null() {
@@ -928,6 +942,7 @@ pub fn set_variable(
     }
     check_lock(name, global, session)?;
     let (index, setting) = find_setting(name).ok_or_else(|| unrecognized(name))?;
+    read_only(setting.name)?;
     let is_global = resolve_scope(setting, scope)?;
     if value.is_null() {
         let invalid = |message: String| Err(Error::new(ErrorKind::InvalidInput, message));
@@ -1020,6 +1035,7 @@ pub fn reset_variable(
     }
     check_lock(name, global, session)?;
     let (index, setting) = find_setting(name).ok_or_else(|| unrecognized(name))?;
+    read_only(setting.name)?;
     running_only(setting.name)?;
     if matches!(setting.name, "allowed_directories" | "allowed_paths") {
         check_external_access_enabled(setting.name, global, session)?;
@@ -1202,7 +1218,16 @@ pub fn get_setting(name: &str, global: &SettingValues, session: &SettingValues) 
     if find_setting(name).is_none() {
         return Err(unrecognized(name));
     }
-    Ok(current_value(name, global, session).unwrap_or_else(Value::sql_null))
+    let value = current_value(name, global, session).unwrap_or_else(Value::sql_null);
+    // `ForceVariantShredding::GetSetting`: no type set is the name of the invalid type
+    if matches!(
+        find_setting(name).map(|(_, setting)| setting.name),
+        Some("debug_force_variant_shredding")
+    ) && (value.is_null() || value.try_to_string().is_ok_and(|text| text.is_empty()))
+    {
+        return Ok(Value::varchar("INVALID"));
+    }
+    Ok(value)
 }
 
 pub fn current_value(name: &str, global: &SettingValues, session: &SettingValues) -> Option<Value> {
@@ -1416,4 +1441,15 @@ mod tests {
         )
         .unwrap();
     }
+}
+
+/// `StandardVectorSizeSetting::SetGlobal` and `ResetGlobal`: what the build fixed can't be set.
+fn read_only(name: &str) -> Result<()> {
+    if name == "standard_vector_size" {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "standard_vector_size is a read-only setting determined at compile time",
+        ));
+    }
+    Ok(())
 }

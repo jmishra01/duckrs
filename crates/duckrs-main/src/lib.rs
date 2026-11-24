@@ -940,6 +940,29 @@ const PRAGMA_FUNCTIONS: &[&str] = &[
     "tpcds",
 ];
 
+/// The PRAGMAs that change the configuration, which `lock_configuration` refuses.
+const CONFIGURING_PRAGMAS: &[&str] = &[
+    "enable_profiling",
+    "enable_profile",
+    "disable_profiling",
+    "disable_profile",
+    "verify_parallelism",
+    "disable_verify_parallelism",
+    "force_checkpoint",
+    "enable_checkpoint_on_shutdown",
+    "disable_checkpoint_on_shutdown",
+];
+
+/// The table functions that change the configuration, which `lock_configuration` refuses.
+const CONFIGURING_CALLS: &[&str] = &[
+    "enable_profiling",
+    "disable_profiling",
+    "enable_logging",
+    "disable_logging",
+    "add_grammar_extension",
+    "remove_grammar_extension",
+];
+
 /// The no-op pragmas that warn they are deprecated (`WarnDeprecatedPragma`).
 const DEPRECATED_PRAGMAS: &[&str] = &[
     "enable_verification",
@@ -958,10 +981,6 @@ const NO_OP_PRAGMAS: &[&str] = &[
     "disable_verify_serializer",
     "verify_parallelism",
     "disable_verify_parallelism",
-    "enable_progress_bar",
-    "disable_progress_bar",
-    "enable_print_progress_bar",
-    "disable_print_progress_bar",
     "enable_object_cache",
     "disable_object_cache",
 ];
@@ -1541,9 +1560,12 @@ impl ClientContext {
             variables: self.variables.clone(),
             setting: {
                 let (schema, search_path) = (self.default_schema_setting(), SearchEntry::list_text(&self.search_path));
+                let profiling = self.profiling;
                 Box::new(move |name| match name.to_lowercase().as_str() {
                     "schema" => Ok(Value::varchar(schema.clone())),
                     "search_path" => Ok(Value::varchar(search_path.clone())),
+                    // `EnableProfilingSetting::GetSetting`: nothing while profiling is off, which keeps the format
+                    "enable_profiling" | "enable_profile" if !profiling => Ok(Value::sql_null()),
                     _ => settings::get_setting(name, &db.settings.read(), &session),
                 })
             },
@@ -3840,19 +3862,19 @@ impl ClientContext {
                          encrypted databases.",
                     ));
                 }
-                // `ForceVariantShredding::SetGlobal` (`UnboundType::TryParseAndDefaultBind`): a type it can parse
+                // `ForceVariantShredding::SetGlobal` (`UnboundType::TryParseAndDefaultBind`): a type it can parse, nested
+                // in LISTs and STRUCTs only
                 if (name.eq_ignore_ascii_case("force_variant_shredding")
                     || name.eq_ignore_ascii_case("debug_force_variant_shredding"))
                     && let Some(text) = (!value.is_null()).then(|| value.try_to_string()).transpose()?
                     && !text.is_empty()
-                    && duckrs_core::planner::binder::Binder::new(&self.catalog())
-                        .type_from_name(&text)
-                        .is_err()
                 {
-                    return Err(Error::new(
-                        ErrorKind::InvalidInput,
-                        format!("Could not parse type string '{text}'"),
-                    ));
+                    let ty = duckrs_core::planner::binder::Binder::new(&self.catalog())
+                        .type_from_name(&text)
+                        .map_err(|_| {
+                            Error::new(ErrorKind::InvalidInput, format!("Could not parse type string '{text}'"))
+                        })?;
+                    check_shredding_type(&ty)?;
                 }
                 // `ProfilingOutputSetting::SetLocal`: a file of the format the profile is in, or text
                 if name.eq_ignore_ascii_case("profiling_output") {
@@ -4020,6 +4042,10 @@ impl ClientContext {
                 parameters,
                 named_parameters,
             }) => {
+                // `lock_configuration`: the PRAGMAs that change the configuration are refused, no-ops too
+                if parameters.is_empty() && CONFIGURING_PRAGMAS.iter().any(|p| p.eq_ignore_ascii_case(name)) {
+                    settings::check_lock(&name.to_lowercase(), &self.home.settings.read(), &self.settings)?;
+                }
                 if parameters.is_empty()
                     && named_parameters.is_empty()
                     && NO_OP_PRAGMAS.iter().any(|p| p.eq_ignore_ascii_case(name))
@@ -4094,6 +4120,11 @@ impl ClientContext {
                 let sql = match (lower.as_str(), parameters.as_slice()) {
                     ("enable_optimizer", []) => Some("SET enable_optimizer = true".to_string()),
                     ("disable_optimizer", []) => Some("SET enable_optimizer = false".to_string()),
+                    // `PragmaEnableProgressBar` and the rest: settings, under `lock_configuration` like a SET
+                    ("enable_progress_bar", []) => Some("SET enable_progress_bar = true".to_string()),
+                    ("disable_progress_bar", []) => Some("SET enable_progress_bar = false".to_string()),
+                    ("enable_print_progress_bar", []) => Some("SET enable_progress_bar_print = true".to_string()),
+                    ("disable_print_progress_bar", []) => Some("SET enable_progress_bar_print = false".to_string()),
                     ("show_tables", []) => Some("SHOW TABLES".to_string()),
                     ("show_tables_expanded", []) => Some("SHOW ALL TABLES".to_string()),
                     ("show_databases" | "database_list", []) => Some("SELECT * FROM duckdb_databases()".to_string()),
@@ -4237,6 +4268,22 @@ impl ClientContext {
             }
             Statement::Call(function) if checkpoint_call(function).is_some() => {
                 return self.checkpoint(function);
+            }
+            // `lock_configuration`: what changes the configuration is refused before it runs
+            Statement::Call(function)
+                if matches!(&function.kind, ExprKind::Function(call) if CONFIGURING_CALLS
+                    .iter()
+                    .any(|name| call.name.name.eq_ignore_ascii_case(name))) =>
+            {
+                let ExprKind::Function(call) = &function.kind else {
+                    unreachable!("matched above")
+                };
+                let name = call.name.name.to_lowercase();
+                settings::check_lock(&name, &self.home.settings.read(), &self.settings)?;
+                if logging::logging_call(function).is_some() {
+                    return self.run_logging_call(function);
+                }
+                return Err(duckrs_core::unported(format!("the table function {name}")));
             }
             Statement::Call(function) if logging::logging_call(function).is_some() => {
                 return self.run_logging_call(function);
@@ -9647,4 +9694,21 @@ fn stored_group_rows(source: &dyn duckrs_core::catalog::TableSource) -> Option<u
         return None;
     }
     ((1..groups - 1).all(|g| source.group_rows(g) == first) && source.group_rows(groups - 1) <= first).then_some(first)
+}
+
+/// `ForceVariantShredding::SetGlobal`'s `TypeVisitor::Contains`: the nested types of a shredding are LISTs and STRUCTs.
+fn check_shredding_type(ty: &duckrs_common::types::LogicalType) -> Result<()> {
+    use duckrs_common::types::LogicalTypeId;
+    match ty.id() {
+        LogicalTypeId::Struct => ty.struct_children().iter().try_for_each(|(_, child)| check_shredding_type(child)),
+        LogicalTypeId::List => ty.child_type().map_or(Ok(()), check_shredding_type),
+        _ if ty.is_nested() => Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "Shredding can consist of the nested types LIST (for ARRAY Variant values) or STRUCT (for OBJECT \
+                 Variant values), not {ty}"
+            ),
+        )),
+        _ => Ok(()),
+    }
 }
