@@ -293,8 +293,9 @@ impl Binder<'_> {
         schema_of(name)
     }
 
-    /// A table or view of the connection's default database, when this binder binds in another one.
-    fn default_database_entry(&self, name: &str) -> Option<crate::catalog::TableOrView> {
+    /// A table or view of the connection's default database, when this binder binds in another one, in the
+    /// schema (a nested one too) a name is qualified with.
+    fn default_database_entry_in(&self, schema: Option<&str>, name: &str) -> Option<crate::catalog::TableOrView> {
         let session = self.session.as_ref()?;
         if session.default_database.eq_ignore_ascii_case(&session.database) {
             return None;
@@ -303,7 +304,7 @@ impl Binder<'_> {
         if std::ptr::eq(Arc::as_ptr(&catalog), self.catalog) {
             return None;
         }
-        catalog.get_entry(None, None, name).ok()
+        catalog.get_entry(schema, None, name).ok()
     }
 
     /// The catalog of an attached database other than this binder's that `name` is qualified by, and
@@ -2978,8 +2979,14 @@ impl Binder<'_> {
                 // database comes that of the connection, in its default database
                 let mut entry_catalog = self.catalog.name.clone();
                 let entry = match entry {
-                    Err(error) if foreign.is_none() && other.is_none() && name.qualification.is_empty() => {
-                        match self.default_database_entry(&name.name) {
+                    Err(error) if foreign.is_none() && other.is_none() => {
+                        // a schema path is looked for in the default database too
+                        let schema = if name.qualification.is_empty() {
+                            None
+                        } else {
+                            self.schema_of(name).ok().flatten()
+                        };
+                        match self.default_database_entry_in(schema.as_deref(), &name.name) {
                             Some(found) => {
                                 if let Some(session) = &self.session {
                                     entry_catalog.clone_from(&session.default_database);
@@ -3008,8 +3015,12 @@ impl Binder<'_> {
                             TableOrView::Table(table) => ("Table", &table.schema, &table.name),
                             TableOrView::View(view) => ("View", &view.schema, &view.name),
                         };
-                        let found_qualified = [entry_catalog.as_str(), found_schema, found_name]
+                        // (a nested schema is written as its path)
+                        let found_qualified = std::iter::once(entry_catalog.as_str())
+                            .chain(found_schema.split(crate::catalog::SCHEMA_PATH_SEPARATOR))
+                            .chain(std::iter::once(found_name.as_str()))
                             .map(ast::sql_identifier)
+                            .collect::<Vec<_>>()
                             .join(".");
                         let n = &name.name;
                         return Err(Error::new(

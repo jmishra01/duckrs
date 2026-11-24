@@ -111,6 +111,15 @@ fn rows_of(new_rows: &Option<MaterializedQueryResult>, old_rows: &Option<Materia
         .map_or(0, |rows| rows.collection.len())
 }
 
+/// The schema a qualification names (`Binder::BindTableName`): a path of schemas is a nested one.
+fn schema_key(qualification: &[String], name: &str) -> Option<String> {
+    let name = duckrs_parser::ast::QualifiedName {
+        qualification: qualification.to_vec(),
+        name: name.to_string(),
+    };
+    duckrs_core::planner::binder::schema_of(&name).ok().flatten()
+}
+
 /// The schema with the entry `name`: the one it is qualified with, or the first of the search path
 /// that has it.
 fn table_schema(
@@ -118,8 +127,8 @@ fn table_schema(
     qualification: &[String],
     name: &str,
 ) -> Option<Arc<duckrs_core::catalog::SchemaCatalogEntry>> {
-    match qualification.last() {
-        Some(schema) => catalog.get_schema(schema).filter(|s| s.get_entry(name).is_some()),
+    match schema_key(qualification, name) {
+        Some(schema) => catalog.get_schema(&schema).filter(|s| s.get_entry(name).is_some()),
         None => [TEMP_SCHEMA, DEFAULT_SCHEMA]
             .iter()
             .filter_map(|schema| catalog.get_schema(schema))
@@ -723,7 +732,7 @@ impl ClientContext {
         let catalog = self.catalog();
         // `Catalog::GetEntry`, for its errors
         catalog.get_entry(
-            table_name.qualification.last().map(String::as_str),
+            schema_key(&table_name.qualification, &table_name.name).as_deref(),
             None,
             &table_name.name,
         )?;
@@ -902,9 +911,10 @@ impl ClientContext {
                     sql_quoted_identifier(&name.name)
                 )));
             }
+            // a first part that is a schema of this database starts a path of nested schemas
             if !temp_reference
-                && (name.qualification.len() >= 2
-                    || (name.qualification.len() == 1 && catalog.get_schema(&name.qualification[0]).is_none()))
+                && !name.qualification.is_empty()
+                && catalog.get_schema(&name.qualification[0]).is_none()
             {
                 let database = &name.qualification[0];
                 if !database.eq_ignore_ascii_case(&self.db.name) && !database.eq_ignore_ascii_case(DEFAULT_CATALOG) {
@@ -946,7 +956,7 @@ impl ClientContext {
         name: &str,
     ) -> Option<(Arc<duckrs_core::catalog::SchemaCatalogEntry>, Arc<TableCatalogEntry>)> {
         let catalog = self.catalog();
-        let schema = match qualification.last() {
+        let schema = match qualification.first() {
             None if schema.get_entry(name).is_some() => schema.clone(),
             _ => table_schema(&catalog, qualification, name)?,
         };
@@ -1108,7 +1118,7 @@ impl ClientContext {
     fn drop_trigger_in(&mut self, info: &DropInfo, table_name: &duckrs_parser::ast::QualifiedName) -> Result<()> {
         let catalog = self.catalog();
         catalog.get_entry(
-            table_name.qualification.last().map(String::as_str),
+            schema_key(&table_name.qualification, &table_name.name).as_deref(),
             None,
             &table_name.name,
         )?;

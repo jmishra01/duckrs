@@ -3269,10 +3269,15 @@ impl Catalog {
 
     /// `schema_for`, of what is called `name`: without a schema that can be a temporary one.
     pub fn schema_with_entry(&self, schema: Option<&str>, name: &str) -> Result<Arc<SchemaCatalogEntry>> {
-        let temporary = self
-            .get_schema(TEMP_SCHEMA)
-            .filter(|temporary| schema.is_none() && temporary.get_entry(name).is_some());
-        temporary.map_or_else(|| self.schema_for(schema), Ok)
+        if schema.is_some() {
+            return self.schema_for(schema);
+        }
+        // the temporary schema, then the search path (`CatalogSearchPath`)
+        let found = std::iter::once(TEMP_SCHEMA.to_string())
+            .chain(std::iter::once(default_schema()))
+            .chain(search_schemas())
+            .find_map(|key| self.get_schema(&key).filter(|s| s.get_entry(name).is_some()));
+        found.map_or_else(|| self.schema_for(None), Ok)
     }
 
     /// `Catalog::GetEntry`: looks the name up in `schema`, or without one along the search path:

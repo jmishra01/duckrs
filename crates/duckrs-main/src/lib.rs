@@ -1149,6 +1149,47 @@ fn strip_database(statement: &mut Statement, database: &str) {
     }
 }
 
+/// `RemotePushdownOptimizer::StripCatalogName`: `database` taken off the names of `query` that start with it.
+fn strip_view_catalog(query: &mut duckrs_parser::ast::SelectStatement, database: &str, catalog: &Catalog) {
+    // (a schema of the same name is what the name is, not the database)
+    if database.is_empty() || catalog.get_schema(database).is_some() {
+        return;
+    }
+    let names_database = |qualification: &[String]| {
+        qualification
+            .first()
+            .is_some_and(|first| first.eq_ignore_ascii_case(database))
+    };
+    duckrs_core::planner::statement_names::for_each_query_table_name(&mut query.node, &mut |name| {
+        if names_database(&name.qualification) {
+            name.qualification.remove(0);
+        }
+    });
+    let mut strip = |e: &mut Expr| match &mut e.kind {
+        // `db.t.c` and longer: a two-part name is a table's column or a struct's field
+        ExprKind::ColumnRef(names) if names.len() >= 3 && names_database(names) => {
+            names.remove(0);
+        }
+        ExprKind::Function(function) if names_database(&function.name.qualification) => {
+            function.name.qualification.remove(0);
+        }
+        ExprKind::Window(window) if names_database(&window.name.qualification) => {
+            window.name.qualification.remove(0);
+        }
+        _ => {}
+    };
+    duckrs_parser::transformer::visit_all_query_node_exprs_mut(&mut query.node, &mut |e: &mut Expr| {
+        duckrs_parser::transformer::visit_expr_mut(e, &mut strip);
+    });
+}
+
+/// The first schema along the search path that `has` what an unqualified DROP names.
+fn search_path_schema(catalog: &Catalog, has: impl Fn(&SchemaCatalogEntry) -> bool) -> Option<String> {
+    duckrs_core::catalog::search_schemas()
+        .into_iter()
+        .find(|schema| catalog.get_schema(schema).is_some_and(|schema| has(&schema)))
+}
+
 /// A fully materialized result (`MaterializedQueryResult`).
 #[derive(Debug)]
 pub struct MaterializedQueryResult {
@@ -2614,9 +2655,15 @@ impl ClientContext {
                 })
             });
         }
+        // `ResolveCatalog`: the parent of a new schema is a database before it is a schema
+        let creates_schema = matches!(
+            statement,
+            Statement::Create(info) if matches!(info.kind, CreateKind::Schema { .. })
+        );
         let database_of = |name: &QualifiedName| {
             let first = name.qualification.first()?;
             let is_schema = name.qualification.len() == 1
+                && !(creates_schema && self.find_database(first).is_some())
                 && (self.catalog().get_schema(first).is_some() || first.eq_ignore_ascii_case(TEMP_SCHEMA));
             if is_schema {
                 return None;
@@ -4480,6 +4527,18 @@ impl ClientContext {
                     _ => {}
                 }
                 path.push(info.name.name.clone());
+                // `BindCreateSchema`: an older file has no place for a nested schema
+                if path.len() > 1
+                    && catalog
+                        .storage_version()
+                        .is_some_and(|version| version < duckrs_common::serializer::StorageVersion::V2_0_0)
+                {
+                    return Err(Error::new(
+                        ErrorKind::Binder,
+                        "Nested schemas are only supported for storage versions v2.0.0 and higher.\nUse an in-memory \
+                         database, or ATTACH with (STORAGE_VERSION 'v2.0.0')",
+                    ));
+                }
                 catalog.create_schema_path(&path, on_create_conflict(info.on_conflict))?;
                 return Ok(Self::success());
             }
@@ -4884,9 +4943,13 @@ impl ClientContext {
                 "CREATE OR REPLACE is not allowed to depend on itself",
             ));
         }
+        // `BindCreateViewInfo` (`StripCatalogName`): the view finds its own catalog's entries first anyway, and
+        // without the name it keeps working when the database is attached under another one
+        let mut query = (**query).clone();
+        strip_view_catalog(&mut query, &self.db.name, &catalog);
         schema.create_view(
             &info.name.name,
-            (**query).clone(),
+            query,
             aliases.clone(),
             on_conflict,
             dependencies,
@@ -5083,7 +5146,17 @@ impl ClientContext {
         match info.entry_type {
             kind @ ("TABLE" | "VIEW") => {
                 let type_name = if kind == "TABLE" { "Table" } else { "View" };
-                let schema = schema_of(&info.name).map_err(|_| duckrs_core::unported(format!("this form of DROP {kind}")))?;
+                let mut schema =
+                    schema_of(&info.name).map_err(|_| duckrs_core::unported(format!("this form of DROP {kind}")))?;
+                // an unqualified name is looked up along the search path, as in a query
+                if schema.is_none()
+                    && let Ok(found) = catalog.get_entry(None, None, &info.name.name)
+                {
+                    schema = Some(match found {
+                        TableOrView::Table(table) => table.schema.clone(),
+                        TableOrView::View(view) => view.schema.clone(),
+                    });
+                }
                 let dropped = match catalog.schema_for(schema.as_deref()) {
                     Ok(schema) => {
                         if schema.get_entry(&info.name.name).is_some() {
@@ -5115,7 +5188,14 @@ impl ClientContext {
             }
             kind @ ("MACRO" | "MACRO TABLE") => {
                 let table_macro = kind == "MACRO TABLE";
-                let schema = schema_of(&info.name).map_err(|_| duckrs_core::unported("this form of DROP MACRO"))?;
+                let mut schema =
+                    schema_of(&info.name).map_err(|_| duckrs_core::unported("this form of DROP MACRO"))?;
+                // an unqualified name is looked up along the search path, as in a call
+                if schema.is_none() {
+                    let found = |table_macro| catalog.get_macro_in(None, None, &info.name.name, table_macro).ok().flatten();
+                    let found = found(table_macro).or_else(|| if table_macro { None } else { found(true) });
+                    schema = found.map(|(schema, _)| schema);
+                }
                 let dropped = match catalog.schema_for(schema.as_deref()) {
                     // DROP MACRO also drops a table macro, if there is no scalar one
                     Ok(schema) => {
@@ -5167,7 +5247,11 @@ impl ClientContext {
                 Ok(())
             }
             "SEQUENCE" => {
-                let schema = schema_of(&info.name).map_err(|_| duckrs_core::unported("this form of DROP SEQUENCE"))?;
+                let mut schema =
+                    schema_of(&info.name).map_err(|_| duckrs_core::unported("this form of DROP SEQUENCE"))?;
+                if schema.is_none() {
+                    schema = search_path_schema(&catalog, |s| s.get_sequence(&info.name.name).is_some());
+                }
                 let dropped = match catalog.schema_for(schema.as_deref()) {
                     Ok(schema) => schema.drop_sequence_checked(&info.name.name, info.cascade)?,
                     Err(_) if info.if_exists => false,

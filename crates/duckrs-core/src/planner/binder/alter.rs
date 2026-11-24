@@ -564,7 +564,7 @@ impl Binder<'_> {
                     );
                     return Ok(BoundAlter::Table(Box::new(alter)));
                 }
-                let mut definition = self.bind_new_column(column, &alter.schema.name)?;
+                let mut definition = self.bind_new_column(column, &alter.schema.key())?;
                 definition.not_null = *not_null;
                 let mut projection = identity(&table)?;
                 projection.push(
