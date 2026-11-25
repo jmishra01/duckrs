@@ -2791,6 +2791,22 @@ impl Binder<'_> {
     }
 
     fn bind_unsampled_table_ref_inner(&mut self, table_ref: &TableRef) -> Result<LogicalOperator> {
+        let bound = self.bind_unsampled_table_ref_kind(table_ref);
+        // `Binder::Bind(BaseTableRef)`: a table that does not exist is reported at the reference
+        match (&table_ref.kind, table_ref.query_location.0, bound) {
+            (TableRefKind::BaseTable { name, .. }, Some(location), Err(mut error))
+                if error.position.is_none()
+                    && error.kind == ErrorKind::Catalog
+                    && error.message.starts_with(&format!("Table with name {} does not exist", name.name)) =>
+            {
+                error.position = Some(location);
+                Err(error)
+            }
+            (_, _, bound) => bound,
+        }
+    }
+
+    fn bind_unsampled_table_ref_kind(&mut self, table_ref: &TableRef) -> Result<LogicalOperator> {
         match &table_ref.kind {
             TableRefKind::Empty => {
                 let table_index = self.generate_table_index();

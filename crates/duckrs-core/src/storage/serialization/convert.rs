@@ -824,6 +824,7 @@ pub fn table_ref(stored: g::TableRef) -> Result<ast::TableRef> {
         alias: stored.alias,
         column_name_alias,
         sample: stored.sample.map(|s| sample(*s)).transpose()?,
+        query_location: ast::QueryLocation(stored.query_location.and_then(|l| usize::try_from(l).ok())),
     })
 }
 

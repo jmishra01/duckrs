@@ -133,6 +133,10 @@ impl Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // An error already made JSON (`errors_as_json`) is the message alone, as `ErrorData::Message` gives it.
+        if self.message.starts_with("{\"exception_type\":") {
+            return f.write_str(&self.message);
+        }
         write!(f, "{} Error: {}", self.kind.name(), self.message)
     }
 }

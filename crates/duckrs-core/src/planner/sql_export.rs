@@ -2493,6 +2493,7 @@ impl Exporter<'_> {
             alias: String::new(),
             column_name_alias: Vec::new(),
             sample: None,
+            query_location: Default::default(),
         };
         let mut columns = left_columns;
         columns.extend(right_columns);

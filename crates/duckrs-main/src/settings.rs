@@ -61,7 +61,6 @@ const UNHONORED: &[&str] = &[
     // `dialect_compatibility_mode` is honored: SPARK changes how GROUP BY ALL and ORDER BY ALL bind when the
     // parser reads ALL as a column, and the duckrs parser always reads it as the keyword
     "disable_timestamptz_casts",
-    "errors_as_json",
     "legacy_disable_null_type",
     "schema",
     "search_path",
@@ -1525,7 +1524,7 @@ mod tests {
         );
         // a result-changing setting that is not implemented
         let err = set_variable(
-            "errors_as_json",
+            "legacy_disable_null_type",
             SetScope::Automatic,
             &Value::boolean(true),
             &mut global,

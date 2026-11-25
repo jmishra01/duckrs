@@ -457,15 +457,15 @@ impl BindContext {
             })
             .collect();
         if matching.is_empty() {
+            let name = match schema {
+                Some(schema) => format!("{}.{table}", schema.replace(crate::catalog::SCHEMA_PATH_SEPARATOR, ".")),
+                None => table.to_string(),
+            };
             let scores = self
                 .bindings
                 .iter()
                 .map(|b| (b.alias.clone(), similarity_rating(&b.alias, table)))
                 .collect();
-            let name = match schema {
-                Some(schema) => format!("{}.{table}", schema.replace(crate::catalog::SCHEMA_PATH_SEPARATOR, ".")),
-                None => table.to_string(),
-            };
             return Err(binder_error(format!(
                 "Referenced table \"{name}\" not found!{}",
                 candidates_message(&top_n_strings(scores), "Candidate tables")
@@ -606,6 +606,16 @@ impl BindContext {
             }
             [catalog, schema, table, column] if catalog.eq_ignore_ascii_case(crate::catalog::DEFAULT_CATALOG) => {
                 self.bind_qualified_column(Some(schema), table, column)
+            }
+            // `catalog.schema.table.column[.field]` of a table that has no such column
+            [catalog, schema, table, column, rest @ ..]
+                if !rest.is_empty()
+                    && self
+                        .bindings_of(Some(&format!("{catalog}{}{schema}", crate::catalog::SCHEMA_PATH_SEPARATOR)), table)
+                        .is_ok_and(|found| found.iter().all(|b| b.column(column).is_none())) =>
+            {
+                let qualification = format!("{catalog}{}{schema}", crate::catalog::SCHEMA_PATH_SEPARATOR);
+                self.bind_qualified_column(Some(&qualification), table, column)
             }
             // `[catalog.]schema path.table.column` of a table in a nested schema
             [prefix @ .., table, column] if prefix.len() >= 2 => {

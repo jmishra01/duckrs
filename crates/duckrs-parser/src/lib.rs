@@ -77,8 +77,9 @@ pub fn parse_ast_with(sql: &str, options: &ParserOptions) -> Result<Vec<ast::Sta
     let sql = sql.to_string();
     let options = options.clone();
     pool::run(move || {
-        let (_, trees) = parse_on_this_thread_with(&sql, &options)?;
+        let (tokens, trees) = parse_on_this_thread_with(&sql, &options)?;
         let mut transformer = transformer::Transformer::new(Grammar::duckdb());
+        transformer.token_offsets = tokens.iter().map(|t| t.offset).collect();
         transformer.max_expression_depth = options.max_expression_depth;
         transformer.integer_division = options.integer_division;
         transformer.regex_full_match = options.regex_full_match;
@@ -92,8 +93,9 @@ pub fn parse_ast_with_text(sql: &str, options: &ParserOptions) -> Result<Vec<(as
     let sql = sql.to_string();
     let options = options.clone();
     pool::run(move || {
-        let (text, _, trees, starts) = parse_statements(&sql, &options)?;
+        let (text, tokens, trees, starts) = parse_statements(&sql, &options)?;
         let mut transformer = transformer::Transformer::new(Grammar::duckdb());
+        transformer.token_offsets = tokens.iter().map(|t| t.offset).collect();
         transformer.max_expression_depth = options.max_expression_depth;
         transformer.integer_division = options.integer_division;
         transformer.regex_full_match = options.regex_full_match;

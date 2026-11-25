@@ -1259,12 +1259,26 @@ pub enum TableRefKind {
     MatchRecognize(MatchRecognizeRef),
 }
 
+/// `QueryLocation`: the byte offset in the query that a node starts at, for error positions. Two nodes are equal
+/// whatever their locations are (`TableRef::Equals` leaves it out).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct QueryLocation(pub Option<usize>);
+
+impl PartialEq for QueryLocation {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for QueryLocation {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableRef {
     pub kind: TableRefKind,
     pub alias: String,
     pub column_name_alias: Vec<String>,
     pub sample: Option<SampleOptions>,
+    pub query_location: QueryLocation,
 }
 
 impl From<TableRefKind> for TableRef {
@@ -1274,6 +1288,7 @@ impl From<TableRefKind> for TableRef {
             alias: String::new(),
             column_name_alias: Vec::new(),
             sample: None,
+            query_location: QueryLocation::default(),
         }
     }
 }
