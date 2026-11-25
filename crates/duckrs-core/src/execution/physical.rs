@@ -2317,6 +2317,10 @@ impl PhysicalOperator for PhysicalRecursiveCte {
         check_buffered(&data)
     }
     fn finalize(&self) -> Result<()> {
+        // each run starts over: a plan run again, or a recursion inside a subquery run per outer row, must not see
+        // the recurring rows or the seen rows of the last run
+        self.recurring.lock().reset();
+        self.seen.lock().clear();
         if !self.key.is_empty() {
             return self.run_keyed();
         }

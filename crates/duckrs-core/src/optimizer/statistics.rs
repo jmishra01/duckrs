@@ -1009,6 +1009,47 @@ impl StatisticsMap {
         self.0.stats.insert(target, stats);
     }
 
+    /// The columns that `renumbering` moved have their statistics at their new places; what was at those places
+    /// before is gone.
+    pub fn renumber(&mut self, renumbering: &HashMap<ColumnBinding, ColumnBinding>) {
+        if renumbering.is_empty() {
+            return;
+        }
+        fn moved<V>(map: &mut HashMap<ColumnBinding, V>, renumbering: &HashMap<ColumnBinding, ColumnBinding>) {
+            let old = std::mem::take(map);
+            let mut moving = Vec::new();
+            for (key, value) in old {
+                match renumbering.get(&key) {
+                    Some(new) => moving.push((*new, value)),
+                    None => {
+                        map.insert(key, value);
+                    }
+                }
+            }
+            for new in renumbering.values() {
+                map.remove(new);
+            }
+            map.extend(moving);
+        }
+        let to_map = |set: &mut HashSet<ColumnBinding>| -> HashMap<ColumnBinding, ()> {
+            std::mem::take(set).into_iter().map(|b| (b, ())).collect()
+        };
+        let propagator = &mut self.0;
+        moved(&mut propagator.stats, renumbering);
+        moved(&mut propagator.sources, renumbering);
+        moved(&mut propagator.aliases, renumbering);
+        for target in propagator.aliases.values_mut() {
+            if let Some(new) = renumbering.get(target) {
+                *target = *new;
+            }
+        }
+        for set in [&mut propagator.hidden, &mut propagator.nullable] {
+            let mut map = to_map(set);
+            moved(&mut map, renumbering);
+            set.extend(map.into_keys());
+        }
+    }
+
     /// `CopyStatistics`: `target` has the values of `source`.
     pub fn copy(&mut self, source: ColumnBinding, target: ColumnBinding) {
         if source != target {

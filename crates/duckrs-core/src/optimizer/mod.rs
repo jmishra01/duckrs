@@ -523,7 +523,10 @@ pub fn optimize_timed(
     }
     if options.unused_columns {
         plan = run("unused_columns", plan, &mut |mut plan| {
-            unused_columns::remove_unused_columns(&mut plan);
+            let renumbering = unused_columns::remove_unused_columns(&mut plan);
+            if let Some(statistics_map) = statistics_map.as_mut() {
+                statistics_map.renumber(&renumbering);
+            }
             plan
         });
         // C++ runs it after `TOP_N`, with the unused columns gone, and removes those again after
@@ -531,7 +534,10 @@ pub fn optimize_timed(
             let late = options.late_materialization_options;
             plan = run("late_materialization", plan, &mut |mut plan| {
                 if late_materialization::optimize(&mut plan, late) {
-                    unused_columns::remove_unused_columns(&mut plan);
+                    let renumbering = unused_columns::remove_unused_columns_with(&mut plan, false);
+                    if let Some(statistics_map) = statistics_map.as_mut() {
+                        statistics_map.renumber(&renumbering);
+                    }
                 }
                 plan
             });
@@ -570,7 +576,10 @@ pub fn optimize_timed(
         let unused = options.unused_columns;
         plan = run("topn_window_elimination", plan, &mut |mut plan| {
             if topn_window_elimination::optimize(&mut plan) && unused {
-                unused_columns::remove_unused_columns(&mut plan);
+                let renumbering = unused_columns::remove_unused_columns_with(&mut plan, false);
+                if let Some(statistics_map) = statistics_map.as_mut() {
+                    statistics_map.renumber(&renumbering);
+                }
             }
             plan
         });
