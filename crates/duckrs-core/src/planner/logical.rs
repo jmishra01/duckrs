@@ -451,6 +451,9 @@ pub struct OnConflict {
     /// These and the condition read the columns of the table, then those of `excluded`.
     pub set_expressions: Vec<BoundExpr>,
     pub condition: Option<BoundExpr>,
+    /// per target, if one of its columns has a collation, the key of a row of the table as the join of
+    /// `GenerateMergeInto` compares it: its columns, collated
+    pub collated_keys: Vec<Option<Vec<BoundExpr>>>,
 }
 
 /// A comparison between the two sides of a join (`JoinCondition`): `left comparison right`.

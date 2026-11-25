@@ -272,8 +272,9 @@ const LINKED_EXTENSIONS: [&str; 3] = ["core_functions", "json", "parquet"];
 
 const DESCRIBE_NAMES: [&str; 6] = ["column_name", "column_type", "null", "key", "default", "extra"];
 
-const SYSTEM_TABLES: [&str; 19] = [
+const SYSTEM_TABLES: [&str; 20] = [
     "duckdb_functions",
+    "pragma_collations",
     "duckdb_extensions",
     "pragma_user_agent",
     "duckdb_dialects",
@@ -2329,6 +2330,11 @@ impl Binder<'_> {
                 }
                 (vec![("user_agent", varchar.clone())], vec![vec![text(&agent)]])
             }
+            // `PragmaCollateFunction`: the collations of the catalog
+            "pragma_collations" => (
+                vec![("collname", varchar.clone())],
+                crate::planner::collation::collation_names().map(|name| vec![text(name)]).collect(),
+            ),
             // `PragmaPlatformFunction`
             "pragma_platform" => (vec![("platform", varchar.clone())], vec![vec![text(&platform())]]),
             "pragma_database_size" => {

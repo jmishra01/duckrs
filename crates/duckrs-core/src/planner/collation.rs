@@ -16,6 +16,11 @@ const COLLATIONS: [(&str, &str, bool); 3] = [
     ("nfc", "nfc_normalize", false),
 ];
 
+/// The names of the collations in the catalog (`PragmaCollateInit`).
+pub fn collation_names() -> impl Iterator<Item = &'static str> {
+    COLLATIONS.iter().map(|(name, ..)| *name)
+}
+
 /// Which collations to apply (`CollationType`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CollationType {

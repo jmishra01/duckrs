@@ -1718,13 +1718,18 @@ impl Binder<'_> {
                 let reference =
                     BoundExpr::column_ref(ColumnBinding::new(group_index, group), ty.clone(), names[i].clone());
                 let original = std::mem::replace(&mut expressions[i], reference);
-                // a collated group: grouped by the collated value, selected as `first(x)`
-                let (collated, requires_collation) = crate::planner::collation::push_collation(
-                    original.clone(),
-                    &ty,
-                    &default_collation,
-                    crate::planner::collation::CollationType::AllCollations,
-                )?;
+                // a collated group: grouped by the collated value, selected as `first(x)`; a volatile one is
+                // grouped as it is, so that it is evaluated once
+                let (collated, requires_collation) = if volatile_with_subqueries(&original) {
+                    (original.clone(), false)
+                } else {
+                    crate::planner::collation::push_collation(
+                        original.clone(),
+                        &ty,
+                        &default_collation,
+                        crate::planner::collation::CollationType::AllCollations,
+                    )?
+                };
                 if requires_collation {
                     let set = crate::function::BuiltinFunctions::get()
                         .aggregate("first")
@@ -4741,4 +4746,21 @@ impl Binder<'_> {
         }
         Ok(Some(compression))
     }
+}
+
+/// `BoundSubqueryExpression::IsVolatile`: volatile, also through what the plans of its subqueries compute.
+fn volatile_with_subqueries(expr: &BoundExpr) -> bool {
+    fn plan_is_volatile(op: &LogicalOperator) -> bool {
+        let mut probe = LogicalOperator::new(op.kind.clone(), Vec::new());
+        probe.expressions_mut().into_iter().any(|e| volatile_with_subqueries(e)) || op.children.iter().any(plan_is_volatile)
+    }
+    if expr.is_volatile() {
+        return true;
+    }
+    if let BoundExprKind::Subquery { subquery, .. } = &expr.kind
+        && plan_is_volatile(&subquery.plan)
+    {
+        return true;
+    }
+    expr.children().into_iter().any(volatile_with_subqueries)
 }

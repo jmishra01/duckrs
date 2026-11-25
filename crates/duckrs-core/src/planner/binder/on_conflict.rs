@@ -107,7 +107,32 @@ impl Binder<'_> {
                  the conflict columns is used for partial indexes which are not supported.",
             ));
         }
+        // the MERGE INTO of `GenerateMergeInto` joins on the conflict columns, which compares them collated
+        let default_collation = self.default_collation();
+        let types = table.types();
+        let mut collated_keys = Vec::with_capacity(targets.len());
+        for target in &targets {
+            let mut any = false;
+            let mut keys = Vec::with_capacity(target.len());
+            for &column in target {
+                let reference = crate::planner::expression::BoundExpr {
+                    kind: crate::planner::expression::BoundExprKind::Reference(column),
+                    return_type: types[column].clone(),
+                    alias: String::new(),
+                };
+                let (key, pushed) = crate::planner::collation::push_collation(
+                    reference,
+                    &types[column],
+                    &default_collation,
+                    crate::planner::collation::CollationType::AllCollations,
+                )?;
+                any |= pushed;
+                keys.push(key);
+            }
+            collated_keys.push(any.then_some(keys));
+        }
         let mut result = OnConflict {
+            collated_keys,
             do_update: info.action != OnConflictAction::Nothing,
             targets,
             set_columns: Vec::new(),

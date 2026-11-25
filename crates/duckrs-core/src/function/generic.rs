@@ -1138,11 +1138,17 @@ pub fn bind_generic_function(name: &str, children: Vec<BoundExpr>) -> Result<Bou
             if children.is_empty() {
                 return Err(no_match(&lower, &children));
             }
-            // `PUSH_COMBINABLE_COLLATIONS`: the arguments hash as they compare
+            // `PUSH_COMBINABLE_COLLATIONS`: the arguments hash as they compare, all of them with the collations they
+            // share (`PushCollations`)
+            use crate::planner::collation::{FunctionCollations, apply_collations, extract_collations};
+            let mut collations = FunctionCollations::default();
+            for child in &children {
+                extract_collations(&child.return_type, &mut collations)?;
+            }
             let children = children
                 .into_iter()
                 .map(|child| {
-                    let ty = child.return_type.clone();
+                    let ty = apply_collations(&child.return_type, &collations);
                     let kind = crate::planner::collation::CollationType::CombinableCollations;
                     Ok(crate::planner::collation::push_collation(child, &ty, "", kind)?.0)
                 })
