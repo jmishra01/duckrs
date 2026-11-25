@@ -2691,7 +2691,7 @@ impl StatisticsPropagator {
                 return;
             }
             // `IntersectsExtentFilterPrune` of `g && <constant>` on a scan
-            if matches!(op.children[0].kind, K::Get { .. }) {
+            if matches!(op.children[0].kind, K::Get { .. } | K::ParquetScan { .. }) {
                 match self.intersects_extent(&expr) {
                     Some(false) => {
                         *op = empty_result(op);

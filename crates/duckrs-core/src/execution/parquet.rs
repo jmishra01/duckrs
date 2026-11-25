@@ -3637,6 +3637,30 @@ pub fn scan_statistics(scan: &ParquetScanData) -> Vec<Option<crate::catalog::Col
                 distinct: None,
                 children: Vec::new(),
             };
+            // `ParquetGeoStatistics`: the bounding boxes of the row groups; parquet does not say whether there are
+            // empty geometries, so the flags say there may be
+            if scan.types[column].id() == LogicalTypeId::Geometry {
+                let mut geometry = duckrs_common::geometry::GeometryStats::empty();
+                let mut known = !metadata.row_groups().is_empty();
+                for group in metadata.row_groups() {
+                    match group.column(leaf).geo_statistics().and_then(|geo| geo.bounding_box()) {
+                        Some(bbox) => {
+                            let mut extent = duckrs_common::geometry::Extent::empty();
+                            extent.x_min = bbox.get_xmin();
+                            extent.x_max = bbox.get_xmax();
+                            extent.y_min = bbox.get_ymin();
+                            extent.y_max = bbox.get_ymax();
+                            geometry.extent.merge(&extent);
+                        }
+                        None => known = false,
+                    }
+                }
+                if known {
+                    geometry.types = [0xFF; 4];
+                    geometry.flags = 0x0F;
+                    stats.geometry = Some(geometry);
+                }
+            }
             let mut bounds_known = true;
             let mut usable = true;
             // `StringStats` of each row group (`TransformParquetStatistics`), merged
