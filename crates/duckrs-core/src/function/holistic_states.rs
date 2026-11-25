@@ -64,6 +64,12 @@ pub fn layout(kind: Holistic, arguments: &[LogicalType], result: &LogicalType) -
         }
         // `OptionalStateType<bool>`
         BoolAnd | BoolOr => LogicalType::BOOLEAN,
+        // `BitState<T>`: `OptionalStateType<T>` of an integer (a BIT keeps its state opaque)
+        BitAnd | BitOr | BitXor
+            if result.is_integral() && result.id() != duckrs_common::types::LogicalTypeId::UHugeInt =>
+        {
+            result.clone()
+        }
         // `StringAggState`: `OptionalStateType<StateString<StateReturnType>>`
         StringAgg => LogicalType::VARCHAR,
         // `OptionalStateType<double>`
@@ -420,6 +426,8 @@ fn kahan_finalize(summed: f64, err: f64) -> f64 {
 /// A state, in the form of its layout.
 enum State {
     Bool(Option<bool>),
+    /// `BitState`: unset, or the bits so far
+    Bits(Option<i128>),
     Text(Option<String>),
     Product(Option<f64>),
     Dev(Dev),
@@ -453,10 +461,20 @@ enum State {
     KahanAvg(u64, f64, f64),
 }
 
+/// `BitAndOperation`, `BitOrOperation` and `BitXorOperation` of two values.
+fn bits(kind: Holistic, current: i128, input: i128) -> i128 {
+    match kind {
+        Holistic::BitAnd => current & input,
+        Holistic::BitOr => current | input,
+        _ => current ^ input,
+    }
+}
+
 fn empty(kind: Holistic) -> State {
     use Holistic::*;
     match kind {
         BoolAnd | BoolOr => State::Bool(None),
+        BitAnd | BitOr | BitXor => State::Bits(None),
         StringAgg => State::Text(None),
         Product => State::Product(None),
         CovarPop | CovarSamp => State::Covar(Covar::default()),
@@ -663,6 +681,13 @@ fn fold(kind: Holistic, rows: &[Value]) -> Result<State> {
                 };
                 append(text, &input.try_to_string()?, &separator);
             }
+            State::Bits(value) => {
+                let Some(input) = row.as_i128() else { continue };
+                *value = Some(match *value {
+                    None => input,
+                    Some(current) => bits(kind, current, input),
+                });
+            }
             State::Bool(value) => {
                 let ValueData::Bool(input) = row.data() else { continue };
                 let current = value.unwrap_or(kind == BoolAnd);
@@ -805,6 +830,7 @@ fn read(kind: Holistic, value: &Value) -> Result<State> {
             ValueData::Bool(v) => State::Bool(Some(*v)),
             _ => return Err(failure()),
         },
+        State::Bits(_) => State::Bits(Some(value.as_i128().ok_or_else(failure)?)),
         State::Product(_) => State::Product(Some(double(value)?)),
         State::Dev(_) => State::Dev(Dev::read(value)?),
         State::Covar(_) => State::Covar(Covar::read(value)?),
@@ -1010,8 +1036,16 @@ fn write(state: &State, ty: &LogicalType) -> Result<Value> {
         State::ArgExtreme(Some((arg, by))) => {
             Value::struct_value(vec![("arg".into(), arg.clone()), ("by".into(), by.clone())])
         }
-        State::Bool(None) | State::Product(None) | State::Kahan(None) | State::Text(None) | State::ArgExtreme(None) => {
+        State::Bool(None)
+        | State::Bits(None)
+        | State::Product(None)
+        | State::Kahan(None)
+        | State::Text(None)
+        | State::ArgExtreme(None) => {
             return Ok(Value::null(ty.clone()));
+        }
+        State::Bits(Some(v)) => {
+            return crate::function::cast::cast_value(&Value::hugeint(*v), &ty.state_layout());
         }
         State::Text(Some(text)) => Value::varchar(text.clone()),
         State::Bool(Some(v)) => Value::boolean(*v),
@@ -1303,6 +1337,14 @@ pub fn combine(
                 append(target, &source, &separator);
             }
         }
+        (State::Bits(target), State::Bits(source)) => {
+            if let Some(source) = source {
+                *target = Some(match *target {
+                    None => source,
+                    Some(current) => bits(kind, current, source),
+                });
+            }
+        }
         (State::Bool(target), State::Bool(source)) => {
             if let Some(source) = source {
                 let current = target.unwrap_or(kind == BoolAnd);
@@ -1453,6 +1495,10 @@ pub fn finalize(kind: Holistic, value: &Value, result: &LogicalType, constants: 
             super::holistic::finish(kind, &rows, result)?
         }
         State::Bool(v) => v.map_or_else(null, Value::boolean),
+        State::Bits(v) => match v {
+            Some(v) => crate::function::cast::cast_value(&Value::hugeint(v), result)?,
+            None => null(),
+        },
         State::Text(v) => v.map_or_else(null, Value::varchar),
         State::Product(v) => v.map_or_else(null, Value::double),
         State::Dev(dev) => {

@@ -806,7 +806,20 @@ pub fn resolve_state(ty: &LogicalType) -> Result<(Arc<AggregateFunction>, Logica
         })
         .collect();
     let bound = super::binder::bind_aggregate_function(set, placeholders, None, false)?;
-    Ok((bound.function, bound.return_type))
+    // an argument kept as ANY binds to NULL: the result of a state that is its result (or holds it) is its layout's
+    let mut result = bound.return_type;
+    if result.id() == LogicalTypeId::SqlNull {
+        let layout = ty.state_layout();
+        result = match bound.function.kind {
+            AggregateKind::Min | AggregateKind::Max | AggregateKind::List => layout,
+            AggregateKind::First | AggregateKind::Last | AggregateKind::AnyValue => layout
+                .struct_children()
+                .first()
+                .map_or(result, |(_, child)| child.clone()),
+            _ => result,
+        };
+    }
+    Ok((bound.function, result))
 }
 
 fn state_bytes(value: &Value) -> Result<&[u8]> {
