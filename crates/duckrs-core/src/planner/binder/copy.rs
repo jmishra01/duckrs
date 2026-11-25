@@ -1681,7 +1681,7 @@ impl Binder<'_> {
                 .strip_suffix(".gz")
                 .or_else(|| lower.strip_suffix(".zst"))
                 .unwrap_or(&lower);
-            ["parquet", "json", "ndjson", "jsonl"]
+            ["parquet", "geojsonl", "geojson", "json", "ndjson", "jsonl"]
                 .into_iter()
                 .find(|extension| lower.ends_with(&format!(".{extension}")))
                 .unwrap_or("csv")
@@ -1691,7 +1691,7 @@ impl Binder<'_> {
         };
         let known = matches!(
             format.as_str(),
-            "csv" | "tsv" | "auto" | "json" | "ndjson" | "jsonl" | "blob"
+            "csv" | "tsv" | "auto" | "json" | "ndjson" | "jsonl" | "geojson" | "geojsonl" | "blob"
         );
         // a format taken from the file's extension that no COPY function has is CSV
         let format = if !known && !info.format_given {
@@ -1706,10 +1706,18 @@ impl Binder<'_> {
             self.copy_json = false;
             return Ok((path, false));
         }
-        if !matches!(format.as_str(), "csv" | "tsv" | "auto" | "json" | "ndjson" | "jsonl") {
+        if !matches!(
+            format.as_str(),
+            "csv" | "tsv" | "auto" | "json" | "ndjson" | "jsonl" | "geojson" | "geojsonl"
+        ) {
             return Err(crate::unported(format!("COPY with the format {format}")));
         }
-        self.copy_json = matches!(format.as_str(), "json" | "ndjson" | "jsonl");
+        self.copy_json = matches!(format.as_str(), "json" | "ndjson" | "jsonl" | "geojson" | "geojsonl");
+        self.copy_geojson = match format.as_str() {
+            "geojson" => Some(false),
+            "geojsonl" => Some(true),
+            _ => None,
+        };
         Ok((path, format == "tsv"))
     }
 
@@ -2248,12 +2256,26 @@ impl Binder<'_> {
         let mut compression = Compression::Auto;
         let bound = self.bind_select_statement(&select)?;
         let copy_options = self.copy_options(info)?;
+        let geojson = self.copy_geojson.filter(|_| self.copy_json);
+        // `JSONCopyToFormat`: what error messages name it
+        let format_name = if geojson.is_some() { "GEOJSON" } else { "JSON" };
         if self.copy_json {
             // `GetSingleJSONCopyValue` and `GetSingleJSONCopyString`
             for (name, value) in &copy_options {
+                // NULL explicitly unsets the column options of GeoJSON
+                let column_option = matches!(name.as_str(), "geometry_column" | "id_column");
+                if geojson.is_some() && column_option {
+                    if !value.is_null() && value.logical_type().id() != LogicalTypeId::Varchar {
+                        return Err(binder_error(format!(
+                            "COPY (FORMAT {format_name}) parameter {name} expects a VARCHAR argument, but got {}.",
+                            value.logical_type()
+                        )));
+                    }
+                    continue;
+                }
                 if value.is_null() {
                     return Err(binder_error(format!(
-                        "COPY (FORMAT JSON) parameter {name} cannot be NULL."
+                        "COPY (FORMAT {format_name}) parameter {name} cannot be NULL."
                     )));
                 }
                 let text_option = matches!(
@@ -2269,13 +2291,54 @@ impl Binder<'_> {
                 );
                 if text_option && value.logical_type().id() != LogicalTypeId::Varchar {
                     return Err(binder_error(format!(
-                        "COPY (FORMAT JSON) parameter {name} expects a VARCHAR argument, but got {}.",
+                        "COPY (FORMAT {format_name}) parameter {name} expects a VARCHAR argument, but got {}.",
                         value.logical_type()
                     )));
                 }
             }
         }
         Self::check_copy_options(&copy_options, false)?;
+        // `CopyToJSONPlanInternal`: the options the JSON writers take
+        if self.copy_json {
+            const SUPPORTED_BASE_OPTIONS: [&str; 18] = [
+                "compression",
+                "encoding",
+                "use_tmp_file",
+                "overwrite_or_ignore",
+                "overwrite",
+                "append",
+                "filename_pattern",
+                "file_extension",
+                "per_thread_output",
+                "file_size_bytes",
+                "partition_by",
+                "return_files",
+                "preserve_order",
+                "return_stats",
+                "write_partition_columns",
+                "write_empty_file",
+                "hive_file_pattern",
+                "return_column_types",
+            ];
+            for (name, _) in &copy_options {
+                let known = SUPPORTED_BASE_OPTIONS.contains(&name.as_str())
+                    || matches!(
+                        name.as_str(),
+                        "format" | "order_by" | "dateformat" | "date_format" | "timestampformat" | "timestamp_format"
+                            | "array"
+                    )
+                    || (geojson.is_some() && matches!(name.as_str(), "geometry_column" | "id_column" | "bbox"));
+                if !known {
+                    return Err(binder_error(format!(
+                        "Unknown option for COPY ... TO ... (FORMAT {format_name}): {}.",
+                        duckrs_parser::ast::sql_identifier(name)
+                    )));
+                }
+            }
+        }
+        // GeoJSON is a FeatureCollection, unless newline-delimited
+        let (mut geometry_column, mut id_column, mut write_bbox) = (None, None, false);
+        let mut array_output = geojson == Some(false);
         if self.copy_json {
             options.json_names = Some(unique_names(&bound.names));
             options.header = false;
@@ -2312,13 +2375,17 @@ impl Binder<'_> {
             }
             match name.as_str() {
                 "format" | "order_by" => {}
-                "array" if self.copy_json => {
-                    if is_true(&value, &name)? {
-                        options.prefix = "[\n\t".to_string();
-                        options.new_line = ",\n\t".to_string();
-                        options.suffix = "\n]\n".to_string();
+                "array" if self.copy_json => array_output = is_true(&value, &name)?,
+                "geometry_column" | "id_column" if geojson.is_some() => {
+                    // NULL is explicitly none, which the empty name stands for
+                    let column = if value.is_null() { String::new() } else { text(&value)? };
+                    if name == "geometry_column" {
+                        geometry_column = Some(column);
+                    } else {
+                        id_column = Some(column);
                     }
                 }
+                "bbox" if geojson.is_some() => write_bbox = is_true(&value, &name)?,
                 "dateformat" | "date_format" => options.date_format = Some(text(&value)?),
                 // `CSVReaderOptions::SetWriteOption`: ISO is the ISO 8601 format with microseconds
                 "timestampformat" | "timestamp_format" => {
@@ -2354,6 +2421,16 @@ impl Binder<'_> {
                 _ => return Err(crate::unported(format!("the COPY option {name}"))),
             }
         }
+        if array_output {
+            options.prefix = if geojson.is_some() {
+                "{\"type\":\"FeatureCollection\",\"features\":[\n\t"
+            } else {
+                "[\n\t"
+            }
+            .to_string();
+            options.new_line = ",\n\t".to_string();
+            options.suffix = if geojson.is_some() { "\n]}\n" } else { "\n]\n" }.to_string();
+        }
         if !escape_given {
             options.escape = options.quote;
         }
@@ -2369,7 +2446,13 @@ impl Binder<'_> {
         }
         options.force_quote = force_quote;
         let compression = compression.for_path(&path);
-        let mut extension = if self.copy_json { "json" } else { "csv" }.to_string();
+        let mut extension = match geojson {
+            Some(true) => "geojsonl",
+            Some(false) => "geojson",
+            None if self.copy_json => "json",
+            None => "csv",
+        }
+        .to_string();
         match compression {
             Compression::Gzip => extension += ".gz",
             Compression::Zstd => extension += ".zst",
@@ -2388,8 +2471,33 @@ impl Binder<'_> {
             options.partitioning.as_mut(),
         )?;
         self.set_max_open_files(options.partitioning.as_mut());
+        // `JSONCopyToGeoJSONBind`, over the columns that are written: the partition columns are not, by default
+        if geojson.is_some() {
+            let written: Vec<(String, LogicalType)> = bound
+                .names
+                .iter()
+                .zip(&bound.types)
+                .enumerate()
+                .filter(|(at, _)| {
+                    options
+                        .partitioning
+                        .as_ref()
+                        .is_none_or(|partitioning| partitioning.write_columns || !partitioning.columns.contains(at))
+                })
+                .map(|(_, (name, ty))| (name.clone(), ty.clone()))
+                .collect();
+            let mut layout =
+                crate::function::geojson_copy::layout(&written, &geometry_column, &id_column, write_bbox)?;
+            layout.date_format = options.date_format.clone();
+            layout.timestamp_format = options.timestamp_format.clone();
+            options.geojson = Some(layout);
+        }
         options.rotation = partition.rotation(&path, &extension, file_size_bytes, None, per_thread)?;
-        let format = if self.copy_json { "json" } else { "csv" };
+        let format = match geojson {
+            Some(_) => "geojson",
+            None if self.copy_json => "json",
+            None => "csv",
+        };
         options.output = output.build(options.partitioning.is_some(), per_thread, ordered, Some(format))?;
         let (result_names, return_type) = copy_result(&options.output);
         let result_types = options.output.types();

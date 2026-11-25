@@ -601,6 +601,7 @@ impl Binder<'_> {
             LogicalOperatorKind::ExpressionGet {
                 function: None,
                 volatile: false,
+                materialized: false,
                 table_index,
                 types,
                 expressions,

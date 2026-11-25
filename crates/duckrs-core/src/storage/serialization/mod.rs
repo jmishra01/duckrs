@@ -7,6 +7,7 @@
 pub mod convert;
 pub mod custom;
 pub mod generated;
+pub mod plan;
 pub mod to_stored;
 pub mod verify;
 
