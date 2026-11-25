@@ -37,6 +37,9 @@
 #   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
 # Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
 # stop passing. Regenerate with:
+#   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
+# Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
+# stop passing. Regenerate with:
 test/common/test_cast_hugeint.test
 test/common/test_cast_struct.test
 test/common/test_local_file_urls.test
@@ -3982,6 +3985,7 @@ test/sql/sql_export/values_consumers.test
 test/sql/sql_export/variant_key_order.test
 test/sql/sql_export/window_unnest_results.test
 test/sql/storage/adaptive_segment_lifecycle.test
+test/sql/storage/adaptive_segment_rollback.test
 test/sql/storage/alter/alter_add_col_defaultexpr_sequence.test
 test/sql/storage/alter/alter_based_on_unfinished_insert_fails.test
 test/sql/storage/alter/alter_column_constraint.test
@@ -4159,6 +4163,7 @@ test/sql/storage/compression/fsst/fsst_corrupt_decoded_length.test
 test/sql/storage/compression/fsst/fsst_corrupt_escape_symbol_index.test
 test/sql/storage/compression/fsst/fsst_disable_compression.test
 test/sql/storage/compression/fsst/fsst_greedy_long_strings.test
+test/sql/storage/compression/fsst/fsst_select_across_segments.test
 test/sql/storage/compression/fsst/fsst_small_symbol_table.test
 test/sql/storage/compression/fsst/fsst_storage_info.test
 test/sql/storage/compression/fsst/invalid_fsst_bitpacking_width.test
@@ -4221,6 +4226,8 @@ test/sql/storage/compression/roaring/roaring_inverted_run_simple.test
 test/sql/storage/compression/roaring/roaring_run_boundaries.test
 test/sql/storage/compression/roaring/roaring_run_simple.test
 test/sql/storage/compression/roaring/roaring_smaller_than_vector.test
+test/sql/storage/compression/select_across_segments.test
+test/sql/storage/compression/select_bitpacking.test
 test/sql/storage/compression/simple_compression.test
 test/sql/storage/compression/skip_explicit_compression_analyze.test
 test/sql/storage/compression/string/big_strings.test
@@ -4280,6 +4287,7 @@ test/sql/storage/extended_string_stats.test
 test/sql/storage/extensions/extension_default.test
 test/sql/storage/extensions/extension_views.test
 test/sql/storage/external_file_cache/local_file_rewrite_same_second.test
+test/sql/storage/fetch_consecutive_rows.test
 test/sql/storage/filter_pushdown_struct.test
 test/sql/storage/full_vector_delete_checkpoint.test
 test/sql/storage/in_memory_autocheckpoint_large_commit.test

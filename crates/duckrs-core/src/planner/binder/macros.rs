@@ -346,6 +346,22 @@ impl Binder<'_> {
             return Ok(None);
         }
         let search_first = self.search_schema.as_deref();
+        // `Catalog::GetEntry` along the search path: a statement routed to another database still has the default
+        // database on its path, which comes first
+        if schema.is_none()
+            && let Some(session) = &self.session
+            && !session.default_database.eq_ignore_ascii_case(&session.database)
+            && let Some(default) = (session.attached_catalog)(&session.default_database)
+            && !std::ptr::eq(Arc::as_ptr(&default), self.catalog)
+        {
+            let found = match default.get_macro_in(None, None, &name.name, table_macro)? {
+                Some(found) => Some(found),
+                None => default.get_macro_in(None, None, &name.name, !table_macro)?,
+            };
+            if let Some((_, entry)) = found {
+                return Ok(Some(entry));
+            }
+        }
         let found = match self
             .catalog
             .get_macro_in(schema, search_first, &name.name, table_macro)?

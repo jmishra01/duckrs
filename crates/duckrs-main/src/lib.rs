@@ -5012,6 +5012,8 @@ impl ClientContext {
             Statement::Create(info) if matches!(info.kind, CreateKind::Index { .. }) => {
                 let catalog = self.catalog();
                 let mut binder = Binder::new(&catalog);
+                // what the key calls is looked up along the search path of the connection
+                binder.session = Some(self.session_values());
                 if let Some((table, index)) = binder.bind_create_index(info)? {
                     execute_create_index(&table, index)?;
                 }

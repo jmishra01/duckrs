@@ -171,6 +171,8 @@ impl Binder<'_> {
             return Err(binder_error(error));
         }
         let mut binder = Binder::new(self.catalog);
+        // the macros of the key are looked up along the connection's search path
+        binder.session = self.session.clone();
         binder.aggregate_error = "aggregate functions are not allowed in index expressions";
         let table_index = binder.generate_table_index();
         binder.bind_context.add_binding(Binding {
