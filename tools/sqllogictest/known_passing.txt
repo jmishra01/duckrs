@@ -34,6 +34,9 @@
 #   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
 # Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
 # stop passing. Regenerate with:
+#   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
+# Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
+# stop passing. Regenerate with:
 test/common/test_cast_hugeint.test
 test/common/test_cast_struct.test
 test/common/test_local_file_urls.test
@@ -3984,7 +3987,12 @@ test/sql/storage/alter/alter_based_on_unfinished_insert_fails.test
 test/sql/storage/alter/alter_column_constraint.test
 test/sql/storage/alter/alter_lazy_metadata_load.test
 test/sql/storage/append_strings_to_persistent.test
+test/sql/storage/attach/attach_autocheckpoint_no_wal_writes.test
+test/sql/storage/attach/attach_autocheckpoint_propagation.test
+test/sql/storage/attach/attach_invalidation.test
 test/sql/storage/attach/attach_invalidation_default_db.test
+test/sql/storage/attach/attach_invalidation_sibling_commit.test
+test/sql/storage/attach/attach_invalidation_sibling_rollback.test
 test/sql/storage/attach_mmap.test
 test/sql/storage/bc/null_rows_v1_5_or_filter.test
 test/sql/storage/bc/test_broken_view_v092.test
@@ -4022,6 +4030,11 @@ test/sql/storage/checkpoint/checkpoint_in_transaction.test
 test/sql/storage/checkpoint/checkpoint_rolled_back_use.test
 test/sql/storage/checkpoint/checkpoint_with_outstanding_insertions.test
 test/sql/storage/checkpoint/checkpoint_without_transactions.test
+test/sql/storage/checkpoint/initial_database_autocheckpoint_failure.test
+test/sql/storage/checkpoint/sql_maintenance_checkpoint_lock.test
+test/sql/storage/checkpoint/test_checkpoint_failure_delayed_commit.test
+test/sql/storage/checkpoint/test_checkpoint_failure_delayed_rollback.test
+test/sql/storage/checkpoint/test_checkpoint_failure_on_detach.test
 test/sql/storage/checkpointed_self_append.test
 test/sql/storage/checkpointed_self_append_tinyint.test
 test/sql/storage/commit_abort.test
@@ -4306,6 +4319,7 @@ test/sql/storage/optimistic_write/optimistic_write_temp_table.test
 test/sql/storage/optimistic_write/optimistic_write_unique_index_wal_replay.test
 test/sql/storage/optimistic_write/optimistic_write_unique_index_wal_replay_desync.test
 test/sql/storage/optimistic_write/optimistic_write_update.test
+test/sql/storage/partial_blocks/in_memory_checkpoint_abort.test
 test/sql/storage/partial_blocks/many_columns_drop_table.test
 test/sql/storage/partial_blocks/many_columns_rle.test
 test/sql/storage/partial_blocks/many_columns_storage.test

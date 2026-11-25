@@ -138,10 +138,27 @@ impl Durable {
 
 /// The records of one commit, as the version of the file has them.
 /// The bytes of some log records, the version they are in, how many there are, and how the file is encrypted.
-struct Records(Vec<u8>, StorageVersion, u64, Option<super::encryption::FileEncryption>);
+/// The bytes, the version they are in, how many records, the encryption, and whether a record updates, deletes or
+/// drops (`UndoBufferProperties::has_updates` / `has_dropped_entries`).
+struct Records(Vec<u8>, StorageVersion, u64, Option<super::encryption::FileEncryption>, bool);
 
 impl Records {
     fn entry(&mut self, wal: u64, body: impl FnOnce(&mut BinarySerializer)) {
+        use wal_type as w;
+        self.4 |= matches!(
+            wal,
+            w::DELETE_TUPLE
+                | w::UPDATE_TUPLE
+                | w::DROP_TABLE
+                | w::DROP_SCHEMA
+                | w::DROP_VIEW
+                | w::DROP_SEQUENCE
+                | w::DROP_MACRO
+                | w::DROP_TYPE
+                | w::DROP_TABLE_MACRO
+                | w::DROP_INDEX
+                | w::DROP_TRIGGER
+        );
         let mut s = BinarySerializer::new(SerializationOptions {
             target: self.1,
             ..Default::default()
@@ -674,6 +691,8 @@ pub struct WriteAheadLog {
     entries: u64,
     /// Of a log that was replayed and isn't written to: where what it committed ends
     replayed: Option<u64>,
+    /// whether the last commit updated, deleted or dropped something
+    last_commit_updates: bool,
     /// of an encrypted file, whose log is encrypted as well
     encryption: Option<super::encryption::FileEncryption>,
 }
@@ -740,6 +759,12 @@ impl WriteAheadLog {
         let wanted = self.wal_version();
         self.replayed = replayed.filter(|(_, version)| *version == wanted).map(|(end, _)| end);
         self
+    }
+
+    /// Whether the last commit updated, deleted or dropped something, which other transactions may still need
+    /// the state from before of (`GetCheckpointType`).
+    pub fn last_commit_updates(&self) -> bool {
+        self.last_commit_updates
     }
 
     /// `GetWALEntriesCount`.
@@ -882,7 +907,7 @@ impl WriteAheadLog {
         block_size: usize,
         ahead: Option<WriteAhead>,
     ) -> Result<Records> {
-        let mut records = Records(Vec::new(), self.version, 0, self.encryption.clone());
+        let mut records = Records(Vec::new(), self.version, 0, self.encryption.clone(), false);
         let schema_of = |key: &Key| -> Result<Arc<SchemaCatalogEntry>> { catalog.schema_for(Some(&key.0)) };
         let gone = |old_same: bool, new_exists: bool| !new_exists || !old_same;
         // before the tables they are on go
@@ -1118,6 +1143,7 @@ impl WriteAheadLog {
             self.differences(catalog, name, &current, block_size, ahead)
         })?;
         self.durable = current;
+        self.last_commit_updates = records.4;
         if records.0.is_empty() {
             return Ok(false);
         }
@@ -1126,6 +1152,16 @@ impl WriteAheadLog {
         self.append(path, &records.0)?;
         self.entries += records.2;
         Ok(true)
+    }
+
+    /// A commit of a database that writes no log (`RECOVERY_MODE NO_WAL_WRITES`): what is durable moves on, and the
+    /// size of the records it would have written is what `AutomaticCheckpoint` estimates of it.
+    pub fn commit_unlogged(&mut self, catalog: &Catalog, name: &str, block_size: usize) -> Result<u64> {
+        let current = Durable::of(catalog);
+        let records = self.differences(catalog, name, &current, block_size, None)?;
+        self.durable = current;
+        self.last_commit_updates = records.4;
+        Ok(records.0.len() as u64)
     }
 
     /// `WriteCheckpoint`: before a checkpoint, for a crash during it to be told from one after it.
@@ -1148,7 +1184,7 @@ impl WriteAheadLog {
         }
         let size = self.size;
         if self.file.is_some() {
-            let mut records = Records(Vec::new(), self.version, 0, self.encryption.clone());
+            let mut records = Records(Vec::new(), self.version, 0, self.encryption.clone(), false);
             records.entry(wal_type::CHECKPOINT, |s| s.write_property(101, "meta_block", &root));
             records.entry(wal_type::WAL_FLUSH, |_| {});
             self.append(path, &records.0)?;
