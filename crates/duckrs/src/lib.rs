@@ -12,6 +12,7 @@ pub use duckrs_common::value::Value;
 pub use duckrs_common::vector::DataChunk;
 pub use duckrs_common::{Error, ErrorKind, Result};
 pub use duckrs_main::MaterializedQueryResult as QueryResult;
+pub use duckrs_main::with_error_location;
 
 mod arrow_export;
 pub use arrow_export::{arrow_schema, arrow_type, record_batches};

@@ -22,6 +22,9 @@
 #   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
 # Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
 # stop passing. Regenerate with:
+#   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
+# Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
+# stop passing. Regenerate with:
 test/common/test_cast_hugeint.test
 test/common/test_cast_struct.test
 test/common/test_local_file_urls.test
@@ -2286,6 +2289,8 @@ test/sql/delete/test_using_delete_duplicates.test
 test/sql/detailed_profiler/test_detailed_profiler.test
 test/sql/error/aggregate_order_by.test
 test/sql/error/error_location_not_duplicated.test
+test/sql/error/error_position.test
+test/sql/error/error_position_json_execute.test
 test/sql/error/escape_percent_sign.test
 test/sql/error/incorrect_sql.test
 test/sql/error/missing_type.test
@@ -3574,8 +3579,10 @@ test/sql/parser/test_many_or.test
 test/sql/parser/test_nested_subquery_depth.test
 test/sql/parser/test_operator_precedence.test
 test/sql/parser/trailing_commas.test
+test/sql/parser/unicode_whitespace_error_position.test
 test/sql/parser/unquoted_underscore_digit_identifiers.test
 test/sql/parser/unreserved_keyword_casing.test
+test/sql/parser/values_list_error.test
 test/sql/parser/values_list_without_brackets.test
 test/sql/parser/wide_type_definitions.test
 test/sql/peg_parser/binary_type.test

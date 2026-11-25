@@ -200,6 +200,8 @@ fn chain_links(node: &ParseNode) -> usize {
 
 pub struct Transformer<'g> {
     grammar: &'g Grammar,
+    /// The byte offset each token starts at, for the `query_location` of nodes.
+    pub token_offsets: Vec<usize>,
     window_clauses: Vec<HashMap<String, WindowExpr>>,
     in_window_definition: bool,
     param_count: u64,
@@ -226,6 +228,7 @@ impl<'g> Transformer<'g> {
     pub fn new(grammar: &'g Grammar) -> Self {
         Self {
             grammar,
+            token_offsets: Vec::new(),
             window_clauses: Vec::new(),
             in_window_definition: false,
             param_count: 0,
@@ -313,6 +316,22 @@ impl<'g> Transformer<'g> {
     }
 
     /// The first terminal anywhere under `node`.
+    /// The index of the first token under `node`.
+    fn first_token(node: &ParseNode) -> Option<usize> {
+        match node {
+            ParseNode::Terminal { token, .. } => Some(*token),
+            ParseNode::Rule { child, .. } => Self::first_token(child),
+            ParseNode::Choice { child, .. } => Self::first_token(child),
+            ParseNode::List(items) | ParseNode::Repeat(items) => items.iter().find_map(Self::first_token),
+            ParseNode::Optional(child) => child.as_deref().and_then(Self::first_token),
+        }
+    }
+
+    /// `query_location`: the byte offset `node` starts at.
+    fn location(&self, node: &ParseNode) -> QueryLocation {
+        QueryLocation(Self::first_token(node).and_then(|token| self.token_offsets.get(token).copied()))
+    }
+
     fn terminal(node: &ParseNode) -> Option<&TerminalValue> {
         match node {
             ParseNode::Terminal { value, .. } => Some(value),
@@ -2383,19 +2402,25 @@ impl<'g> Transformer<'g> {
 
     fn values_clause(&mut self, node: &ParseNode) -> Result<SelectStatement> {
         let mut rows = Vec::new();
+        let mut locations = Vec::new();
         for row in self.subs(node, "ValuesExpressions") {
+            locations.push(self.subs(row, "Expression").first().map_or(QueryLocation::default(), |e| self.location(e)));
             rows.push(self.exprs(row, "Expression")?);
         }
-        for row in rows.iter().skip(1) {
+        for (row, location) in rows.iter().zip(&locations).skip(1) {
             if row.len() != rows[0].len() {
                 let entries = |n: usize| if n == 1 { "entry" } else { "entries" };
-                return Err(parser_error(format!(
+                let error = parser_error(format!(
                     "VALUES lists must all be the same length, expected {} {} but found a list with {} {}",
                     rows[0].len(),
                     entries(rows[0].len()),
                     row.len(),
                     entries(row.len())
-                )));
+                ));
+                return Err(match location.0 {
+                    Some(position) => error.with_position(position),
+                    None => error,
+                });
             }
         }
         let mut values = TableRef::from(TableRefKind::ExpressionList(rows));
@@ -2804,11 +2829,13 @@ impl<'g> Transformer<'g> {
         } else {
             vec![Self::text(inner)]
         };
-        Ok(TableRefKind::BaseTable {
+        let mut table: TableRef = TableRefKind::BaseTable {
             name: QualifiedName::from_parts(parts),
             at_clause: None,
         }
-        .into())
+        .into();
+        table.query_location = self.location(node);
+        Ok(table)
     }
 
     fn join_type(&self, node: Option<&ParseNode>) -> Result<JoinType> {

@@ -876,7 +876,7 @@ pub fn table_ref(stored: &ast::TableRef) -> Result<g::TableRef> {
         type_,
         alias: stored.alias.clone(),
         sample: stored.sample.as_ref().map(sample).transpose()?.map(Box::new),
-        query_location: None,
+        query_location: stored.query_location.0.map(|l| l as u64),
         query_location_length: None,
         kind,
     })

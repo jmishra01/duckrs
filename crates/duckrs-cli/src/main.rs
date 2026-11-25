@@ -1099,96 +1099,9 @@ fn sql_is_complete(sql: &str) -> bool {
     terminated
 }
 
-/// `ErrorData::Message` with `QueryErrorContext::Format`: the error, and the line it is at with a caret.
+/// `ErrorData::Message`: the client added the line the error is at already (`ClientContext::ProcessError`).
 pub fn format_error(error: &Error, query: &str) -> String {
-    let message = error.to_string();
-    let Some(location) = error.position else {
-        return message;
-    };
-    if location >= query.len() {
-        return message;
-    }
-    const MAX_LINE_RENDER_WIDTH: usize = 120;
-    let bytes = query.as_bytes();
-    let mut start = 0;
-    let mut line_number = 1;
-    for i in 0..location {
-        let newline = match bytes[i] {
-            b'\r' => i + 1 >= location || bytes[i + 1] != b'\n',
-            b'\n' => true,
-            _ => false,
-        };
-        if newline {
-            line_number += 1;
-            start = i + 1;
-        }
-    }
-    let end = query[location..]
-        .find(['\n', '\r'])
-        .map(|p| p + location)
-        .unwrap_or(query.len());
-    // the characters of the line, with their widths and positions
-    let line = &query[start..end];
-    let chars: Vec<(usize, char)> = line.char_indices().collect();
-    let widths: Vec<usize> = chars.iter().map(|(_, c)| char_width(*c)).collect();
-    let is_break = |c: char| c.is_ascii_whitespace() || "+-*/%<>=!~^&|,()[]{};:".contains(c);
-    let epos = chars
-        .iter()
-        .position(|(p, _)| *p >= location - start)
-        .unwrap_or(chars.len());
-    let mut spos = 0;
-    let mut render_start = start;
-    let mut render_end = end;
-    let mut truncate_beginning = false;
-    let mut truncate_end = false;
-    let mut width = 0;
-    let mut i = epos;
-    while i > 0 {
-        width += widths.get(i).copied().unwrap_or(1);
-        if width >= MAX_LINE_RENDER_WIDTH / 2 {
-            let scan_start = i.saturating_sub(4);
-            let scan_end = (i + 4).min(epos);
-            if let Some(k) = (scan_start..scan_end).find(|&k| is_break(chars[k].1)) {
-                i = k;
-            }
-            truncate_beginning = true;
-            render_start = start + chars[i].0;
-            spos = i;
-            break;
-        }
-        i -= 1;
-    }
-    width = 0;
-    let mut i = epos;
-    while i < chars.len() {
-        width += widths[i];
-        if width >= MAX_LINE_RENDER_WIDTH / 2 {
-            let scan_start = if i > epos + 4 { i - 4 } else { epos };
-            let scan_end = (i + 4).min(chars.len());
-            if let Some(k) = (scan_start..scan_end).find(|&k| is_break(chars[k].1)) {
-                i = k;
-            }
-            truncate_end = true;
-            render_end = start + chars[i].0;
-            break;
-        }
-        i += 1;
-    }
-    let indicator = format!("LINE {line_number}: ");
-    let begin = if truncate_beginning { "..." } else { "" };
-    let finish = if truncate_end { "..." } else { "" };
-    let caret_offset: usize =
-        widths[spos..epos.min(widths.len())].iter().sum::<usize>() + indicator.len() + begin.len();
-    format!(
-        "{message}\n\n{indicator}{begin}{}{finish}\n{}^",
-        &query[render_start..render_end],
-        " ".repeat(caret_offset)
-    )
-}
-
-fn char_width(c: char) -> usize {
-    let mut buffer = [0u8; 4];
-    box_renderer::render_width(c.encode_utf8(&mut buffer))
+    duckrs::with_error_location(error, query).to_string()
 }
 
 /// The user and system CPU seconds this process has used (`getrusage`).

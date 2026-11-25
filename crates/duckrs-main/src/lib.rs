@@ -1196,6 +1196,137 @@ fn search_path_schema(catalog: &Catalog, has: impl Fn(&SchemaCatalogEntry) -> bo
         .find(|schema| catalog.get_schema(schema).is_some_and(|schema| has(&schema)))
 }
 
+/// `ErrorData::AddErrorLocation` with `QueryErrorContext::Format`: the message, and the line of `query` the error is
+/// at with a caret under it. The position is used up.
+pub fn with_error_location(error: &Error, query: &str) -> Error {
+    let mut error = error.clone();
+    let Some(location) = error.position.take() else {
+        return error;
+    };
+    let message = error.message.clone();
+    if location >= query.len() {
+        return error;
+    }
+    const MAX_LINE_RENDER_WIDTH: usize = 120;
+    let bytes = query.as_bytes();
+    let mut start = 0;
+    let mut line_number = 1;
+    for i in 0..location {
+        let newline = match bytes[i] {
+            b'\r' => i + 1 >= location || bytes[i + 1] != b'\n',
+            b'\n' => true,
+            _ => false,
+        };
+        if newline {
+            line_number += 1;
+            start = i + 1;
+        }
+    }
+    let end = query[location..]
+        .find(['\n', '\r'])
+        .map(|p| p + location)
+        .unwrap_or(query.len());
+    // the characters of the line, with their widths and positions
+    let line = &query[start..end];
+    let chars: Vec<(usize, char)> = line.char_indices().collect();
+    let widths: Vec<usize> = chars.iter().map(|(_, c)| char_width(*c)).collect();
+    let is_break = |c: char| c.is_ascii_whitespace() || "+-*/%<>=!~^&|,()[]{};:".contains(c);
+    let epos = chars
+        .iter()
+        .position(|(p, _)| *p >= location - start)
+        .unwrap_or(chars.len());
+    let mut spos = 0;
+    let mut render_start = start;
+    let mut render_end = end;
+    let mut truncate_beginning = false;
+    let mut truncate_end = false;
+    let mut width = 0;
+    let mut i = epos;
+    while i > 0 {
+        width += widths.get(i).copied().unwrap_or(1);
+        if width >= MAX_LINE_RENDER_WIDTH / 2 {
+            let scan_start = i.saturating_sub(4);
+            let scan_end = (i + 4).min(epos);
+            if let Some(k) = (scan_start..scan_end).find(|&k| is_break(chars[k].1)) {
+                i = k;
+            }
+            truncate_beginning = true;
+            render_start = start + chars[i].0;
+            spos = i;
+            break;
+        }
+        i -= 1;
+    }
+    width = 0;
+    let mut i = epos;
+    while i < chars.len() {
+        width += widths[i];
+        if width >= MAX_LINE_RENDER_WIDTH / 2 {
+            let scan_start = if i > epos + 4 { i - 4 } else { epos };
+            let scan_end = (i + 4).min(chars.len());
+            if let Some(k) = (scan_start..scan_end).find(|&k| is_break(chars[k].1)) {
+                i = k;
+            }
+            truncate_end = true;
+            render_end = start + chars[i].0;
+            break;
+        }
+        i += 1;
+    }
+    let indicator = format!("LINE {line_number}: ");
+    let begin = if truncate_beginning { "..." } else { "" };
+    let finish = if truncate_end { "..." } else { "" };
+    let caret_offset: usize =
+        widths[spos..epos.min(widths.len())].iter().sum::<usize>() + indicator.len() + begin.len();
+    error.message = format!(
+        "{message}\n\n{indicator}{begin}{}{finish}\n{}^",
+        &query[render_start..render_end],
+        " ".repeat(caret_offset)
+    );
+    error
+}
+
+fn char_width(c: char) -> usize {
+    let mut buffer = [0u8; 4];
+    duckrs_common::render_width::render_width(c.encode_utf8(&mut buffer))
+}
+
+/// `StringUtil::ExceptionToJSONMap`: the error as a JSON object, with its position.
+fn error_as_json(error: &Error) -> Error {
+    if error.message.starts_with('{') {
+        return error.clone();
+    }
+    let text = |s: &str| {
+        let mut out = String::with_capacity(s.len() + 2);
+        out.push('"');
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+        out
+    };
+    let mut fields = vec![
+        format!("{}:{}", text("exception_type"), text(error.kind.name())),
+        format!("{}:{}", text("exception_message"), text(&error.message)),
+    ];
+    if let Some(position) = error.position {
+        fields.push(format!("{}:{}", text("position"), text(&position.to_string())));
+    }
+    let mut converted = error.clone();
+    converted.message = format!("{{{}}}", fields.join(","));
+    converted.position = None;
+    converted
+}
+
+
 /// A fully materialized result (`MaterializedQueryResult`).
 #[derive(Debug)]
 pub struct MaterializedQueryResult {
@@ -1873,6 +2004,19 @@ impl ClientContext {
     }
 
     pub fn query(&mut self, sql: &str) -> Result<MaterializedQueryResult> {
+        self.query_text(sql).map_err(|error| self.process_error(&error, sql))
+    }
+
+    /// `ClientContext::ProcessError`: the error as JSON with `errors_as_json`, or else with the line it is at.
+    fn process_error(&self, error: &Error, sql: &str) -> Error {
+        if self.setting_text("errors_as_json") == "true" {
+            error_as_json(error)
+        } else {
+            with_error_location(error, sql)
+        }
+    }
+
+    fn query_text(&mut self, sql: &str) -> Result<MaterializedQueryResult> {
         let _temp = SessionTemp::enter(&self.temp);
         let statements = match duckrs_parser::parse_ast_with_text(sql, &self.parser_options()) {
             Ok(statements) => statements,
@@ -8862,8 +9006,14 @@ mod tests {
         );
         assert_eq!(
             err(&mut context, "SELECT * FROM t"),
-            "Catalog Error: Table with name t does not exist!\nDid you mean \"pg_tables\"?"
+            "Catalog Error: Table with name t does not exist!\nDid you mean \"pg_tables\"?\n\nLINE 1: SELECT * FROM t\n                      ^"
         );
+        run(&mut context, "SET errors_as_json = true");
+        assert_eq!(
+            err(&mut context, "SELECT * FROM t"),
+            "{\"exception_type\":\"Catalog\",\"exception_message\":\"Table with name t does not exist!\\nDid you mean \\\"pg_tables\\\"?\",\"position\":\"14\"}"
+        );
+        run(&mut context, "SET errors_as_json = false");
         run(&mut context, "CREATE TABLE t (abc INTEGER)");
         assert_eq!(
             err(&mut context, "SELECT abd FROM t"),
