@@ -270,6 +270,8 @@ fn new_line(value: &str) -> Result<String> {
 #[derive(Default)]
 struct CsvArguments {
     files: Vec<String>,
+    /// what `BaseCSVData::Finalize` finds wrong with the options, which C++ checks once the file is sniffed
+    finalize_error: Option<Error>,
     options: CsvReadOptions,
     auto_detect: Option<bool>,
     columns: Option<Vec<(String, LogicalType)>>,
@@ -862,7 +864,7 @@ impl Binder<'_> {
                 result.types_by_name.clear();
             }
         }
-        csv_finalize(&result.options)?;
+        result.finalize_error = csv_finalize(&result.options).err();
         // `CSVReaderOptions::SetRejectsOptions`
         let named = result.rejects_table.is_some() || result.rejects_scan.is_some();
         if named && result.store_rejects == Some(false) {
@@ -949,6 +951,9 @@ impl Binder<'_> {
                 (sniff_of(&data)?, Some(data))
             }
         };
+        if let Some(error) = &arguments.finalize_error {
+            return Err(error.clone());
+        }
         if let Some(names) = &arguments.names {
             // more names than columns: with null_padding, VARCHAR columns the rows are padded with
             if names.len() > sniffed.names.len() && arguments.options.null_padding {
@@ -1391,8 +1396,9 @@ impl Binder<'_> {
         let (scans, errors) = (table(scans_name), table(errors_name));
         let (scans_ok, errors_ok) = (ours(&scans, "file_path"), ours(&errors, "error_message"));
         // `CSVRejectsTable::GetOrCreate`: tables of these names are reused only as the pair they were made as
-        let partial = scans.is_some() != errors.is_some();
-        if !scans_ok || !errors_ok || partial {
+        let pair = (scans_name.to_uppercase(), errors_name.to_uppercase());
+        let made = self.catalog.rejects_pairs.lock().contains(&pair);
+        if !scans_ok || !errors_ok || ((scans.is_some() || errors.is_some()) && !made) {
             let mut message = String::new();
             if scans.is_some() {
                 message += &format!("Reject Scan Table name \"{scans_name}\" is already in use. ");
@@ -1418,6 +1424,7 @@ impl Binder<'_> {
             .map(str::to_string)
             .to_vec(),
         )?;
+        self.catalog.rejects_pairs.lock().insert(pair);
         let create = |name: &str, columns: Vec<ColumnDefinition>| -> Result<Arc<TableCatalogEntry>> {
             temp.create_table(name, columns, Vec::new(), Vec::new(), OnCreateConflict::Ignore)?;
             table(name).ok_or_else(|| binder_error("The rejects tables could not be created"))
@@ -1456,8 +1463,11 @@ impl Binder<'_> {
             ],
         )?;
         // `CSVRejectsTable`: one scan id for the scans of a query, whose files are numbered on from one another
-        static LAST: std::sync::Mutex<Option<(u64, u64, usize)>> = std::sync::Mutex::new(None);
-        let query = self.session.as_ref().map(|session| session.query_id);
+        // (a query of one connection: query ids of others are numbered on their own)
+        /// the connection and query of the last scan, its scan id, and the next file number
+        type LastScan = Option<((u64, u64), u64, usize)>;
+        static LAST: std::sync::Mutex<LastScan> = std::sync::Mutex::new(None);
+        let query = self.session.as_ref().map(|session| (session.connection_id, session.query_id));
         let (scan_id, file_offset) = {
             let mut last = LAST.lock().expect("not poisoned");
             let (scan_id, file_offset) = match (*last, query) {

@@ -199,7 +199,8 @@ pub fn can_cast(text: &str, ty: &LogicalType, parsing: &Parsing) -> bool {
     };
     match ty.id() {
         LogicalTypeId::Varchar => true,
-        LogicalTypeId::Boolean => ["t", "f", "true", "false"]
+        // `TryCastStringBool` with `strict`: `yes` and `no` too, but not `y`, `n`, `1` or `0`
+        LogicalTypeId::Boolean => ["t", "f", "true", "false", "yes", "no"]
             .iter()
             .any(|word| word.eq_ignore_ascii_case(text)),
         LogicalTypeId::TinyInt => parse_int(i8::MIN.into(), i8::MAX.into()),
@@ -312,6 +313,8 @@ pub struct Sniffed {
 struct Sample {
     rows: Vec<Vec<Option<String>>>,
     errors: usize,
+    /// the first row was left out for a value that is not UTF-8: a header that can't be read
+    invalid_first: bool,
 }
 
 /// `StringValueScanner::ParseChunk`, of VARCHAR columns.
@@ -319,6 +322,7 @@ fn parse_sample(scanner: &mut ValueScanner, data: &[u8], columns: usize, options
     let mut result = Sample {
         rows: Vec::new(),
         errors: 0,
+        invalid_first: false,
     };
     let dialect = scanner.machine.dialect.clone();
     let strict = dialect.strict;
@@ -368,6 +372,8 @@ fn parse_sample(scanner: &mut ValueScanner, data: &[u8], columns: usize, options
         if valid {
             values.resize(columns, None);
             result.rows.push(values);
+        } else if result.rows.is_empty() && result.errors == 0 {
+            result.invalid_first = true;
         }
     }
     result
@@ -1334,6 +1340,17 @@ pub fn sniff(
         let mut scanner = ValueScanner::new(Machine::with_transitions(dialect.clone(), transitions, begin));
         let sample = parse_sample(&mut scanner, data, columns_found, options);
         sniffer.reached(scanner.machine.position);
+        // `CSVError::InvalidUTF8` of the header the options say there is
+        if sample.invalid_first && options.header == Some(true) && !options.ignore_errors {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "Invalid unicode (byte sequence mismatch) detected. This file is not utf-8 encoded.\nFile: \
+                     {path}\n",
+                    path = sniffer.path
+                ),
+            ));
+        }
         if sample.errors > 0 && !options.ignore_errors {
             continue;
         }

@@ -13,6 +13,9 @@
 #   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
 # Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
 # stop passing. Regenerate with:
+#   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
+# Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
+# stop passing. Regenerate with:
 test/common/test_cast_hugeint.test
 test/common/test_cast_struct.test
 test/common/test_local_file_urls.test
@@ -1744,11 +1747,15 @@ test/sql/copy/csv/rejects/csv_rejects_auto.test
 test/sql/copy/csv/rejects/csv_rejects_cache_key_collision.test
 test/sql/copy/csv/rejects/csv_rejects_flush_cast.test
 test/sql/copy/csv/rejects/csv_rejects_flush_message.test
+test/sql/copy/csv/rejects/csv_rejects_invalid_utf8_nested.test
 test/sql/copy/csv/rejects/csv_rejects_maximum_line.test
+test/sql/copy/csv/rejects/csv_rejects_read.test
+test/sql/copy/csv/rejects/csv_rejects_truncate_line_invalid_utf8.test
 test/sql/copy/csv/rejects/csv_rejects_two_tables.test
 test/sql/copy/csv/rejects/csv_unquoted_rejects.test
 test/sql/copy/csv/rejects/test_invalid_parameters.test
 test/sql/copy/csv/rejects/test_invalid_utf_rejects.test
+test/sql/copy/csv/rejects/test_mixed.test
 test/sql/copy/csv/relaxed_quotes.test
 test/sql/copy/csv/sniff_csv_skip_overflow.test
 test/sql/copy/csv/struct.test
@@ -1824,6 +1831,7 @@ test/sql/copy/csv/test_mixed_new_line.test
 test/sql/copy/csv/test_ncvoter.test
 test/sql/copy/csv/test_nfc.test
 test/sql/copy/csv/test_nfc_suite.test
+test/sql/copy/csv/test_non_unicode_header.test
 test/sql/copy/csv/test_null_padding_projection.test
 test/sql/copy/csv/test_null_padding_union.test
 test/sql/copy/csv/test_ontime.test
