@@ -16,6 +16,9 @@
 #   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
 # Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
 # stop passing. Regenerate with:
+#   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
+# Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
+# stop passing. Regenerate with:
 test/common/test_cast_hugeint.test
 test/common/test_cast_struct.test
 test/common/test_local_file_urls.test
@@ -860,6 +863,7 @@ test/sql/aggregate/aggregate_state_export/count_export_state.test
 test/sql/aggregate/aggregate_state_export/finalize_null_fields.test
 test/sql/aggregate/aggregate_state_export/first_last_export_state.test
 test/sql/aggregate/aggregate_state_export/kahan_avg_export_state.test
+test/sql/aggregate/aggregate_state_export/legacy_aggregate_state.test
 test/sql/aggregate/aggregate_state_export/list_export_state.test
 test/sql/aggregate/aggregate_state_export/minmax_export_state.test
 test/sql/aggregate/aggregate_state_export/ordered_aggregate_export_state.test
@@ -878,6 +882,7 @@ test/sql/aggregate/aggregate_state_export/test_sorted_aggregate_state_types.test
 test/sql/aggregate/aggregate_state_export/test_state_export_opaque.test
 test/sql/aggregate/aggregate_state_export/test_state_export_quantile.test
 test/sql/aggregate/aggregate_state_export/test_state_export_string_agg.test
+test/sql/aggregate/aggregate_state_export/test_state_export_struct.test
 test/sql/aggregate/aggregate_state_export/test_stddev_export_state.test
 test/sql/aggregate/aggregate_state_export/to_aggregate_state_argument_types.test
 test/sql/aggregate/aggregate_state_export/vector_minmax_export_state.test
