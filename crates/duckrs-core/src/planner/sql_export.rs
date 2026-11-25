@@ -1569,6 +1569,28 @@ impl Exporter<'_> {
                 expr: Expr::constant(Literal::boolean(true)),
             });
         }
+        // a bound schema is what the reconstruction reads too, instead of what the first file has
+        if scan.bound {
+            let declared = scan
+                .names
+                .iter()
+                .zip(&scan.types)
+                .map(|(name, ty)| FunctionArgument {
+                    name: name.clone(),
+                    expr: Expr::constant(Literal::string(ty.to_string())),
+                })
+                .collect();
+            let mut pack = FunctionExpr::new("struct_pack", Vec::new());
+            pack.args = declared;
+            function.args.push(FunctionArgument {
+                name: "bound_schema".into(),
+                expr: pack.into(),
+            });
+            function.args.push(FunctionArgument {
+                name: "hive_partitioning".into(),
+                expr: Expr::constant(Literal::boolean(false)),
+            });
+        }
         let count = scan.types.len();
         let alias = self.alias();
         let mut from: TableRef = TableRefKind::TableFunction {

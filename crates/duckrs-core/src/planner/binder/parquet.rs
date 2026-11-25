@@ -111,6 +111,8 @@ impl Binder<'_> {
         let geoparquet = self.geoparquet_conversion();
         let mut utf8_validation = crate::execution::parquet::Utf8Validation::Strict;
         let mut schema_value = None;
+        let mut bound_schema: Option<Vec<(String, LogicalType)>> = None;
+        let mut column_statistics: Vec<GivenStatistics> = Vec::new();
         let mut allow_empty = false;
         let mut files_for_stats = 0;
         let (mut can_have_nan, mut explicit_cardinality) = (None, None);
@@ -186,6 +188,8 @@ impl Binder<'_> {
                     can_have_nan = Some(is_true(&value, &option)?);
                 }
                 "schema" => schema_value = Some(value),
+                "bound_schema" => bound_schema = Some(self.parse_bound_schema(&value)?),
+                "column_statistics" => column_statistics = column_statistics_option(&option, &value)?,
                 // what COPY ... FROM passes on of the table it loads into
                 "__copy_names" => copy_names = Some(strings(&value)?),
                 "__copy_types" => {
@@ -216,6 +220,18 @@ impl Binder<'_> {
                 }
                 _ => return Err(crate::unported(format!("the {name} option {option}"))),
             }
+        }
+        // `MultiFileOptions::ValidateBoundSchema`: before any file is looked at
+        if let Some(bound) = &bound_schema {
+            validate_bound_schema(
+                bound,
+                schema_value.is_some(),
+                union_by_name,
+                &hive_options,
+                filename.as_deref(),
+                file_row_number,
+                allow_empty,
+            )?;
         }
         let entries = paths.ok_or_else(|| binder_error(format!("{name} requires a file name")))?;
         // `ParquetReader::LoadMetadata`: a footer length given for a file must fit in it
@@ -266,6 +282,18 @@ impl Binder<'_> {
             _ => None,
         };
         let (mut names, mut types) = match &schema {
+            // `BindOptions`: the declared columns that are no generated or Hive column are the file's, read by name;
+            // the first file is not asked for its schema
+            None if bound_schema.is_some() => {
+                let bound = bound_schema.as_ref().expect("checked");
+                let role = |column: &str| {
+                    filename.as_deref().is_some_and(|f| f.eq_ignore_ascii_case(column))
+                        || (file_row_number && column.eq_ignore_ascii_case("file_row_number"))
+                        || (hive_options.wanted == Some(true)
+                            && hive_options.types.iter().any(|(key, _)| key.eq_ignore_ascii_case(column)))
+                };
+                bound.iter().filter(|(column, _)| !role(column)).cloned().unzip()
+            }
             None if empty => (vec!["empty".to_string()], vec![LogicalType::BOOLEAN]),
             Some(columns) => (
                 columns.iter().map(|c| c.name.clone()).collect(),
@@ -339,7 +367,13 @@ impl Binder<'_> {
         if schema.is_some() && hive_options.wanted.is_none() && hive_options.types.is_empty() {
             hive_options.wanted = Some(false);
         }
-        for (key, ty) in super::copy::hive_partition_columns(&files, &hive_options)? {
+        let partitions = super::copy::hive_partition_columns(&files, &hive_options)?;
+        if bound_schema.is_some() && partitions.len() != hive_options.types.len() {
+            return Err(binder_error(
+                "'bound_schema' requires hive_types for every Hive partition column",
+            ));
+        }
+        for (key, ty) in partitions {
             match names.iter().position(|n| n.eq_ignore_ascii_case(&key)) {
                 // a column of the file as well: the path gives its values, and its type
                 Some(column) => {
@@ -377,6 +411,31 @@ impl Binder<'_> {
                 }
             }
         }
+        // the declared order, which the columns of the scan are put in by a projection over it
+        let bound_order = match &bound_schema {
+            Some(bound) => {
+                let mut order = Vec::with_capacity(bound.len());
+                for (column, ty) in bound {
+                    let Some(at) = output_names.iter().position(|n| n.eq_ignore_ascii_case(column)) else {
+                        return Err(binder_error(format!(
+                            "'bound_schema' column \"{column}\" does not match the resolved output"
+                        )));
+                    };
+                    if &output_types[at] != ty {
+                        return Err(binder_error(format!(
+                            "'bound_schema' column \"{column}\" does not match the resolved output"
+                        )));
+                    }
+                    order.push(at);
+                }
+                let scan_names = output_names.clone();
+                output_names = bound.iter().map(|(column, _)| column.clone()).collect();
+                Some((order, scan_names))
+            }
+            None => None,
+        };
+        // `MultiFileOptions::VerifyColumnStatistics`, against the columns of the scan
+        let explicit_statistics = explicit_statistics(&column_statistics, &output_names, &output_types)?;
         let mut output_names = Self::alias_columns(table_ref, &alias, output_names)?;
         // `Binder::BindTableFunctionInternal`: a column without a name is `C` and its index
         for (i, name) in output_names.iter_mut().enumerate() {
@@ -385,17 +444,29 @@ impl Binder<'_> {
             }
         }
         let table_index = self.generate_table_index();
-        let (virtual_columns, bound_virtual) =
-            crate::execution::multi_file::bind_parquet_virtual_columns(&output_names);
+        let (virtual_columns, bound_virtual) = crate::execution::multi_file::bind_parquet_virtual_columns(
+            bound_order.as_ref().map_or(&output_names, |(_, scan_names)| scan_names),
+        );
+        // with a bound schema, the scan has no binding: the projection that orders it has
+        let projection_index = bound_order.as_ref().map(|_| self.generate_table_index());
+        let scan_types = output_types.clone();
+        let (binding_index, binding_types, binding_virtual) = match (&bound_order, projection_index) {
+            (Some((order, _)), Some(index)) => (
+                index,
+                order.iter().map(|&at| output_types[at].clone()).collect(),
+                Vec::new(),
+            ),
+            _ => (table_index, output_types, bound_virtual),
+        };
         self.bind_context.add_binding(Binding {
             alias,
             schema: None,
             catalog: None,
-            table_index,
+            table_index: binding_index,
             names: output_names,
-            types: output_types,
+            types: binding_types,
             row_id: None,
-            virtual_columns: bound_virtual,
+            virtual_columns: binding_virtual,
             generated: Vec::new(),
         });
         let scan = ParquetScanData {
@@ -413,6 +484,8 @@ impl Binder<'_> {
             hive,
             virtual_columns,
             schema,
+            bound: bound_schema.is_some(),
+            explicit_statistics,
             read: None,
             hive_overrides,
             function_name: call.name.name.to_lowercase(),
@@ -431,13 +504,67 @@ impl Binder<'_> {
             explicit_cardinality,
             metadata_cache: self.bool_setting("parquet_metadata_cache", false),
         };
-        Ok(LogicalOperator::new(
+        let scan = LogicalOperator::new(
             LogicalOperatorKind::ParquetScan {
                 table_index,
                 scan: Arc::new(scan),
             },
             vec![],
+        );
+        let (Some((order, scan_names)), Some(projection_index)) = (bound_order, projection_index) else {
+            return Ok(scan);
+        };
+        let expressions = order
+            .iter()
+            .map(|&at| {
+                crate::planner::expression::BoundExpr::column_ref(
+                    crate::planner::expression::ColumnBinding::new(table_index, at),
+                    scan_types[at].clone(),
+                    scan_names[at].clone(),
+                )
+            })
+            .collect();
+        Ok(LogicalOperator::new(
+            LogicalOperatorKind::Projection {
+                table_index: projection_index,
+                expressions,
+            },
+            vec![scan],
         ))
+    }
+
+    /// `MultiFileOptions::SetBoundSchema`: a STRUCT of the column names to their types.
+    fn parse_bound_schema(&mut self, value: &Value) -> Result<Vec<(String, LogicalType)>> {
+        let ValueData::Struct(children) = value.data() else {
+            return Err(binder_error(
+                "'bound_schema' expects a non-NULL STRUCT of column names to type strings",
+            ));
+        };
+        if value.logical_type().id() != LogicalTypeId::Struct {
+            return Err(binder_error(
+                "'bound_schema' expects a non-NULL STRUCT of column names to type strings",
+            ));
+        }
+        if children.is_empty() {
+            return Err(binder_error("'bound_schema' cannot be empty"));
+        }
+        let fields = value.logical_type().struct_children().to_vec();
+        let mut columns = Vec::with_capacity(children.len());
+        for ((name, _), child) in fields.iter().zip(children) {
+            if child.is_null() || child.logical_type().id() != LogicalTypeId::Varchar {
+                return Err(binder_error("'bound_schema' types must be non-NULL VARCHAR values"));
+            }
+            let text = child.try_to_string()?;
+            // `TransformStringToLogicalType`: what is no type of a column
+            if text.trim().eq_ignore_ascii_case("any") {
+                return Err(Error::new(
+                    ErrorKind::Conversion,
+                    format!("Value \"{text}\" can not be converted to a DuckDB Type."),
+                ));
+            }
+            columns.push((name.clone(), self.csv_type(&text)?));
+        }
+        Ok(columns)
     }
 
     /// `parquet_metadata` and its kin, as a list of constants for each file.
@@ -1279,3 +1406,288 @@ const PARQUET_COPY_OPTIONS: &[&str] = &[
     "row_groups_per_file",
     "dictionary_compression_ratio_threshold",
 ];
+
+/// `MultiFileOptions::ValidateBoundSchema`.
+fn validate_bound_schema(
+    bound: &[(String, LogicalType)],
+    has_schema: bool,
+    union_by_name: bool,
+    hive: &super::copy::HiveOptions,
+    filename: Option<&str>,
+    file_row_number: bool,
+    allow_empty: bool,
+) -> Result<()> {
+    if has_schema {
+        return Err(binder_error("'bound_schema' cannot be combined with 'schema'"));
+    }
+    if union_by_name {
+        return Err(binder_error(
+            "'bound_schema' does not support union_by_name or multi-file schema sampling",
+        ));
+    }
+    let Some(hive_partitioning) = hive.wanted else {
+        return Err(binder_error(
+            "'bound_schema' requires explicit hive_partitioning=true or false",
+        ));
+    };
+    if hive_partitioning && hive.autocast {
+        return Err(binder_error(
+            "'bound_schema' requires hive_types_autocast=false and complete hive_types",
+        ));
+    }
+    if !hive_partitioning && !hive.types.is_empty() {
+        return Err(binder_error(
+            "'bound_schema' cannot combine hive_types with hive_partitioning=false",
+        ));
+    }
+    for (at, (name, ty)) in bound.iter().enumerate() {
+        let duplicate = bound[..at].iter().any(|(other, _)| other.eq_ignore_ascii_case(name));
+        if duplicate || matches!(ty.id(), LogicalTypeId::Any | LogicalTypeId::Unknown) {
+            return Err(binder_error(
+                "'bound_schema' requires complete types and distinct column names",
+            ));
+        }
+    }
+    let require = |name: &str, ty: &LogicalType| -> Result<()> {
+        match bound.iter().find(|(column, _)| column.eq_ignore_ascii_case(name)) {
+            Some((_, declared)) if declared == ty => Ok(()),
+            _ => Err(binder_error(format!(
+                "'bound_schema' must include column \"{name}\" with type {ty}"
+            ))),
+        }
+    };
+    if let Some(column) = filename {
+        require(column, &LogicalType::VARCHAR)?;
+    }
+    if file_row_number {
+        require("file_row_number", &LogicalType::BIGINT)?;
+        if filename.is_some_and(|column| column.eq_ignore_ascii_case("file_row_number")) {
+            return Err(binder_error(
+                "'bound_schema' cannot assign filename and file_row_number to the same column",
+            ));
+        }
+    }
+    for (key, ty) in &hive.types {
+        require(key, ty)?;
+        let generated = filename.is_some_and(|column| column.eq_ignore_ascii_case(key))
+            || (file_row_number && key.eq_ignore_ascii_case("file_row_number"));
+        if generated {
+            return Err(binder_error(format!(
+                "'bound_schema' cannot assign generated and Hive roles to column \"{key}\""
+            )));
+        }
+    }
+    if allow_empty {
+        return Err(binder_error("'bound_schema' does not support allow_empty"));
+    }
+    Ok(())
+}
+
+/// A key of `column_statistics` and the statistics it gives, by name.
+type GivenStatistics = (String, Vec<(String, String)>);
+
+/// `MultiFileOptions::SetColumnStatistics`: a MAP of column (path) to a MAP of statistic name to value, as
+/// `COPY ... (RETURN_STATS)` reports them; NULL is none.
+fn column_statistics_option(option: &str, value: &Value) -> Result<Vec<GivenStatistics>> {
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    let wrong = || {
+        Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "{option} must be a MAP of column name to a MAP of statistic name ('min', 'max', 'count', \
+                 'null_count', 'distinct_count') to its value, but '{}' was provided",
+                value.logical_type()
+            ),
+        )
+    };
+    let target = LogicalType::map(
+        LogicalType::VARCHAR,
+        LogicalType::map(LogicalType::VARCHAR, LogicalType::VARCHAR),
+    );
+    if value.logical_type().id() != LogicalTypeId::Map {
+        return Err(wrong());
+    }
+    let cast = crate::execution::parquet::try_cast_value(value, &target).ok_or_else(wrong)?;
+    let entries = |map: &Value| -> Vec<(Value, Value)> {
+        let ValueData::List(items) = map.data() else {
+            return Vec::new();
+        };
+        items
+            .iter()
+            .filter_map(|item| match item.data() {
+                ValueData::Struct(parts) if parts.len() == 2 => Some((parts[0].clone(), parts[1].clone())),
+                _ => None,
+            })
+            .collect()
+    };
+    let mut result = Vec::new();
+    for (key, stats) in entries(&cast) {
+        if key.is_null() || stats.is_null() {
+            continue;
+        }
+        let mut given = Vec::new();
+        for (name, stat) in entries(&stats) {
+            if name.is_null() || stat.is_null() {
+                continue;
+            }
+            given.push((name.try_to_string()?.to_lowercase(), stat.try_to_string()?));
+        }
+        result.push((key.try_to_string()?, given));
+    }
+    Ok(result)
+}
+
+/// `ParseColumnStatisticsKey`: `"s"."x"` is field x of struct column s; a key without quotes a top-level column.
+fn column_statistics_key(key: &str) -> Result<Vec<String>> {
+    let invalid = |message: String| Error::new(ErrorKind::InvalidInput, message);
+    if !key.contains('"') {
+        return Ok(vec![key.to_string()]);
+    }
+    let chars: Vec<char> = key.chars().collect();
+    let mut path = Vec::new();
+    let mut at = 0;
+    while at < chars.len() {
+        if chars[at] != '"' {
+            return Err(invalid(format!(
+                "column_statistics: key '{key}' is not a quoted column path (\"column\".\"field\")"
+            )));
+        }
+        at += 1;
+        let mut component = String::new();
+        loop {
+            let Some(&c) = chars.get(at) else {
+                return Err(invalid(format!("column_statistics: key '{key}' has an unterminated quote")));
+            };
+            if c == '"' {
+                if chars.get(at + 1) == Some(&'"') {
+                    component.push('"');
+                    at += 2;
+                    continue;
+                }
+                at += 1;
+                break;
+            }
+            component.push(c);
+            at += 1;
+        }
+        path.push(component);
+        if at < chars.len() {
+            if chars[at] != '.' {
+                return Err(invalid(format!(
+                    "column_statistics: key '{key}' has '{}' where a '.' or the end was expected",
+                    chars[at]
+                )));
+            }
+            at += 1;
+        }
+    }
+    Ok(path)
+}
+
+/// `ApplyColumnStatistics`: only what is given is claimed; bounds only of a numeric column.
+fn apply_column_statistics(
+    statistics: &mut crate::catalog::ColumnStatistics,
+    ty: &LogicalType,
+    given: &[(String, String)],
+    key: &str,
+) -> Result<()> {
+    let (mut min, mut max, mut count, mut null_count, mut distinct) = (None, None, None, None, None);
+    for (name, value) in given {
+        let parse_count = || -> Result<u64> {
+            value.trim().parse::<u64>().map_err(|_| {
+                Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("column_statistics: '{name}' of '{key}' must be a count, got '{value}'"),
+                )
+            })
+        };
+        match name.as_str() {
+            "min" => min = Some(value.clone()),
+            "max" => max = Some(value.clone()),
+            "count" => count = Some(parse_count()?),
+            "null_count" => null_count = Some(parse_count()?),
+            "distinct_count" => distinct = Some(parse_count()?),
+            // what else a writer reports says nothing the optimizer uses
+            _ => {}
+        }
+    }
+    if let Some(nulls) = null_count {
+        if nulls == 0 {
+            statistics.can_be_null = false;
+        }
+        if count.is_some_and(|count| nulls >= count) {
+            statistics.can_be_valid = false;
+        }
+    }
+    let has_values = count.is_none() || null_count.is_none() || null_count < count;
+    if has_values
+        && let (Some(min), Some(max)) = (min, max)
+        && (ty.is_numeric() || matches!(ty.id(), LogicalTypeId::Date | LogicalTypeId::Timestamp))
+    {
+        let cast = |text: String| crate::execution::parquet::cast_value(&Value::varchar(text), ty);
+        statistics.min = Some(cast(min)?);
+        statistics.max = Some(cast(max)?);
+    }
+    if let Some(distinct) = distinct.filter(|&d| d > 0) {
+        statistics.distinct = Some(distinct);
+    }
+    Ok(())
+}
+
+/// The statistics an unknown column of `ty` has, with a child of each field of a STRUCT.
+fn unknown_statistics(ty: &LogicalType) -> crate::catalog::ColumnStatistics {
+    let mut statistics = crate::catalog::ColumnStatistics::unknown();
+    if ty.id() == LogicalTypeId::Struct {
+        statistics.children = ty.struct_children().iter().map(|(_, child)| unknown_statistics(child)).collect();
+    }
+    statistics
+}
+
+/// `MultiFileOptions::VerifyColumnStatistics` and `GetColumnStatistics`: the statistics of each column a key names,
+/// checked at bind.
+fn explicit_statistics(
+    given: &[GivenStatistics],
+    names: &[String],
+    types: &[LogicalType],
+) -> Result<Vec<(usize, crate::catalog::ColumnStatistics)>> {
+    let mut result: Vec<(usize, crate::catalog::ColumnStatistics)> = Vec::new();
+    for (key, stats) in given {
+        let path = column_statistics_key(key)?;
+        let Some(column) = names.iter().position(|name| name == &path[0]) else {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!("column_statistics: '{key}' names no column of the scan"),
+            ));
+        };
+        let at = match result.iter().position(|(c, _)| *c == column) {
+            Some(at) => at,
+            None => {
+                result.push((column, unknown_statistics(&types[column])));
+                result.len() - 1
+            }
+        };
+        // `DescendColumnStatistics`: of a STRUCT, the field of that name
+        let mut target = &mut result[at].1;
+        let mut ty = types[column].clone();
+        for component in &path[1..] {
+            let field = (ty.id() == LogicalTypeId::Struct)
+                .then(|| ty.struct_children().iter().position(|(name, _)| name == component))
+                .flatten();
+            let Some(field) = field else {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "column_statistics: '{key}' names no part of column \"{}\" of type {}",
+                        path[0], types[column]
+                    ),
+                ));
+            };
+            ty = ty.struct_children()[field].1.clone();
+            target = &mut target.children[field];
+        }
+        apply_column_statistics(target, &ty, stats, key)?;
+    }
+    Ok(result)
+}

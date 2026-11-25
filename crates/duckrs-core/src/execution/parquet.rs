@@ -61,6 +61,10 @@ pub struct ParquetScanData {
     pub virtual_columns: Vec<crate::execution::multi_file::VirtualColumn>,
     /// `schema`: the columns by field id or name, in place of those of the first file
     pub schema: Option<Arc<Vec<crate::execution::parquet_schema::SchemaColumn>>>,
+    /// `bound_schema`: the columns are declared, and read from each file by name
+    pub bound: bool,
+    /// `column_statistics`: what the caller says of columns, by position, in place of what the files say
+    pub explicit_statistics: Vec<(usize, crate::catalog::ColumnStatistics)>,
     /// by the columns from the files, those the query reads (`column_ids`); the others are NULL
     pub read: Option<Vec<bool>>,
     /// the hive partitions that are also columns of the files, by the position of the column
@@ -3598,6 +3602,18 @@ fn cache_metadata(path: &str, metadata: Arc<ParquetMetaData>) {
 /// `ParquetReader::ReadStatistics` over the files of a scan: what the footers say of each column from the
 /// files, `None` where they don't say it.
 pub fn scan_statistics(scan: &ParquetScanData) -> Vec<Option<crate::catalog::ColumnStatistics>> {
+    let mut result = file_scan_statistics(scan);
+    // `MultiFileOptions::GetColumnStatistics`: what is given is claimed, of the target domain, the rest unknown
+    for (column, statistics) in &scan.explicit_statistics {
+        if *column >= result.len() {
+            result.resize(*column + 1, None);
+        }
+        result[*column] = Some(statistics.clone());
+    }
+    result
+}
+
+fn file_scan_statistics(scan: &ParquetScanData) -> Vec<Option<crate::catalog::ColumnStatistics>> {
     let unknown = vec![None; scan.names.len()];
     if !all_files_opened(scan) {
         return unknown;
@@ -3868,7 +3884,28 @@ fn row_group_strings(zone: &crate::catalog::ColumnZone, varchar: bool) -> crate:
 /// that is a leaf, not overridden by a hive partition, and not repaired as it is read.
 /// With a `schema`, the column is the file's column of the name its key gives (`MatchesPhysicalColumn`): not
 /// one found by field id, a nested one, or one the file stores as another type.
+/// Of a scan with a `bound_schema`, whether the file has its column `column` as declared: at the same position, of
+/// the same name and the complete type (collation and all). Only then are the file's statistics and readers its own.
+pub fn bound_column_matches(scan: &ParquetScanData, path: &str, column: usize) -> bool {
+    if !scan.bound {
+        return true;
+    }
+    let (Some(name), Some(ty)) = (scan.names.get(column), scan.types.get(column)) else {
+        return false;
+    };
+    let Ok(builder) = open_builder(path) else {
+        return false;
+    };
+    let schema = builder.schema();
+    // `EqualsIncludingCollation`
+    schema.fields().get(column).is_some_and(|field| field.name().eq_ignore_ascii_case(name))
+        && stored_type(scan, path, name).is_some_and(|stored| &stored == ty && stored.collation() == ty.collation())
+}
+
 fn statistics_leaf(scan: &ParquetScanData, metadata: &ParquetMetaData, column: usize, path: &str) -> Option<usize> {
+    if !bound_column_matches(scan, path, column) {
+        return None;
+    }
     let (name, ty) = match &scan.schema {
         Some(schema) => {
             let defined = schema.get(column)?;
