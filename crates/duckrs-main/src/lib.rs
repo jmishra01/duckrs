@@ -563,10 +563,11 @@ impl DatabaseInstance {
     }
 
     /// Makes a commit durable, in the log of the file, and checkpoints if the log has grown past
-    /// `threshold` bytes and nobody is in the middle of a transaction.
-    fn log_commit(&self, threshold: u64, entry_limit: u64, abort: &str) -> Result<()> {
+    /// `threshold` bytes and nobody is in the middle of a transaction. A checkpoint that fails is the error it
+    /// returns, with whether the commit is durable anyway, being in the log (`DuckTransactionManager::CommitTransaction`).
+    fn log_commit(&self, threshold: u64, entry_limit: u64, abort: &str) -> Result<Option<(Error, bool)>> {
         let Some(file) = self.file.as_ref().filter(|_| self.file_access.is_none()) else {
-            return Ok(());
+            return Ok(None);
         };
         // what a statement is in the middle of isn't committed, nor are its rows all there
         let reading = self.statements.read();
@@ -575,10 +576,19 @@ impl DatabaseInstance {
         let identifier = blocks.main_header().db_identifier;
         // `AutomaticCheckpoint`: what the log held before this commit
         let entries = log.entries();
-        // `DuckTransaction::ShouldWriteToWAL`: the changes wait for a checkpoint
+        // `DuckTransaction::ShouldWriteToWAL`: the changes wait for a checkpoint, which a large enough commit makes
         if file.no_wal_writes {
             self.changed.store(true, AtomicOrdering::SeqCst);
-            return Ok(());
+            let size = log.commit_unlogged(&self.catalog, &file.name, blocks.block_size())?;
+            let updates = log.last_commit_updates();
+            drop(log);
+            drop(reading);
+            if size >= threshold && (!updates || self.transactions.lock().open.is_empty()) && !self.catalog.has_writers()
+            {
+                let _writing = self.statements.write();
+                return Ok(self.write_checkpoint_with(abort).err().map(|error| (error, false)));
+            }
+            return Ok(None);
         }
         // `OptimisticDataWriter`: large appends go to blocks of their own ahead of a checkpoint
         let write_ahead =
@@ -596,17 +606,20 @@ impl DatabaseInstance {
             blocks.block_size(),
             ahead,
         )? {
-            return Ok(());
+            return Ok(None);
         }
         self.changed.store(true, AtomicOrdering::SeqCst);
         let full = log.size() >= threshold || (entry_limit > 0 && entries >= entry_limit);
+        // `GetCheckpointType`: with other transactions open, a commit that only added checkpoints concurrently; one
+        // that updated, deleted or dropped something does not, as they may need what was there before
+        let updates = log.last_commit_updates();
         drop(log);
         drop(reading);
-        if full && self.transactions.lock().open.is_empty() {
+        if full && (!updates || self.transactions.lock().open.is_empty()) && !self.catalog.has_writers() {
             let _writing = self.statements.write();
-            self.write_checkpoint_with(abort)?;
+            return Ok(self.write_checkpoint_with(abort).err().map(|error| (error, true)));
         }
-        Ok(())
+        Ok(None)
     }
 
     /// `SingleFileStorageManager::GetDatabaseSize`: all zeros in memory.
@@ -653,6 +666,18 @@ impl DatabaseInstance {
     /// Writes all of the database to its file, if it has one that takes it.
     fn write_checkpoint(&self) -> Result<()> {
         self.write_checkpoint_with("")
+    }
+
+    /// `CheckpointOnShutdown`, as a database is closed: once, and not of an invalidated one.
+    fn close_checkpoint(&self, abort: &str) -> Result<()> {
+        if !self.checkpoint_on_shutdown.swap(false, AtomicOrdering::SeqCst) || self.invalid.lock().is_some() {
+            return Ok(());
+        }
+        let result = self.write_checkpoint_with(abort);
+        if let Err(error) = &result {
+            self.invalidate(&error.message);
+        }
+        result
     }
 
     /// What is a crash in a test is one here too: nothing is undone, nor does anything run again.
@@ -849,6 +874,14 @@ impl DatabaseInstance {
     }
 
     fn write_checkpoint_timed(&self, abort: &str) -> Result<()> {
+        // `InMemoryCheckpointer`: an in-memory database has nothing to write, and its checkpoint is where
+        // `debug_checkpoint_abort` stops one
+        if self.file.is_none() && abort == "in_memory_checkpoint" {
+            return Err(Error::new(
+                ErrorKind::Io,
+                "In-memory checkpoint aborted because of PRAGMA debug_checkpoint_abort flag",
+            ));
+        }
         let Some(file) = self.file.as_ref().filter(|_| self.file_access.is_none()) else {
             return Ok(());
         };
@@ -2320,6 +2353,11 @@ impl ClientContext {
                 let Some(mut transaction) = self.transaction.take() else {
                     return Err(error("cannot commit - no transaction is active"));
                 };
+                // `MetaTransaction::Commit`: a transaction that touched an invalidated database fails, and rolls back
+                if let Some(error) = self.touched_invalid(&transaction) {
+                    self.end_transaction(transaction);
+                    return Err(error);
+                }
                 // COMMIT of an invalidated transaction rolls it back
                 let rollback = transaction.invalidated;
                 if !rollback
@@ -2348,23 +2386,39 @@ impl ClientContext {
                 if !rollback {
                     let current = self.db.clone();
                     let mut result = Ok(());
-                    for database in databases {
-                        self.db = database;
+                    for database in &databases {
+                        self.db = database.clone();
                         result = result.and(self.log_commit());
                     }
                     self.db = current;
                     result?;
+                }
+                // a database detached while this transaction had it closes now
+                for database in databases {
+                    if self.is_detached(&database) {
+                        self.close_detached(database)?;
+                    }
                 }
             }
             TransactionType::Rollback => {
                 let Some(transaction) = self.transaction.take() else {
                     return Err(error("cannot rollback - no transaction is active"));
                 };
+                let invalid = self.touched_invalid(&transaction);
+                let databases: Vec<_> = transaction.forks.iter().map(|(database, _)| database.clone()).collect();
                 // what the transaction attached is not attached any more; what it detached stays detached
                 let mut attached = self.home.attached.write();
                 attached.retain(|_, database| !transaction.attached.iter().any(|a| Arc::ptr_eq(a, database)));
                 drop(attached);
                 self.end_transaction(transaction);
+                if let Some(error) = invalid {
+                    return Err(error);
+                }
+                for database in databases {
+                    if self.is_detached(&database) {
+                        self.close_detached(database)?;
+                    }
+                }
             }
         }
         Ok(Self::success())
@@ -2378,7 +2432,51 @@ impl ClientContext {
             .trim()
             .parse()
             .unwrap_or(0);
-        self.db.log_commit(self.checkpoint_threshold(), entry_limit, &abort)
+        match self.db.log_commit(self.checkpoint_threshold(), entry_limit, &abort)? {
+            None => Ok(()),
+            Some((error, true)) => Err(self.autocheckpoint_error(&self.db.clone(), error)),
+            // `error.Merge`: with nothing in the log, the commit failed (`TransactionContext::Commit`)
+            Some((error, false)) => {
+                let failure = self.checkpoint_failure(&self.db.clone(), error);
+                Err(Error::new(ErrorKind::Transaction, format!("Failed to commit: {}", failure.message)))
+            }
+        }
+    }
+
+    /// `SingleFileStorageManager::CreateCheckpoint` failing: what is on disk can't be vouched for now, and only the
+    /// database a connection was made to takes everything down with it.
+    fn checkpoint_failure(&self, database: &Arc<DatabaseInstance>, error: Error) -> Error {
+        database.invalidate(&error.message);
+        if Arc::ptr_eq(database, &self.home) {
+            return Error::new(
+                ErrorKind::Fatal,
+                format!("Failed to create checkpoint because of error: {}", error.message),
+            );
+        }
+        Error::new(
+            ErrorKind::Io,
+            format!(
+                "Checkpoint failed for database \"{}\". The database has been invalidated. Original error: {}",
+                database.name, error.message
+            ),
+        )
+    }
+
+    /// `BuildAutocheckpointError`: the commit is durable, its checkpoint failed.
+    fn autocheckpoint_error(&self, database: &Arc<DatabaseInstance>, error: Error) -> Error {
+        let failure = self.checkpoint_failure(database, error);
+        let recovery = if Arc::ptr_eq(database, &self.home) {
+            "Reopen the database instance to recover."
+        } else {
+            "Detach and reattach the database to recover."
+        };
+        Error::new(
+            failure.kind,
+            format!(
+                "Transaction COMMIT succeeded and is durable, but the autocheckpoint failed. {recovery} {}",
+                failure.message
+            ),
+        )
     }
 
     /// What `debug_force_commit_failure` and `debug_force_wal_fsync_failure` turn a commit into,
@@ -2447,6 +2545,20 @@ impl ClientContext {
 
     /// `ValidChecker`: a database that had a fatal error takes nothing more, and neither does what
     /// else is attached if it was the one this connection was made to.
+    /// Whether `database` was detached: it is not the connection's, nor attached to it.
+    fn is_detached(&self, database: &Arc<DatabaseInstance>) -> bool {
+        !Arc::ptr_eq(database, &self.home) && !self.home.attached.read().values().any(|a| Arc::ptr_eq(a, database))
+    }
+
+    /// The error of a database the transaction touched that checkpointing invalidated since, if any.
+    fn touched_invalid(&self, transaction: &ActiveTransaction) -> Option<Error> {
+        transaction
+            .forks
+            .iter()
+            .filter(|(database, _)| !Arc::ptr_eq(database, &self.home))
+            .find_map(|(database, _)| self.check_valid(database).err())
+    }
+
     fn check_valid(&self, database: &DatabaseInstance) -> Result<()> {
         if let Some(reason) = &*self.home.invalid.lock() {
             return Err(Error::new(
@@ -2458,11 +2570,17 @@ impl ClientContext {
             ));
         }
         if let Some(reason) = &*database.invalid.lock() {
+            // `AttachedDatabase::Invalidate`
+            let recovery = if database.file.is_none() {
+                "It is an in-memory database, so its data cannot be recovered."
+            } else {
+                "Detach and reattach it before using it again."
+            };
             return Err(Error::new(
                 ErrorKind::Io,
                 format!(
-                    "Database \"{}\" has been invalidated because checkpointing failed. Detach and reattach it before \
-                     using it again. Original error: {reason}",
+                    "Database \"{}\" has been invalidated because checkpointing failed. {recovery} Original error: \
+                     {reason}",
                     database.name
                 ),
             ));
@@ -3654,13 +3772,36 @@ impl ClientContext {
         {
             return Ok(());
         }
-        if self.home.attached.write().remove(&name.to_lowercase()).is_none() && !if_exists {
-            return Err(Error::new(
-                ErrorKind::Binder,
-                format!("Failed to detach database with name \"{name}\": database not found"),
-            ));
+        let removed = self.home.attached.write().remove(&name.to_lowercase());
+        let Some(database) = removed else {
+            if !if_exists {
+                return Err(Error::new(
+                    ErrorKind::Binder,
+                    format!("Failed to detach database with name \"{name}\": database not found"),
+                ));
+            }
+            return Ok(());
+        };
+        // `AttachedDatabase::Close`: the last one to hold it checkpoints it, here or once a transaction that still
+        // has it ends
+        self.close_detached(database)
+    }
+
+    /// `AttachedDatabase::Close(DatabaseCloseAction::CHECKPOINT)` of a detached database nobody else holds.
+    fn close_detached(&self, database: Arc<DatabaseInstance>) -> Result<()> {
+        if Arc::strong_count(&database) > 1 {
+            return Ok(());
         }
-        Ok(())
+        let abort = self.setting_text("debug_checkpoint_abort").to_lowercase();
+        database.close_checkpoint(&abort).map_err(|error| {
+            Error::new(
+                error.kind,
+                format!(
+                    "Detached database '{}', but CHECKPOINT during DETACH failed. \n{}",
+                    database.name, error.message
+                ),
+            )
+        })
     }
 
     /// `checkpoint_threshold` in bytes: how large the log can get.
@@ -4219,20 +4360,7 @@ impl ClientContext {
         let Err(error) = result else {
             return Ok(Self::success());
         };
-        database.invalidate(&error.message);
-        if Arc::ptr_eq(&database, &self.home) {
-            return Err(Error::new(
-                ErrorKind::Fatal,
-                format!("Failed to create checkpoint because of error: {}", error.message),
-            ));
-        }
-        Err(Error::new(
-            ErrorKind::Io,
-            format!(
-                "Checkpoint failed for database \"{}\". The database has been invalidated. Original error: {}",
-                database.name, error.message
-            ),
-        ))
+        Err(self.checkpoint_failure(&database, error))
     }
 
     /// `ClientContext::PendingStatementOrPreparedStatement` + `ExecutePendingQueryInternal`.
