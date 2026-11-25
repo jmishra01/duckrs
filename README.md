@@ -2,8 +2,9 @@
 
 An analytical SQL database engine: a port of [DuckDB](https://github.com/duckdb/duckdb) to Rust.
 
-**Status: 3318 files pass, 56.3% of the files that ran (53.5% of all 6,197).** The Phase 6 feature list is ported apart from data-modifying CTEs and a few binder corners, but its gates are not met yet; see "Phase 6" in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). Phase 7 has started: expression rewriting, filter pushdown, empty result pull-up and unused column removal are in, correlated subqueries are flattened where the port covers them, table statistics decide comparisons ahead of time, and inner joins and cross products are reordered by estimated cost; see "Phase 7" there. Phase 4 (types and casts) has started: the scalar casts, the nested types (LIST, ARRAY, STRUCT, MAP, UNION), `CREATE TYPE`, ENUM, BIT, BIGNUM and VARIANT are in, the last in its own in-memory encoding until Phase 9. What is left of the phase is GEOMETRY, which the plan defers. A first batch of Phase 5's functions is in too, because the type tests need them: `unnest`, `TRY(...)`, list slicing, the `list` aggregate, LIKE, and common string, list, map and interval helpers. Nested casts and functions run row by row for now. The engine runs CREATE TABLE, CREATE VIEW, CREATE SEQUENCE, CREATE MACRO, INSERT, prepared statements
-and SELECT (joins, WHERE, GROUP BY, aggregates, ORDER BY, LIMIT, DISTINCT) in memory. What exists today:
+**Status: 5484 files pass, 90.8% of the 6,038 that run (6,367 in all, 329 skipped), against DuckDB's test suite at baseline `d4eea3f208d`.** That meets the overall v1 target of 90%. Still open for v1: the CTE and Parquet gates (83.0% against 85%, 79.3% against 80%), the C API, `dbgen`/`dsdgen` as table functions, and one more TPC-H SF10 run on a quiet machine (the last gave 0.58× of C++'s time against a 1.5× limit). Extensions (`LOAD`, ICU, httpfs, ...) come after v1. Per-directory numbers are in [`docs/STATUS.md`](docs/STATUS.md), and what is left in [`docs/REMAINING_WORK.md`](docs/REMAINING_WORK.md).
+
+What exists today:
 
 - `crates/duckrs-common`: the core building blocks every other crate uses:
   - the type system (`LogicalType`, `PhysicalType`, with DuckDB's ids and names), `string_t`
