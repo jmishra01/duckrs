@@ -65,6 +65,8 @@ pub enum LogicalOperatorKind {
     /// The `range` and `generate_series` table functions: `count` integers from `start`.
     Range {
         table_index: usize,
+        /// `generate_series` rather than `range` (`LogicalGet::GetName`)
+        generate_series: bool,
         start: i128,
         increment: i128,
         count: u64,

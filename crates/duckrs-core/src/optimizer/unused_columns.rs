@@ -17,13 +17,33 @@ thread_local! {
     /// The new places of the outputs of windows that lost some (`ClearUnusedExpressions`), and of recursive CTEs
     /// that did, when the plan has no subquery plan that could refer to them without this pass seeing it.
     static WINDOW_RENUMBERING: RefCell<Option<HashMap<ColumnBinding, ColumnBinding>>> = const { RefCell::new(None) };
+    /// The projections whose columns are read by position, by the scans of the CTE they define: an unread column
+    /// becomes a NULL and keeps its place.
+    static POSITIONAL_PROJECTIONS: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
+    /// Whether the projections of the plan keep their columns in place: with a recursive CTE, whose recursive
+    /// part is resolved to positions already, or with projections of the same table index in two places (late
+    /// materialization's copies), which a renumbering of the bindings of one would move in the other.
+    static KEEP_PROJECTION_COLUMNS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The next table index of the plan, for the projections a pruned recursive CTE gets.
     static NEXT_TABLE_INDEX: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-pub fn remove_unused_columns(plan: &mut LogicalOperator) {
+/// Returns where the columns that moved went.
+pub fn remove_unused_columns(plan: &mut LogicalOperator) -> HashMap<ColumnBinding, ColumnBinding> {
+    remove_unused_columns_with(plan, true)
+}
+
+/// [`remove_unused_columns`]; without `trim_projections`, the unread columns of projections become NULLs in place,
+/// for the runs after the rewrites (late materialization, TOP_N window elimination) that copy parts of the plan.
+pub fn remove_unused_columns_with(
+    plan: &mut LogicalOperator,
+    trim_projections: bool,
+) -> HashMap<ColumnBinding, ColumnBinding> {
     let nested = has_nested_plan(plan);
     WINDOW_RENUMBERING.with(|r| *r.borrow_mut() = (!nested).then(HashMap::new));
+    POSITIONAL_PROJECTIONS.with(|p| p.borrow_mut().clear());
+    KEEP_PROJECTION_COLUMNS
+        .with(|k| k.set(!trim_projections || has_recursive_cte(plan) || has_repeated_projection(plan)));
     NEXT_TABLE_INDEX.with(|next| next.set(super::common_subplan::max_table_index(plan) + 1));
     // the columns of the result are all read, by position
     visit(plan, true, &mut HashSet::new());
@@ -31,6 +51,23 @@ pub fn remove_unused_columns(plan: &mut LogicalOperator) {
     if !renumbering.is_empty() {
         renumber(plan, &renumbering);
     }
+    renumbering
+}
+
+fn has_recursive_cte(op: &LogicalOperator) -> bool {
+    matches!(op.kind, K::RecursiveCte { .. }) || op.children.iter().any(has_recursive_cte)
+}
+
+fn has_repeated_projection(plan: &LogicalOperator) -> bool {
+    fn visit(op: &LogicalOperator, seen: &mut HashSet<usize>) -> bool {
+        if let K::Projection { table_index, .. } = &op.kind
+            && !seen.insert(*table_index)
+        {
+            return true;
+        }
+        op.children.iter().any(|child| visit(child, seen))
+    }
+    visit(plan, &mut HashSet::new())
 }
 
 /// Whether a subquery or lateral join below `op` has a plan of its own.
@@ -91,6 +128,9 @@ fn visit(op: &mut LogicalOperator, by_position: bool, used: &mut HashSet<ColumnB
         let narrow = seen && read.len() < bindings.len() && matches!(op.children[0].kind, K::Projection { .. });
         if narrow {
             used.extend(read.iter().map(|&column| bindings[column]));
+            if let K::Projection { table_index, .. } = &op.children[0].kind {
+                POSITIONAL_PROJECTIONS.with(|p| p.borrow_mut().insert(*table_index));
+            }
         }
         visit(&mut op.children[0], !narrow, used);
         return;
@@ -160,9 +200,45 @@ fn visit(op: &mut LogicalOperator, by_position: bool, used: &mut HashSet<ColumnB
     } = &mut op.kind
         && !by_position
     {
+        let table_index = *table_index;
+        // `ClearUnusedExpressions`: with no subquery plan to refer to them, the unread columns go and the others
+        // move up; a projection none of whose columns are read projects a single constant
+        let positional = POSITIONAL_PROJECTIONS.with(|p| p.borrow().contains(&table_index))
+            || KEEP_PROJECTION_COLUMNS.with(std::cell::Cell::get);
+        let removed = WINDOW_RENUMBERING.with(|r| {
+            if positional {
+                return None;
+            }
+            let mut r = r.borrow_mut();
+            let renumbering = r.as_mut()?;
+            if (0..expressions.len()).all(|index| used.contains(&ColumnBinding::new(table_index, index))) {
+                return Some(());
+            }
+            let mut kept = Vec::new();
+            for (index, expr) in std::mem::take(expressions).into_iter().enumerate() {
+                if !used.contains(&ColumnBinding::new(table_index, index)) {
+                    continue;
+                }
+                if kept.len() != index {
+                    renumbering.insert(
+                        ColumnBinding::new(table_index, index),
+                        ColumnBinding::new(table_index, kept.len()),
+                    );
+                }
+                kept.push(expr);
+            }
+            if kept.is_empty() {
+                kept.push(BoundExpr::constant(Value::integer(42)));
+            }
+            *expressions = kept;
+            Some(())
+        });
         for (index, expr) in expressions.iter_mut().enumerate() {
-            // `ClearUnusedExpressions`: volatile or not, what nothing reads is not computed
-            if !used.contains(&ColumnBinding::new(*table_index, index)) {
+            if removed.is_some() {
+                break;
+            }
+            // volatile or not, what nothing reads is not computed
+            if !used.contains(&ColumnBinding::new(table_index, index)) {
                 let ty = expr.return_type.clone();
                 expr.kind = BoundExprKind::Constant(Value::null(ty));
                 // the column is gone, as C++ removes it: so is its name

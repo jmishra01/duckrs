@@ -25,6 +25,9 @@
 #   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
 # Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
 # stop passing. Regenerate with:
+#   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
+# Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
+# stop passing. Regenerate with:
 test/common/test_cast_hugeint.test
 test/common/test_cast_struct.test
 test/common/test_local_file_urls.test
@@ -2201,6 +2204,7 @@ test/sql/cte/insert_cte_bug_3417.test
 test/sql/cte/lazy_cte_bind.test
 test/sql/cte/lazy_cte_bind_correlated.test
 test/sql/cte/materialized/annotated_and_auto_materialized.test
+test/sql/cte/materialized/cte_filter_pusher.test
 test/sql/cte/materialized/cte_gated_buffered_consumer.test
 test/sql/cte/materialized/cte_gated_buffered_consumer_27925.test
 test/sql/cte/materialized/cte_gated_buffered_consumer_runtime_filter.test
@@ -2244,6 +2248,7 @@ test/sql/cte/recursive_cte_key_finalize_reads.test
 test/sql/cte/recursive_cte_key_finalized_values.test
 test/sql/cte/recursive_cte_key_hll_aggregation.test
 test/sql/cte/recursive_cte_key_snapshot.test
+test/sql/cte/recursive_cte_key_union.test
 test/sql/cte/recursive_cte_large_payload.test
 test/sql/cte/recursive_cte_limit.test
 test/sql/cte/recursive_cte_member_limit_union.test
@@ -2251,9 +2256,11 @@ test/sql/cte/recursive_cte_ordered_aggregate.test
 test/sql/cte/recursive_cte_ordered_member.test
 test/sql/cte/recursive_cte_parallel_union_all_sink.test
 test/sql/cte/recursive_cte_parallel_union_distinct_sink.test
+test/sql/cte/recursive_cte_recurring_replay.test
 test/sql/cte/recursive_cte_shared_operator_lifecycle.test
 test/sql/cte/recursive_hang_2745.test
 test/sql/cte/test_bug_922.test
+test/sql/cte/test_cte.test
 test/sql/cte/test_cte_in_cte.test
 test/sql/cte/test_cte_overflow.test
 test/sql/cte/test_issue_5673.test

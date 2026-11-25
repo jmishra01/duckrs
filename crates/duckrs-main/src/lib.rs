@@ -1376,6 +1376,8 @@ pub struct ClientContext {
     prepared_statements: HashMap<String, Arc<PreparedStatementData>>,
     /// the parameters of the prepared statement running now
     parameters: Option<Arc<ParameterValues>>,
+    /// while a prepared statement runs, the `default_collation` it was prepared with
+    prepared_collation: Option<String>,
     /// what SET VARIABLE set (`ClientConfig::user_variables`), by lower-case name
     variables: HashMap<String, Value>,
     /// `CatalogSearchPath::set_paths`: what `SET schema`, `SET search_path` and `USE` set
@@ -1624,6 +1626,9 @@ pub struct PreparedStatementData {
     statement: Statement,
     /// the parameters, lowercase, in order of appearance
     parameters: Vec<String>,
+    /// `default_collation` when it was prepared, which its plan keeps if it was bound then; a statement bound again
+    /// when it runs (`RequireRebind`) follows the setting of then
+    default_collation: Option<String>,
 }
 
 impl ClientContext {
@@ -1646,6 +1651,7 @@ impl ClientContext {
             settings: SettingValues::default(),
             prepared_statements: HashMap::new(),
             parameters: None,
+            prepared_collation: None,
             variables: HashMap::new(),
             search_path: Vec::new(),
             current_query: String::new(),
@@ -1748,7 +1754,10 @@ impl ClientContext {
             log_target: self.log_target_id,
             connection_id: self.id,
             query_id: self.query_id,
-            default_collation: self.setting_text("default_collation"),
+            default_collation: self
+                .prepared_collation
+                .clone()
+                .unwrap_or_else(|| self.setting_text("default_collation")),
             variables: self.variables.clone(),
             setting: {
                 let (schema, search_path) = (self.default_schema_setting(), SearchEntry::list_text(&self.search_path));
@@ -2102,6 +2111,7 @@ impl ClientContext {
                 | Statement::Drop(_)
                 | Statement::Vacuum { .. }
         );
+        let mut bound_at_prepare = false;
         if !client_statement {
             let catalog = self.catalog();
             let mut binder = Binder::with_options(&catalog, self.bind_options());
@@ -2124,13 +2134,18 @@ impl ClientContext {
                 }
                 other => {
                     other?;
+                    bound_at_prepare = true;
                 }
             }
         }
         let seen = parameters.seen.lock().clone();
+        let has_parameters = !seen.is_empty();
         Ok(Arc::new(PreparedStatementData {
             statement,
             parameters: seen,
+            // with parameters, `RequireRebind` binds again whenever a value's type is not the one bound, which duckrs
+            // does not track: such a statement is taken to be bound again
+            default_collation: (bound_at_prepare && !has_parameters).then(|| self.setting_text("default_collation")),
         }))
     }
 
@@ -2191,7 +2206,12 @@ impl ClientContext {
             values: Some(values),
             ..ParameterValues::default()
         }));
+        let collation = match &prepared.default_collation {
+            Some(collation) => self.prepared_collation.replace(collation.clone()),
+            None => self.prepared_collation.take(),
+        };
         let result = self.run_statement(&prepared.statement);
+        self.prepared_collation = collation;
         self.parameters = None;
         result
     }

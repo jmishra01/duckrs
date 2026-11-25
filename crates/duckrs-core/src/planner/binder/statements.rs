@@ -345,6 +345,19 @@ impl Binder<'_> {
     /// `Binder::BindNode(QueryNode)`: the CTEs of a query are visible for what the query binds.
     /// They are not materialized: each reference binds and plans the CTE's query again.
     pub(super) fn bind_query_node(&mut self, node: &QueryNode) -> Result<BoundStatement> {
+        self.bind_query_node_with(node, |binder| match &node.kind {
+            QueryNodeKind::Select(select) => binder.bind_select_node(select, &node.modifiers),
+            QueryNodeKind::SetOperation(operation) => binder.bind_set_operation(operation, &node.modifiers),
+            _ => Err(not_implemented("this kind of query")),
+        })
+    }
+
+    /// [`Self::bind_query_node`], with `body` binding what the CTEs of `node` are visible to.
+    fn bind_query_node_with(
+        &mut self,
+        node: &QueryNode,
+        body: impl FnOnce(&mut Self) -> Result<BoundStatement>,
+    ) -> Result<BoundStatement> {
         let scope = self.ctes.len();
         for (name, cte) in &node.cte_map.0 {
             match &cte.query.kind {
@@ -385,11 +398,7 @@ impl Binder<'_> {
                 materialized,
             ));
         }
-        let result = match &node.kind {
-            QueryNodeKind::Select(select) => self.bind_select_node(select, &node.modifiers),
-            QueryNodeKind::SetOperation(operation) => self.bind_set_operation(operation, &node.modifiers),
-            _ => Err(not_implemented("this kind of query")),
-        };
+        let result = body(self);
         let pushed = self.ctes.split_off(scope);
         let mut result = result?;
         // `FinishCTE`: a materialized CTE that was referenced runs before the query, the first one
@@ -494,7 +503,10 @@ impl Binder<'_> {
         // a CTE sees what is around its definition, and not what is around a reference to it
         binder.outer_contexts.truncate(outer_depth);
         let bound = match &cte.query.kind {
-            QueryNodeKind::RecursiveCte(node) => binder.bind_recursive_cte(&name, node, &cte.aliases)?,
+            // the WITH of the recursive CTE's own query is visible to both its parts
+            QueryNodeKind::RecursiveCte(node) => {
+                binder.bind_query_node_with(&cte.query, |b| b.bind_recursive_cte(&name, node, &cte.aliases))?
+            }
             _ => binder.bind_query_node(&cte.query)?,
         };
         self.next_table_index = binder.next_table_index;
@@ -3627,6 +3639,7 @@ impl Binder<'_> {
         Ok(LogicalOperator::new(
             LogicalOperatorKind::Range {
                 table_index,
+                generate_series,
                 start,
                 increment,
                 count,

@@ -120,7 +120,7 @@ fn apply_rules(expr: &mut BoundExpr, in_filter: bool, preimage: bool) -> bool {
         || empty_needle_removal(expr)
         || least_greatest_simplification(expr)
         || not_constant_or_null_simplification(expr)
-        || move_constants(expr)
+        || (preimage && move_constants(expr))
         || (preimage && super::monotone_preimage::monotone_preimage(expr, in_filter))
         || case_simplification(expr)
         || conjunction_simplification(expr, in_filter)
