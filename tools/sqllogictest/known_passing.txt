@@ -19,6 +19,9 @@
 #   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
 # Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
 # stop passing. Regenerate with:
+#   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
+# Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
+# stop passing. Regenerate with:
 test/common/test_cast_hugeint.test
 test/common/test_cast_struct.test
 test/common/test_local_file_urls.test
@@ -4890,6 +4893,8 @@ test/sql/types/geo/geometry_crs_id_overflow.test
 test/sql/types/geo/geometry_crs_persist.test
 test/sql/types/geo/geometry_crs_projjson.test
 test/sql/types/geo/geometry_crs_wkt2.test
+test/sql/types/geo/geometry_from_wkb_stats.test
+test/sql/types/geo/geometry_intersection_filter_parquet.test
 test/sql/types/geo/geometry_intersects.test
 test/sql/types/geo/geometry_legacy_recheckpoint.test
 test/sql/types/geo/geometry_nonascii_cast.test
@@ -4904,6 +4909,7 @@ test/sql/types/geo/geometry_shred_pk_append.test
 test/sql/types/geo/geometry_stats.test
 test/sql/types/geo/geometry_stats_prune.test
 test/sql/types/geo/geometry_stats_prune_nan.test
+test/sql/types/geo/geometry_stats_prune_null.test
 test/sql/types/geo/geometry_stats_prune_shredded.test
 test/sql/types/geo/geometry_storage_version.test
 test/sql/types/geo/geometry_try_cast_malformed.test

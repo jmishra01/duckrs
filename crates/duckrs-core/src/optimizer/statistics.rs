@@ -157,6 +157,40 @@ fn add_nested_statistics(
 }
 
 /// `VertexExtractStats`: the bounds of a coordinate of the points, and whether it is always NULL.
+/// `FromWKBStats`: the one geometry type of every row of a column of WKB, if the 5-byte header (byte order and type)
+/// of its smallest and largest blob is the same, and its shortest blob holds a value of that type.
+fn wkb_header_types(stats: &Stats) -> Option<[u8; 4]> {
+    const HEADER: usize = 5;
+    let strings = stats.strings.as_ref()?;
+    let (min, max) = strings.bounds.as_ref()?;
+    if min.len() < HEADER || max.len() < HEADER || min[..HEADER] != max[..HEADER] {
+        return None;
+    }
+    let little_endian = min[0] != 0;
+    let bytes = [min[1], min[2], min[3], min[4]];
+    let meta = if little_endian {
+        u32::from_le_bytes(bytes)
+    } else {
+        u32::from_be_bytes(bytes)
+    };
+    let (type_id, flag_id) = ((meta & 0xFFFF) % 1000, (meta & 0xFFFF) / 1000);
+    if !(1..=7).contains(&type_id) || flag_id > 3 {
+        return None;
+    }
+    // Z and M also by the Extended-WKB high bits
+    let has_z = flag_id & 1 != 0 || meta & 0x8000_0000 != 0;
+    let has_m = flag_id & 2 != 0 || meta & 0x4000_0000 != 0;
+    let dimensions = 2 + u64::from(has_z) + u64::from(has_m);
+    // a POINT has its ordinates inline, the others an element count
+    let shortest = if type_id == 1 { HEADER as u64 + dimensions * 8 } else { HEADER as u64 + 4 };
+    if strings.min_length.is_none_or(|length| length < shortest) {
+        return None;
+    }
+    let mut types = [0u8; 4];
+    types[usize::from(has_z) + 2 * usize::from(has_m)] = 1 << type_id;
+    Some(types)
+}
+
 fn vertex_extract_stats(
     child: &Stats,
     geometry: &duckrs_common::geometry::GeometryStats,
@@ -2124,6 +2158,21 @@ impl StatisticsPropagator {
                 return result;
             }
         }
+        // `FromWKBStats`: a header the smallest and the largest blob share is every row's type
+        if function.name.eq_ignore_ascii_case("st_geomfromwkb") && children.len() == 1 {
+            let mut geometry = duckrs_common::geometry::GeometryStats::unknown();
+            if let Some(types) = wkb_header_types(&stats[0]) {
+                geometry.types = types;
+            }
+            return Stats {
+                geometry: Some(geometry),
+                strings: None,
+                min: None,
+                max: None,
+                distinct: None,
+                ..stats[0].clone()
+            };
+        }
         if function.name == "vertex_extract" && children.len() == 2 {
             let coordinate = match &children[1].kind {
                 BoundExprKind::Constant(value) => value.try_to_string().ok(),
@@ -2641,6 +2690,17 @@ impl StatisticsPropagator {
                 *op = empty_result(op);
                 return;
             }
+            // `IntersectsExtentFilterPrune` of `g && <constant>` on a scan
+            if matches!(op.children[0].kind, K::Get { .. } | K::ParquetScan { .. }) {
+                match self.intersects_extent(&expr) {
+                    Some(false) => {
+                        *op = empty_result(op);
+                        return;
+                    }
+                    Some(true) => continue,
+                    None => {}
+                }
+            }
             // `ExpressionFilter::CheckStatistics` of the IN lists `PushdownGet` put into the scan
             if matches!(op.children[0].kind, K::Get { .. }) {
                 match self.check_in_list(&expr) {
@@ -2730,6 +2790,46 @@ impl StatisticsPropagator {
 
     /// `CheckInOperatorStatistics` and `CheckNotOperatorStatistics`, for `col IN (...)` and
     /// `NOT (col IN (...))` of constants.
+    /// `IntersectsExtentFilterPrune`: whether `column && constant` is never (`false`) or always (`true`) true by the
+    /// extent of the column, if the statistics tell.
+    fn intersects_extent(&mut self, expr: &BoundExpr) -> Option<bool> {
+        let BoundExprKind::Function { function, children, .. } = &expr.kind else {
+            return None;
+        };
+        if function.name != "st_intersects_extent" || children.len() != 2 {
+            return None;
+        }
+        let (column, constant) = match (&children[0].kind, &children[1].kind) {
+            (BoundExprKind::ColumnRef { binding, depth: 0 }, BoundExprKind::Constant(value))
+            | (BoundExprKind::Constant(value), BoundExprKind::ColumnRef { binding, depth: 0 }) => (*binding, value),
+            _ => return None,
+        };
+        let column = self.lookup(column);
+        let column_geometry = column.geometry?;
+        let constant = geometry_stats_of(constant)?;
+        if !column.can_be_valid {
+            return Some(false);
+        }
+        // `GeometryExtent::CanPruneXY`: an axis that is known
+        let can_prune = |e: &duckrs_common::geometry::Extent| {
+            (e.x_min.is_finite() && e.x_max.is_finite()) || (e.y_min.is_finite() && e.y_max.is_finite())
+        };
+        let (column_extent, constant_extent) = (&column_geometry.extent, &constant.extent);
+        if !can_prune(column_extent) {
+            return None;
+        }
+        if !can_prune(constant_extent) || !constant_extent.intersects_xy(column_extent) {
+            return Some(false);
+        }
+        // `GeometryExtent::ContainsXY`: every row in the zonemap matches; NULLs and empty geometries don't
+        let contains = constant_extent.x_min <= column_extent.x_min
+            && constant_extent.x_max >= column_extent.x_max
+            && constant_extent.y_min <= column_extent.y_min
+            && constant_extent.y_max >= column_extent.y_max;
+        let has_empty = column_geometry.flags & duckrs_common::geometry::HAS_EMPTY_GEOM != 0;
+        (contains && !column.can_be_null && !has_empty).then_some(true)
+    }
+
     fn check_in_list(&mut self, expr: &BoundExpr) -> Option<InListResult> {
         let (list, negated) = match &expr.kind {
             BoundExprKind::Operator {
