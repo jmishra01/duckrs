@@ -2690,6 +2690,17 @@ impl StatisticsPropagator {
                 *op = empty_result(op);
                 return;
             }
+            // `IntersectsExtentFilterPrune` of `g && <constant>` on a scan
+            if matches!(op.children[0].kind, K::Get { .. }) {
+                match self.intersects_extent(&expr) {
+                    Some(false) => {
+                        *op = empty_result(op);
+                        return;
+                    }
+                    Some(true) => continue,
+                    None => {}
+                }
+            }
             // `ExpressionFilter::CheckStatistics` of the IN lists `PushdownGet` put into the scan
             if matches!(op.children[0].kind, K::Get { .. }) {
                 match self.check_in_list(&expr) {
@@ -2779,6 +2790,46 @@ impl StatisticsPropagator {
 
     /// `CheckInOperatorStatistics` and `CheckNotOperatorStatistics`, for `col IN (...)` and
     /// `NOT (col IN (...))` of constants.
+    /// `IntersectsExtentFilterPrune`: whether `column && constant` is never (`false`) or always (`true`) true by the
+    /// extent of the column, if the statistics tell.
+    fn intersects_extent(&mut self, expr: &BoundExpr) -> Option<bool> {
+        let BoundExprKind::Function { function, children, .. } = &expr.kind else {
+            return None;
+        };
+        if function.name != "st_intersects_extent" || children.len() != 2 {
+            return None;
+        }
+        let (column, constant) = match (&children[0].kind, &children[1].kind) {
+            (BoundExprKind::ColumnRef { binding, depth: 0 }, BoundExprKind::Constant(value))
+            | (BoundExprKind::Constant(value), BoundExprKind::ColumnRef { binding, depth: 0 }) => (*binding, value),
+            _ => return None,
+        };
+        let column = self.lookup(column);
+        let column_geometry = column.geometry?;
+        let constant = geometry_stats_of(constant)?;
+        if !column.can_be_valid {
+            return Some(false);
+        }
+        // `GeometryExtent::CanPruneXY`: an axis that is known
+        let can_prune = |e: &duckrs_common::geometry::Extent| {
+            (e.x_min.is_finite() && e.x_max.is_finite()) || (e.y_min.is_finite() && e.y_max.is_finite())
+        };
+        let (column_extent, constant_extent) = (&column_geometry.extent, &constant.extent);
+        if !can_prune(column_extent) {
+            return None;
+        }
+        if !can_prune(constant_extent) || !constant_extent.intersects_xy(column_extent) {
+            return Some(false);
+        }
+        // `GeometryExtent::ContainsXY`: every row in the zonemap matches; NULLs and empty geometries don't
+        let contains = constant_extent.x_min <= column_extent.x_min
+            && constant_extent.x_max >= column_extent.x_max
+            && constant_extent.y_min <= column_extent.y_min
+            && constant_extent.y_max >= column_extent.y_max;
+        let has_empty = column_geometry.flags & duckrs_common::geometry::HAS_EMPTY_GEOM != 0;
+        (contains && !column.can_be_null && !has_empty).then_some(true)
+    }
+
     fn check_in_list(&mut self, expr: &BoundExpr) -> Option<InListResult> {
         let (list, negated) = match &expr.kind {
             BoundExprKind::Operator {
