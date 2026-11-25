@@ -11,7 +11,7 @@ use super::csv_state_machine::{Field, Machine, NewLine, Scanned, ValueScanner, s
 use super::file_system::{Compression, read_file};
 use crate::catalog::TableCatalogEntry;
 use crate::function::cast::{CastMode, cast_vector};
-use crate::function::dates::{strftime_text, strptime_micros};
+use crate::function::dates::{strftime_text, strftime_text_nanos, strptime_micros};
 use crate::function::json::{Json, value_to_json};
 use duckrs_common::types::{LogicalType, LogicalTypeId, Timestamp};
 use duckrs_common::value::{Value, ValueData};
@@ -1893,6 +1893,8 @@ pub struct CsvWriteOptions {
     pub output: super::parquet::CopyOutputOptions,
     /// `FORMAT BLOB`: the bytes of the values, nothing else
     pub raw_blob: bool,
+    /// `FORMAT GEOJSON`: each row is a Feature of the written columns, laid out by this
+    pub geojson: Option<crate::function::geojson_copy::FeatureLayout>,
 }
 
 impl Default for CsvWriteOptions {
@@ -1913,6 +1915,7 @@ impl Default for CsvWriteOptions {
             suffix: String::new(),
             force_quote: Vec::new(),
             raw_blob: false,
+            geojson: None,
             partitioning: None,
             rotation: None,
             output: super::parquet::CopyOutputOptions::default(),
@@ -1999,8 +2002,46 @@ impl CsvWriteOptions {
                 )
                 .map(Some)
             }
+            // `TIMESTAMP_NS`: the nanoseconds past the microsecond go to `%n`
+            (LogicalTypeId::TimestampNs, ValueData::Int64(nanos)) if self.timestamp_format.is_some() => {
+                const NANOS_PER_DAY: i64 = MICROS_PER_DAY * 1000;
+                let time = nanos.rem_euclid(NANOS_PER_DAY);
+                strftime_text_nanos(
+                    self.timestamp_format.as_deref().unwrap_or_default(),
+                    nanos.div_euclid(NANOS_PER_DAY) as i32,
+                    time / 1000,
+                    time % 1000,
+                    false,
+                )
+                .map(Some)
+            }
             _ => Ok(None),
         }
+    }
+
+    /// The JSON of a value, with the dates and timestamps in it, also inside structs and lists, in the formats of
+    /// the COPY (`JSONCopyToJSONFunctionData`).
+    fn formatted_json(&self, value: &Value) -> Result<Json> {
+        if let Some(text) = self.formatted_temporal(value)? {
+            return Ok(Json::Str(text));
+        }
+        if self.date_format.is_none() && self.timestamp_format.is_none() {
+            return value_to_json(value);
+        }
+        let ty = value.logical_type();
+        Ok(match (ty.id(), value.data()) {
+            (LogicalTypeId::Struct, ValueData::Struct(fields)) => Json::Object(
+                ty.struct_children()
+                    .iter()
+                    .zip(fields)
+                    .map(|((name, _), field)| Ok((name.clone(), self.formatted_json(field)?)))
+                    .collect::<Result<_>>()?,
+            ),
+            (LogicalTypeId::List | LogicalTypeId::Array, ValueData::List(items)) => {
+                Json::Array(items.iter().map(|item| self.formatted_json(item)).collect::<Result<_>>()?)
+            }
+            _ => value_to_json(value)?,
+        })
     }
 
     pub fn write_chunk(&self, out: &mut Vec<u8>, chunk: &DataChunk) -> Result<()> {
@@ -2026,16 +2067,24 @@ impl CsvWriteOptions {
             }
             return Ok(());
         }
+        if let (Some(names), Some(layout)) = (&self.json_names, &self.geojson) {
+            let written: Vec<String> = columns.iter().map(|&column| names[column].clone()).collect();
+            for &row in rows {
+                let values: Vec<Value> = columns.iter().map(|&column| chunk.get_value(column, row)).collect();
+                let feature = crate::function::geojson_copy::feature(&values, &written, layout)?;
+                if json_rows.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 0 {
+                    out.extend_from_slice(self.new_line.as_bytes());
+                }
+                out.extend_from_slice(feature.text().as_bytes());
+            }
+            return Ok(());
+        }
         if let Some(names) = &self.json_names {
             for &row in rows {
                 let mut items = Vec::with_capacity(columns.len());
                 for &column in columns {
                     let value = chunk.get_value(column, row);
-                    let value = match self.formatted_temporal(&value)? {
-                        Some(text) => Value::varchar(text),
-                        None => value,
-                    };
-                    items.push((names[column].clone(), value_to_json(&value)?));
+                    items.push((names[column].clone(), self.formatted_json(&value)?));
                 }
                 if json_rows.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 0 {
                     out.extend_from_slice(self.new_line.as_bytes());

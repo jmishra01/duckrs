@@ -124,6 +124,9 @@ pub enum LogicalOperatorKind {
         /// the rows can differ between runs of the plan (`FunctionStability::VOLATILE` of the table function):
         /// `pragma_table_info` of a view, which is bound again when it runs
         volatile: bool,
+        /// rows computed while binding, as SHOW and DESCRIBE give them, which C++ plans as a
+        /// `LogicalColumnDataGet` of their collection rather than as VALUES
+        materialized: bool,
     },
     /// `LogicalFilter`: keeps the rows for which all expressions are true.
     Filter { expressions: Vec<BoundExpr> },

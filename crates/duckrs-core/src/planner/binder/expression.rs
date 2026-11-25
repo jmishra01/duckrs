@@ -2447,6 +2447,10 @@ impl Binder<'_> {
                     }
                     return Ok(bound);
                 }
+                if function.name.name.eq_ignore_ascii_case(super::json_plan::NAME) && function.name.qualification.is_empty()
+                {
+                    return self.bind_json_serialize_plan(function);
+                }
                 if crate::function::json_serialize::is_serialize_function(&function.name.name) {
                     let names: Vec<String> = function.args.iter().map(|a| a.name.clone()).collect();
                     let children = function
@@ -2461,6 +2465,16 @@ impl Binder<'_> {
                         children,
                         target,
                     );
+                }
+                if function.name.name.eq_ignore_ascii_case(crate::function::geojson_copy::NAME)
+                    && function.name.qualification.is_empty()
+                {
+                    let children = function
+                        .args
+                        .iter()
+                        .map(|a| self.bind_expression(&a.expr))
+                        .collect::<Result<Vec<_>>>()?;
+                    return crate::function::geojson_copy::bind(children);
                 }
                 if crate::function::json::is_json_function(&function.name.name) {
                     let children = function
@@ -2679,6 +2693,10 @@ impl Binder<'_> {
                     }
                     // `CMUtils::Bind`: they are in the catalog in C++, for (de)serialization only
                     let lower = function.name.name.to_ascii_lowercase();
+                    // `JSONCopyToJSONBind`: the JSON COPY writer's function, which a query can't call
+                    if lower == "__internal_json_copy_to_json" {
+                        return Err(binder_error(format!("{lower} is for internal use only")));
+                    }
                     if lower.starts_with("__internal_compress_") || lower.starts_with("__internal_decompress_") {
                         return Err(binder_error(
                             "Compressed materialization functions are for internal use only!".to_string(),

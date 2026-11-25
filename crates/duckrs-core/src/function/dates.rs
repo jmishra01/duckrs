@@ -1654,7 +1654,7 @@ pub(crate) fn strftime_text(format: &str, days: i32, time: i64, zoned: bool) -> 
 }
 
 /// `StrfTimeFormat` with the nanoseconds past the microsecond of a TIMESTAMP_NS.
-fn strftime_text_nanos(format: &str, days: i32, time: i64, nanos: i64, zoned: bool) -> Result<String> {
+pub(crate) fn strftime_text_nanos(format: &str, days: i32, time: i64, nanos: i64, zoned: bool) -> Result<String> {
     let (year, month, day) = Date(days).to_ymd();
     let hour = time / MICROS_PER_HOUR;
     let minute = (time / MICROS_PER_MINUTE) % 60;

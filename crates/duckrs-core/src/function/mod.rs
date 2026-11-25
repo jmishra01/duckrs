@@ -22,6 +22,7 @@ mod hyperloglog;
 // the whole of C++'s TDigest is ported; approx_quantile uses part of it
 pub mod json;
 pub mod json_serialize;
+pub mod geojson_copy;
 mod lists;
 pub(crate) mod math;
 pub mod nested;

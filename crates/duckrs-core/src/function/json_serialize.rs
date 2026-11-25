@@ -134,20 +134,29 @@ pub fn serialize_sql(sql: &str, options: &SerializeOptions) -> String {
             ("error".to_string(), Json::Bool(false)),
             ("statements".to_string(), Json::Array(statements)),
         ]),
-        Err(error) => {
-            let mut members = vec![
-                ("error".to_string(), Json::Bool(true)),
-                ("error_type".to_string(), Json::Str(error.kind.name().to_lowercase())),
-                ("error_message".to_string(), Json::Str(error.message.clone())),
-            ];
-            if let Some(position) = error.position {
-                members.push(("position".to_string(), Json::Str(position.to_string())));
-            }
-            Json::Object(members)
-        }
+        Err(error) => error_document(&error),
     };
+    write_document(&document, options.format)
+}
+
+/// What `json_serialize_sql` and `json_serialize_plan` give for an error: its type, its message and
+/// the extra info of `ErrorData`.
+pub fn error_document(error: &Error) -> Json {
+    let mut members = vec![
+        ("error".to_string(), Json::Bool(true)),
+        ("error_type".to_string(), Json::Str(error.kind.name().to_lowercase())),
+        ("error_message".to_string(), Json::Str(error.message.clone())),
+    ];
+    if let Some(position) = error.position {
+        members.push(("position".to_string(), Json::Str(position.to_string())));
+    }
+    Json::Object(members)
+}
+
+/// A document as text, indented with `format` (`JSONCommon::WRITE_PRETTY_FLAG`).
+pub fn write_document(document: &Json, format: bool) -> String {
     let mut out = String::new();
-    if options.format {
+    if format {
         document.pretty(0, &mut out);
     } else {
         document.write(&mut out);

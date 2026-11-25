@@ -14,6 +14,7 @@ mod generated;
 mod index_key;
 mod join;
 mod json;
+mod json_plan;
 mod lambda;
 pub use lambda::is_lambda_function;
 mod macros;
@@ -981,6 +982,8 @@ pub struct Binder<'a> {
     column_orders: std::collections::HashMap<usize, crate::execution::multi_file::ColumnOrder>,
     /// The COPY being bound is about JSON.
     copy_json: bool,
+    /// ... and about GeoJSON: newline-delimited (`GEOJSONL`) or not
+    copy_geojson: Option<bool>,
     /// Binding what a table function was given: `TableFunctionBinder` reads a name as its text.
     table_function_argument: bool,
     /// binding the body of a macro or view being created: what binding would run (the external resource
@@ -1129,6 +1132,7 @@ impl<'a> Binder<'a> {
             next_table_index: 0,
             column_orders: std::collections::HashMap::new(),
             copy_json: false,
+            copy_geojson: None,
             table_function_argument: false,
             defining: false,
             unnamed_subquery_index: 1,

@@ -40,6 +40,9 @@
 #   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
 # Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
 # stop passing. Regenerate with:
+#   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
+# Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
+# stop passing. Regenerate with:
 test/common/test_cast_hugeint.test
 test/common/test_cast_struct.test
 test/common/test_local_file_urls.test
@@ -1414,6 +1417,7 @@ test/sql/catalog/function/default_macro_shadowing_logging.test
 test/sql/catalog/function/default_table_macro_shadowing.test
 test/sql/catalog/function/information_schema_macro.test
 test/sql/catalog/function/macro_query_table.test
+test/sql/catalog/function/macro_returns_type.test
 test/sql/catalog/function/macro_typed_parameter_rendering.test
 test/sql/catalog/function/python_style_macro_parameters.test
 test/sql/catalog/function/query_function.test
@@ -3132,6 +3136,9 @@ test/sql/join/test_merge_join_predicate.test
 test/sql/join/test_nested_inequality.test
 test/sql/join/test_predicate_binding.test
 test/sql/join/test_string_payload.test
+test/sql/json/copy_geojson.test
+test/sql/json/copy_geojson_column_option_constant.test
+test/sql/json/copy_geojson_write_bbox_constant.test
 test/sql/json/copy_json_null_options.test
 test/sql/json/issues/internal_issue1035.test
 test/sql/json/issues/internal_issue2732.test
@@ -3224,6 +3231,7 @@ test/sql/json/table/read_geojson_errors.test
 test/sql/json/table/read_geojson_featurecollection.test
 test/sql/json/table/read_geojson_ndjson.test
 test/sql/json/table/read_geojson_nested.test
+test/sql/json/table/read_geojson_pseudo_columns.test
 test/sql/json/table/read_json_dates_vector_boundary.test
 test/sql/json/table/read_json_decimal.test
 test/sql/json/table/read_json_ignore_errors_spanning.test
@@ -3244,6 +3252,7 @@ test/sql/json/test_execute_serialized_rescan.test
 test/sql/json/test_json_bool.test
 test/sql/json/test_json_cast.test
 test/sql/json/test_json_copy_dateformat_error.test
+test/sql/json/test_json_copy_serialize_plan.test
 test/sql/json/test_json_deserialize_depth.test
 test/sql/json/test_json_deserialize_grouping_sets.test
 test/sql/json/test_json_deserialize_invalid_statements.test
@@ -3256,6 +3265,7 @@ test/sql/json/test_json_group_window_macro.test
 test/sql/json/test_json_macros.test
 test/sql/json/test_json_path_long_index.test
 test/sql/json/test_json_persistence.test
+test/sql/json/test_json_serialize_plan.test
 test/sql/json/test_json_serialize_sql.test
 test/sql/json/test_json_sqlite.test
 test/sql/json/test_serialized_decimal_no_type_info.test
@@ -3840,6 +3850,7 @@ test/sql/select/test_select_empty_table.test
 test/sql/select/test_select_into.test
 test/sql/select/test_select_locking.test
 test/sql/select/test_select_qualified_view.test
+test/sql/serialization/function_argument_metadata.test
 test/sql/serialization/function_argument_names.test
 test/sql/serialization/logical_operator_serialization.test
 test/sql/setops/ambiguous_order_by.test

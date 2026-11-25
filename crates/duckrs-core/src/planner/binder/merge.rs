@@ -282,6 +282,7 @@ impl Binder<'_> {
                 LogicalOperatorKind::ExpressionGet {
                     function: None,
                     volatile: false,
+                    materialized: false,
                     table_index,
                     types: vec![LogicalType::INTEGER],
                     expressions: vec![vec![BoundExpr::constant(Value::integer(42))]],
