@@ -468,7 +468,22 @@ impl Binder<'_> {
                 },
             };
         let name = original.to_lowercase();
-        if let Some(ty) = self.catalog.get_type(None, self.search_schema.as_deref(), &name)? {
+        // and else along the search path, which for a statement routed to another database has the default one
+        let found = match self.catalog.get_type(None, self.search_schema.as_deref(), &name)? {
+            Some(ty) => Some(ty),
+            None => match &self.session {
+                Some(session) if !session.default_database.eq_ignore_ascii_case(&session.database) => {
+                    match (session.attached_catalog)(&session.default_database) {
+                        Some(default) if !std::ptr::eq(Arc::as_ptr(&default), self.catalog) => {
+                            default.get_type(None, None, &name)?
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            },
+        };
+        if let Some(ty) = found {
             if !children.is_empty() {
                 return Err(binder_error(format!(
                     "Type \"{original}\" does not take any type parameters"
