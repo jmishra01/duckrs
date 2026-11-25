@@ -1464,7 +1464,9 @@ impl Binder<'_> {
         )?;
         // `CSVRejectsTable`: one scan id for the scans of a query, whose files are numbered on from one another
         // (a query of one connection: query ids of others are numbered on their own)
-        static LAST: std::sync::Mutex<Option<((u64, u64), u64, usize)>> = std::sync::Mutex::new(None);
+        /// the connection and query of the last scan, its scan id, and the next file number
+        type LastScan = Option<((u64, u64), u64, usize)>;
+        static LAST: std::sync::Mutex<LastScan> = std::sync::Mutex::new(None);
         let query = self.session.as_ref().map(|session| (session.connection_id, session.query_id));
         let (scan_id, file_offset) = {
             let mut last = LAST.lock().expect("not poisoned");
