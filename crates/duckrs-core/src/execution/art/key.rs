@@ -144,6 +144,11 @@ impl ArtKey {
         &self.data
     }
 
+    /// A key of these bytes, made elsewhere (the collated keys of an upsert).
+    pub fn from_bytes(data: Vec<u8>) -> Self {
+        Self { data }
+    }
+
     pub fn len(&self) -> usize {
         self.data.len()
     }

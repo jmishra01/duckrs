@@ -4587,6 +4587,8 @@ impl ClientContext {
                     ("show_tables", []) => Some("SHOW TABLES".to_string()),
                     ("show_tables_expanded", []) => Some("SHOW ALL TABLES".to_string()),
                     ("show_databases" | "database_list", []) => Some("SELECT * FROM duckdb_databases()".to_string()),
+                    // `PragmaCollations`
+                    ("collations", []) => Some("SELECT * FROM pragma_collations() ORDER BY 1".to_string()),
                     ("table_info" | "show" | "storage_info", [table]) => {
                         Some(format!("SELECT * FROM pragma_{lower}({})", pragma_argument(table)))
                     }

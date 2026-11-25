@@ -185,13 +185,41 @@ fn split_input(
     let indexes: Vec<usize> = action.targets.iter().map(|columns| index_of(table, columns)).collect();
     let table_keys = table.keys();
     let targets: Vec<&TableKey> = indexes.iter().map(|index| &table_keys[*index]).collect();
+    // a collated target finds the rows of the table by their collated keys
+    let collated: Vec<Option<HashMap<Vec<u8>, usize>>> = action
+        .collated_keys
+        .iter()
+        .map(|exprs| {
+            exprs
+                .as_ref()
+                .map(|exprs| {
+                    let mut positions = HashMap::new();
+                    for (index, chunk) in rows.chunks().enumerate() {
+                        for (row, key) in collated_keys(exprs, chunk)?.into_iter().enumerate() {
+                            if let Some(key) = key {
+                                positions.entry(key).or_insert(index * STANDARD_VECTOR_SIZE + row);
+                            }
+                        }
+                    }
+                    Ok(positions)
+                })
+                .transpose()
+        })
+        .collect::<Result<_>>()?;
     let mut seen = vec![HashSet::<ArtKey>::new(); targets.len()];
     let mut matched = Vec::new();
     let mut inserts = Vec::new();
     for (index, chunk) in input.iter().enumerate() {
         let chunk_keys = targets
             .iter()
-            .map(|key| keys_of(key, chunk))
+            .zip(&action.collated_keys)
+            .map(|(key, exprs)| match exprs {
+                Some(exprs) => Ok(collated_keys(exprs, chunk)?
+                    .into_iter()
+                    .map(|key| key.map(ArtKey::from_bytes))
+                    .collect()),
+                None => keys_of(key, chunk),
+            })
             .collect::<Result<Vec<_>>>()?;
         for row in 0..chunk.len() {
             let row_keys: Vec<Option<&ArtKey>> = chunk_keys
@@ -209,7 +237,10 @@ fn split_input(
             for (t, (key, seen)) in row_keys.iter().zip(&mut seen).enumerate() {
                 if let Some(key) = key {
                     if position.is_none() {
-                        position = keys[indexes[t]].get(key)?;
+                        position = match &collated[t] {
+                            Some(positions) => positions.get(key.as_bytes()).copied(),
+                            None => keys[indexes[t]].get(key)?,
+                        };
                     }
                     seen.insert((*key).clone());
                 }
@@ -266,4 +297,22 @@ fn updated_rows(
         }
     }
     Ok(updates)
+}
+
+/// The collated keys of the rows of `chunk`, a row of the table: none for a row with a NULL among them.
+fn collated_keys(exprs: &[crate::planner::expression::BoundExpr], chunk: &DataChunk) -> Result<Vec<Option<Vec<u8>>>> {
+    let vectors = exprs.iter().map(|e| execute(e, chunk)).collect::<Result<Vec<_>>>()?;
+    let mut keys: Vec<Option<Vec<u8>>> = vec![Some(Vec::new()); chunk.len()];
+    for vector in &vectors {
+        let values = crate::function::aggregates::value_keys(vector, chunk.len())?;
+        for (row, (key, value)) in keys.iter_mut().zip(values).enumerate() {
+            if !vector.is_valid(row) {
+                *key = None;
+            } else if let Some(key) = key {
+                key.extend_from_slice(&(value.len() as u64).to_le_bytes());
+                key.extend(value);
+            }
+        }
+    }
+    Ok(keys)
 }

@@ -318,6 +318,18 @@ impl Binder<'_> {
                     ));
                 }
                 let set = set.expect("an aggregate has its set");
+                // `FunctionBinder::BindAggregateFunction`: a DISTINCT count counts collated values
+                let arguments = if window.distinct && set.name == "count" {
+                    arguments
+                        .into_iter()
+                        .map(|argument| {
+                            let ty = argument.return_type.clone();
+                            self.collate(argument, &ty)
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                } else {
+                    arguments
+                };
                 let bound = bind_aggregate_function(set, arguments, None, window.distinct)?;
                 (
                     WindowFunction::Aggregate,

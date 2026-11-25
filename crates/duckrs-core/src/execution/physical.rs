@@ -4136,11 +4136,21 @@ impl PhysicalAggregate {
             None => None,
         };
         let input = aggregate.children.first().map(|c| execute(c, chunk)).transpose()?;
-        let distinct_input = aggregate
-            .distinct_key
-            .as_ref()
-            .map(|key| execute(key, chunk))
-            .transpose()?;
+        let distinct_input = match (&aggregate.distinct_key, aggregate.children.first(), &input) {
+            // the shared input of `MultiStageAggregateRewriter`: a volatile argument is evaluated once per row, and
+            // the key is computed from its values
+            (Some(key), Some(child), Some(values)) if child.is_volatile() => {
+                let mut over_values = key.clone();
+                if replace_subtree(&mut over_values, child) {
+                    let values = DataChunk::from_columns(vec![values.clone()], chunk.len());
+                    Some(execute(&over_values, &values)?)
+                } else {
+                    Some(execute(key, chunk)?)
+                }
+            }
+            (Some(key), ..) => Some(execute(key, chunk)?),
+            _ => None,
+        };
         let order_vectors = aggregate
             .order_by
             .iter()
@@ -5834,4 +5844,21 @@ fn struct_fields_of(
     let mut fields = Vec::new();
     rewrite(&mut prune, column_ids, &mut fields);
     Some((prune, fields))
+}
+
+/// Replaces the subtrees of `expr` equal to `subtree` with the first column of the input; whether there were any.
+fn replace_subtree(expr: &mut BoundExpr, subtree: &BoundExpr) -> bool {
+    if format!("{expr:?}") == format!("{subtree:?}") {
+        *expr = BoundExpr {
+            kind: BoundExprKind::Reference(0),
+            return_type: subtree.return_type.clone(),
+            alias: String::new(),
+        };
+        return true;
+    }
+    let mut replaced = false;
+    for child in expr.children_mut() {
+        replaced |= replace_subtree(child, subtree);
+    }
+    replaced
 }

@@ -28,6 +28,9 @@
 #   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
 # Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
 # stop passing. Regenerate with:
+#   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
+# Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
+# stop passing. Regenerate with:
 test/common/test_cast_hugeint.test
 test/common/test_cast_struct.test
 test/common/test_local_file_urls.test
@@ -1519,7 +1522,9 @@ test/sql/catalog/view/test_view_sql.test
 test/sql/catalog/view/test_view_sql_with_dependencies.test
 test/sql/catalog/view/view_catalog_alias.test
 test/sql/catalog/view/view_if_not_exists.test
+test/sql/collate/collate_distinct_aggregate.test
 test/sql/collate/collate_filter_pushdown.test
+test/sql/collate/collate_group_by_all.test
 test/sql/collate/collate_group_subquery.test
 test/sql/collate/collate_in_subquery.test
 test/sql/collate/collate_json_ordered_aggregate.test
@@ -1532,11 +1537,13 @@ test/sql/collate/collate_string_col.test
 test/sql/collate/collate_struct_minmax.test
 test/sql/collate/collate_subquery.test
 test/sql/collate/collated_cast_rendering_storage.test
+test/sql/collate/count_distinct_collation.test
 test/sql/collate/nop_collation_join_filter_pushdown.test
 test/sql/collate/test_collate_accent_insensitive.test
 test/sql/collate/test_collate_between.test
 test/sql/collate/test_collate_case_insensitive.test
 test/sql/collate/test_collate_expression.test
+test/sql/collate/test_collate_list.test
 test/sql/collate/test_collate_list_contains.test
 test/sql/collate/test_collate_list_has_any_all.test
 test/sql/collate/test_collate_null_constant.test
@@ -2432,6 +2439,7 @@ test/sql/function/generic/constant_argument_errors.test
 test/sql/function/generic/constant_or_null.test
 test/sql/function/generic/error.test
 test/sql/function/generic/fold_constant_arguments.test
+test/sql/function/generic/hash_comparison_keys.test
 test/sql/function/generic/hash_func.test
 test/sql/function/generic/invoke.test
 test/sql/function/generic/least_greatest_enum.test
@@ -5356,6 +5364,7 @@ test/sql/upsert/test_generated_column.test
 test/sql/upsert/test_problematic_conditional_do_update.test
 test/sql/upsert/upsert_aliased.test
 test/sql/upsert/upsert_basic.test
+test/sql/upsert/upsert_conflict_key_type.test
 test/sql/upsert/upsert_conflict_key_type_json.test
 test/sql/upsert/upsert_conflict_target.test
 test/sql/upsert/upsert_conflict_target_index.test
