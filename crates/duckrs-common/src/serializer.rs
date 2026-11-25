@@ -1377,6 +1377,7 @@ mod type_info {
     pub const STRUCT: u8 = 5;
     pub const ENUM: u8 = 6;
     pub const UNBOUND: u8 = 7;
+    pub const LEGACY_AGGREGATE_STATE: u8 = 8;
     pub const ARRAY: u8 = 9;
     pub const GEO: u8 = 13;
 }
@@ -1824,6 +1825,14 @@ fn read_logical_type(d: &mut BinaryDeserializer<'_>) -> Result<LogicalType> {
                         LogicalType::enum_type(values)
                     }
                     type_info::UNBOUND => read_unbound_type(d)?,
+                    // `LegacyAggregateStateTypeInfo::Deserialize`: what it says of the function is not kept, and its
+                    // values are read as the bytes they are
+                    type_info::LEGACY_AGGREGATE_STATE => {
+                        d.read_deleted_property::<String>(200, "function_name")?;
+                        d.read_deleted_property::<LogicalType>(201, "return_type")?;
+                        d.read_deleted_property::<Vec<LogicalType>>(202, "bound_argument_types")?;
+                        LogicalType::new(LogicalTypeId::LegacyAggregateState)
+                    }
                     other => {
                         return Err(Error::not_implemented(format!(
                             "deserializing type info {other} is not supported yet"
