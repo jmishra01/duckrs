@@ -31,6 +31,9 @@
 #   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
 # Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
 # stop passing. Regenerate with:
+#   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
+# Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
+# stop passing. Regenerate with:
 test/common/test_cast_hugeint.test
 test/common/test_cast_struct.test
 test/common/test_local_file_urls.test
@@ -2320,6 +2323,7 @@ test/sql/error/unknown_window_function.test
 test/sql/execution/column_binding_resolver.test
 test/sql/execution/function_null_verification.test
 test/sql/execution/lazy_chunk_scalar_execution.test
+test/sql/execution/limit_percent_runtime.test
 test/sql/execution/physical_verify_vector.test
 test/sql/execution/positional_scan_nested.test
 test/sql/explain/explain_execute.test
@@ -3586,6 +3590,7 @@ test/sql/parser/switch_case.test
 test/sql/parser/switch_null_arguments.test
 test/sql/parser/test_columns.test
 test/sql/parser/test_columns_order.test
+test/sql/parser/test_columns_prepared.test
 test/sql/parser/test_columns_where.test
 test/sql/parser/test_deep_expression_chains.test
 test/sql/parser/test_deep_expression_nesting.test
@@ -3635,6 +3640,7 @@ test/sql/pg_catalog/pg_constraint.test
 test/sql/pg_catalog/pg_database.test
 test/sql/pg_catalog/pg_enum.test
 test/sql/pg_catalog/pg_index.test
+test/sql/pg_catalog/pg_prepared_statements.test
 test/sql/pg_catalog/pg_privilege.test
 test/sql/pg_catalog/pg_sequence.test
 test/sql/pg_catalog/pg_sequences.test
@@ -3734,6 +3740,8 @@ test/sql/prepared/prepare_from_first.test
 test/sql/prepared/prepare_in.test
 test/sql/prepared/prepare_lambda.test
 test/sql/prepared/prepare_list_functions.test
+test/sql/prepared/prepare_list_sort_untyped_parameter.test
+test/sql/prepared/prepare_maintain_types.test
 test/sql/prepared/prepare_mixed_types.test
 test/sql/prepared/prepare_nested_unresolved_parameter.test
 test/sql/prepared/prepare_offset_first.test
@@ -3745,6 +3753,7 @@ test/sql/prepared/prepared_null_binding.test
 test/sql/prepared/prepared_rebind_macro_view.test
 test/sql/prepared/prepared_select.test
 test/sql/prepared/prepared_stale_statistics.test
+test/sql/prepared/prepared_statistics_optimization.test
 test/sql/prepared/prepared_update.test
 test/sql/prepared/test_basic_prepare.test
 test/sql/prepared/test_issue_2079.test
@@ -3752,6 +3761,7 @@ test/sql/prepared/test_issue_21077.test
 test/sql/prepared/test_issue_4010.test
 test/sql/prepared/test_issue_4042.test
 test/sql/prepared/test_issue_6276.test
+test/sql/prepared/test_prepare_ambiguous_type.test
 test/sql/prepared/test_prepare_delete.test
 test/sql/prepared/test_prepare_delete_update.test
 test/sql/prepared/test_prepare_drop.test
@@ -3762,6 +3772,7 @@ test/sql/prepared/test_prepare_null.test
 test/sql/prepared/test_prepare_select.test
 test/sql/prepared/test_prepare_subquery.test
 test/sql/prepared/test_prepare_types.test
+test/sql/prepared/test_prepare_unused_cte.test
 test/sql/projection/coalesce_error.test
 test/sql/projection/coalesce_rowid.test
 test/sql/projection/reference_only_output.test
@@ -4628,6 +4639,7 @@ test/sql/table_function/duckdb_indexes.test
 test/sql/table_function/duckdb_keywords.test
 test/sql/table_function/duckdb_memory_convert_to_persistent.test
 test/sql/table_function/duckdb_optimizers.test
+test/sql/table_function/duckdb_prepared_statements.test
 test/sql/table_function/duckdb_schemas.test
 test/sql/table_function/duckdb_sequences.test
 test/sql/table_function/duckdb_settings.test
@@ -5008,6 +5020,7 @@ test/sql/types/list/unnest_table_function.test
 test/sql/types/list/unnest_types.test
 test/sql/types/map/map_cast.test
 test/sql/types/map/map_const_and_col_combination.test
+test/sql/types/map/map_empty.test
 test/sql/types/map/map_extract_nested_null.test
 test/sql/types/map/map_keys_outer_join_null.test
 test/sql/types/map/map_null.test

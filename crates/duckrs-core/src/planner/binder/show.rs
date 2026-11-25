@@ -272,8 +272,9 @@ const LINKED_EXTENSIONS: [&str; 3] = ["core_functions", "json", "parquet"];
 
 const DESCRIBE_NAMES: [&str; 6] = ["column_name", "column_type", "null", "key", "default", "extra"];
 
-const SYSTEM_TABLES: [&str; 20] = [
+const SYSTEM_TABLES: [&str; 21] = [
     "duckdb_functions",
+    "duckdb_prepared_statements",
     "pragma_collations",
     "duckdb_extensions",
     "pragma_user_agent",
@@ -2329,6 +2330,40 @@ impl Binder<'_> {
                     }
                 }
                 (vec![("user_agent", varchar.clone())], vec![vec![text(&agent)]])
+            }
+            // `DuckDBPreparedStatementsFunction`
+            "duckdb_prepared_statements" => {
+                let list = LogicalType::list(varchar.clone());
+                let types = |types: &[String]| {
+                    Value::list(varchar.clone(), types.iter().map(|t| Value::varchar(t.clone())).collect())
+                };
+                let rows = self
+                    .session
+                    .as_ref()
+                    .map(|session| session.prepared_statements.clone())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|row| {
+                        let parameters = match row.parameter_count {
+                            0 => Value::null(list.clone()),
+                            count => types(&vec!["UNKNOWN".to_string(); count])?,
+                        };
+                        let results = match row.result_types.as_deref() {
+                            Some(result_types) => types(result_types)?,
+                            None => Value::null(list.clone()),
+                        };
+                        Ok(vec![text(&row.name), text(&row.statement), parameters, results])
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                (
+                    vec![
+                        ("name", varchar.clone()),
+                        ("statement", varchar.clone()),
+                        ("parameter_types", list.clone()),
+                        ("result_types", list.clone()),
+                    ],
+                    rows,
+                )
             }
             // `PragmaCollateFunction`: the collations of the catalog
             "pragma_collations" => (

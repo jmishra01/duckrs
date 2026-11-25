@@ -351,19 +351,24 @@ fn list_where(args: &DataChunk, result: &mut Vector) -> Result<()> {
 
 fn list_grade_up(args: &DataChunk, result: &mut Vector) -> Result<()> {
     let ty = result.logical_type().clone();
+    // `ListSortBindData`: the options are constants, which the binder filled in (`ResolveNullOrder`)
+    let option = |column: usize| -> Result<String> {
+        match args.columns().get(column) {
+            Some(vector) if !args.is_empty() => Ok(vector.get_value(0).try_to_string()?.to_uppercase()),
+            _ => Ok(String::new()),
+        }
+    };
+    let descending = option(1)?.starts_with("DESC");
+    let nulls_first = option(2)? == "NULLS FIRST";
     strict_rows(args, result, |row| {
         let values = items(&row[0]);
-        let descending = row.get(1).is_some_and(|o| {
-            o.try_to_string()
-                .is_ok_and(|text| text.to_uppercase().starts_with("DESC"))
-        });
         let element = row[0].logical_type().child_type().expect("a list").clone();
         let keys = keys_of(values, &element)?;
         let mut order: Vec<usize> = (0..values.len()).collect();
         order.sort_by(|a, b| {
             let (left, right) = (values[*a].is_null(), values[*b].is_null());
             if left || right {
-                return right.cmp(&left);
+                return if nulls_first { right.cmp(&left) } else { left.cmp(&right) };
             }
             if descending {
                 keys[*b].cmp(&keys[*a])
@@ -565,9 +570,14 @@ fn bind_search(
         }
         _ => needle.return_type.clone(),
     };
-    // a VARCHAR next to a type that is not a string deduces no `T`
+    // a VARCHAR next to a type that is not a string deduces no `T`, nor does a nested type next to one that is not
     let varchar = |t: &LogicalType| t.id() == LogicalTypeId::Varchar;
-    if (varchar(&element) || varchar(&needle_type)) && super::nested::deduce_template(&element, &needle_type).is_none()
+    let nested = |t: &LogicalType| t.is_nested();
+    let incompatible = varchar(&element) || varchar(&needle_type) || nested(&element) != nested(&needle_type);
+    if incompatible
+        && needle_type.id() != LogicalTypeId::SqlNull
+        && element.id() != LogicalTypeId::SqlNull
+        && super::nested::deduce_template(&element, &needle_type).is_none()
     {
         let error = no_match(name, &[list.clone(), needle.clone()]);
         return Err(Error::new(

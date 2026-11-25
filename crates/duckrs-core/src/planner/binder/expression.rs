@@ -1436,7 +1436,8 @@ impl Binder<'_> {
         };
         // `ListSortBindData`: the elements sort by their collated values, a list of them after the
         // options, and keep their own
-        if matches!(function.name.as_str(), "list_sort" | "array_sort") && children.len() <= 3 {
+        let grade_up = function.name == "list_grade_up";
+        if (grade_up || matches!(function.name.as_str(), "list_sort" | "array_sort")) && children.len() <= 3 {
             // `ListNormalSortBind`: `ResolveOrder` and `ResolveNullOrder` fill in the options
             // that are not given, from the settings
             let option = |text: &str| BoundExpr::constant(Value::varchar(text));
@@ -1465,6 +1466,10 @@ impl Binder<'_> {
                     duckrs_common::sort_key::NullOrder::NullsLast => "NULLS LAST",
                     _ => "NULLS FIRST",
                 }));
+            }
+            // `ListGradeUpBind`: the same options; the grades are of the values as they are
+            if grade_up {
+                return Ok(bound);
             }
             let ty = children[0].return_type.clone();
             let (keys, collated) = push_collation(
@@ -2852,7 +2857,21 @@ impl Binder<'_> {
                     seen.push(key.clone());
                 }
                 let value = parameters.values.as_ref().and_then(|values| values.get(&key));
-                BoundExpr::constant(value.cloned().unwrap_or_else(Value::sql_null))
+                let constant = BoundExpr::constant(value.cloned().unwrap_or_else(Value::sql_null));
+                if parameters.typed.contains(&key) {
+                    // not a literal (`GetExpressionReturnType` sees a constant as one): of the type it has
+                    let return_type = constant.return_type.clone();
+                    BoundExpr {
+                        kind: BoundExprKind::Cast {
+                            child: Box::new(constant),
+                            try_cast: false,
+                        },
+                        return_type,
+                        alias: String::new(),
+                    }
+                } else {
+                    constant
+                }
             }
             ExprKind::Star(_) => return Err(binder_error("STAR expression is not supported here")),
             ExprKind::Default => {
