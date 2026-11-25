@@ -402,6 +402,13 @@ impl Binder<'_> {
         let Some(argument) = &star.expr else {
             return Ok((columns, None));
         };
+        // `ParameterNotResolvedException`: a parameter is not foldable while the statement is prepared
+        if self.parameters.as_ref().is_some_and(|p| p.values.is_none()) && super::macros::has_parameter(argument) {
+            return Err(duckrs_common::Error::new(
+                duckrs_common::ErrorKind::ParameterNotResolved,
+                "Parameter types could not be resolved",
+            ));
+        }
         // `TableFunctionBinder`: no columns, but the client's variables and settings
         let mut binder = Binder::with_options(self.catalog, self.options.clone());
         binder.session = self.session.clone();

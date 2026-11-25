@@ -2054,7 +2054,8 @@ impl Binder<'_> {
             ResultModifier::Limit { limit, offset, percent } => {
                 if *percent {
                     let offset = match offset {
-                        Some(offset) => self.bind_limit_value(offset, true)?.unwrap_or(0),
+                        // the OFFSET of a LIMIT % is read when it runs, a parameter's too (`BoundLimitNode`)
+                        Some(offset) => self.bind_limit_value(offset, true, true)?.unwrap_or(0),
                         None => 0,
                     };
                     let Some(limit) = limit else {
@@ -2072,7 +2073,7 @@ impl Binder<'_> {
                     let Some(expr) = expr else {
                         return Ok(None);
                     };
-                    match self.bind_limit_value(expr, is_offset) {
+                    match self.bind_limit_value(expr, is_offset, false) {
                         Err(error) if !matches!(error.kind, ErrorKind::Binder | ErrorKind::Parser) => {
                             failure.get_or_insert(error);
                             Ok(None)
@@ -2120,7 +2121,7 @@ impl Binder<'_> {
     }
 
     /// `Binder::BindLimitValue` for constant values: NULL means no limit (or no offset).
-    fn bind_limit_value(&mut self, expr: &Expr, is_offset: bool) -> Result<Option<u64>> {
+    fn bind_limit_value(&mut self, expr: &Expr, is_offset: bool, runtime_parameter: bool) -> Result<Option<u64>> {
         let mut binder = self.child_binder();
         binder.inline_ctes();
         binder.correlated = Arc::default();
@@ -2129,8 +2130,8 @@ impl Binder<'_> {
             return Err(binder_error("Correlated columns not supported in LIMIT/OFFSET"));
         }
         // `BindLimitValue`: a subquery is evaluated by the LIMIT operator, whose
-        // `GetLimitValue` reads its value as an idx_t (`Value::GetValue`)
-        let mut has_subquery = false;
+        // `GetLimitValue` reads its value as an idx_t (`Value::GetValue`); so is a parameter where it is read then
+        let mut has_subquery = runtime_parameter && super::macros::has_parameter(expr);
         bound.clone().walk_mut(&mut |e| {
             has_subquery |= matches!(e.kind, BoundExprKind::Subquery { .. });
         });

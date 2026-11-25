@@ -1626,6 +1626,8 @@ pub struct PreparedStatementData {
     statement: Statement,
     /// the parameters, lowercase, in order of appearance
     parameters: Vec<String>,
+    /// what `duckdb_prepared_statements()` gives as its result types
+    result_types: Option<Vec<String>>,
     /// `default_collation` when it was prepared, which its plan keeps if it was bound then; a statement bound again
     /// when it runs (`RequireRebind`) follows the setting of then
     default_collation: Option<String>,
@@ -1779,6 +1781,16 @@ impl ClientContext {
             current_query: self.current_query.clone(),
             appended: self.appended.clone(),
             replacement_scans: self.replacement_scans.0.clone(),
+            prepared_statements: self
+                .prepared_statements
+                .iter()
+                .map(|(name, prepared)| duckrs_core::planner::binder::PreparedStatementRow {
+                    name: name.clone(),
+                    statement: prepared.statement.to_string(),
+                    parameter_count: prepared.parameters.len(),
+                    result_types: prepared.result_types.clone(),
+                })
+                .collect(),
             open_database: {
                 let home = self.home.clone();
                 Arc::new(move |path: &str| {
@@ -2054,7 +2066,7 @@ impl ClientContext {
                     let old_casting = duckrs_core::function::cast_rules::set_old_implicit_casting(
                         self.setting_text("old_implicit_casting") == "true",
                     );
-                    let result = match self.verification_statement(statement) {
+                    let result = match self.verify_no_parameters(statement).and_then(|()| self.verification_statement(statement)) {
                         Ok(Some(replacement)) => self.run_statement(&replacement),
                         Ok(None) => self.run_statement(statement),
                         Err(error) => Err(error),
@@ -2081,6 +2093,32 @@ impl ClientContext {
             result = outcome?;
         }
         Ok(result)
+    }
+
+    /// `SubmitStatementInternal`: a statement run directly has no values for its parameters (`VerifyParameters`);
+    /// a named one can read the user variable of its name.
+    fn verify_no_parameters(&self, statement: &Statement) -> Result<()> {
+        if self.parameters.is_some() || matches!(statement, Statement::Prepare { .. } | Statement::Execute { .. }) {
+            return Ok(());
+        }
+        // the statements a PIVOT was rewritten into, a PREPARE among them, each by itself
+        if let Statement::Multi(statements) = statement {
+            return statements.iter().try_for_each(|statement| self.verify_no_parameters(statement));
+        }
+        let missing: Vec<String> = parameter_names(&statement.to_string())
+            .into_iter()
+            .filter(|name| name.starts_with(|c: char| c.is_ascii_digit()) || !self.variables.contains_key(name))
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "Values were not provided for the following parameters: {}",
+                missing.join(", ")
+            ),
+        ))
     }
 
     /// `ClientContext::Prepare`: checks one statement and keeps it to run later.
@@ -2112,6 +2150,7 @@ impl ClientContext {
                 | Statement::Vacuum { .. }
         );
         let mut bound_at_prepare = false;
+        let mut result_types = None;
         if !client_statement {
             let catalog = self.catalog();
             let mut binder = Binder::with_options(&catalog, self.bind_options());
@@ -2119,7 +2158,18 @@ impl ClientContext {
             binder.session = Some(self.session_values());
             let bound = match dml_cte::split(&statement) {
                 Some((ctes, rest)) => self.bind_dml_ctes(&ctes, &rest, &parameters),
-                None => binder.bind(&statement).map(drop),
+                None => binder.bind(&statement).map(|bound| {
+                    use duckrs_core::planner::binder::StatementReturnType;
+                    // `DuckDBPreparedStatementsFunction`: the types of a plan that was kept, which one that reads
+                    // the data of the database is not (the statistics it was planned with could change)
+                    result_types = match bound.return_type {
+                        StatementReturnType::ChangedRows => Some(vec!["BIGINT".to_string()]),
+                        StatementReturnType::QueryResult if !reads_database(&bound.plan) => {
+                            Some(bound.types.iter().map(ToString::to_string).collect())
+                        }
+                        _ => None,
+                    };
+                }),
             };
             match bound {
                 // `ParameterNotResolvedException`: bound again with the values on execution; the
@@ -2138,11 +2188,26 @@ impl ClientContext {
                 }
             }
         }
-        let seen = parameters.seen.lock().clone();
+        // `named_param_map` has the parameters of all of the text, also of a CTE nothing reads
+        let seen = {
+            let mut seen = parameters.seen.lock().clone();
+            for name in &parameters.declared {
+                if !seen.contains(name) {
+                    seen.push(name.clone());
+                }
+            }
+            seen
+        };
         let has_parameters = !seen.is_empty();
+        // a statement whose parameters have no types until it runs keeps no plan (`bound_all_parameters`); duckrs
+        // binds parameters without their types, so it takes any statement with parameters to be one
+        if !bound_at_prepare || has_parameters {
+            result_types = None;
+        }
         Ok(Arc::new(PreparedStatementData {
             statement,
             parameters: seen,
+            result_types,
             // with parameters, `RequireRebind` binds again whenever a value's type is not the one bound, which duckrs
             // does not track: such a statement is taken to be bound again
             default_collation: (bound_at_prepare && !has_parameters).then(|| self.setting_text("default_collation")),
@@ -2161,7 +2226,7 @@ impl ClientContext {
             .enumerate()
             .map(|(i, value)| ((i + 1).to_string(), value.clone()))
             .collect();
-        self.execute_with(prepared, named)
+        self.execute_with(prepared, named, HashSet::new())
     }
 
     /// `PreparedStatement::VerifyParameters`, then the statement with these values.
@@ -2169,6 +2234,7 @@ impl ClientContext {
         &mut self,
         prepared: &PreparedStatementData,
         values: HashMap<String, Value>,
+        typed: HashSet<String>,
     ) -> Result<MaterializedQueryResult> {
         let mut excess: Vec<&str> = values
             .keys()
@@ -2204,6 +2270,7 @@ impl ClientContext {
         }
         self.parameters = Some(Arc::new(ParameterValues {
             values: Some(values),
+            typed,
             ..ParameterValues::default()
         }));
         let collation = match &prepared.default_collation {
@@ -3628,7 +3695,7 @@ impl ClientContext {
         &self,
         name: &str,
         values: &[(String, Expr)],
-    ) -> Result<(Arc<PreparedStatementData>, HashMap<String, Value>)> {
+    ) -> Result<BoundExecute> {
         let Some(prepared) = self.prepared_statements.get(&name.to_lowercase()).cloned() else {
             return Err(Error::new(
                 ErrorKind::Binder,
@@ -3636,11 +3703,16 @@ impl ClientContext {
             ));
         };
         let mut bound = HashMap::with_capacity(values.len());
+        let mut typed = HashSet::new();
         for (parameter, value) in values {
+            // `Bind(ExecuteStatement)`: a literal keeps a literal type, anything else the type of its value
+            if !matches!(value.kind, duckrs_parser::ast::ExprKind::Constant(_)) {
+                typed.insert(parameter.to_lowercase());
+            }
             let value = evaluate_scalar(&bind_constant_expression(&self.catalog(), value)?)?;
             bound.insert(parameter.to_lowercase(), value);
         }
-        Ok((prepared, bound))
+        Ok((prepared, bound, typed))
     }
 
     /// `COMMENT ON INDEX`: a table of a transaction gets an entry of its own.
@@ -4671,9 +4743,10 @@ impl ClientContext {
                     // `Binder::Bind(ExplainStatement &)`: EXECUTE is not one of the statements
                     return self.explain_sql(statement);
                 }
-                let (prepared, values) = self.bound_execute(name, values)?;
+                let (prepared, values, typed) = self.bound_execute(name, values)?;
                 let parameters = ParameterValues {
                     values: Some(values),
+                    typed,
                     ..ParameterValues::default()
                 };
                 let saved = self.parameters.replace(Arc::new(parameters));
@@ -4755,8 +4828,8 @@ impl ClientContext {
                 return Ok(Self::success());
             }
             Statement::Execute { name, values } => {
-                let (prepared, bound) = self.bound_execute(name, values)?;
-                return self.execute_with(&prepared, bound);
+                let (prepared, bound, typed) = self.bound_execute(name, values)?;
+                return self.execute_with(&prepared, bound, typed);
             }
             // what is compiled in needs no loading
             Statement::Load(info)
@@ -10216,3 +10289,16 @@ fn stored_group_rows(source: &dyn duckrs_core::catalog::TableSource) -> Option<u
     }
     ((1..groups - 1).all(|g| source.group_rows(g) == first) && source.group_rows(groups - 1) <= first).then_some(first)
 }
+
+/// Whether `plan` reads the data of the database (a table, or a file), which `PreparedStatementData` does not keep
+/// a plan of.
+fn reads_database(plan: &duckrs_core::planner::logical::LogicalOperator) -> bool {
+    use duckrs_core::planner::logical::LogicalOperatorKind as K;
+    matches!(
+        plan.kind,
+        K::Get { .. } | K::CsvScan { .. } | K::ParquetScan { .. } | K::JsonScan { .. }
+    ) || plan.children.iter().any(reads_database)
+}
+
+/// What EXECUTE runs: the statement, the values of its parameters, and those given as other than literals.
+type BoundExecute = (Arc<PreparedStatementData>, HashMap<String, Value>, HashSet<String>);

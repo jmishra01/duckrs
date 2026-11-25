@@ -736,6 +736,20 @@ pub struct SessionValues {
     pub database_files: Box<dyn Fn() -> Vec<std::path::PathBuf> + Send + Sync>,
     /// the catalog of an attached database by name (`Catalog::GetCatalogEntry`), committed state
     pub attached_catalog: AttachedCatalogLookup,
+    /// `duckdb_prepared_statements()`: the connection's prepared statements
+    pub prepared_statements: Vec<PreparedStatementRow>,
+}
+
+/// A row of `duckdb_prepared_statements()`.
+#[derive(Debug, Clone)]
+pub struct PreparedStatementRow {
+    pub name: String,
+    /// `unbound_statement->ToString()`
+    pub statement: String,
+    /// how many parameters it has, which are of unknown type until it runs
+    pub parameter_count: usize,
+    /// the types of its result, where it has a plan to run (`physical_plan`), or `[BIGINT]` of what changes rows
+    pub result_types: Option<Vec<String>>,
 }
 
 /// [`SessionValues::attached_catalog`].
@@ -908,6 +922,9 @@ pub struct ParameterValues {
     /// while a statement is prepared, the parameters in its text: one only inside the SQL text of
     /// `query()` never gets a value
     pub declared: Vec<String>,
+    /// the parameters whose values EXECUTE gave as other than literals (`BoundParameterData` of the value's own
+    /// type): they bind as their type, where a literal adapts to what it is used with
+    pub typed: std::collections::HashSet<String>,
 }
 
 /// How column references bind while a select list or HAVING clause is being bound.
