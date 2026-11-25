@@ -973,6 +973,17 @@ fn max_value(a: f64, b: f64) -> f64 {
     if a > b { a } else { b }
 }
 
+/// `GeometryExtent::MergeAxis`.
+fn merge_axis(min: &mut f64, max: &mut f64, other_min: f64, other_max: f64) {
+    if other_min.is_nan() || other_max.is_nan() {
+        *min = f64::NEG_INFINITY;
+        *max = f64::INFINITY;
+        return;
+    }
+    *min = min_value(*min, other_min);
+    *max = max_value(*max, other_max);
+}
+
 impl Extent {
     /// `GeometryExtent::Empty`: nothing intersects it, and merging it changes nothing.
     pub fn empty() -> Self {
@@ -1024,30 +1035,21 @@ impl Extent {
 
     /// `GeometryExtent::Merge`.
     pub fn merge(&mut self, other: &Extent) {
-        self.x_min = min_value(self.x_min, other.x_min);
-        self.y_min = min_value(self.y_min, other.y_min);
-        self.z_min = min_value(self.z_min, other.z_min);
-        self.m_min = min_value(self.m_min, other.m_min);
-        self.x_max = max_value(self.x_max, other.x_max);
-        self.y_max = max_value(self.y_max, other.y_max);
-        self.z_max = max_value(self.z_max, other.z_max);
-        self.m_max = max_value(self.m_max, other.m_max);
+        merge_axis(&mut self.x_min, &mut self.x_max, other.x_min, other.x_max);
+        merge_axis(&mut self.y_min, &mut self.y_max, other.y_min, other.y_max);
+        merge_axis(&mut self.z_min, &mut self.z_max, other.z_min, other.z_max);
+        merge_axis(&mut self.m_min, &mut self.m_max, other.m_min, other.m_max);
     }
 
     /// `GeometryExtent::Extend` by a vertex, its Z and M if it has them.
     fn extend(&mut self, vertex: &[f64], has_z: bool, has_m: bool) {
-        self.x_min = min_value(self.x_min, vertex[0]);
-        self.y_min = min_value(self.y_min, vertex[1]);
-        self.x_max = max_value(self.x_max, vertex[0]);
-        self.y_max = max_value(self.y_max, vertex[1]);
+        extend_axis(&mut self.x_min, &mut self.x_max, vertex[0]);
+        extend_axis(&mut self.y_min, &mut self.y_max, vertex[1]);
         if has_z {
-            self.z_min = min_value(self.z_min, vertex[2]);
-            self.z_max = max_value(self.z_max, vertex[2]);
+            extend_axis(&mut self.z_min, &mut self.z_max, vertex[2]);
         }
         if has_m {
-            let m = vertex[2 + usize::from(has_z)];
-            self.m_min = min_value(self.m_min, m);
-            self.m_max = max_value(self.m_max, m);
+            extend_axis(&mut self.m_min, &mut self.m_max, vertex[2 + usize::from(has_z)]);
         }
     }
 }
