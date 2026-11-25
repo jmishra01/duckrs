@@ -157,6 +157,40 @@ fn add_nested_statistics(
 }
 
 /// `VertexExtractStats`: the bounds of a coordinate of the points, and whether it is always NULL.
+/// `FromWKBStats`: the one geometry type of every row of a column of WKB, if the 5-byte header (byte order and type)
+/// of its smallest and largest blob is the same, and its shortest blob holds a value of that type.
+fn wkb_header_types(stats: &Stats) -> Option<[u8; 4]> {
+    const HEADER: usize = 5;
+    let strings = stats.strings.as_ref()?;
+    let (min, max) = strings.bounds.as_ref()?;
+    if min.len() < HEADER || max.len() < HEADER || min[..HEADER] != max[..HEADER] {
+        return None;
+    }
+    let little_endian = min[0] != 0;
+    let bytes = [min[1], min[2], min[3], min[4]];
+    let meta = if little_endian {
+        u32::from_le_bytes(bytes)
+    } else {
+        u32::from_be_bytes(bytes)
+    };
+    let (type_id, flag_id) = ((meta & 0xFFFF) % 1000, (meta & 0xFFFF) / 1000);
+    if !(1..=7).contains(&type_id) || flag_id > 3 {
+        return None;
+    }
+    // Z and M also by the Extended-WKB high bits
+    let has_z = flag_id & 1 != 0 || meta & 0x8000_0000 != 0;
+    let has_m = flag_id & 2 != 0 || meta & 0x4000_0000 != 0;
+    let dimensions = 2 + u64::from(has_z) + u64::from(has_m);
+    // a POINT has its ordinates inline, the others an element count
+    let shortest = if type_id == 1 { HEADER as u64 + dimensions * 8 } else { HEADER as u64 + 4 };
+    if strings.min_length.is_none_or(|length| length < shortest) {
+        return None;
+    }
+    let mut types = [0u8; 4];
+    types[usize::from(has_z) + 2 * usize::from(has_m)] = 1 << type_id;
+    Some(types)
+}
+
 fn vertex_extract_stats(
     child: &Stats,
     geometry: &duckrs_common::geometry::GeometryStats,
@@ -2123,6 +2157,21 @@ impl StatisticsPropagator {
             if let Some(result) = date_part_stats(&part, &stats[at], &children[at].return_type, &return_type) {
                 return result;
             }
+        }
+        // `FromWKBStats`: a header the smallest and the largest blob share is every row's type
+        if function.name.eq_ignore_ascii_case("st_geomfromwkb") && children.len() == 1 {
+            let mut geometry = duckrs_common::geometry::GeometryStats::unknown();
+            if let Some(types) = wkb_header_types(&stats[0]) {
+                geometry.types = types;
+            }
+            return Stats {
+                geometry: Some(geometry),
+                strings: None,
+                min: None,
+                max: None,
+                distinct: None,
+                ..stats[0].clone()
+            };
         }
         if function.name == "vertex_extract" && children.len() == 2 {
             let coordinate = match &children[1].kind {

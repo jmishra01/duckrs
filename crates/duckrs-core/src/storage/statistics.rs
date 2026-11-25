@@ -263,6 +263,8 @@ fn read_type_stats(
     // types and flags, none of which is used yet
     if ty.id() == LogicalTypeId::Geometry {
         if d.has_property(200)? {
+            // (the string statistics are not of the geometries: they are unknown, `GeometryStats::CreateUnknown`)
+            *geometry = Some(duckrs_common::geometry::GeometryStats::unknown());
             return string_stats(d).map(|_| None);
         }
         let mut stats = duckrs_common::geometry::GeometryStats::empty();
