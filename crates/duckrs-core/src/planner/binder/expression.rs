@@ -2100,6 +2100,10 @@ impl Binder<'_> {
             } => {
                 let target = self.bind_type(target)?;
                 let child = self.bind_expression(child)?;
+                if matches!(child.kind, BoundExprKind::Parameter { .. }) {
+                    // `AddCastToType`: the cast gives the parameter its type
+                    return Ok(child.cast_to(&target, *try_cast));
+                }
                 if !crate::function::cast::has_cast(&child.return_type, &target) {
                     return Err(crate::unported(format!("casting {} to {target}", child.return_type)));
                 }
@@ -2895,6 +2899,18 @@ impl Binder<'_> {
                 let mut seen = parameters.seen.lock();
                 if !seen.contains(&key) {
                     seen.push(key.clone());
+                }
+                drop(seen);
+                if preparing && parameters.infer_types {
+                    // `BoundParameterMap::BindParameterExpression`: of no type yet, whatever the type its
+                    // parameter has (a cast of this occurrence decides what happens to it)
+                    return Ok(BoundExpr::new(
+                        BoundExprKind::Parameter {
+                            identifier: key.clone(),
+                            data: parameters.type_of(&key),
+                        },
+                        LogicalType::new(LogicalTypeId::Unknown),
+                    ));
                 }
                 let value = parameters.values.as_ref().and_then(|values| values.get(&key));
                 let constant = BoundExpr::constant(value.cloned().unwrap_or_else(Value::sql_null));

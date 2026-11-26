@@ -2727,6 +2727,9 @@ impl Exporter<'_> {
     fn expr(&mut self, scope: &Scope, e: &BoundExpr) -> Res<Expr> {
         let expr = match &e.kind {
             BoundExprKind::Constant(value) => return self.constant(value),
+            BoundExprKind::Parameter { .. } => {
+                return self.constant(&crate::planner::expression::parameter_null(&e.return_type));
+            }
             BoundExprKind::ColumnRef { binding, .. } => {
                 let Some((mut expr, ty)) = self.lookup(scope, *binding) else {
                     return Err("The SQL column binding resolver has no matching entry".into());

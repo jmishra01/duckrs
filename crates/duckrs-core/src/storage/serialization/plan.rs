@@ -514,6 +514,11 @@ impl PlanWriter {
                 Self::header(s, "BOUND_CONSTANT", "VALUE_CONSTANT", alias);
                 s.write_property(200, "value", value);
             }
+            // only a statement being prepared has one, and its plan is not serialized: as the NULL it evaluates to
+            BoundExprKind::Parameter { .. } => {
+                Self::header(s, "BOUND_CONSTANT", "VALUE_CONSTANT", alias);
+                s.write_property(200, "value", &crate::planner::expression::parameter_null(return_type));
+            }
             BoundExprKind::ColumnRef { binding, depth } => {
                 Self::header(s, "BOUND_COLUMN_REF", "BOUND_COLUMN_REF", alias);
                 s.write_property(200, "return_type", return_type);

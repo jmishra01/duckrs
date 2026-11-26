@@ -169,8 +169,8 @@ pub unsafe extern "C" fn duckdb_parameter_name(prepared_statement: duckdb_prepar
     }
 }
 
-/// `duckdb_param_logical_type`: duckrs binds parameters without their types, so the type of a parameter is that of
-/// the value bound to it, if one is.
+/// `duckdb_param_logical_type`: the type preparing found for the parameter (`TryGetParameterType`), else that of the
+/// value bound to it (`BoundParameterData`, where a VARCHAR is a STRING_LITERAL), if one is.
 ///
 /// # Safety
 ///
@@ -179,7 +179,15 @@ unsafe fn param_type(prepared_statement: duckdb_prepared_statement, param_idx: i
     // SAFETY: by the contract of this function.
     let wrapper = unsafe { prepared(prepared_statement) }?;
     let name = wrapper.name(param_idx)?;
-    wrapper.values.get(name).map(|value| value.logical_type().clone())
+    if let Some(ty) = wrapper.prepared().and_then(|statement| statement.parameter_type(name)) {
+        return Some(ty.clone());
+    }
+    let ty = wrapper.values.get(name)?.logical_type();
+    // `BoundParameterData::GetDefaultType`
+    if ty.id() == LogicalTypeId::Varchar && ty.collation().is_none_or(str::is_empty) {
+        return Some(LogicalType::new(LogicalTypeId::StringLiteral));
+    }
+    Some(ty.clone())
 }
 
 #[unsafe(no_mangle)]
@@ -218,15 +226,8 @@ pub unsafe extern "C" fn duckdb_clear_bindings(prepared_statement: duckdb_prepar
 unsafe fn result_columns<'a>(prepared_statement: duckdb_prepared_statement) -> Option<(&'a [String], &'a [LogicalType])> {
     // SAFETY: by the contract of this function.
     let statement = unsafe { prepared(prepared_statement) }?.statement.as_ref().ok()?;
-    let (names, types) = statement.result_columns()?;
-    // a result with a column of a parameter whose type is not known yet (which duckrs binds as a NULL) is one
-    // column `unknown` of type INVALID (`PreparedStatementData::GetTypes` of an unbound statement)
-    static UNKNOWN_NAMES: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| vec!["unknown".to_string()]);
-    static UNKNOWN_TYPES: [LogicalType; 1] = [LogicalType::INVALID];
-    if !statement.parameter_names().is_empty() && types.iter().any(|ty| ty.id() == LogicalTypeId::SqlNull) {
-        return Some((UNKNOWN_NAMES.as_slice(), &UNKNOWN_TYPES));
-    }
-    Some((names, types))
+    // a statement whose parameters' types could not be resolved has one column `unknown` of type UNKNOWN
+    statement.result_columns()
 }
 
 #[unsafe(no_mangle)]

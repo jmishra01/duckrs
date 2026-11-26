@@ -1210,6 +1210,8 @@ pub fn has_cast(source: &LogicalType, target: &LogicalType) -> bool {
     (target.id() == LogicalTypeId::Variant && contains_type(source))
         || source == target
         || source.id() == LogicalTypeId::SqlNull
+        // a parameter of a statement being prepared, which a cast gives its type instead
+        || source.id() == LogicalTypeId::Unknown
         || target.id() == LogicalTypeId::SqlNull
         || target.id() == LogicalTypeId::Varchar
         || (is_numeric_or_bool(source) && is_numeric_or_bool(target))

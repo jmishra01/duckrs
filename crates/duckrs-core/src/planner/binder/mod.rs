@@ -47,7 +47,7 @@ use crate::catalog::{Catalog, MacroCatalogEntry, ViewCatalogEntry};
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::sort_key::{NullOrder, OrderModifiers, OrderType};
 use duckrs_common::string_util::{candidates_message, similarity_rating, top_n_strings};
-use duckrs_common::types::LogicalType;
+use duckrs_common::types::{LogicalType, LogicalTypeId};
 use duckrs_common::value::Value;
 use duckrs_common::{Error, ErrorKind, Result};
 use duckrs_parser::ast;
@@ -931,6 +931,45 @@ pub struct ParameterValues {
     /// the parameters whose values EXECUTE gave as other than literals (`BoundParameterData` of the value's own
     /// type): they bind as their type, where a literal adapts to what it is used with
     pub typed: std::collections::HashSet<String>,
+    /// while a statement is prepared: parameters bind as `BoundParameterExpression`s of the types their uses give
+    /// them (in `types`), not as NULLs
+    pub infer_types: bool,
+    /// the type of each parameter bound so far, which all its occurrences share (`BoundParameterMap::parameters`
+    /// and `BoundParameterData::return_type`): UNKNOWN until a use gives it one, INVALID when uses disagree
+    pub types: Mutex<HashMap<String, Arc<Mutex<LogicalType>>>>,
+}
+
+impl ParameterValues {
+    /// Values for a statement that is being prepared, whose parameters bind with the types their uses give them.
+    pub fn inferring(declared: Vec<String>) -> Self {
+        Self {
+            declared,
+            infer_types: true,
+            ..Self::default()
+        }
+    }
+
+    /// `BoundParameterMap::CreateOrGetData`: the type state parameter `key` shares among its occurrences.
+    fn type_of(&self, key: &str) -> Arc<Mutex<LogicalType>> {
+        self.types
+            .lock()
+            .entry(key.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(LogicalType::new(LogicalTypeId::Unknown))))
+            .clone()
+    }
+
+    /// The parameters whose types binding found (`Planner::CreatePlan`'s `value_map`): without the ones that got no
+    /// type, or uses that disagree.
+    pub fn inferred_types(&self) -> HashMap<String, LogicalType> {
+        self.types
+            .lock()
+            .iter()
+            .filter_map(|(key, ty)| {
+                let ty = ty.lock().clone();
+                (!matches!(ty.id(), LogicalTypeId::Invalid | LogicalTypeId::Unknown)).then(|| (key.clone(), ty))
+            })
+            .collect()
+    }
 }
 
 /// How column references bind while a select list or HAVING clause is being bound.

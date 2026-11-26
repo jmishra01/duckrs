@@ -764,6 +764,17 @@ impl LogicalType {
         }
     }
 
+    /// `TypeVisitor::Contains`: whether this type or one inside it is of type `id`.
+    pub fn contains_id(&self, id: LogicalTypeId) -> bool {
+        self.id == id
+            || match self.params() {
+                Params::List(child) => child.contains_id(id),
+                Params::Array { child, .. } => child.contains_id(id),
+                Params::Struct(children) => children.iter().any(|(_, ty)| ty.contains_id(id)),
+                _ => false,
+            }
+    }
+
     pub fn enum_type(values: Vec<String>) -> Self {
         Self::with_params(LogicalTypeId::Enum, Params::Enum(values.into()))
     }

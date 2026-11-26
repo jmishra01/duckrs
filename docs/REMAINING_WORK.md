@@ -778,9 +778,11 @@ Each item gives the number of failing files in `test/` that it should fix, where
     appender, `duckdb_value`, date/time helpers, pending results, error data); `unsafe` only at the FFI boundary
     (`src/ffi.rs`), struct layouts checked against `duckdb.h` (`tests/layout.rs`)
   - [x] `tools/capi_tests/run.sh` builds DuckDB's Catch2 C API tests against `libduckrs_capi` (missing functions are
-    weak stubs that fail only the cases calling them): 96 of 115 test cases of the 11 core files pass; 6 cases that
+    weak stubs that fail only the cases calling them): 101 of 115 test cases of the 11 core files pass; 6 cases that
     read C++ internals are excluded (`tools/capi_tests/excluded.txt`)
-  - [ ] parameter types before binding (`duckdb_param_type`: the binder infers none), the engine gaps the prepared
+  - [x] parameter types before binding: while preparing, a parameter is a `BoundExprKind::Parameter` that the first
+    implicit cast types (`AddCastToType`), a root left UNKNOWN is ParameterNotResolved; `duckdb_param_type` reads them
+  - [ ] the engine gaps the prepared
     tests reach (preparing EXECUTE, EXPLAIN, CHECKPOINT, PIVOT), real streaming and pending results (duckrs
     finishes a query first), `duckdb_interrupt`, `duckdb_vector_reference_vector` sharing its buffer
   - [ ] scalar, aggregate, table, cast and copy functions; Arrow; replacement scans; profiling and logging; the

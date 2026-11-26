@@ -377,6 +377,18 @@ impl PreparedStatement {
         self.data.parameter_names()
     }
 
+    /// The type that preparing found for parameter `name` (as [`PreparedStatement::parameter_names`] gives it), from
+    /// what the statement does with it (`TryGetParameterType`): `i = $1` with an INTEGER `i`, `CAST($1 AS BIGINT)`,
+    /// an INSERT into a column. `None` when its type is only known once a value is bound.
+    pub fn parameter_type(&self, name: &str) -> Option<&LogicalType> {
+        self.data.parameter_type(name)
+    }
+
+    /// The parameters whose types preparing found, by name (`GetExpectedParameterTypes`).
+    pub fn parameter_types(&self) -> &std::collections::HashMap<String, LogicalType> {
+        self.data.parameter_types()
+    }
+
     /// The names and types of its result columns (`GetNames`, `GetTypes`), when it was bound as it was prepared.
     pub fn result_columns(&self) -> Option<(&[String], &[LogicalType])> {
         self.data.result_columns()
@@ -414,6 +426,34 @@ mod tests {
         // what is not ported yet is a "not implemented" error (loading extensions comes after v1)
         let err = con.query("LOAD httpfs").unwrap_err();
         assert_eq!(err.kind, ErrorKind::NotImplemented);
+    }
+
+    #[test]
+    fn prepared_parameters_take_types_from_their_uses() {
+        let db = Database::open_in_memory().unwrap();
+        let mut con = db.connect().unwrap();
+        con.query("CREATE TABLE a (i INTEGER, s VARCHAR)").unwrap();
+        let type_of = |con: &mut Connection, sql: &str, name: &str| {
+            con.prepare(sql).unwrap().parameter_type(name).map(LogicalType::to_string)
+        };
+        let integer = Some("INTEGER".to_string());
+        assert_eq!(type_of(&mut con, "INSERT INTO a VALUES (?, 'x')", "1"), integer);
+        assert_eq!(type_of(&mut con, "SELECT sum(i) FROM a WHERE i > ?", "1"), integer);
+        assert_eq!(type_of(&mut con, "SELECT * FROM a WHERE s = $1", "1"), Some("VARCHAR".to_string()));
+        assert_eq!(type_of(&mut con, "SELECT CAST($v AS BIGINT)", "v"), Some("BIGINT".to_string()));
+        assert_eq!(type_of(&mut con, "SELECT CAST(CAST($1 AS INTEGER) AS VARCHAR)", "1"), integer);
+        // uses that disagree leave the parameter without a type, as does a use that gives none
+        assert_eq!(type_of(&mut con, "SELECT $1::INTEGER + $1::BIGINT", "1"), None);
+        let prepared = con.prepare("SELECT $1::INTEGER, $2").unwrap();
+        assert_eq!(prepared.parameter_type("1"), Some(&LogicalType::INTEGER));
+        assert_eq!(prepared.parameter_type("2"), None);
+        // a result column of a parameter of no type is `unknown` (`ParameterNotResolvedException`)
+        let (names, types) = prepared.result_columns().unwrap();
+        assert_eq!(names, ["unknown"]);
+        assert_eq!(types[0].id(), LogicalTypeId::Unknown);
+        // values are still bound when it runs
+        let result = con.execute(&prepared, &[Value::integer(1), Value::varchar("b")]).unwrap();
+        assert_eq!(result.value(1, 0), Value::varchar("b"));
     }
 
     #[test]

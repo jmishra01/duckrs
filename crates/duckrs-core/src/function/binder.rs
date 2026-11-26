@@ -65,10 +65,12 @@ fn match_overload(parameters: &[LogicalType], arguments: &[LogicalType]) -> Opti
         return None;
     }
     let mut cost = 0;
+    let mut has_unknown_argument = false;
     for (argument, parameter) in arguments.iter().zip(parameters) {
         if argument.id() == LogicalTypeId::Unknown {
-            // with a parameter of an unknown type, the cost is 0
-            return Some(0);
+            // a parameter of a statement being prepared takes any type
+            has_unknown_argument = true;
+            continue;
         }
         let cast_cost = implicit_cast(argument, parameter);
         if cast_cost < 0 {
@@ -76,7 +78,8 @@ fn match_overload(parameters: &[LogicalType], arguments: &[LogicalType]) -> Opti
         }
         cost += cast_cost;
     }
-    Some(cost)
+    // with a parameter of an unknown type, the cost is 0
+    Some(if has_unknown_argument { 0 } else { cost })
 }
 
 /// `FunctionBinder::SelectFunction`: the cheapest overload, or the error DuckDB reports.
