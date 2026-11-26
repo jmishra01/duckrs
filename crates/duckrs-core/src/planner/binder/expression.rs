@@ -2319,7 +2319,14 @@ impl Binder<'_> {
                     );
                     return self.bind_expression(&Expr::from(ExprKind::Function(call)));
                 }
-                if function.name.name.eq_ignore_ascii_case("write_log") && function.name.qualification.is_empty() {
+                // (`system.main.write_log` is the same function, as EXPLAIN (SQL) qualifies it)
+                let builtin = match function.name.qualification.as_slice() {
+                    [] => true,
+                    [schema] => schema.eq_ignore_ascii_case("main"),
+                    [catalog, schema] => catalog.eq_ignore_ascii_case("system") && schema.eq_ignore_ascii_case("main"),
+                    _ => false,
+                };
+                if function.name.name.eq_ignore_ascii_case("write_log") && builtin {
                     return self.bind_write_log(function);
                 }
                 if function.name.name.eq_ignore_ascii_case("parse_duckdb_log_message")

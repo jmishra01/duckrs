@@ -4373,6 +4373,8 @@ impl ClientContext {
             self.db = previous;
             return result;
         }
+        // (statement verification exports before the statement runs, and so before its search path is set)
+        let _search_path = duckrs_core::catalog::SearchPathGuard::set(self.search_path_for(&self.db.name.clone()));
         let catalog = self.catalog();
         let mut binder = Binder::with_options(&catalog, self.bind_options());
         binder.parameters = self.parameters.clone();
@@ -4496,6 +4498,16 @@ impl ClientContext {
             "explain_sql_strict" => true,
             _ => return Ok(None),
         };
+        // data-modifying CTEs run as statements of their own (`dml_cte`): their plan is not one to export
+        if dml_cte::split(statement).is_some() {
+            if strict {
+                return Err(Error::new(
+                    ErrorKind::NotImplemented,
+                    "EXPLAIN (SQL) cannot render this query: data-modifying CTEs have no SQL export",
+                ));
+            }
+            return Ok(None);
+        }
         let Some(sql) = self.export_sql(statement, !strict)? else {
             return Ok(None);
         };
@@ -4533,6 +4545,7 @@ impl ClientContext {
         let logical_optimized = explain::logical_tree(&plan, Some(&estimate));
         duckrs_core::execution::join_filter::note_probe_estimates(&plan);
         resolve_column_bindings(&mut plan)?;
+        duckrs_core::execution::check_plan(&plan)?;
         let physical_plan = create_plan(plan);
         let physical = explain::physical_tree(physical_plan.as_ref(), Some(&optimized), Some(&estimate), analyze);
         Ok(([logical, logical_optimized, physical], names, types))
@@ -5491,6 +5504,7 @@ impl ClientContext {
         });
         duckrs_core::execution::join_filter::note_probe_estimates(&plan);
         resolve_column_bindings(&mut plan)?;
+        duckrs_core::execution::check_plan(&plan)?;
         let plan = create_plan(plan);
         let physical = profiling.map(|_| std::time::Instant::now());
         let collector = PhysicalResultCollector::new(plan);

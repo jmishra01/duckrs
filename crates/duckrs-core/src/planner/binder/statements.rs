@@ -4549,18 +4549,8 @@ impl Binder<'_> {
 }
 
 /// Fails like DuckDB would for a cast that is not implemented here yet.
-/// `LogicalSample`, with the check of `PlanSample`.
+/// `LogicalSample` (the physical plan refuses a BERNOULLI sample of a count: `execution::check_plan`).
 fn bind_sample(options: &ast::SampleOptions, plan: LogicalOperator) -> Result<LogicalOperator> {
-    if !options.is_percentage && options.method == ast::SampleMethod::Bernoulli {
-        return Err(Error::new(
-            ErrorKind::Parser,
-            format!(
-                "Sample method {} cannot be used with a discrete sample count, either switch to reservoir sampling \
-                 or use a sample_size",
-                options.method.name()
-            ),
-        ));
-    }
     Ok(LogicalOperator::new(
         LogicalOperatorKind::Sample {
             options: options.clone(),

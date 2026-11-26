@@ -328,6 +328,9 @@ impl BoundWindow {
     }
 }
 
+/// The alias of a cast that compressed materialization added (`InternalCompressedMaterializationCastFun`).
+pub const COMPRESSED_MATERIALIZATION_CAST: &str = "__internal_compressed_materialization_cast";
+
 /// A bound expression (`Expression`).
 #[derive(Debug, Clone)]
 pub struct BoundExpr {
@@ -356,6 +359,20 @@ impl BoundExpr {
             return_type: ty,
             alias: alias.into(),
         }
+    }
+
+    /// `CMUtils::MarkCast`: a cast that compressed materialization added, which SQL has no need of.
+    pub fn mark_compressed_cast(self) -> Self {
+        if matches!(self.kind, BoundExprKind::Cast { .. }) {
+            self.with_alias(COMPRESSED_MATERIALIZATION_CAST)
+        } else {
+            self
+        }
+    }
+
+    /// Whether [`Self::mark_compressed_cast`] marked this.
+    pub fn is_compressed_cast(&self) -> bool {
+        self.alias == COMPRESSED_MATERIALIZATION_CAST && matches!(self.kind, BoundExprKind::Cast { .. })
     }
 
     pub fn with_alias(mut self, alias: impl Into<String>) -> Self {
