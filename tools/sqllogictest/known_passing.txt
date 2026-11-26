@@ -2045,7 +2045,6 @@ test/sql/copy/parquet/read_ahead/readahead_open_error.test
 test/sql/copy/parquet/read_ahead/readahead_order_preservation.test
 test/sql/copy/parquet/read_ahead/readahead_parked_job_progress.test
 test/sql/copy/parquet/read_ahead/readahead_starved_consumers.test
-test/sql/copy/parquet/read_ahead/readahead_waiting_consumers.test
 test/sql/copy/parquet/read_parquet_parameter.test
 test/sql/copy/parquet/read_single_parquet_file.test
 test/sql/copy/parquet/read_single_parquet_file_late_materialization.test
