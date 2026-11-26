@@ -1,0 +1,81 @@
+// Ported from duckdb/extension/tpcds/dsdgen/include/dsdgen-c/tables.h @ rust-port-baseline
+// Generated from the C header; do not edit by hand.
+
+//! Table numbers: the 24 warehouse tables, the source tables and the pseudo tables.
+//!
+//! All of the header is kept, so most of the names are unused.
+#![allow(dead_code)]
+
+pub const CALL_CENTER: i32 = 0;
+pub const CATALOG_PAGE: i32 = 1;
+pub const CATALOG_RETURNS: i32 = 2;
+pub const CATALOG_SALES: i32 = 3;
+pub const CUSTOMER: i32 = 4;
+pub const CUSTOMER_ADDRESS: i32 = 5;
+pub const CUSTOMER_DEMOGRAPHICS: i32 = 6;
+pub const DATET: i32 = 7;
+pub const HOUSEHOLD_DEMOGRAPHICS: i32 = 8;
+pub const INCOME_BAND: i32 = 9;
+pub const INVENTORY: i32 = 10;
+pub const ITEM: i32 = 11;
+pub const PROMOTION: i32 = 12;
+pub const REASON: i32 = 13;
+pub const SHIP_MODE: i32 = 14;
+pub const STORE: i32 = 15;
+pub const STORE_RETURNS: i32 = 16;
+pub const STORE_SALES: i32 = 17;
+pub const TIME: i32 = 18;
+pub const WAREHOUSE: i32 = 19;
+pub const WEB_PAGE: i32 = 20;
+pub const WEB_RETURNS: i32 = 21;
+pub const WEB_SALES: i32 = 22;
+pub const WEB_SITE: i32 = 23;
+pub const DBGEN_VERSION: i32 = 24;
+pub const S_BRAND: i32 = 25;
+pub const S_CUSTOMER_ADDRESS: i32 = 26;
+pub const S_CALL_CENTER: i32 = 27;
+pub const S_CATALOG: i32 = 28;
+pub const S_CATALOG_ORDER: i32 = 29;
+pub const S_CATALOG_ORDER_LINEITEM: i32 = 30;
+pub const S_CATALOG_PAGE: i32 = 31;
+pub const S_CATALOG_PROMOTIONAL_ITEM: i32 = 32;
+pub const S_CATALOG_RETURNS: i32 = 33;
+pub const S_CATEGORY: i32 = 34;
+pub const S_CLASS: i32 = 35;
+pub const S_COMPANY: i32 = 36;
+pub const S_CUSTOMER: i32 = 37;
+pub const S_DIVISION: i32 = 38;
+pub const S_INVENTORY: i32 = 39;
+pub const S_ITEM: i32 = 40;
+pub const S_MANAGER: i32 = 41;
+pub const S_MANUFACTURER: i32 = 42;
+pub const S_MARKET: i32 = 43;
+pub const S_PRODUCT: i32 = 44;
+pub const S_PROMOTION: i32 = 45;
+pub const S_PURCHASE: i32 = 46;
+pub const S_PURCHASE_LINEITEM: i32 = 47;
+pub const S_REASON: i32 = 48;
+pub const S_STORE: i32 = 49;
+pub const S_STORE_PROMOTIONAL_ITEM: i32 = 50;
+pub const S_STORE_RETURNS: i32 = 51;
+pub const S_SUBCATEGORY: i32 = 52;
+pub const S_SUBCLASS: i32 = 53;
+pub const S_WAREHOUSE: i32 = 54;
+pub const S_WEB_ORDER: i32 = 55;
+pub const S_WEB_ORDER_LINEITEM: i32 = 56;
+pub const S_WEB_PAGE: i32 = 57;
+pub const S_WEB_PROMOTIONAL_ITEM: i32 = 58;
+pub const S_WEB_RETURNS: i32 = 59;
+pub const S_WEB_SITE: i32 = 60;
+pub const S_ZIPG: i32 = 61;
+pub const PSEUDO_TABLE_START: i32 = 62;
+pub const ITEM_BRAND: i32 = 62;
+pub const ITEM_CLASS: i32 = 63;
+pub const ITEM_CATEGORY: i32 = 64;
+pub const DIVISIONS: i32 = 65;
+pub const COMPANY: i32 = 66;
+pub const CONCURRENT_WEB_SITES: i32 = 67;
+pub const ACTIVE_CITIES: i32 = 68;
+pub const ACTIVE_COUNTIES: i32 = 69;
+pub const ACTIVE_STATES: i32 = 70;
+pub const MAX_TABLE: i32 = 70;

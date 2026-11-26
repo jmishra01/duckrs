@@ -193,6 +193,9 @@ impl Binder<'_> {
         }
         let name = call.name.name.to_lowercase();
         let args: Vec<FunctionArgument> = call.args.iter().map(named_argument).collect();
+        if let Some(op) = self.bind_tpc_function(&name, &args, table_ref)? {
+            return Ok(Some(op));
+        }
         let sql = match name.as_str() {
             "unnest" => {
                 // `UnnestBind`: a NULL is no list (its type is not one)

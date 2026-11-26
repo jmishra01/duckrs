@@ -3,7 +3,7 @@
 What is still missing from the roadmap in [`RUST_PORT_PLAN.md`](../../RUST_PORT_PLAN.md) §6.
 The test numbers come from [`STATUS.md`](STATUS.md) at baseline `d4eea3f208d`.
 
-- Overall: 5484 of 6367 test files pass (**90.8%** of the 6038 that run), on 2026-11-26. The v1 target is ≥ 90%.
+- Overall: 5558 of 6367 test files pass (**91.3%** of the 6090 that run), on 2026-11-26. The v1 target is ≥ 90%.
 - Phases 0–11 have code, and their gates are met: `test/parquet` is at 85.6% (95 of 111, gate 80%) since
   `bound_schema` (phase 82). `sql/cte` is at 84.0% against 85%, and counts as met for v1 (decided 2026-11-26; see item 23). The failing-file counts in the items below are from earlier runs; `STATUS.md` has the current ones.
 - Phase 12 is partly done. Phases 13 and 14 have not started.
@@ -556,7 +556,10 @@ Each item gives the number of failing files in `test/` that it should fix, where
 - [ ] 19. TPC-H 22/22 and TPC-DS 99/99 correct
   - [x] with `tools/tpch` and `tools/tpcds` building dbgen and dsdgen from the C++ checkout, the examples get
     TPC-H 22/22 at SF 0.01 and 0.1, TPC-DS 99/99 at SF 0.01
-  - [ ] `dbgen` / `dsdgen` as table functions in duckrs, so the corpus's tpch and tpcds tests run
+  - [x] `dbgen` / `dsdgen` in duckrs: the crates `duckrs-tpch` and `duckrs-tpcds` port the generators (their
+    output matches C++'s byte for byte: TPC-H at SF 0.01 and 0.1, TPC-DS at SF 0.01), with `CALL dbgen` /
+    `CALL dsdgen`, `PRAGMA tpch` / `tpcds`, `tpch_queries` / `tpch_answers` / `tpcds_queries` / `tpcds_answers`;
+    C++'s parallel generation is not ported, and `dbgen` / `dsdgen` in a FROM clause are not
 - [x] 20. Verification mode: run each query with the optimizer on and off and compare the results
   (`sqllogictest --diff-against unoptimized --diff-out <file>`); over `optimizer`, `join`, `subquery` and
   `aggregate` it found `complex_top_n` (105 rows against 102) and `test_no_pushdown_cast_into_cte`, both fixed

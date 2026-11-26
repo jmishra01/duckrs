@@ -1,0 +1,15 @@
+[package]
+name = "duckrs-tpcds"
+description = "TPC-DS data generator (dsdgen), schema, queries and answers for duckrs: a port of DuckDB's tpcds extension"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+# The generator, distributions, queries and answers are TPC material; see LICENSE-TPC.
+include = ["src/**", "data/**", "tests/**", "LICENSE-TPC", "Cargo.toml"]
+
+[dependencies]
+duckrs-common.workspace = true
+
+[lints]
+workspace = true

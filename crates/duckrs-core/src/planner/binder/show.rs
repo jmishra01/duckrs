@@ -268,7 +268,7 @@ const EXTENSION_ALIASES: [(&str, &str); 10] = [
 ];
 
 /// The extensions duckrs has compiled in, as C++'s `linked_extensions` of a build with them.
-const LINKED_EXTENSIONS: [&str; 3] = ["core_functions", "json", "parquet"];
+const LINKED_EXTENSIONS: [&str; 5] = ["core_functions", "json", "parquet", "tpcds", "tpch"];
 
 const DESCRIBE_NAMES: [&str; 6] = ["column_name", "column_type", "null", "key", "default", "extra"];
 

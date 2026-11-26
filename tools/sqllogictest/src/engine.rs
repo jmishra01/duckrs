@@ -161,7 +161,7 @@ impl Connection for DuckrsConnection {
 
     fn load_extension(&mut self, name: &str) -> bool {
         // what duckrs has compiled in
-        matches!(name, "parquet" | "json")
+        matches!(name, "parquet" | "json" | "tpch" | "tpcds")
     }
 }
 

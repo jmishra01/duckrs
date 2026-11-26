@@ -9,6 +9,8 @@ license.workspace = true
 [dependencies]
 duckrs-common.workspace = true
 duckrs-parser.workspace = true
+duckrs-tpch.workspace = true
+duckrs-tpcds.workspace = true
 flate2.workspace = true
 snap.workspace = true
 brotli.workspace = true

@@ -31,6 +31,7 @@ mod star;
 mod statements;
 mod table_constraints;
 mod table_functions;
+mod tpc;
 pub use table_functions::named_argument;
 mod window;
 

@@ -793,6 +793,8 @@ dependencies = [
  "brotli",
  "duckrs-common",
  "duckrs-parser",
+ "duckrs-tpcds",
+ "duckrs-tpch",
  "flate2",
  "hashbrown",
  "libc",
@@ -820,6 +822,8 @@ dependencies = [
  "duckrs-common",
  "duckrs-core",
  "duckrs-parser",
+ "duckrs-tpcds",
+ "duckrs-tpch",
  "parking_lot",
 ]
 
@@ -830,6 +834,20 @@ dependencies = [
  "duckrs-common",
  "proptest",
  "sqllogictest",
+]
+
+[[package]]
+name = "duckrs-tpcds"
+version = "0.0.1"
+dependencies = [
+ "duckrs-common",
+]
+
+[[package]]
+name = "duckrs-tpch"
+version = "0.0.1"
+dependencies = [
+ "duckrs-common",
 ]
 
 [[package]]
