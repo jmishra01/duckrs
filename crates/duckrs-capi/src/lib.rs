@@ -1,0 +1,30 @@
+// Ported from duckdb/src/main/capi/v1 @ rust-port-baseline
+
+//! DuckDB's C API (`duckdb.h`, v1) over duckrs.
+//!
+//! Every function has the name and the signature `duckdb.h` gives it, so a C program built against the header
+//! links with `libduckrs_capi` as it would with `libduckdb`. The types of the header are in [`types`]; the
+//! handles C holds point to the Rust objects of this crate (a [`database::DatabaseWrapper`], a
+//! `duckrs::LogicalType`, a `duckrs::DataChunk`, ...), as C++'s point to its own.
+//!
+//! `unsafe` is used at the boundary only, where a pointer C passes becomes a reference and where a result is
+//! written through a pointer C passes; [`ffi`] has the helpers that do it. What is behind the boundary is safe
+//! Rust over duckrs's API.
+
+#![allow(clippy::missing_safety_doc)]
+
+pub mod appender;
+pub mod database;
+pub mod datetime;
+pub mod error;
+mod ffi;
+pub mod helper;
+pub mod logical_type;
+pub mod pending;
+pub mod prepared;
+pub mod result;
+pub mod types;
+pub mod value;
+pub mod vector;
+
+pub use types::*;

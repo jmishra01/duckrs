@@ -149,6 +149,11 @@ pub fn find_setting(name: &str) -> Option<(usize, &'static SettingDefinition)> {
         .find(|(_, s)| s.name.eq_ignore_ascii_case(name) || s.aliases.iter().any(|a| a.eq_ignore_ascii_case(name)))
 }
 
+/// `DBConfig::GetOptionByIndex`: every setting, those of the compiled-in extensions last.
+pub fn all_settings() -> impl Iterator<Item = &'static SettingDefinition> {
+    SETTINGS.iter().chain(&EXTENSION_SETTINGS)
+}
+
 /// `Catalog::UnrecognizedConfigurationError`.
 fn unrecognized(name: &str) -> Error {
     let mut names: Vec<String> = SETTINGS

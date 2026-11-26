@@ -1,0 +1,19 @@
+[package]
+name = "duckrs-capi"
+description = "DuckDB's C API (duckdb.h, v1) over duckrs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "duckrs_capi"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+duckrs.workspace = true
+duckrs-common.workspace = true
+libc.workspace = true
+
+[lints]
+workspace = true
