@@ -735,7 +735,8 @@ pub struct SessionValues {
     pub open_database: OpenDatabase,
     /// the rows an `Appender` flushes: the names and types of its columns, and its chunks
     pub appended: Option<AppendedRows>,
-    /// the client's replacement scans: rows for a table name the catalog does not have
+    /// the client's replacement scans, the connection's and then the database's: what to read for a table name the
+    /// catalog does not have
     pub replacement_scans: Vec<ReplacementScan>,
     /// `DatabaseManager::IsAttachedDatabaseFile`: the files of the attached databases
     pub database_files: Box<dyn Fn() -> Vec<std::path::PathBuf> + Send + Sync>,
@@ -774,9 +775,19 @@ pub type AppendedRows = (
     Arc<Vec<duckrs_common::vector::DataChunk>>,
 );
 
-/// `ReplacementScan`: for a table name, the rows to read in its place (names, types and chunks), if
-/// the scan has any.
-pub type ReplacementScan = Arc<dyn Fn(&str) -> Option<Result<AppendedRows>> + Send + Sync>;
+/// What a [`ReplacementScan`] reads in place of a table (the `TableRef` that `ReplacementScan::function` returns).
+#[derive(Debug, Clone)]
+pub enum Replacement {
+    /// rows: the names and types of their columns, and their chunks
+    Rows(AppendedRows),
+    /// `TableFunctionRef`: a call of the table function `name`, with constants for its arguments
+    /// (`ConstantExpression::FromValue` of each)
+    TableFunction { name: String, parameters: Vec<Value> },
+}
+
+/// `ReplacementScan`: for a table name, what to read in its place, if the scan has anything; an error stops the
+/// binding.
+pub type ReplacementScan = Arc<dyn Fn(&str) -> Option<Result<Replacement>> + Send + Sync>;
 
 /// The replacement scans of a connection.
 #[derive(Clone, Default)]

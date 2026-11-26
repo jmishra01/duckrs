@@ -2805,7 +2805,7 @@ impl Binder<'_> {
         self.bind_rewritten(&select, table_ref, &name)
     }
 
-    fn bind_unsampled_table_ref(&mut self, table_ref: &TableRef) -> Result<LogicalOperator> {
+    pub(super) fn bind_unsampled_table_ref(&mut self, table_ref: &TableRef) -> Result<LogicalOperator> {
         let TableRefKind::TableFunction { function, .. } = &table_ref.kind else {
             return self.bind_unsampled_table_ref_inner(table_ref);
         };
@@ -3108,9 +3108,14 @@ impl Binder<'_> {
                         .map(|session| session.replacement_scans.clone())
                         .unwrap_or_default();
                     for scan in scans {
-                        if let Some(rows) = scan(&name.name) {
-                            let (names, types, chunks) = rows?;
-                            return self.bind_chunks(table_ref, &name.name, names, types, chunks);
+                        match scan(&name.name).transpose()? {
+                            None => {}
+                            Some(super::Replacement::Rows((names, types, chunks))) => {
+                                return self.bind_chunks(table_ref, &name.name, names, types, chunks);
+                            }
+                            Some(super::Replacement::TableFunction { name: function, parameters }) => {
+                                return self.bind_replacement_function(table_ref, &name.name, &function, &parameters);
+                            }
                         }
                     }
                 }
