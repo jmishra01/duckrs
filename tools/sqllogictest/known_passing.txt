@@ -545,6 +545,7 @@ test/optimizer/distributivity_rule.test
 test/optimizer/eager_aggregate_execution.test
 test/optimizer/eager_aggregate_execution_parquet.test
 test/optimizer/estimated_cardinalities_are_in_logical_plan.test
+test/optimizer/estimated_cardinalities_through_struct_extract.test
 test/optimizer/expression_rewriter/functions_that_error_are_not_reordered.test
 test/optimizer/expression_rewriter/ordered_aggregate_incorrectly_remove_order.test
 test/optimizer/filter_pushdown/filter_pushdown_into_subquery.test
@@ -600,6 +601,7 @@ test/optimizer/joins/test_delim_join_with_cross_product_in_rhs.test
 test/optimizer/joins/test_logical_get_with_unnest.test
 test/optimizer/joins/test_must_apply_residual_predicate.test
 test/optimizer/joins/test_tpcds_pushdown.test
+test/optimizer/joins/tpcds_nofail.test
 test/optimizer/joins/unsupported_conjunct_selectivity.test
 test/optimizer/joins/wide_build_skinny_probe.test
 test/optimizer/joins/zero_column_filter_reconstruction.test
@@ -612,6 +614,7 @@ test/optimizer/needle_optimizer.test
 test/optimizer/not_in_null.test
 test/optimizer/optimize_unsigned_vs_signed_ints.test
 test/optimizer/ordered_aggregate.test
+test/optimizer/outer_join_simplification.test
 test/optimizer/outer_join_simplification_anti_on_filter.test
 test/optimizer/parquet_cardinality_bounds.test
 test/optimizer/partial_aggregate_precomputation.test
@@ -2217,6 +2220,7 @@ test/sql/cte/materialized/cte_streaming_over_materialization.test
 test/sql/cte/materialized/dml_materialized_cte.test
 test/sql/cte/materialized/incorrect_recursive_cte_materialized.test
 test/sql/cte/materialized/internal_3004.test
+test/sql/cte/materialized/materialized_cte_modifiers.test
 test/sql/cte/materialized/materialized_cte_prepared.test
 test/sql/cte/materialized/recursive_array_slice_materialized.test
 test/sql/cte/materialized/recursive_cte_complex_pipelines.test
@@ -2352,6 +2356,7 @@ test/sql/export/parquet/export_parquet_map.test
 test/sql/export/parquet/export_parquet_struct.test
 test/sql/export/parquet_export.test
 test/sql/extensions/concurrent_failed_aliased_load.test
+test/sql/extensions/require_direct_load.test
 test/sql/filter/between_nested_exponential.test
 test/sql/filter/default_boolean_selection.test
 test/sql/filter/dense_integral_selection.test
@@ -3410,6 +3415,7 @@ test/sql/optimizer/plan/test_except_empty_rhs.test
 test/sql/optimizer/plan/test_filter_pushdown.test
 test/sql/optimizer/plan/test_filter_pushdown_duplicate.test
 test/sql/optimizer/plan/test_filter_pushdown_large.test
+test/sql/optimizer/plan/test_filter_pushdown_materialized_cte.test
 test/sql/optimizer/plan/test_recursive_build_side_probe_side.test
 test/sql/optimizer/plan/test_recursive_join_order_guard.test
 test/sql/optimizer/plan/test_table_filter_pushdown.test
@@ -3425,6 +3431,8 @@ test/sql/optimizer/scalar_aggregate_merge.test
 test/sql/optimizer/scalar_aggregate_merge_files.test
 test/sql/optimizer/scalar_aggregate_merge_files_plan.test
 test/sql/optimizer/scalar_aggregate_merge_plan.test
+test/sql/optimizer/scalar_aggregate_merge_tpcds.test
+test/sql/optimizer/scalar_aggregate_merge_tpcds_plan.test
 test/sql/optimizer/secure_view_explain.test
 test/sql/optimizer/secure_view_fallible_functions.test
 test/sql/optimizer/secure_view_join_order.test
@@ -3454,6 +3462,7 @@ test/sql/optimizer/test_common_subplan_repeatability.test
 test/sql/optimizer/test_common_subplan_repeatability_json.test
 test/sql/optimizer/test_common_subplan_repeatability_readers.test
 test/sql/optimizer/test_common_subplan_repeatability_system.test
+test/sql/optimizer/test_common_subplan_repeatability_tpcds.test
 test/sql/optimizer/test_common_subplan_repeatability_tpch.test
 test/sql/optimizer/test_common_subplan_scan_filters.test
 test/sql/optimizer/test_common_subplan_self_join.test
@@ -3541,6 +3550,7 @@ test/sql/parallelism/interquery/concurrent_index_scans_while_appending.test
 test/sql/parallelism/interquery/concurrent_reads_while_altering.test
 test/sql/parallelism/interquery/concurrent_reads_while_renaming.test
 test/sql/parallelism/interquery/concurrent_set_async_threads_read_ahead.test
+test/sql/parallelism/intraquery/depth_first_evaluation_union_and_join.test
 test/sql/parallelism/intraquery/error_in_pipeline.test
 test/sql/parallelism/intraquery/parallel_sample.test
 test/sql/parallelism/intraquery/test_parallel_nested_aggregates.test
@@ -4718,6 +4728,10 @@ test/sql/topn/top_n_pruning_read_ahead.test
 test/sql/topn/topn_dynamic_filter_cast.test
 test/sql/topn/tpcds_q14_topn.test
 test/sql/topn/tpcds_q59_topn.test
+test/sql/tpcds/dsdgen_readonly.test
+test/sql/tpcds/dsdgen_sync_scan.test
+test/sql/tpcds/tpcds_queries_sf.test
+test/sql/tpcds/tpcds_sf0.test
 test/sql/tpch/dbgen_readonly.test
 test/sql/tpch/dbgen_reference_values.test
 test/sql/tpch/tpch_queries_sf.test

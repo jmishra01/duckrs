@@ -264,7 +264,7 @@ fn change_field(
 }
 
 /// The expression of `sql`.
-fn parse_expression(sql: &str) -> Result<Expr> {
+pub(super) fn parse_expression(sql: &str) -> Result<Expr> {
     let statements = duckrs_parser::parse_ast(&format!("SELECT {sql}"))?;
     if let [ast::Statement::Select(select)] = statements.as_slice()
         && let ast::QueryNodeKind::Select(node) = &select.node.kind

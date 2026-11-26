@@ -1,8 +1,9 @@
-// Ported from duckdb/extension/tpch/tpch_extension.cpp @ rust-port-baseline
+// Ported from duckdb/extension/tpch/tpch_extension.cpp and duckdb/extension/tpcds/tpcds_extension.cpp
+// @ rust-port-baseline
 //
-//! The table functions of the `tpch` extension that only return text: `tpch_queries` and
-//! `tpch_answers`. `CALL dbgen` creates and fills tables, so the client runs it
-//! (`duckrs-main`'s `tpc` module).
+//! The table functions of the `tpch` and `tpcds` extensions that only return text:
+//! `tpch_queries`, `tpch_answers`, `tpcds_queries` and `tpcds_answers`. `CALL dbgen` and
+//! `CALL dsdgen` create and fill tables, so the client runs them (`duckrs-main`'s `tpc` module).
 
 use super::{Binder, binder_error};
 use crate::planner::expression::BoundExpr;
@@ -30,7 +31,7 @@ impl Binder<'_> {
                         Some(sf) => duckrs_tpch::get_query_for_sf(query, sf)?,
                         None => duckrs_tpch::get_query(query)?.to_string(),
                     };
-                    rows.push(vec![Value::integer(query), Value::varchar(text)]);
+                    rows.push(constants(vec![Value::integer(query), Value::varchar(text)]));
                 }
                 (
                     vec!["query_nr", "query"],
@@ -45,7 +46,54 @@ impl Binder<'_> {
                 for sf in duckrs_tpch::TPCH_ANSWER_SCALE_FACTORS {
                     for query in 1..=duckrs_tpch::TPCH_QUERIES_COUNT {
                         let answer = duckrs_tpch::get_answer(sf, query)?;
-                        rows.push(vec![Value::integer(query), Value::double(sf), Value::varchar(answer)]);
+                        rows.push(constants(vec![
+                            Value::integer(query),
+                            Value::double(sf),
+                            Value::varchar(answer),
+                        ]));
+                    }
+                }
+                (
+                    vec!["query_nr", "scale_factor", "answer"],
+                    vec![LogicalType::INTEGER, LogicalType::DOUBLE, LogicalType::VARCHAR],
+                    rows,
+                )
+            }
+            "tpcds_queries" => {
+                let sf = self.query_scale_factor(name, args)?;
+                let count = duckrs_tpcds::QUERIES_COUNT as i32;
+                let mut rows = Vec::with_capacity(count as usize);
+                for query in 1..=count {
+                    // `TPCDSQueriesBindData::GetQuery`
+                    let text = match sf {
+                        Some(sf) => duckrs_tpcds::query_for_scale(query, sf)?,
+                        None => duckrs_tpcds::query(query)?.to_string(),
+                    };
+                    rows.push(constants(vec![Value::integer(query), Value::varchar(text)]));
+                }
+                (
+                    vec!["query_nr", "query"],
+                    vec![LogicalType::INTEGER, LogicalType::VARCHAR],
+                    rows,
+                )
+            }
+            "tpcds_answers" => {
+                self.no_arguments(name, args)?;
+                let count = duckrs_tpcds::QUERIES_COUNT as i32;
+                let mut rows = Vec::new();
+                // `TPCDSQueryAnswerFunction`: C++ lists scale factors it has no answers for (10), whose
+                // `GetAnswer` throws when the scan reaches them, not when it is bound
+                for sf in duckrs_tpcds::TPCDS_ANSWERS_SCALE_FACTORS {
+                    for query in 1..=count {
+                        let answer = match duckrs_tpcds::answer(sf, query) {
+                            Ok(answer) => BoundExpr::constant(Value::varchar(answer)),
+                            Err(error) => self.runtime_error(&error)?,
+                        };
+                        rows.push(vec![
+                            BoundExpr::constant(Value::integer(query)),
+                            BoundExpr::constant(Value::double(sf)),
+                            answer,
+                        ]);
                     }
                 }
                 (
@@ -106,7 +154,7 @@ impl Binder<'_> {
         name: &str,
         names: Vec<String>,
         types: Vec<LogicalType>,
-        rows: Vec<Vec<Value>>,
+        expressions: Vec<Vec<BoundExpr>>,
     ) -> Result<LogicalOperator> {
         let alias = if table_ref.alias.is_empty() {
             name.to_string()
@@ -126,10 +174,6 @@ impl Binder<'_> {
             virtual_columns: Vec::new(),
             generated: Vec::new(),
         });
-        let expressions = rows
-            .into_iter()
-            .map(|row| row.into_iter().map(BoundExpr::constant).collect())
-            .collect();
         Ok(LogicalOperator::new(
             LogicalOperatorKind::ExpressionGet {
                 function: None,
@@ -142,6 +186,19 @@ impl Binder<'_> {
             vec![],
         ))
     }
+}
+
+impl Binder<'_> {
+    /// A VARCHAR expression that fails with `error` when it is evaluated.
+    fn runtime_error(&mut self, error: &Error) -> Result<BoundExpr> {
+        let message = error.message.replace('\'', "''");
+        let expr = super::alter_fields::parse_expression(&format!("error('{message}')::VARCHAR"))?;
+        self.bind_expression(&expr)
+    }
+}
+
+fn constants(values: Vec<Value>) -> Vec<BoundExpr> {
+    values.into_iter().map(BoundExpr::constant).collect()
 }
 
 /// `Value::GetValue<double>`, as the argument of a DOUBLE parameter is cast.

@@ -4698,13 +4698,13 @@ impl ClientContext {
                 settings::reset_variable(name, *scope, &mut global, &mut self.settings)?;
                 return Ok(Self::success());
             }
-            // `PRAGMA tpch(n)` runs TPC-H query n
+            // `PRAGMA tpch(n)` / `PRAGMA tpcds(n)` run query n of the benchmark
             Statement::Pragma(PragmaInfo {
                 parameters,
                 named_parameters,
                 ..
-            }) if tpc::is_tpch_pragma(statement) => {
-                return self.run_tpch_pragma(parameters, named_parameters);
+            }) if let Some(benchmark) = tpc::query_pragma(statement) => {
+                return self.run_query_pragma(benchmark, parameters, named_parameters);
             }
             Statement::Pragma(PragmaInfo {
                 name,
@@ -4941,9 +4941,10 @@ impl ClientContext {
             Statement::Call(function) if checkpoint_call(function).is_some() => {
                 return self.checkpoint(function);
             }
-            // the `tpch` extension, compiled in: `CALL dbgen(...)` creates the TPC-H tables and fills them
-            Statement::Call(function) if tpc::is_dbgen_call(function) => {
-                return self.run_dbgen(function);
+            // the `tpch` and `tpcds` extensions, compiled in: `CALL dbgen(...)` / `CALL dsdgen(...)` create
+            // the benchmark's tables and fill them
+            Statement::Call(function) if let Some(benchmark) = tpc::generator_call(function) => {
+                return self.run_generator(benchmark, function);
             }
             // `lock_configuration`: what changes the configuration is refused before it runs
             Statement::Call(function)
@@ -4978,7 +4979,7 @@ impl ClientContext {
                 if matches!(
                     info.load_type,
                     duckrs_parser::ast::LoadType::Load | duckrs_parser::ast::LoadType::Install
-                ) && ["parquet", "json", "tpch"]
+                ) && ["parquet", "json", "tpch", "tpcds"]
                     .iter()
                     .any(|name| info.filename.eq_ignore_ascii_case(name)) =>
             {
