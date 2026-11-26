@@ -316,6 +316,10 @@ impl Binder<'_> {
                 ));
             }
         }
+        // `CatalogSet::RenameEntryInternal` finds a name that is taken before the dependencies are looked at
+        if let AlterKind::RenameTable(new_name) = &info.kind {
+            Self::check_rename(&schema, &table.name, new_name)?;
+        }
         // `DependencyManager::AlterObject`
         let has_dependents = schema.is_referenced(&table) || !table.indexes.read().is_empty();
         if has_dependents

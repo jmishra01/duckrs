@@ -638,7 +638,7 @@ fn replace_unpacked(expr: &mut Expr, columns: &[Expr]) -> Result<()> {
         ExprKind::Operator { op, children }
             if !matches!(
                 op,
-                OperatorType::Coalesce | OperatorType::In | OperatorType::NotIn | OperatorType::ArrayConstructor
+                OperatorType::Coalesce | OperatorType::In | OperatorType::NotIn
             ) && children.iter().any(is_unpack) =>
         {
             let name = match op {
@@ -650,6 +650,8 @@ fn replace_unpacked(expr: &mut Expr, columns: &[Expr]) -> Result<()> {
                 OperatorType::ArrayExtract => "ARRAY_EXTRACT",
                 OperatorType::ArraySlice => "ARRAY_SLICE",
                 OperatorType::StructExtract => "STRUCT_EXTRACT",
+                // `construct_array(...)` and `ARRAY[...]`; a list `[...]` is a call of `list_value`
+                OperatorType::ArrayConstructor => "ARRAY_CONSTRUCTOR",
                 _ => "GROUPING_FUNCTION",
             };
             error.get_or_insert_with(|| {

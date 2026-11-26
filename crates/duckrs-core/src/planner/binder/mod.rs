@@ -1062,6 +1062,9 @@ pub struct Binder<'a> {
     /// The select list aliases of the queries around this subquery, innermost last, with their
     /// columns qualified, and whether they come from a select list (`ExpressionBinder::BindInEnclosingScope`).
     outer_aliases: Vec<(String, duckrs_parser::ast::Expr, bool)>,
+    /// The aliases of the queries around this one that it can't name, with the error that naming one is: those of a
+    /// HAVING (`HavingBinder::BindColumnRef`), and all of them in a LIMIT (`BindLimitValue`).
+    refused_aliases: Vec<(String, String)>,
     /// The left sides of the joins whose right side is being bound. Their columns are out of
     /// reach until LATERAL exists, which is a missing feature and not a bad column.
     left_of_join: Vec<BindContext>,
@@ -1200,6 +1203,7 @@ impl<'a> Binder<'a> {
             alias_fallback: Vec::new(),
             later_select_aliases: None,
             outer_aliases: Vec::new(),
+            refused_aliases: Vec::new(),
             left_of_join: Vec::new(),
             null_extended: std::collections::HashSet::new(),
             inside_try: false,
@@ -1329,6 +1333,7 @@ impl<'a> Binder<'a> {
         binder.ctes_being_bound = self.ctes_being_bound.clone();
         binder.outer_contexts = self.outer_contexts.clone();
         binder.outer_aliases = self.outer_aliases.clone();
+        binder.refused_aliases = self.refused_aliases.clone();
         binder.session = self.session.clone();
         binder.correlated = self.correlated.clone();
         binder.working_tables = self.working_tables.clone();

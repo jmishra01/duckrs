@@ -1788,8 +1788,23 @@ impl Binder<'_> {
                 let mut qualify = qualify.clone();
                 self.normalize_filter_stars(&mut qualify)?;
                 let qualify = self.qualified_with_aliases(&qualify, &state);
+                let (columns_before, aggregate_before) = {
+                    let aggregates = self.aggregates.as_mut().expect("set above");
+                    (
+                        aggregates.bound_columns.len(),
+                        std::mem::replace(&mut aggregates.bound_aggregate, false),
+                    )
+                };
                 let bound = self.bind_expression(&qualify);
                 self.alias_fallback.clear();
+                // `QualifyBinder`: a QUALIFY that reads columns can't aggregate too
+                {
+                    let aggregates = self.aggregates.as_mut().expect("set above");
+                    if bound.is_ok() && aggregates.bound_columns.len() > columns_before && aggregates.bound_aggregate {
+                        return Err(binder_error("Cannot mix aggregates with non-aggregated columns!"));
+                    }
+                    aggregates.bound_aggregate |= aggregate_before;
+                }
                 // `QualifyBinder::BindColumnRef`: a column that is neither in FROM nor an alias
                 let bound = bound.map_err(|error| {
                     let missing = error
@@ -2136,6 +2151,28 @@ impl Binder<'_> {
         let mut binder = self.child_binder();
         binder.inline_ctes();
         binder.correlated = Arc::default();
+        // an alias of a query around it whose expression reads its columns or aggregates is a correlated column too
+        // (one of a constant just binds again)
+        let correlated_alias = |aliased: &Expr| {
+            let mut reads = false;
+            visit_expr_mut(&mut aliased.clone(), &mut |e| match &e.kind {
+                ExprKind::ColumnRef(_) => reads = true,
+                ExprKind::Function(f) if !f.is_operator => {
+                    reads |= crate::function::BuiltinFunctions::get().aggregate(&f.name.name).is_some();
+                }
+                _ => {}
+            });
+            reads
+        };
+        let (refused, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut binder.outer_aliases)
+            .into_iter()
+            .partition(|(_, aliased, _)| correlated_alias(aliased) && !super::pivot::has_subquery(aliased));
+        binder.outer_aliases = kept;
+        for (alias, ..) in refused {
+            binder
+                .refused_aliases
+                .push((alias, "Correlated columns not supported in LIMIT/OFFSET".to_string()));
+        }
         let bound = binder.bind_expression(expr)?;
         if !binder.correlated.lock().is_empty() {
             return Err(binder_error("Correlated columns not supported in LIMIT/OFFSET"));

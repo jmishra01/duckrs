@@ -935,7 +935,15 @@ impl Binder<'_> {
             }
             let mut binder = self.child_binder();
             binder.outer_contexts.push(context);
+            let in_having = self.aggregates.as_ref().is_some_and(|a| a.mode == super::ColumnMode::Having);
             for (alias, aliased) in &self.alias_fallback {
+                if in_having {
+                    binder.refused_aliases.push((
+                        alias.clone(),
+                        format!("Having clause cannot reference alias {alias} in correlated subquery"),
+                    ));
+                    continue;
+                }
                 let mut aliased = aliased.clone();
                 self.qualify_column_names(&mut aliased);
                 binder
@@ -1631,6 +1639,9 @@ impl Binder<'_> {
                     "Column \"{name}\" referenced that exists in the SELECT clause - but this column cannot be \
                      referenced before it is defined"
                 )));
+            }
+            if let Some((_, error)) = self.refused_aliases.iter().rev().find(|(a, _)| a.eq_ignore_ascii_case(name)) {
+                return Err(binder_error(error.clone()));
             }
             // an alias of a query around this one
             let Some(position) = self

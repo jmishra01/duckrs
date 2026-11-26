@@ -424,6 +424,14 @@ pub fn verify_append(
     chunk: &DataChunk,
     first_new_row: usize,
 ) -> Result<()> {
+    // `DataTable::AppendToIndexes`: every index takes the keys of the rows, which an expression of one can fail to
+    // compute; C++ appends to them at the commit
+    for index in table.indexes.read().iter().filter(|index| !index.unique) {
+        for expression in index.expressions.iter().filter(|e| crate::optimizer::can_throw(e)) {
+            super::expression_executor::execute(expression, chunk)
+                .map_err(|error| Error::new(ErrorKind::Transaction, format!("Failed to commit: {}", error.message)))?;
+        }
+    }
     if table.constraints.is_empty() && !table.indexes.read().iter().any(|index| index.unique) {
         return Ok(());
     }
