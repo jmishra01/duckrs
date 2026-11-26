@@ -14,6 +14,8 @@ mod external_resources;
 mod logging;
 mod secret;
 pub mod settings;
+mod statement_type;
+pub use statement_type::{StatementProperties, StatementReturnType, StatementType};
 mod settings_table;
 mod tpc;
 
@@ -1670,9 +1672,28 @@ pub struct PreparedStatementData {
     parameters: Vec<String>,
     /// what `duckdb_prepared_statements()` gives as its result types
     result_types: Option<Vec<String>>,
+    /// the names and types of its result, when it bound when it was prepared (`PreparedStatement::GetNames`,
+    /// `GetTypes`); a parameter whose type is not known yet leaves the type of its column unknown
+    columns: Option<(Vec<String>, Vec<LogicalType>)>,
     /// `default_collation` when it was prepared, which its plan keeps if it was bound then; a statement bound again
     /// when it runs (`RequireRebind`) follows the setting of then
     default_collation: Option<String>,
+}
+
+impl PreparedStatementData {
+    /// The names of its parameters, lowercase, in the order they appear (`1`, `2`, ... for `?` and `$1`).
+    pub fn result_columns(&self) -> Option<(&[String], &[LogicalType])> {
+        self.columns.as_ref().map(|(names, types)| (names.as_slice(), types.as_slice()))
+    }
+
+    pub fn parameter_names(&self) -> &[String] {
+        &self.parameters
+    }
+
+    /// `PreparedStatement::GetStatementType` and `GetStatementProperties().return_type`.
+    pub fn properties(&self) -> StatementProperties {
+        statement_type::statement_properties(&self.statement, &|_| None)
+    }
 }
 
 impl ClientContext {
@@ -2026,7 +2047,28 @@ impl ClientContext {
     /// `ClientContext::Query`: runs every statement in `sql` and returns the last result.
     /// `ClientContext::TableInfo`: the name and type of each column of a table, for an `Appender`.
     pub fn table_columns(&self, schema: Option<&str>, table: &str) -> Result<Vec<(String, LogicalType)>> {
-        let catalog = self.catalog();
+        self.table_columns_in(None, schema, table)
+    }
+
+    /// The catalog of the database named `catalog` (this connection's own without a name).
+    fn catalog_named(&self, catalog: Option<&str>) -> Result<Arc<Catalog>> {
+        match catalog {
+            Some(name) if !name.is_empty() && !name.eq_ignore_ascii_case(&self.db.name) => self
+                .find_database(name)
+                .map(|db| db.catalog.clone())
+                .ok_or_else(|| Error::new(ErrorKind::Catalog, format!("Catalog \"{name}\" does not exist!"))),
+            _ => Ok(self.catalog()),
+        }
+    }
+
+    /// [`Self::table_columns`] of a table in the database named `catalog`.
+    pub fn table_columns_in(
+        &self,
+        catalog: Option<&str>,
+        schema: Option<&str>,
+        table: &str,
+    ) -> Result<Vec<(String, LogicalType)>> {
+        let catalog = self.catalog_named(catalog)?;
         let _search_path = duckrs_core::catalog::SearchPathGuard::set(self.search_path_for(&self.db.name.clone()));
         let entry = catalog.get_table(schema, table).map_err(|_| {
             Error::new(
@@ -2044,6 +2086,28 @@ impl ClientContext {
             .collect())
     }
 
+    /// `Appender`'s `default_values`: the DEFAULT of each column of a table folded to a constant, NULL for a column
+    /// without one, and `None` for a default that does not fold (as `nextval` or `now()`).
+    pub fn table_column_defaults(
+        &self,
+        catalog: Option<&str>,
+        schema: Option<&str>,
+        table: &str,
+    ) -> Result<Vec<Option<Value>>> {
+        let catalog = self.catalog_named(catalog)?;
+        let _search_path = duckrs_core::catalog::SearchPathGuard::set(self.search_path_for(&self.db.name.clone()));
+        let entry = catalog.get_table(schema, table)?;
+        Ok(entry
+            .columns
+            .iter()
+            .map(|column| match &column.default_value {
+                None => Some(Value::null(column.ty.clone())),
+                Some(default) if default.is_foldable() => evaluate_scalar(default).ok(),
+                Some(_) => None,
+            })
+            .collect())
+    }
+
     /// Adds a replacement scan: tables the catalog does not have that `scan` gives rows for.
     pub fn add_replacement_scan(&mut self, scan: duckrs_core::planner::binder::ReplacementScan) {
         self.replacement_scans.0.push(scan);
@@ -2057,11 +2121,29 @@ impl ClientContext {
         columns: Vec<(String, LogicalType)>,
         chunks: Vec<duckrs_common::vector::DataChunk>,
     ) -> Result<()> {
+        self.append_in(None, schema, table, columns, chunks)
+    }
+
+    /// [`Self::append`] to a table in the database named `catalog`.
+    pub fn append_in(
+        &mut self,
+        catalog: Option<&str>,
+        schema: Option<&str>,
+        table: &str,
+        columns: Vec<(String, LogicalType)>,
+        chunks: Vec<duckrs_common::vector::DataChunk>,
+    ) -> Result<()> {
         let quote = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
-        let target = match schema {
+        let mut target = match schema {
             Some(schema) => format!("{}.{}", quote(schema), quote(table)),
             None => quote(table),
         };
+        if let Some(catalog) = catalog.filter(|c| !c.is_empty()) {
+            if schema.is_none() {
+                target = format!("{}.{}", quote("main"), target);
+            }
+            target = format!("{}.{target}", quote(catalog));
+        }
         let column_list = columns
             .iter()
             .map(|(name, _)| quote(name))
@@ -2334,6 +2416,7 @@ impl ClientContext {
         );
         let mut bound_at_prepare = false;
         let mut result_types = None;
+        let mut columns = None;
         if !client_statement {
             let catalog = self.catalog();
             let mut binder = Binder::with_options(&catalog, self.bind_options());
@@ -2342,6 +2425,7 @@ impl ClientContext {
             let bound = match dml_cte::split(&statement) {
                 Some((ctes, rest)) => self.bind_dml_ctes(&ctes, &rest, &parameters),
                 None => binder.bind(&statement).map(|bound| {
+                    columns = Some((bound.names.clone(), bound.types.clone()));
                     use duckrs_core::planner::binder::StatementReturnType;
                     // `DuckDBPreparedStatementsFunction`: the types of a plan that was kept, which one that reads
                     // the data of the database is not (the statistics it was planned with could change)
@@ -2391,10 +2475,57 @@ impl ClientContext {
             statement,
             parameters: seen,
             result_types,
+            columns,
             // with parameters, `RequireRebind` binds again whenever a value's type is not the one bound, which duckrs
             // does not track: such a statement is taken to be bound again
             default_collation: (bound_at_prepare && !has_parameters).then(|| self.setting_text("default_collation")),
         }))
+    }
+
+    /// `StatementProperties` of the last statement of `sql`: its type, and what its result holds. `None` when
+    /// `sql` doesn't parse.
+    pub fn statement_properties(&self, sql: &str) -> Option<StatementProperties> {
+        let statements = duckrs_parser::parse_ast_with(sql, &self.parser_options()).ok()?;
+        Some(self.properties_of(statements.last()?))
+    }
+
+    /// `Connection::ExtractStatements`: the text of each statement of `sql`, to prepare one at a time.
+    /// A parser error ends the transaction as a query's would (`ApplyInvalidationPolicy`).
+    pub fn extract_statements(&mut self, sql: &str) -> Result<Vec<String>> {
+        match duckrs_parser::parse_ast_with_text(sql, &self.parser_options()) {
+            Ok(statements) => Ok(statements.into_iter().map(|(_, text)| text).collect()),
+            Err(error) => {
+                if let Some(transaction) = &mut self.transaction {
+                    transaction.apply_invalidation_policy(error.kind);
+                }
+                Err(self.process_error(&error, sql))
+            }
+        }
+    }
+
+    fn properties_of(&self, statement: &Statement) -> StatementProperties {
+        statement_type::statement_properties(statement, &|name| {
+            let prepared = self.prepared_statements.get(&name.to_lowercase())?;
+            Some(self.properties_of(&prepared.statement))
+        })
+    }
+
+    /// `PreparedStatement::Execute` with values for parameters by name (`1`, `2`, ... for positional ones). Each
+    /// value is of the type it has (`BoundParameterData`), not a literal that may take the type its use asks for.
+    pub fn execute_prepared_named(
+        &mut self,
+        prepared: &PreparedStatementData,
+        values: HashMap<String, Value>,
+    ) -> Result<MaterializedQueryResult> {
+        let _temp = SessionTemp::enter(&self.temp);
+        let values: HashMap<String, Value> =
+            values.into_iter().map(|(name, value)| (name.to_lowercase(), value)).collect();
+        let typed = values
+            .iter()
+            .filter(|(_, value)| !value.is_null())
+            .map(|(name, _)| name.clone())
+            .collect();
+        self.execute_with(prepared, values, typed)
     }
 
     /// `PreparedStatement::Execute` with values for parameters `1`, `2`, ...

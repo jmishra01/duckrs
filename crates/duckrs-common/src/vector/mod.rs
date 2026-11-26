@@ -265,6 +265,13 @@ impl Vector {
         Arc::make_mut(&mut self.flat_mut().data).as_mut_slice::<u8>()
     }
 
+    /// The values of a flat or constant vector of any type as a pointer to their first byte, for handing them to C
+    /// (the C API's `duckdb_vector_get_data`); copies the buffer first if it is shared. Obtaining the pointer is safe;
+    /// whoever writes through it must keep to the layout of the vector's physical type.
+    pub fn data_ptr_mut(&mut self) -> *mut u8 {
+        Arc::make_mut(&mut self.flat_mut().data).as_mut_slice::<u8>().as_mut_ptr()
+    }
+
     /// Mutable strings of a flat VARCHAR/BLOB vector.
     ///
     /// # Safety

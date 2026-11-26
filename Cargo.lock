@@ -764,6 +764,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "duckrs-capi"
+version = "0.0.1"
+dependencies = [
+ "duckrs",
+ "duckrs-common",
+ "libc",
+]
+
+[[package]]
 name = "duckrs-cli"
 version = "0.0.1"
 dependencies = [

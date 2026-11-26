@@ -1,0 +1,8 @@
+# Test cases of DuckDB's C API tests that cannot compile without DuckDB's C++ internals, and are left out of the run.
+# <file>|<test case name>|<why>
+test_capi.cpp|Test C API config|reads DBConfig::options behind the duckdb_config handle
+test_capi_complex_types.cpp|Logical types with aliases|registers the type through DuckDB's C++ Catalog and Connection::context
+test_capi_extract.cpp|Test extract statements for 'ALTER TABLE ... ADD COLUMN ... DEFAULT' in C API|reads the ExtractStatementsWrapper behind the handle
+test_capi_data_chunk.cpp|Test DataChunk populate ListVector in C API|reads the C++ Vector behind the duckdb_vector handle
+test_capi_data_chunk.cpp|Test DataChunk populate ArrayVector in C API|reads the C++ Vector behind the duckdb_vector handle
+test_capi_appender.cpp|Test the appender with parallel appends and multiple data types in the C API|takes its types from DuckDB's C++ TestAllTypesFun
