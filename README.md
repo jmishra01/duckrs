@@ -2,7 +2,7 @@
 
 An analytical SQL database engine: a port of [DuckDB](https://github.com/duckdb/duckdb) to Rust.
 
-**Status: 5558 files pass, 91.3% of the 6,090 that run (6,367 in all, 277 skipped), against DuckDB's test suite at baseline `d4eea3f208d`.** That meets the overall v1 target of 90%. The phase gates are met (`test/parquet` at 85.6% against 80%; the CTE gate counts as met at 84%). Still open for v1: the C API and one more TPC-H SF10 run on a quiet machine (the last gave 0.58× of C++'s time against a 1.5× limit). Extensions (`LOAD`, ICU, httpfs, ...) come after v1. Per-directory numbers are in [`docs/STATUS.md`](docs/STATUS.md), and what is left in [`docs/REMAINING_WORK.md`](docs/REMAINING_WORK.md).
+**Status: 5572 files pass, 91.5% of the 6,090 that run (6,367 in all, 277 skipped), against DuckDB's test suite at baseline `d4eea3f208d`.** That meets the overall v1 target of 90%. The phase gates are met (`test/parquet` at 85.6% against 80%; the CTE gate counts as met at 84%). Still open for v1: the rest of the C API (`crates/duckrs-capi` has 411 of the 548 functions of `duckdb.h`, and passes 119 of 133 test cases of DuckDB's C API tests; see item 41 of REMAINING_WORK) and one more TPC-H SF10 run on a quiet machine (the last gave 0.58× of C++'s time against a 1.5× limit). Extensions (`LOAD`, ICU, httpfs, ...) come after v1. Per-directory numbers are in [`docs/STATUS.md`](docs/STATUS.md), and what is left in [`docs/REMAINING_WORK.md`](docs/REMAINING_WORK.md).
 
 What exists today:
 

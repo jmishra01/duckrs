@@ -3,7 +3,7 @@
 What is still missing from the roadmap in [`RUST_PORT_PLAN.md`](../../RUST_PORT_PLAN.md) §6.
 The test numbers come from [`STATUS.md`](STATUS.md) at baseline `d4eea3f208d`.
 
-- Overall: 5558 of 6367 test files pass (**91.3%** of the 6090 that run), on 2026-11-26. The v1 target is ≥ 90%.
+- Overall: 5572 of 6367 test files pass (**91.5%** of the 6090 that run), on 2026-11-26. The v1 target is ≥ 90%.
 - Phases 0–11 have code, and their gates are met: `test/parquet` is at 85.6% (95 of 111, gate 80%) since
   `bound_schema` (phase 82). `sql/cte` is at 84.0% against 85%, and counts as met for v1 (decided 2026-11-26; see item 23). The failing-file counts in the items below are from earlier runs; `STATUS.md` has the current ones.
 - Phase 12 is partly done. Phases 13 and 14 have not started.
