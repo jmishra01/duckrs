@@ -93,6 +93,10 @@ fn can_push(scan: &ParquetScanData, column: usize, expr: &BoundExpr) -> bool {
     {
         return false;
     }
+    // a declared column the file does not have as declared is not read as it is
+    if !crate::execution::parquet::bound_column_matches(scan, &scan.files[0], column) {
+        return false;
+    }
     // a filter pushed into the scan needs the column itself
     if scan
         .filters

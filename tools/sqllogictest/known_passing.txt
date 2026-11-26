@@ -328,6 +328,7 @@ test/issues/general/test_23940.test
 test/issues/general/test_24049.test
 test/issues/general/test_2407.test
 test/issues/general/test_2416.test
+test/issues/general/test_24204.test
 test/issues/general/test_24212.test
 test/issues/general/test_24245.test
 test/issues/general/test_24298.test
@@ -762,6 +763,13 @@ test/parquet/dlba_utf8_boundaries.test
 test/parquet/gzip_footer_oob.test
 test/parquet/issue_22144.test
 test/parquet/min_max_long_varchar_22515.test
+test/parquet/parquet_bound_schema_filter_mapping.test
+test/parquet/parquet_bound_schema_nested_roles.test
+test/parquet/parquet_bound_schema_plans.test
+test/parquet/parquet_bound_schema_roles.test
+test/parquet/parquet_bound_schema_roundtrip.test
+test/parquet/parquet_bound_schema_statistics.test
+test/parquet/parquet_bound_schema_validation.test
 test/parquet/parquet_combine.test
 test/parquet/parquet_extract_pushdown.test
 test/parquet/parquet_schema_lossy_filter_cast.test
@@ -1953,6 +1961,7 @@ test/sql/copy/parquet/parquet_blob.test
 test/sql/copy/parquet/parquet_blob_string.test
 test/sql/copy/parquet/parquet_bloom_filter_corruption.test
 test/sql/copy/parquet/parquet_column_metadata_corruption.test
+test/sql/copy/parquet/parquet_column_statistics_option.test
 test/sql/copy/parquet/parquet_copy_failure_cleans_up.test
 test/sql/copy/parquet/parquet_copy_type_mismatch.test
 test/sql/copy/parquet/parquet_corrupt_stats.test
@@ -2001,6 +2010,7 @@ test/sql/copy/parquet/parquet_no_stats.test
 test/sql/copy/parquet/parquet_nullbyte.test
 test/sql/copy/parquet/parquet_pandas_date.test
 test/sql/copy/parquet/parquet_prefetch_overlapping_ranges.test
+test/sql/copy/parquet/parquet_pruned_file_stats.test
 test/sql/copy/parquet/parquet_pruned_first_file_cardinality.test
 test/sql/copy/parquet/parquet_read_options.test
 test/sql/copy/parquet/parquet_row_group_row_count.test
