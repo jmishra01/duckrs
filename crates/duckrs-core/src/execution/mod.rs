@@ -17,6 +17,7 @@ pub mod interrupt;
 pub mod group_table;
 pub mod join;
 pub mod join_filter;
+pub mod metric_catalog;
 pub mod json_scan;
 pub mod match_recognize;
 pub mod multi_file;

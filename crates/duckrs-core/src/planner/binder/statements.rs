@@ -3517,6 +3517,11 @@ impl Binder<'_> {
                 .bind_duckdb_logs(&name, call, table_ref)
                 .map(|op| table_function_rows(op, &name));
         }
+        if name == "pragma_metadata_info" {
+            return self
+                .bind_metadata_info(call, table_ref)
+                .map(|op| table_function_rows(op, &name));
+        }
         if name == "pragma_storage_info" {
             return self
                 .bind_storage_info(call, table_ref)

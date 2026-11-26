@@ -272,7 +272,15 @@ const LINKED_EXTENSIONS: [&str; 3] = ["core_functions", "json", "parquet"];
 
 const DESCRIBE_NAMES: [&str; 6] = ["column_name", "column_type", "null", "key", "default", "extra"];
 
-const SYSTEM_TABLES: [&str; 21] = [
+const SYSTEM_TABLES: [&str; 29] = [
+    "duckdb_eviction_queues",
+    "duckdb_available_metrics",
+    "duckdb_dependencies",
+    "duckdb_coordinate_systems",
+    "duckdb_connection_count",
+    "duckdb_approx_database_count",
+    "duckdb_variables",
+    "duckdb_grammar_extensions",
     "duckdb_functions",
     "duckdb_prepared_statements",
     "pragma_collations",
@@ -744,7 +752,11 @@ impl Binder<'_> {
             }
             "\"tables\"" => self.show_tables(table_ref, None),
             "__show_tables_expanded" => self.show_all_tables(table_ref),
-            "\"variables\"" => Err(crate::unported("SHOW VARIABLES")),
+            // `PragmaShowVariables`
+            "\"variables\"" => {
+                let select = parse_select("SELECT * FROM duckdb_variables()", "Expected a single SELECT statement")?;
+                self.bind_rewritten(&select, table_ref, "__show_select")
+            }
             _ => {
                 let name = name.clone();
                 let rows = self.describe_entry(&name)?;
@@ -1524,6 +1536,61 @@ impl Binder<'_> {
     }
 
     /// `pragma_storage_info`: the segments of a table in its file. Rows in memory have none.
+    /// `PragmaMetadataInfoBind`: the metadata blocks of a database (the default one), each with its 64 sub-blocks
+    /// and the ones that are free.
+    pub(super) fn bind_metadata_info(
+        &mut self,
+        call: &duckrs_parser::ast::FunctionExpr,
+        table_ref: &TableRef,
+    ) -> Result<LogicalOperator> {
+        const METADATA_BLOCK_COUNT: u64 = 64;
+        let name = match call.args.as_slice() {
+            [] => self.session.as_ref().map_or_else(String::new, |session| session.database.clone()),
+            [argument] if argument.name.is_empty() => {
+                let value = evaluate_scalar(&self.bind_expression(&argument.expr)?)?;
+                if value.is_null() {
+                    return Err(binder_error("Database argument for pragma_metadata_info cannot be NULL"));
+                }
+                value.try_to_string()?
+            }
+            _ => return Err(binder_error("pragma_metadata_info takes the name of a database")),
+        };
+        if name.eq_ignore_ascii_case("system") || name.eq_ignore_ascii_case(TEMP_SCHEMA) {
+            return Err(binder_error(format!("Database \"{name}\" does not have storage")));
+        }
+        let listing = self.catalog.databases().into_iter().find(|db| db.name.eq_ignore_ascii_case(&name));
+        let Some(listing) = listing else {
+            return Err(duckrs_common::Error::new(
+                duckrs_common::ErrorKind::Catalog,
+                format!("Catalog with name {name} does not exist!"),
+            ));
+        };
+        let rows = listing
+            .metadata_blocks
+            .iter()
+            .map(|&(block, free)| {
+                let free_list: Vec<Value> = (0..METADATA_BLOCK_COUNT)
+                    .filter(|index| free & (1u64 << index) != 0)
+                    .map(|index| Value::bigint(index as i64))
+                    .collect();
+                Ok(vec![
+                    Value::bigint(block as i64),
+                    Value::bigint(METADATA_BLOCK_COUNT as i64),
+                    Value::bigint(free_list.len() as i64),
+                    Value::list(LogicalType::BIGINT, free_list)?,
+                ])
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let names = ["block_id", "total_blocks", "free_blocks", "free_list"].map(String::from).to_vec();
+        let types = vec![
+            LogicalType::BIGINT,
+            LogicalType::BIGINT,
+            LogicalType::BIGINT,
+            LogicalType::list(LogicalType::BIGINT),
+        ];
+        self.bind_rows(table_ref, "pragma_metadata_info", names, types, rows)
+    }
+
     pub(super) fn bind_storage_info(
         &mut self,
         call: &duckrs_parser::ast::FunctionExpr,
@@ -2332,6 +2399,126 @@ impl Binder<'_> {
                 }
                 (vec![("user_agent", varchar.clone())], vec![vec![text(&agent)]])
             }
+            // `DuckDBMetricsFunction`: `MetricsManager::GetAllMetrics`, the metrics of the profiler and then one per
+            // optimizer
+            "duckdb_available_metrics" => {
+                let mut rows: Vec<Vec<Value>> = crate::execution::metric_catalog::INTERNAL_METRICS
+                    .iter()
+                    .map(|(name, kind, description, unit)| vec![text(name), text(kind), text(description), text(unit)])
+                    .collect();
+                for optimizer in OPTIMIZERS {
+                    rows.push(vec![
+                        text(&format!("optimizer.{optimizer}")),
+                        text("double"),
+                        text(&format!("Time spent in the {optimizer} optimizer")),
+                        text("seconds"),
+                    ]);
+                }
+                (
+                    vec![
+                        ("metric_name", varchar.clone()),
+                        ("metric_type", varchar.clone()),
+                        ("description", varchar.clone()),
+                        ("unit", varchar.clone()),
+                    ],
+                    rows,
+                )
+            }
+            // `DuckDBEvictionQueuesFunction`: duckrs's buffer managers cache the blocks of database files, least
+            // recently used first, which is the one queue there is (`BLOCK_AND_EXTERNAL_FILE`)
+            "duckdb_eviction_queues" => {
+                let (size, insertions) = self
+                    .catalog
+                    .databases()
+                    .iter()
+                    .filter_map(|database| database.cached_blocks)
+                    .fold((0u64, 0u64), |(size, total), (cached, inserted)| (size + cached, total + inserted));
+                (
+                    vec![
+                        ("queue_index", bigint.clone()),
+                        ("queue_type", varchar.clone()),
+                        ("approximate_size", bigint.clone()),
+                        ("dead_nodes", bigint.clone()),
+                        ("total_insertions", bigint.clone()),
+                    ],
+                    vec![vec![
+                        Value::bigint(0),
+                        text("BLOCK_AND_EXTERNAL_FILE"),
+                        Value::bigint(size as i64),
+                        Value::bigint(0),
+                        Value::bigint(insertions as i64),
+                    ]],
+                )
+            }
+            // `DuckDBConnectionCountFunction`
+            "duckdb_connection_count" => (
+                vec![("count", LogicalType::UBIGINT)],
+                vec![vec![Value::ubigint(self.session.as_ref().map_or(1, |s| s.connection_count))]],
+            ),
+            // `DuckDBApproxDatabaseCountFunction`
+            "duckdb_approx_database_count" => (
+                vec![("approx_count", LogicalType::UBIGINT)],
+                vec![vec![Value::ubigint(self.session.as_ref().map_or(3, |s| s.approx_database_count))]],
+            ),
+            // `DuckDBVariablesFunction`: the user variables of the connection
+            "duckdb_variables" => {
+                let mut variables: Vec<(String, Value)> = self
+                    .session
+                    .as_ref()
+                    .map(|session| session.variables.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                    .unwrap_or_default();
+                variables.sort_by(|a, b| a.0.cmp(&b.0));
+                let mut rows = Vec::with_capacity(variables.len());
+                for (name, value) in variables {
+                    let shown = if value.is_null() {
+                        Value::null(varchar.clone())
+                    } else {
+                        Value::varchar(value.try_to_string()?)
+                    };
+                    rows.push(vec![text(&name), shown, text(&value.logical_type().to_string())]);
+                }
+                (
+                    vec![("name", varchar.clone()), ("value", varchar.clone()), ("type", varchar.clone())],
+                    rows,
+                )
+            }
+            // `DuckDBCoordinateSystemsFunction`: the default systems of the system catalog. duckrs gives its entries no
+            // oids and has no WKT2 text of them, which are NULL
+            "duckdb_coordinate_systems" => (
+                vec![
+                    ("database_name", varchar.clone()),
+                    ("database_oid", bigint.clone()),
+                    ("schema_name", varchar.clone()),
+                    ("schema_oid", bigint.clone()),
+                    ("crs_oid", bigint.clone()),
+                    ("crs_name", varchar.clone()),
+                    ("auth_name", varchar.clone()),
+                    ("auth_code", varchar.clone()),
+                    ("projjson", varchar.clone()),
+                    ("wkt2_2019", varchar.clone()),
+                ],
+                duckrs_common::geometry_crs::default_coordinate_systems()
+                    .map(|(name, authority, code, projjson)| {
+                        vec![
+                            text("system"),
+                            Value::null(bigint.clone()),
+                            text("main"),
+                            Value::null(bigint.clone()),
+                            Value::null(bigint.clone()),
+                            text(name),
+                            text(authority),
+                            text(code),
+                            text(projjson),
+                            Value::null(varchar.clone()),
+                        ]
+                    })
+                    .collect(),
+            ),
+            // `DuckDBGrammarExtensionsFunction`: duckrs has no grammar extensions
+            "duckdb_grammar_extensions" => (
+                vec![("name", varchar.clone()), ("description", varchar.clone()), ("active", boolean.clone())],
+                Vec::new(),
+            ),
             // `DuckDBPreparedStatementsFunction`
             "duckdb_prepared_statements" => {
                 let list = LogicalType::list(varchar.clone());
@@ -2591,6 +2778,43 @@ impl Binder<'_> {
                         ("index_count", bigint.clone()),
                         ("check_constraint_count", bigint.clone()),
                         ("sql", varchar.clone()),
+                    ],
+                    rows,
+                )
+            }
+            // `DuckDBDependenciesFunction` of the default catalog: what the catalog knows to depend on what. duckrs keeps
+            // no dependency manager; its dependencies are those of an index on its table, which are automatic ('a')
+            "duckdb_dependencies" => {
+                let database = self.session.as_ref().map(|session| session.database.clone());
+                let mut rows = Vec::new();
+                for listed in self.listed_entries() {
+                    if database.as_ref().is_some_and(|name| !listed.database.eq_ignore_ascii_case(name)) {
+                        continue;
+                    }
+                    let TableOrView::Table(table) = &listed.entry else {
+                        continue;
+                    };
+                    for position in 0..table.indexes.read().len() {
+                        rows.push(vec![
+                            Value::bigint(0),
+                            Value::bigint(listed.oid * 1000 + position as i64),
+                            Value::integer(0),
+                            Value::bigint(0),
+                            Value::bigint(listed.oid),
+                            Value::integer(0),
+                            text("a"),
+                        ]);
+                    }
+                }
+                (
+                    vec![
+                        ("classid", bigint.clone()),
+                        ("objid", bigint.clone()),
+                        ("objsubid", integer.clone()),
+                        ("refclassid", bigint.clone()),
+                        ("refobjid", bigint.clone()),
+                        ("refobjsubid", integer.clone()),
+                        ("deptype", varchar.clone()),
                     ],
                     rows,
                 )

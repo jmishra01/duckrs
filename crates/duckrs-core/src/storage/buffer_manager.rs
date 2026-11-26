@@ -38,6 +38,8 @@ struct State {
     /// the bytes in `cached`
     used: usize,
     clock: u64,
+    /// how many blocks went into `cached`, ever
+    insertions: u64,
 }
 
 #[derive(Debug)]
@@ -94,6 +96,13 @@ impl BufferManager {
         }
     }
 
+    /// `BufferPool::GetEvictionQueueInfo` of the one queue there is here: the blocks cached now and how many went in.
+    /// Evicted blocks leave it at once, so it has no dead nodes.
+    pub fn eviction_queue(&self) -> (u64, u64) {
+        let state = self.state.lock();
+        (state.cached.len() as u64, state.insertions)
+    }
+
     pub fn block_manager(&self) -> &Arc<SingleFileBlockManager> {
         &self.blocks
     }
@@ -142,6 +151,8 @@ impl BufferManager {
         if let Some(previous) = previous {
             // somebody else read it in the meantime
             state.used -= previous.block.len();
+        } else {
+            state.insertions += 1;
         }
         Self::evict(&mut state, self.memory_limit.load(std::sync::atomic::Ordering::Relaxed));
         Ok(block)
