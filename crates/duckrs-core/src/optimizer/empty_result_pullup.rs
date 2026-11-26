@@ -15,10 +15,10 @@ pub fn pull_up(mut op: LogicalOperator) -> LogicalOperator {
     op.children = std::mem::take(&mut op.children).into_iter().map(pull_up).collect();
     let any_empty = op.children.iter().any(is_empty);
     match &op.kind {
+        // not ORDER BY or LIMIT: C++ leaves those over an empty input, so a CTE inlined into a join
+        // keeps the join of two empty results (`cte_inlining_empty_result`)
         K::Filter { .. }
         | K::Projection { .. }
-        | K::Order { .. }
-        | K::Limit { .. }
         | K::Distinct { .. }
         | K::Window { .. }
             if any_empty =>
