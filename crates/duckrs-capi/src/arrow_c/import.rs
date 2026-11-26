@@ -234,8 +234,8 @@ pub fn deduplicate(names: &mut [String]) {
             loop {
                 let candidate = format!("{name}_{count}");
                 *count += 1;
-                if !seen.contains_key(&candidate.to_lowercase()) {
-                    seen.insert(candidate.to_lowercase(), 0);
+                if let std::collections::hash_map::Entry::Vacant(entry) = seen.entry(candidate.to_lowercase()) {
+                    entry.insert(0);
                     *name = candidate;
                     break;
                 }

@@ -206,6 +206,10 @@ impl<'a> ArrayView<'a> {
         usize::try_from(self.0.length).unwrap_or(0)
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn offset(&self) -> usize {
         usize::try_from(self.0.offset).unwrap_or(0)
     }

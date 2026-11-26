@@ -168,7 +168,7 @@ impl TableUdfRun for ArrowScanRun {
             };
             // SAFETY: as above.
             let view = unsafe { ArrayView::new(&array.0) };
-            if view.len() == 0 {
+            if view.is_empty() {
                 continue;
             }
             import::validate_shape(&self.schema, &view)?;
@@ -255,7 +255,7 @@ pub unsafe extern "C" fn duckdb_arrow_scan(
         .iter()
         .map(|&child| {
             // SAFETY: each child is a live schema of the stream's.
-            unsafe { std::mem::replace(&mut (*child).release, Some(empty_schema_release)) }
+            unsafe { (*child).release.replace(empty_schema_release) }
         })
         .collect();
     let name = String::from_utf8_lossy(table_name);
