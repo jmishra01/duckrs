@@ -238,6 +238,17 @@ impl TableCatalogEntry {
         same.then_some(&origin.table)
     }
 
+    /// The table of the database where others changed its rows since this copy was made and this transaction did not:
+    /// what an ALTER rewrites, which reads the latest committed rows (`DataTable`'s constructors over its parent's row
+    /// groups) so as not to drop what was committed since.
+    pub(crate) fn latest_committed(&self) -> Option<&Arc<Self>> {
+        let origin = self.origin.as_ref()?;
+        let theirs_only = self.statistics.lock().version == 0
+            && origin.claimed.lock().is_empty()
+            && origin.table.statistics.lock().version != origin.version;
+        theirs_only.then_some(&origin.table)
+    }
+
     /// The keys of the table this one is a fork of, when they are those of this table too.
     pub(crate) fn inherited_keys(&self, rows: usize) -> Option<Vec<super::UniqueKeys>> {
         let origin = self.origin.as_ref()?;
@@ -276,6 +287,11 @@ impl TableCatalogEntry {
         );
         table.generated.clone_from(&self.generated);
         *table.comment.lock() = self.comment.lock().clone();
+        *table.type_dependencies.lock() = self.type_dependencies.lock().clone();
+        table.from_alter.store(
+            self.from_alter.load(std::sync::atomic::Ordering::Relaxed),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         table.from_query.store(
             self.from_query.load(std::sync::atomic::Ordering::Relaxed),
             std::sync::atomic::Ordering::Relaxed,
@@ -341,6 +357,10 @@ struct ChangedEntry {
     schema: String,
     name: String,
     created: bool,
+    /// it is gone
+    dropped: bool,
+    /// of an index, the key of its table
+    table: Option<String>,
 }
 
 /// Whether `new` is what `old` is, changed rows aside.
@@ -369,6 +389,8 @@ fn map_changes<V>(
                 schema: schema.to_string(),
                 name: name.clone(),
                 created: !old.contains_key(name),
+                dropped: false,
+                table: None,
             });
         }
     }
@@ -378,6 +400,8 @@ fn map_changes<V>(
             schema: schema.to_string(),
             name: name.clone(),
             created: false,
+            dropped: true,
+            table: None,
         });
     }
 }
@@ -393,6 +417,8 @@ fn changed_entries(base: &[SchemaEntries], catalog: &Catalog) -> Vec<ChangedEntr
                 schema: name.clone(),
                 name,
                 created: false,
+                dropped: true,
+                table: None,
             });
             continue;
         };
@@ -418,6 +444,8 @@ fn changed_entries(base: &[SchemaEntries], catalog: &Catalog) -> Vec<ChangedEntr
                             schema: name.clone(),
                             name: index.name.clone(),
                             created,
+                            dropped: !created,
+                            table: Some(format!("{name}.{}", key(&table.name))),
                         });
                     }
                 }
@@ -463,6 +491,8 @@ fn changed_entries(base: &[SchemaEntries], catalog: &Catalog) -> Vec<ChangedEntr
                 schema: name.clone(),
                 name: name.clone(),
                 created: true,
+                dropped: false,
+                table: None,
             });
         }
     }
@@ -477,9 +507,24 @@ pub struct CatalogVersions {
     writers: usize,
     owners: HashMap<String, u64>,
     changed: HashMap<String, u64>,
+    /// Those of `owners` and `changed` that are gone (`DataTableVersion::DROPPED`, where the others are `ALTERED`).
+    dropped: HashSet<String>,
+    /// Of the indexes among `owners`, the keys of their tables.
+    index_tables: HashMap<String, String>,
 }
 
 impl CatalogVersions {
+    /// Records `entries` as dropped or not.
+    fn note_dropped(&mut self, entries: &[ChangedEntry]) {
+        for entry in entries {
+            if entry.dropped {
+                self.dropped.insert(entry.key.clone());
+            } else {
+                self.dropped.remove(&entry.key);
+            }
+        }
+    }
+
     fn claim(&mut self, entries: &[ChangedEntry], transaction: u64, start: u64) -> Result<()> {
         for entry in entries {
             let taken = self.owners.get(&entry.key).is_some_and(|owner| *owner != transaction);
@@ -494,8 +539,12 @@ impl CatalogVersions {
         if transaction != 0 {
             for entry in entries {
                 self.owners.insert(entry.key.clone(), transaction);
+                if let Some(table) = &entry.table {
+                    self.index_tables.insert(entry.key.clone(), table.clone());
+                }
             }
         }
+        self.note_dropped(entries);
         Ok(())
     }
 }
@@ -508,6 +557,28 @@ impl Catalog {
             || tables
                 .into_iter()
                 .any(|entry| matches!(entry, TableOrView::Table(table) if table.versions.lock().unseen_update))
+    }
+
+    /// `DataTable::TableModification` of the table `schema.name` for transaction `transaction`, which started at
+    /// `start`: "altered" or "dropped" where another transaction changed its entry and holds it, or committed that
+    /// after `start` (`IsMainTable`). A statement outside of a transaction is transaction 0, from now.
+    pub fn table_conflict(&self, schema: &str, name: &str, transaction: u64, start: u64) -> Option<&'static str> {
+        let entry = format!("{}.{}", key(schema), key(name));
+        let versions = self.versions.lock();
+        let held = versions.owners.get(&entry).is_some_and(|owner| *owner != transaction);
+        let committed = versions.changed.get(&entry).is_some_and(|at| *at > start);
+        (held || committed).then(|| if versions.dropped.contains(&entry) { "dropped" } else { "altered" })
+    }
+
+    /// Whether a transaction other than `transaction` holds an index of the table `schema.name` that it created or
+    /// dropped: an entry that depends on the table (`DependencyManager::AlterObject`).
+    pub fn pending_index(&self, schema: &str, name: &str, transaction: u64) -> bool {
+        let table = format!("{}.{}", key(schema), key(name));
+        let versions = self.versions.lock();
+        versions
+            .index_tables
+            .iter()
+            .any(|(index, of)| *of == table && versions.owners.get(index).is_some_and(|owner| *owner != transaction))
     }
 
     /// Whether what changes here can conflict with a transaction.
@@ -664,6 +735,16 @@ impl Fork {
         Arc::ptr_eq(&self.database, database)
     }
 
+    /// [`Catalog::pending_index`] for this transaction.
+    pub fn pending_index(&self, schema: &str, name: &str) -> bool {
+        self.database.pending_index(schema, name, self.transaction)
+    }
+
+    /// [`Catalog::table_conflict`] for this transaction.
+    pub fn table_conflict(&self, schema: &str, name: &str) -> Option<&'static str> {
+        self.database.table_conflict(schema, name, self.transaction, self.start)
+    }
+
     /// The temporary schema of this fork, which another fork of the transaction can share.
     pub fn temp_schema(&self) -> Option<Arc<SchemaCatalogEntry>> {
         self.catalog.schemas.read().get(TEMP_SCHEMA).cloned()
@@ -757,6 +838,8 @@ impl Fork {
         // created or altered; `prepare_table` checks the rows of others with them
         for table in self.catalog.deferred_tables() {
             constraints::check_deferred_keys(&table, &*table.rows()?, |_| true).map_err(failed_commit)?;
+            // committed, those keys are like any other
+            *table.local_keys_from.lock() = None;
         }
         // first what can fail, for a commit to do all or nothing
         let mut prepared = Vec::new();
@@ -771,13 +854,37 @@ impl Fork {
             if change.is_none() {
                 continue;
             }
+            // (`LocalStorage::Commit` appends with `DataTable::AppendLock`, which says so of an append)
+            let appending = matches!(change, Some(TableChange::Append(_)));
+            let conflict = |how: &str| {
+                if appending {
+                    Error::new(
+                        ErrorKind::Transaction,
+                        format!(
+                            "Failed to commit: Transaction conflict: attempting to insert into table {} but it has \
+                             been {how} by a different transaction",
+                            table.name
+                        ),
+                    )
+                } else {
+                    gone_table(&table.name, how)
+                }
+            };
             let live = self.database.get_schema(&schema);
             let current = live.and_then(|schema| schema.tables.read().get(&key(&table.name)).cloned());
             match current {
-                Some(TableOrView::Table(current)) if Arc::ptr_eq(&current, &origin.table) => {}
+                // `CommitState`: another transaction can hold the table altered or dropped, not yet committed
+                Some(TableOrView::Table(current)) if Arc::ptr_eq(&current, &origin.table) => {
+                    if let Some(how) = self.table_conflict(&table.schema, &table.name) {
+                        return Err(conflict(how));
+                    }
+                }
                 // ALTER gives a new entry, as does dropping a table and creating it again
-                Some(TableOrView::Table(current)) if current.columns.len() != origin.table.columns.len() => {
-                    return Err(gone_table(&table.name, "altered"));
+                Some(TableOrView::Table(current))
+                    if current.columns.len() != origin.table.columns.len()
+                        || current.from_alter.load(std::sync::atomic::Ordering::Relaxed) =>
+                {
+                    return Err(conflict("altered"));
                 }
                 _ => return Err(gone_table(&table.name, "dropped")),
             }
@@ -907,6 +1014,7 @@ impl Fork {
             live.link_foreign_keys();
         }
         let mut versions = self.database.versions.lock();
+        versions.note_dropped(&entries);
         for entry in entries {
             versions.changed.insert(entry.key.clone(), now);
         }
@@ -1110,11 +1218,17 @@ impl Drop for Fork {
         let mut versions = self.database.versions.lock();
         for entry in self.held.lock().iter() {
             versions.owners.remove(entry);
+            versions.index_tables.remove(entry);
+            // (a rollback: the entry is as it was)
+            if !versions.changed.contains_key(entry) {
+                versions.dropped.remove(entry);
+            }
         }
         versions.forks -= 1;
         versions.writers -= usize::from(self.stops_checkpoints);
         if versions.forks == 0 {
             versions.changed.clear();
+            versions.dropped.clear();
         }
     }
 }

@@ -928,12 +928,14 @@ impl<'a> Replay<'a> {
             generated,
             constraints,
             on_conflict,
+            type_dependencies: _,
         } = plan.kind
         else {
             unreachable!("CREATE TABLE without a query binds to CreateTable");
         };
         let table_key = key(&(table.schema.clone(), table.name.clone()));
         let (comment, column_comments) = (table.comment.clone(), table.column_comments.clone());
+        let type_dependencies = table.type_dependencies.clone();
         let mut columns = columns;
         for column in &mut columns {
             column.comment = column_comments
@@ -946,6 +948,7 @@ impl<'a> Replay<'a> {
             .create_table(&name, columns, generated, constraints, on_conflict)?
             .expect("OnCreateConflict::Error fails or creates");
         *entry.comment.lock() = comment;
+        *entry.type_dependencies.lock() = type_dependencies;
         entry.set_source(disk.clone());
         // the deleted rows of the file are known only by scanning it
         let ids = crate::catalog::TableSource::row_ids(&*disk);

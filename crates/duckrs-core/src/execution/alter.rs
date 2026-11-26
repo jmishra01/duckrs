@@ -27,6 +27,11 @@ fn execute_table_alter(alter: BoundTableAlter) -> Result<()> {
     let before: Vec<_> = old.types();
     // rows still in a file stay there: only the columns that the ALTER makes are read and written
     let layered = layered_alter(&old, &alter, &before)?;
+    // a transaction that left the rows as they were rewrites those committed since it started too
+    let rows_of = match &layered {
+        None => old.latest_committed().cloned().unwrap_or_else(|| old.clone()),
+        Some(_) => old.clone(),
+    };
     let empty;
     let loaded;
     let source = match layered {
@@ -35,11 +40,11 @@ fn execute_table_alter(alter: BoundTableAlter) -> Result<()> {
             &empty
         }
         None => {
-            loaded = old.rows()?;
+            loaded = rows_of.rows()?;
             &*loaded
         }
     };
-    let row_ids = old.row_ids(old.row_count());
+    let row_ids = rows_of.row_ids(rows_of.row_count());
     let rows = match &alter.projection {
         _ if layered.is_some() => ColumnDataCollection::new(alter.columns.iter().map(|c| c.ty.clone()).collect()),
         Some(projection) => {
@@ -62,6 +67,8 @@ fn execute_table_alter(alter: BoundTableAlter) -> Result<()> {
     }
     table.generated = alter.generated;
     table.catalog = old.catalog.clone();
+    table.from_alter = std::sync::atomic::AtomicBool::new(true);
+    *table.type_dependencies.lock() = old.type_dependencies.lock().clone();
     *table.comment.lock() = alter.comment;
     table
         .row_group_rows
@@ -95,6 +102,10 @@ fn execute_table_alter(alter: BoundTableAlter) -> Result<()> {
         (*row_ids).clone()
     });
     log_as_alter(&old, &table, alter.logged.as_ref());
+    // a key added in a transaction over rows of its own: those are checked at the commit
+    if adding_key && (0..row_ids.len()).any(|position| row_ids.id(position) >= crate::catalog::MAX_ROW_ID) {
+        *table.local_keys_from.lock() = Some(old.constraints.len());
+    }
     if alter.verify {
         let rows = table.rows()?;
         for chunk in rows.chunks() {

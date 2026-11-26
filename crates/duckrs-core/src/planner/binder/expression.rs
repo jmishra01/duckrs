@@ -394,6 +394,19 @@ impl Binder<'_> {
         Err(crate::unported(format!("the type {ty}")))
     }
 
+    fn note_used_type(&self, name: &str) {
+        let mut used = self.used_types.lock().expect("not poisoned");
+        let name = name.to_lowercase();
+        if !used.contains(&name) {
+            used.push(name);
+        }
+    }
+
+    /// The user types that binding types found since the last call, by name.
+    pub(crate) fn take_used_types(&self) -> Vec<String> {
+        std::mem::take(&mut *self.used_types.lock().expect("not poisoned"))
+    }
+
     pub fn bind_type(&self, target: &CastType) -> Result<LogicalType> {
         let (original, children): (&str, &[Expr]) =
             match target {
@@ -424,6 +437,7 @@ impl Binder<'_> {
                             Ok(None)
                         })?;
                             if let Some(ty) = found {
+                                self.note_used_type(&name.name);
                                 return Ok(ty);
                             }
                             // `catalog.type`: a name that is no schema can be a database
@@ -470,7 +484,10 @@ impl Binder<'_> {
         let name = original.to_lowercase();
         // and else along the search path, which for a statement routed to another database has the default one
         let found = match self.catalog.get_type(None, self.search_schema.as_deref(), &name)? {
-            Some(ty) => Some(ty),
+            Some(ty) => {
+                self.note_used_type(&name);
+                Some(ty)
+            }
             None => match &self.session {
                 Some(session) if !session.default_database.eq_ignore_ascii_case(&session.database) => {
                     match (session.attached_catalog)(&session.default_database) {

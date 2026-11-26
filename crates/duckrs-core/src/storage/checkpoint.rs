@@ -108,6 +108,8 @@ pub struct StoredTable {
     /// What `COMMENT ON TABLE` and `COMMENT ON COLUMN` said, the columns by name.
     pub comment: Option<String>,
     pub column_comments: Vec<(String, String)>,
+    /// The user types it depends on, by name (the TYPE entries of its `dependencies`).
+    pub type_dependencies: Vec<String>,
 }
 
 /// `CreateSequenceInfo`, which is what C++ checkpoints of a sequence.
@@ -379,6 +381,13 @@ pub(super) fn convert_entry(info: g::CreateInfo) -> Result<Converted> {
         };
     }
     let schema = schema_of(&info)?;
+    let type_dependencies: Vec<String> = info
+        .dependencies
+        .iter()
+        .flat_map(|list| list.set.iter())
+        .filter(|dependency| dependency.entry.type_ == g::enums::catalog_type::TYPE_ENTRY)
+        .map(|dependency| dependency.entry.name.clone())
+        .collect();
     Ok(Converted::Entry(match info.kind {
         g::CreateInfoKind::CreateSchemaInfo(_) => unreachable!("returned above"),
         g::CreateInfoKind::CreateTableInfo(stored) => {
@@ -404,6 +413,7 @@ pub(super) fn convert_entry(info: g::CreateInfo) -> Result<Converted> {
                 indexes: Vec::new(),
                 comment: entry_comment,
                 column_comments,
+                type_dependencies,
             })));
         }
         g::CreateInfoKind::CreateIndexInfo(stored) => {

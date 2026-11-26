@@ -759,6 +759,7 @@ fn create_physical(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             generated,
             constraints,
             on_conflict,
+            type_dependencies,
         } => Box::new(PhysicalCreateTable {
             types,
             schema,
@@ -767,6 +768,7 @@ fn create_physical(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
             generated,
             constraints,
             on_conflict,
+            type_dependencies,
         }),
     }
 }

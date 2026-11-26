@@ -520,6 +520,16 @@ pub struct TableCatalogEntry {
     /// The committed rows that a transaction deleted before it added a DEFERRED key, whose keys its
     /// commit still sees: C++ has them in no delete index of that key (a FIXME of its tests)
     pub deleted_before_key: Mutex<Option<ColumnDataCollection>>,
+    /// The first of `constraints` that this transaction added while the table had rows of its own: C++ builds the
+    /// index of a key from the committed rows, so those keys are checked against the transaction's rows at its
+    /// commit (`LocalStorage::Commit`), as a DEFERRED key is.
+    pub local_keys_from: Mutex<Option<usize>>,
+    /// Whether an ALTER made this entry in place of another, which a transaction that wrote to that one finds
+    /// `ALTERED` at its commit (where a table dropped and created again is `DROPPED`).
+    pub from_alter: std::sync::atomic::AtomicBool,
+    /// The user types of this catalog its columns name, by name (`LogicalDependencyList` of its `CreateInfo`): a type
+    /// of an alias of VARCHAR leaves no trace in the column's type.
+    pub type_dependencies: Mutex<Vec<String>>,
     /// Which row is which. Rows added at the end are in here once somebody asks.
     row_ids: Mutex<Arc<RowIds>>,
     versions: Arc<Mutex<RowVersions>>,
@@ -971,6 +981,9 @@ impl TableCatalogEntry {
             rewrites: Default::default(),
             origin: None,
             deleted_before_key: Mutex::default(),
+            local_keys_from: Mutex::default(),
+            from_alter: Default::default(),
+            type_dependencies: Mutex::default(),
             row_ids: Mutex::default(),
             versions: Arc::default(),
             row_group_rows: std::sync::atomic::AtomicUsize::new(ROW_GROUP_ROWS),
@@ -1192,6 +1205,9 @@ impl TableCatalogEntry {
 
     /// Whether a PRIMARY KEY or UNIQUE of the table is DEFERRED, which a commit checks.
     pub fn has_deferred_keys(&self) -> bool {
+        if self.local_keys_from.lock().is_some_and(|from| from < self.constraints.len()) {
+            return true;
+        }
         self.constraints.iter().any(|constraint| {
             matches!(
                 constraint,
@@ -1554,10 +1570,12 @@ impl TableCatalogEntry {
     }
 
     pub fn keys(&self) -> Vec<TableKey> {
+        let local_from = *self.local_keys_from.lock();
         let mut keys: Vec<TableKey> = self
             .constraints
             .iter()
-            .filter_map(|constraint| match constraint {
+            .enumerate()
+            .filter_map(|(position, constraint)| match constraint {
                 TableConstraint::Unique {
                     columns,
                     primary_key,
@@ -1568,7 +1586,8 @@ impl TableCatalogEntry {
                     expressions: None,
                     names: columns.iter().map(|c| self.columns[*c].name.clone()).collect(),
                     primary_key: *primary_key,
-                    deferred: *check_mode == duckrs_parser::ast::ConstraintCheckMode::Deferred,
+                    deferred: *check_mode == duckrs_parser::ast::ConstraintCheckMode::Deferred
+                        || local_from.is_some_and(|from| position >= from),
                 }),
                 _ => None,
             })
@@ -2742,7 +2761,8 @@ impl SchemaCatalogEntry {
             .filter_map(|entry| match entry {
                 TableOrView::Table(table)
                     if !table.from_query.load(std::sync::atomic::Ordering::Relaxed)
-                        && table.columns.iter().any(|c| mentions(&c.ty, &target, name)) =>
+                        && (table.columns.iter().any(|c| mentions(&c.ty, &target, name))
+                            || table.type_dependencies.lock().iter().any(|t| t.eq_ignore_ascii_case(name))) =>
                 {
                     Some(table.name.clone())
                 }

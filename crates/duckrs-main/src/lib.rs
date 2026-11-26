@@ -2940,6 +2940,102 @@ impl ClientContext {
             .find(|fork| fork.is_of(&self.db.catalog))
     }
 
+    /// `DataTable::IsMainTable`: an INSERT, UPDATE, DELETE or CREATE INDEX of a table that another transaction altered or dropped,
+    /// and holds or committed after this one started, conflicts. An INSERT or UPDATE as it starts; a DELETE when it
+    /// commits (`CommitState`), which outside of a transaction is now and in one is left to the commit.
+    fn check_table_conflict(&self, statement: &Statement) -> Result<()> {
+        let base = |table: &duckrs_parser::ast::TableRef| match &table.kind {
+            duckrs_parser::ast::TableRefKind::BaseTable { name, .. } => Some(name.clone()),
+            _ => None,
+        };
+        // `DependencyManager::AlterObject`: an index another transaction is creating depends on the table too
+        if let Statement::Alter(info) = statement
+            && !matches!(
+                info.kind,
+                duckrs_parser::ast::AlterKind::AddColumn { .. }
+                    | duckrs_parser::ast::AlterKind::SetDefault { .. }
+                    | duckrs_parser::ast::AlterKind::SetTableOptions(_)
+                    | duckrs_parser::ast::AlterKind::ResetTableOptions(_)
+                    | duckrs_parser::ast::AlterKind::SetComment { .. }
+                    | duckrs_parser::ast::AlterKind::SetColumnComment { .. }
+            )
+            && let Ok(table) = self
+                .catalog()
+                .get_table(schema_of(&info.name).ok().flatten().as_deref(), &info.name.name)
+        {
+            let pending = match self.fork() {
+                Some(fork) => fork.pending_index(&table.schema, &table.name),
+                None => self.db.catalog.pending_index(&table.schema, &table.name, 0),
+            };
+            if pending {
+                return Err(Error::new(
+                    ErrorKind::Dependency,
+                    format!(
+                        "Cannot alter entry {} because there are entries that depend on it.",
+                        sql_quoted_identifier(&table.name)
+                    ),
+                ));
+            }
+        }
+        let (name, action) = match statement {
+            Statement::Insert(insert) => (Some(insert.table.clone()), "insert"),
+            Statement::Update(update) => (base(&update.table), "update"),
+            Statement::Delete(delete) if self.transaction.is_none() => (base(&delete.table), "delete"),
+            // a key is an index (`PhysicalCreateIndex`)
+            Statement::Alter(info)
+                if matches!(
+                    info.kind,
+                    duckrs_parser::ast::AlterKind::AddConstraint(duckrs_parser::ast::Constraint::Unique { .. })
+                ) =>
+            {
+                (Some(info.name.clone()), "index")
+            }
+            Statement::Create(info) => match &info.kind {
+                CreateKind::Index { table, .. } => (
+                    Some(duckrs_parser::ast::QualifiedName {
+                        qualification: info.name.qualification.clone(),
+                        name: table.clone(),
+                    }),
+                    "index",
+                ),
+                _ => (None, ""),
+            },
+            _ => (None, ""),
+        };
+        let Some(name) = name else { return Ok(()) };
+        let Ok(table) = self
+            .catalog()
+            .get_table(schema_of(&name).ok().flatten().as_deref(), &name.name)
+        else {
+            return Ok(());
+        };
+        let conflict = match self.fork() {
+            Some(fork) => fork.table_conflict(&table.schema, &table.name),
+            None => self.db.catalog.table_conflict(&table.schema, &table.name, 0, u64::MAX),
+        };
+        let Some(modification) = conflict else { return Ok(()) };
+        let message = match action {
+            "insert" => format!(
+                "Transaction conflict: attempting to insert into table {} but it has been {modification} by a different \
+                 transaction",
+                table.name
+            ),
+            "update" => format!(
+                "Transaction conflict: attempting to update table {} but it has been {modification} by a different \
+                 transaction",
+                table.name
+            ),
+            // `PhysicalCreateIndex::GetGlobalSinkState`
+            "index" => "Transaction conflict: cannot add an index to a table that has been altered or dropped".into(),
+            // (the commit of the statement fails)
+            _ => format!(
+                "Failed to commit: Attempting to modify table {} but another transaction has {modification} this table",
+                table.name
+            ),
+        };
+        Err(Error::new(ErrorKind::Transaction, message))
+    }
+
     /// Whether the table that `statement` writes to is one that is private to the connection.
     fn writes_temporary_table(&self, statement: &Statement) -> bool {
         let table_of = |table: &duckrs_parser::ast::TableRef| match &table.kind {
@@ -3145,6 +3241,9 @@ impl ClientContext {
             self.db.check_writable(statement)?;
         }
         self.start_on_database();
+        if write {
+            self.check_table_conflict(statement)?;
+        }
         let writes_temporary_table = self.writes_temporary_table(statement);
         // `MetaTransaction::ModifyDatabase`: a transaction writes to one database (and the temporary one)
         if write

@@ -383,6 +383,8 @@ pub enum LogicalOperatorKind {
         generated: Vec<GeneratedColumn>,
         constraints: Vec<TableConstraint>,
         on_conflict: OnCreateConflict,
+        /// the user types its columns name, which it depends on
+        type_dependencies: Vec<String>,
     },
 }
 
