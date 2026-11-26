@@ -793,6 +793,7 @@ dependencies = [
  "brotli",
  "duckrs-common",
  "duckrs-parser",
+ "duckrs-tpch",
  "flate2",
  "hashbrown",
  "libc",
@@ -820,6 +821,7 @@ dependencies = [
  "duckrs-common",
  "duckrs-core",
  "duckrs-parser",
+ "duckrs-tpch",
  "parking_lot",
 ]
 

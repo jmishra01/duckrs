@@ -22,6 +22,7 @@ duckrs-common = { path = "crates/duckrs-common" }
 duckrs-core = { path = "crates/duckrs-core" }
 duckrs-main = { path = "crates/duckrs-main" }
 duckrs-parser = { path = "crates/duckrs-parser" }
+duckrs-tpch = { path = "crates/duckrs-tpch" }
 parking_lot = "0.13"
 proptest = "1.12"
 criterion = "0.8"

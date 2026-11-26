@@ -15,6 +15,7 @@ mod logging;
 mod secret;
 pub mod settings;
 mod settings_table;
+mod tpc;
 
 use duckrs_core::catalog::{
     Catalog, DEFAULT_CATALOG, Fork, IndexCatalogEntry, OnCreateConflict, SchemaCatalogEntry, SequenceData, SessionTemp,
@@ -1642,6 +1643,7 @@ fn cte_names(statement: &Statement) -> Vec<String> {
 fn statement_type_name(statement: &Statement) -> &'static str {
     match statement {
         Statement::Insert(_) => "INSERT",
+        Statement::Call(_) => "CALL",
         Statement::Update(_) => "UPDATE",
         Statement::Delete(_) => "DELETE",
         Statement::Merge(_) => "MERGE_INTO",
@@ -4696,6 +4698,14 @@ impl ClientContext {
                 settings::reset_variable(name, *scope, &mut global, &mut self.settings)?;
                 return Ok(Self::success());
             }
+            // `PRAGMA tpch(n)` runs TPC-H query n
+            Statement::Pragma(PragmaInfo {
+                parameters,
+                named_parameters,
+                ..
+            }) if tpc::is_tpch_pragma(statement) => {
+                return self.run_tpch_pragma(parameters, named_parameters);
+            }
             Statement::Pragma(PragmaInfo {
                 name,
                 parameters,
@@ -4931,6 +4941,10 @@ impl ClientContext {
             Statement::Call(function) if checkpoint_call(function).is_some() => {
                 return self.checkpoint(function);
             }
+            // the `tpch` extension, compiled in: `CALL dbgen(...)` creates the TPC-H tables and fills them
+            Statement::Call(function) if tpc::is_dbgen_call(function) => {
+                return self.run_dbgen(function);
+            }
             // `lock_configuration`: what changes the configuration is refused before it runs
             Statement::Call(function)
                 if matches!(&function.kind, ExprKind::Function(call) if CONFIGURING_CALLS
@@ -4964,7 +4978,7 @@ impl ClientContext {
                 if matches!(
                     info.load_type,
                     duckrs_parser::ast::LoadType::Load | duckrs_parser::ast::LoadType::Install
-                ) && ["parquet", "json"]
+                ) && ["parquet", "json", "tpch"]
                     .iter()
                     .any(|name| info.filename.eq_ignore_ascii_case(name)) =>
             {
@@ -5608,18 +5622,20 @@ impl ClientContext {
                 if result.column_count() != 1 {
                     return Err(Error::new(ErrorKind::Binder, "The query must return a single column"));
                 }
+                // `PhysicalCreateType::Sink`: NULLs and values seen before are skipped
                 let mut values = Vec::with_capacity(result.row_count());
+                let mut seen = std::collections::HashSet::with_capacity(result.row_count());
                 for row in 0..result.row_count() {
                     let value = result.value(0, row);
                     if value.is_null() {
-                        return Err(Error::new(
-                            ErrorKind::InvalidInput,
-                            "Attempted to create ENUM type with NULL value!",
-                        ));
+                        continue;
                     }
-                    values.push(value.try_to_string()?);
+                    let text = value.try_to_string()?;
+                    if seen.insert(text.clone()) {
+                        values.push(text);
+                    }
                 }
-                enum_type_from(values)?
+                LogicalType::enum_type(values)
             }
             CreateTypeKind::Alias(target) => {
                 let catalog = self.catalog();
