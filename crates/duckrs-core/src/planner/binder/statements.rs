@@ -4375,6 +4375,8 @@ impl Binder<'_> {
             return self.bind_create_table_as(info, query, schema, on_conflict);
         }
         let mut columns = Vec::with_capacity(info.columns.len());
+        let mut type_dependencies = Vec::new();
+        self.take_used_types();
         for (position, column) in info.columns.iter().enumerate() {
             if info.columns[..position]
                 .iter()
@@ -4401,6 +4403,7 @@ impl Binder<'_> {
                 return Err(not_implemented("columns without a type"));
             };
             let mut definition = ColumnDefinition::new(column.name.clone(), self.bind_type(ty)?);
+            type_dependencies.extend(self.take_used_types().into_iter().map(|t| (column.name.clone(), t)));
             definition.compression = self.column_compression(column, &definition.ty)?;
             if let Some(default) = &column.default_value {
                 // `Binder::BindCreateTableInfo`: a stored DEFAULT can't refer to parameters
@@ -4447,6 +4450,7 @@ impl Binder<'_> {
                 generated,
                 constraints,
                 on_conflict,
+                type_dependencies,
             },
             vec![],
         );
@@ -4492,6 +4496,7 @@ impl Binder<'_> {
                             generated: Vec::new(),
                             constraints: Vec::new(),
                             on_conflict,
+                            type_dependencies: Vec::new(),
                         },
                         vec![],
                     );

@@ -1082,6 +1082,9 @@ pub struct Binder<'a> {
     foreign_databases: Vec<read_duckdb::ForeignDatabase>,
     /// the tables and views (schema and name) that what is bound reads, for the dependencies of a view
     read_entries: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    /// the user types of this catalog that binding types found, by name: those a table's columns name are entries
+    /// it depends on (`SetCatalogLookupCallback` of `BindCreateTableInfo`)
+    used_types: Arc<std::sync::Mutex<Vec<String>>>,
     /// the table function whose arguments are being bound, for `TableFunctionBinder`'s errors
     table_function_name: String,
     /// how many bodies of system macros are being bound
@@ -1206,6 +1209,7 @@ impl<'a> Binder<'a> {
             search_schema: None,
             foreign_databases: Vec::new(),
             read_entries: Arc::default(),
+            used_types: Arc::default(),
             read_macros: Arc::default(),
             system_table_function: false,
             system_macro_depth: 0,
@@ -1315,6 +1319,7 @@ impl<'a> Binder<'a> {
         binder.search_schema = self.search_schema.clone();
         binder.foreign_databases = self.foreign_databases.clone();
         binder.read_entries = self.read_entries.clone();
+        binder.used_types = self.used_types.clone();
         binder.read_macros = self.read_macros.clone();
         binder.system_macro_depth = self.system_macro_depth;
         binder.table_function_name = self.table_function_name.clone();

@@ -1202,6 +1202,31 @@ pub(super) fn table_info(
         kind,
     );
     info.comment = table.comment.lock().clone().map(Value::varchar);
+    // `LogicalDependencyList`: the user types its columns name
+    let mut types: Vec<String> = Vec::new();
+    for (_, name) in table.type_dependencies.lock().iter() {
+        if !types.contains(name) {
+            types.push(name.clone());
+        }
+    }
+    if !types.is_empty() {
+        info.dependencies = Some(g::LogicalDependencyList {
+            set: types
+                .iter()
+                .map(|name| g::LogicalDependency {
+                    entry: g::CatalogEntryInfo {
+                        type_: catalog_type::TYPE_ENTRY,
+                        schema: schema.name.clone(),
+                        name: name.clone(),
+                        schema_path: Vec::new(),
+                        table: None,
+                    },
+                    catalog: catalog.to_string(),
+                    flags: None,
+                })
+                .collect(),
+        });
+    }
     Ok(info)
 }
 

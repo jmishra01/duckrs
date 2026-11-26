@@ -5656,6 +5656,7 @@ pub struct PhysicalCreateTable {
     pub generated: Vec<GeneratedColumn>,
     pub constraints: Vec<TableConstraint>,
     pub on_conflict: OnCreateConflict,
+    pub type_dependencies: Vec<(String, String)>,
 }
 
 impl PhysicalOperator for PhysicalCreateTable {
@@ -5669,13 +5670,16 @@ impl PhysicalOperator for PhysicalCreateTable {
         true
     }
     fn get_data(&self, _state: &mut SourceState) -> Result<Option<DataChunk>> {
-        self.schema.create_table(
+        let table = self.schema.create_table(
             &self.table_name,
             self.columns.clone(),
             self.generated.clone(),
             self.constraints.clone(),
             self.on_conflict,
         )?;
+        if let Some(table) = table {
+            *table.type_dependencies.lock() = self.type_dependencies.clone();
+        }
         Ok(None)
     }
 }

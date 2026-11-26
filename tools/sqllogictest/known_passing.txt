@@ -146,6 +146,7 @@ test/fuzzer/pedro/incorrect_offset_result.test
 test/fuzzer/pedro/index_current_timestamp.test
 test/fuzzer/pedro/index_insert_from_union.test
 test/fuzzer/pedro/index_not_updated_returning.test
+test/fuzzer/pedro/index_on_altered_table.test
 test/fuzzer/pedro/insert_or_replace_only_pk.test
 test/fuzzer/pedro/intersect_correlated_subquery.test
 test/fuzzer/pedro/intersect_empty_array.test
@@ -1063,6 +1064,7 @@ test/sql/alter/add_col/test_add_col_index_rollback.test
 test/sql/alter/add_col/test_add_col_local_storage.test
 test/sql/alter/add_col/test_add_col_not_null.test
 test/sql/alter/add_col/test_add_col_stats.test
+test/sql/alter/add_col/test_add_col_transactions.test
 test/sql/alter/add_col/test_add_col_unique.test
 test/sql/alter/add_col/test_add_col_user_type.test
 test/sql/alter/add_pk/test_add_multi_column_pk.test
@@ -1070,6 +1072,7 @@ test/sql/alter/add_pk/test_add_pk.test
 test/sql/alter/add_pk/test_add_pk_alter_in_tx.test
 test/sql/alter/add_pk/test_add_pk_catalog_error.test
 test/sql/alter/add_pk/test_add_pk_commit.test
+test/sql/alter/add_pk/test_add_pk_concurrent_create_index.test
 test/sql/alter/add_pk/test_add_pk_concurrent_null.test
 test/sql/alter/add_pk/test_add_pk_drop_and_reload.test
 test/sql/alter/add_pk/test_add_pk_gaps_in_rowids.test
@@ -1077,15 +1080,18 @@ test/sql/alter/add_pk/test_add_pk_invalid_data.test
 test/sql/alter/add_pk/test_add_pk_invalid_type.test
 test/sql/alter/add_pk/test_add_pk_local_null.test
 test/sql/alter/add_pk/test_add_pk_naming_conflict.test
+test/sql/alter/add_pk/test_add_pk_rollback.test
 test/sql/alter/add_pk/test_add_pk_storage.test
 test/sql/alter/add_pk/test_add_pk_wal.test
 test/sql/alter/add_pk/test_add_pk_wal_generated.test
 test/sql/alter/add_pk/test_add_pk_with_generated_column.test
+test/sql/alter/add_pk/test_add_same_pk_simultaneously.test
 test/sql/alter/add_pk/test_add_same_pk_twice.test
 test/sql/alter/add_unique/test_add_unique.test
 test/sql/alter/add_unique/test_add_unique_wal.test
 test/sql/alter/alter_col/test_drop_not_null_primary_key.test
 test/sql/alter/alter_col/test_not_null_in_tran.test
+test/sql/alter/alter_col/test_not_null_multi_tran.test
 test/sql/alter/alter_col/test_set_collate.test
 test/sql/alter/alter_col/test_set_not_null.test
 test/sql/alter/alter_col/test_set_not_null_after_delete.test
@@ -1095,6 +1101,7 @@ test/sql/alter/alter_table_nullability_requires_column.test
 test/sql/alter/alter_table_set_partitioned_by.test
 test/sql/alter/alter_table_set_sorted_by.test
 test/sql/alter/alter_table_set_table_options.test
+test/sql/alter/alter_type/alter_type_concurrent_committed_update.test
 test/sql/alter/alter_type/alter_type_distinct_stats.test
 test/sql/alter/alter_type/alter_type_failed_cast_keeps_table_usable.test
 test/sql/alter/alter_type/alter_type_struct.test
@@ -1109,6 +1116,7 @@ test/sql/alter/alter_type/test_alter_type_local.test
 test/sql/alter/alter_type/test_alter_type_multi_column.test
 test/sql/alter/alter_type/test_alter_type_not_null.test
 test/sql/alter/alter_type/test_alter_type_rollback.test
+test/sql/alter/alter_type/test_alter_type_transactions.test
 test/sql/alter/alter_type/test_alter_type_unique.test
 test/sql/alter/alter_type/test_alter_type_using_not_null.test
 test/sql/alter/alter_type/test_alter_type_with_generated_column.test
@@ -1126,6 +1134,7 @@ test/sql/alter/drop_col/test_drop_col_not_null_next.test
 test/sql/alter/drop_col/test_drop_col_operations.test
 test/sql/alter/drop_col/test_drop_col_pk.test
 test/sql/alter/drop_col/test_drop_col_rollback.test
+test/sql/alter/drop_col/test_drop_col_transactions.test
 test/sql/alter/drop_col/test_drop_col_with_generated_cols.test
 test/sql/alter/drop_constraint.test
 test/sql/alter/list/add_column_in_struct.test
@@ -1382,6 +1391,7 @@ test/sql/catalog/dependencies/test_concurrent_schema_creation.test
 test/sql/catalog/dependencies/test_default_value_dependency.test
 test/sql/catalog/dependencies/test_drop_column_sequence_dependency.test
 test/sql/catalog/dependencies/test_drop_default_referencing_sequence.test
+test/sql/catalog/dependencies/test_drop_type_table_dependency.test
 test/sql/catalog/dependencies/test_prepare_dependencies_transactions.test
 test/sql/catalog/dependencies/test_prepared_dependency.test
 test/sql/catalog/dependencies/test_schema_dependency.test
