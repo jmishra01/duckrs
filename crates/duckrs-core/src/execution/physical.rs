@@ -1900,6 +1900,53 @@ impl PhysicalOperator for PhysicalChunkScan {
     }
 }
 
+// Ported from the `PhysicalTableScan` of a table function, as duckdb/src/main/capi/v1/table_function-c.cpp's
+// `CTableFunctionInit`, `CTableFunctionLocalInit` and `CTableFunction` run in it @ rust-port-baseline
+
+/// `PhysicalTableScan` of a table function the client registered: its init runs when the scan starts, and then
+/// its function gives chunks until it gives an empty one.
+#[derive(Debug)]
+pub struct PhysicalUserTableScan {
+    pub types: Vec<LogicalType>,
+    pub scan: crate::function::udf::UserTableScan,
+}
+
+impl PhysicalOperator for PhysicalUserTableScan {
+    fn name(&self) -> &'static str {
+        "TABLE_SCAN"
+    }
+    fn explain_details(&self) -> Vec<String> {
+        let mut details = vec![format!("Function: {}", self.scan.name)];
+        if let Some((cardinality, _)) = self.scan.cardinality {
+            details.push(format!("~{cardinality} rows"));
+        }
+        details
+    }
+    fn types(&self) -> &[LogicalType] {
+        &self.types
+    }
+    fn is_source(&self) -> bool {
+        true
+    }
+    fn source_state(&self) -> SourceState {
+        // the init runs with the first chunk, as an error of it is an error of the query
+        Box::new(None::<Box<dyn crate::function::udf::TableUdfRun>>)
+    }
+    fn get_data(&self, state: &mut SourceState) -> Result<Option<DataChunk>> {
+        let run = state
+            .downcast_mut::<Option<Box<dyn crate::function::udf::TableUdfRun>>>()
+            .expect("table function scan state");
+        if run.is_none() {
+            let column_ids: Vec<usize> = (0..self.types.len()).collect();
+            *run = Some(self.scan.scan.init(&column_ids)?);
+        }
+        let run = run.as_mut().expect("initialized above");
+        let mut chunk = DataChunk::new(&self.types);
+        run.next(&mut chunk)?;
+        Ok((!chunk.is_empty()).then_some(chunk))
+    }
+}
+
 /// `PhysicalExpressionScan`: the rows of a VALUES list, evaluated in order.
 #[derive(Debug)]
 pub struct PhysicalExpressionScan {

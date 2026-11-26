@@ -53,7 +53,7 @@ fn logical_name(op: &LogicalOperator) -> &'static str {
         // `LogicalGet::GetName`: the table function's name
         K::Range { generate_series: false, .. } => "RANGE",
         K::Range { generate_series: true, .. } => "GENERATE_SERIES",
-        K::Get { .. } | K::ExpressionGet { .. } | K::ChunkGet { .. } => "SEQ_SCAN",
+        K::Get { .. } | K::ExpressionGet { .. } | K::ChunkGet { .. } | K::UserTableScan { .. } => "SEQ_SCAN",
         K::EmptyResult { .. } => "EMPTY_RESULT",
         K::DummyScan { .. } => "DUMMY_SCAN",
         K::Filter { .. } => "FILTER",

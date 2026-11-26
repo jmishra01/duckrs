@@ -399,6 +399,7 @@ fn create_physical(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
         LogicalOperatorKind::EmptyResult { .. } => Box::new(PhysicalEmptyResult { types }),
         LogicalOperatorKind::DummyScan { .. } => Box::new(PhysicalDummyScan { types }),
         LogicalOperatorKind::ChunkGet { chunks, .. } => Box::new(PhysicalChunkScan { types, chunks }),
+        LogicalOperatorKind::UserTableScan { scan, .. } => Box::new(PhysicalUserTableScan { types, scan }),
         LogicalOperatorKind::ExpressionGet {
             expressions,
             function: None,

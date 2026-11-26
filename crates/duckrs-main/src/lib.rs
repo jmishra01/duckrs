@@ -106,6 +106,9 @@ pub struct DatabaseInstance {
     hidden: bool,
     /// the options of its ATTACH that went to its storage, by name, as given
     attach_options: Vec<(String, String)>,
+    /// the functions the client registered (`duckdb_register_scalar_function`, ...), which DuckDB keeps in its
+    /// system catalog
+    user_functions: Arc<duckrs_core::function::udf::UserFunctions>,
 }
 
 /// What `ATTACH` can say of a file.
@@ -325,6 +328,7 @@ impl DatabaseInstance {
             transaction_number: AtomicU64::new(0),
             hidden: false,
             attach_options: Vec::new(),
+            user_functions: Arc::default(),
         }
     }
 
@@ -1865,6 +1869,7 @@ impl ClientContext {
             current_query: self.current_query.clone(),
             appended: self.appended.clone(),
             replacement_scans: self.replacement_scans.0.clone(),
+            user_functions: Some(self.home.user_functions.clone()),
             connection_count: self.home.connections.load(AtomicOrdering::SeqCst),
             // `DatabaseManager::ApproxDatabaseCount`: the system and temporary catalogs with the attached ones
             approx_database_count: 3 + self.home.attached.read().len() as u64,
@@ -2120,6 +2125,17 @@ impl ClientContext {
                 Some(_) => None,
             })
             .collect())
+    }
+
+    /// The functions the client registered on the database (`duckdb_register_scalar_function`, ...), which every
+    /// connection to it can call.
+    pub fn user_functions(&self) -> Arc<duckrs_core::function::udf::UserFunctions> {
+        self.home.user_functions.clone()
+    }
+
+    /// `ClientContext::GetConnectionId`.
+    pub fn connection_id(&self) -> u64 {
+        self.id
     }
 
     /// Adds a replacement scan: tables the catalog does not have that `scan` gives rows for.

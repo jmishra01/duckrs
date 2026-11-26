@@ -87,6 +87,15 @@ pub fn select_function(set: &ScalarFunctionSet, arguments: &[LogicalType]) -> Re
     select_overload(&set.name, &set.functions, |f| &f.arguments, arguments)
 }
 
+/// [`select_function`] for the overloads of a user-defined table function, by their positional parameters.
+pub(crate) fn select_table_overload(
+    name: &str,
+    functions: &[Arc<super::udf::TableUdfOverload>],
+    arguments: &[LogicalType],
+) -> Result<Arc<super::udf::TableUdfOverload>> {
+    select_overload(name, functions, |f| &f.arguments, arguments)
+}
+
 /// [`select_function`] for any kind of function.
 fn select_overload<F: std::fmt::Display>(
     name: &str,
@@ -625,6 +634,11 @@ pub fn bind_aggregate_function(
         .collect();
     let mut return_type = function.resolve_return_type(children.first().map(|c| &c.return_type));
     let mut children = children;
+    // `CAPIAggregateUpdate` takes a chunk of the arguments, which come to the state as one STRUCT
+    if function.kind == AggregateKind::User && children.len() > 1 {
+        let names = (0..children.len()).map(|i| format!("a{i}")).collect();
+        children = vec![bind_struct_pack(names, children)?];
+    }
     if let AggregateKind::Holistic(kind) = function.kind {
         let types: Vec<LogicalType> = children.iter().map(|c| c.return_type.clone()).collect();
         return_type = kind.return_type(&return_type, &types);

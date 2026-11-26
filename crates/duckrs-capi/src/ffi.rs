@@ -181,6 +181,18 @@ pub(crate) fn free<T>(ptr: *mut T) {
     unsafe { libc::free(ptr.cast()) }
 }
 
+/// A pointer C gave to be handed back to it (extra info, bind data, a state), which duckrs never reads or writes
+/// through.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CPointer(pub *mut c_void);
+
+// SAFETY: duckrs only passes the pointer back to C's callbacks, and DuckDB's C API runs those on any of its threads,
+// so what the pointer points to is C's to make usable from any thread (as it must be with libduckdb).
+unsafe impl Send for CPointer {}
+
+// SAFETY: as for `Send`: duckrs does nothing with the pointer itself but copy it.
+unsafe impl Sync for CPointer {}
+
 /// Runs `body`, giving `fallback` if it panics, so a panic of duckrs does not unwind into C (where it would abort).
 pub(crate) fn guard<R>(fallback: R, body: impl FnOnce() -> R) -> R {
     catch_unwind(AssertUnwindSafe(body)).unwrap_or(fallback)

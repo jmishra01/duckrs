@@ -4208,7 +4208,7 @@ fn monotone_bounds(
     stats: &[Stats],
     return_type: &LogicalType,
 ) -> Option<Stats> {
-    if children.is_empty() || function.random.is_some() || expr_is_volatile_function(&function.name) {
+    if children.is_empty() || function.random.is_some() || function.volatile || expr_is_volatile_function(&function.name) {
         return None;
     }
     let numeric_stats = return_type.is_numeric()

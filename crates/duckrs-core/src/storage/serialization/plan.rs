@@ -892,9 +892,12 @@ impl PlanWriter {
 
     fn type_name(&self, op: &LogicalOperator) -> &'static str {
         match &op.kind {
-            K::Get { .. } | K::Range { .. } | K::CsvScan { .. } | K::JsonScan { .. } | K::ParquetScan { .. } => {
-                "LOGICAL_GET"
-            }
+            K::Get { .. }
+            | K::Range { .. }
+            | K::CsvScan { .. }
+            | K::JsonScan { .. }
+            | K::ParquetScan { .. }
+            | K::UserTableScan { .. } => "LOGICAL_GET",
             K::CopyToParquet { .. } | K::CopyToFile { .. } => "LOGICAL_COPY_TO_FILE",
             K::EmptyResult { .. } => "LOGICAL_EMPTY_RESULT",
             K::DummyScan { .. } => "LOGICAL_DUMMY_SCAN",
@@ -1109,6 +1112,27 @@ impl PlanWriter {
                 );
             }
             K::DummyScan { table_index: index } => table_index(s, 200, *index),
+            // `LogicalGet` of the function, whose bind data a plan cannot keep (`SupportStatementCache` is false)
+            K::UserTableScan {
+                table_index,
+                types,
+                scan,
+            } => {
+                let get = GetFields {
+                    table_index: *table_index,
+                    types: types.clone(),
+                    names: op.column_bindings().iter().map(|b| b.column_index.to_string()).collect(),
+                    column_ids: (0..types.len()).collect(),
+                    projection: Vec::new(),
+                    filters: Vec::new(),
+                    zone_filters: Vec::new(),
+                    function: &scan.name,
+                    parameters: Vec::new(),
+                    data: None,
+                    sample: None,
+                };
+                self.get(s, &get);
+            }
             K::ChunkGet {
                 table_index: index,
                 types,
