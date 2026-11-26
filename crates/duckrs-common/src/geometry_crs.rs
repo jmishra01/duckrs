@@ -352,6 +352,18 @@ fn wkt2_crs(text: &str, name: &str, children: &[Wkt]) -> Option<Crs> {
 /// `DefaultCoordinateReferenceSystem`: the name, authority and code of those the catalog has.
 const DEFAULTS: [(&str, &str, &str); 2] = [("OGC:CRS84", "OGC", "CRS84"), ("OGC:CRS83", "OGC", "CRS83")];
 
+/// The coordinate systems the system catalog has (`DefaultCoordinateSystemGenerator`): name, authority, code and
+/// PROJJSON.
+pub fn default_coordinate_systems() -> impl Iterator<Item = (&'static str, &'static str, &'static str, &'static str)> {
+    DEFAULTS.iter().map(|&(name, authority, code)| {
+        let projjson = DEFAULT_PROJJSON
+            .iter()
+            .find(|(default, _)| *default == name)
+            .map_or("", |(_, definition)| definition);
+        (name, authority, code, projjson)
+    })
+}
+
 /// `OGC_CRS84_PROJJSON` and `OGC_CRS83_PROJJSON`: the PROJJSON definitions of [`DEFAULTS`], by name.
 const DEFAULT_PROJJSON: [(&str, &str); 2] = [
     (

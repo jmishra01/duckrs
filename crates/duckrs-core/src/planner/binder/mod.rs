@@ -740,6 +740,10 @@ pub struct SessionValues {
     pub attached_catalog: AttachedCatalogLookup,
     /// `duckdb_prepared_statements()`: the connection's prepared statements
     pub prepared_statements: Vec<PreparedStatementRow>,
+    /// `duckdb_connection_count()`
+    pub connection_count: u64,
+    /// `duckdb_approx_database_count()`
+    pub approx_database_count: u64,
 }
 
 /// A row of `duckdb_prepared_statements()`.

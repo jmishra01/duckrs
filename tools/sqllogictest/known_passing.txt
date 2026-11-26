@@ -2451,9 +2451,11 @@ test/sql/function/generic/make_type_empty_name.test
 test/sql/function/generic/null_constant_return_type.test
 test/sql/function/generic/replace_type.test
 test/sql/function/generic/table_func_varargs.test
+test/sql/function/generic/test_approx_database_count.test
 test/sql/function/generic/test_barrier.test
 test/sql/function/generic/test_between.test
 test/sql/function/generic/test_boolean_test.test
+test/sql/function/generic/test_connection_count.test
 test/sql/function/generic/test_if.test
 test/sql/function/generic/test_if_null.test
 test/sql/function/generic/test_in.test
@@ -2736,6 +2738,7 @@ test/sql/function/table/multi_file_array_parameter.test
 test/sql/function/table/query_function_null.test
 test/sql/function/table/read_duckdb_empty_projection.test
 test/sql/function/table/read_duckdb_struct_children.test
+test/sql/function/table/system_metadata_empty.test
 test/sql/function/test_scalar_executor.test
 test/sql/function/time/epoch.test
 test/sql/function/time/make_time_nan.test
@@ -2923,6 +2926,7 @@ test/sql/index/art/storage/test_art_buffered_replays_interleaved.test
 test/sql/index/art/storage/test_art_buffered_replays_interval_merging.test
 test/sql/index/art/storage/test_art_buffered_replays_multi_col.test
 test/sql/index/art/storage/test_art_checkpoint.test
+test/sql/index/art/storage/test_art_colocation_buffers.test
 test/sql/index/art/storage/test_art_duckdb_versions.test
 test/sql/index/art/storage/test_art_if_not_exists_constraint_name.test
 test/sql/index/art/storage/test_art_import.test
@@ -3268,6 +3272,7 @@ test/sql/limit/streaming_limit_pipeline_flush2.test
 test/sql/limit/test_batch_limit_filters.test
 test/sql/limit/test_limit0.test
 test/sql/limit/test_preserve_insertion_order.test
+test/sql/logging/enable_logging_file_keeps_path.test
 test/sql/logging/enable_logging_file_no_path.test
 test/sql/logging/logging.test
 test/sql/logging/logging_branch_coverage.test
@@ -3281,6 +3286,7 @@ test/sql/logging/logging_file_persistence.test
 test/sql/logging/logging_file_truncate_rewrite.test
 test/sql/logging/logging_non_queryable_storage.test
 test/sql/logging/logging_types.test
+test/sql/logging/test_enable_logging_unknown_type_file_storage.test
 test/sql/logging/test_logging_function.test
 test/sql/match_recognize/test_match_recognize.test
 test/sql/match_recognize/test_match_recognize_aggregate_idioms.test
@@ -3654,6 +3660,7 @@ test/sql/peg_parser/unterminated_literals.test
 test/sql/pg_catalog/pg_attribute.test
 test/sql/pg_catalog/pg_constraint.test
 test/sql/pg_catalog/pg_database.test
+test/sql/pg_catalog/pg_depend.test
 test/sql/pg_catalog/pg_enum.test
 test/sql/pg_catalog/pg_index.test
 test/sql/pg_catalog/pg_prepared_statements.test
@@ -3703,6 +3710,7 @@ test/sql/pivot/unpivot_types.test
 test/sql/pivot/unpivot_unnamed_subquery.test
 test/sql/pivot/unpivot_view.test
 test/sql/pragma/pragma_database_size_readonly.test
+test/sql/pragma/profiling/call_enable_profiling_function.test
 test/sql/pragma/profiling/profiling_output_not_allowed.test
 test/sql/pragma/profiling/profiling_renderer_settings_null.test
 test/sql/pragma/profiling/test_all_profiling_settings.test
@@ -3737,6 +3745,7 @@ test/sql/pragma/test_disabled_compression.test
 test/sql/pragma/test_enable_profile.test
 test/sql/pragma/test_force_compression.test
 test/sql/pragma/test_memory_limit.test
+test/sql/pragma/test_metadata_info.test
 test/sql/pragma/test_pragma_database_size.test
 test/sql/pragma/test_pragma_functions.test
 test/sql/pragma/test_pragma_parsing.test
@@ -4051,6 +4060,7 @@ test/sql/storage/checkpoint/sql_maintenance_checkpoint_lock.test
 test/sql/storage/checkpoint/test_checkpoint_failure_delayed_commit.test
 test/sql/storage/checkpoint/test_checkpoint_failure_delayed_rollback.test
 test/sql/storage/checkpoint/test_checkpoint_failure_on_detach.test
+test/sql/storage/checkpoint_system_catalog.test
 test/sql/storage/checkpointed_self_append.test
 test/sql/storage/checkpointed_self_append_tinyint.test
 test/sql/storage/commit_abort.test
@@ -4341,6 +4351,7 @@ test/sql/storage/optimistic_write/optimistic_write_temp_table.test
 test/sql/storage/optimistic_write/optimistic_write_unique_index_wal_replay.test
 test/sql/storage/optimistic_write/optimistic_write_unique_index_wal_replay_desync.test
 test/sql/storage/optimistic_write/optimistic_write_update.test
+test/sql/storage/partial_blocks/deferred_checkpoint_colocation.test
 test/sql/storage/partial_blocks/in_memory_checkpoint_abort.test
 test/sql/storage/partial_blocks/many_columns_drop_table.test
 test/sql/storage/partial_blocks/many_columns_rle.test
@@ -4663,13 +4674,17 @@ test/sql/subquery/test_neumann.test
 test/sql/subquery/test_offset.test
 test/sql/table_function/create_external_resource.test
 test/sql/table_function/database_oid.test
+test/sql/table_function/duckdb_available_metrics.test
 test/sql/table_function/duckdb_constraints.test
 test/sql/table_function/duckdb_constraints_fk.test
 test/sql/table_function/duckdb_constraints_issue11284.test
 test/sql/table_function/duckdb_constraints_issue12863.test
 test/sql/table_function/duckdb_constraints_struct_check.test
 test/sql/table_function/duckdb_databases.test
+test/sql/table_function/duckdb_dependencies.test
 test/sql/table_function/duckdb_dialects.test
+test/sql/table_function/duckdb_eviction_queues.test
+test/sql/table_function/duckdb_eviction_queues_transactions.test
 test/sql/table_function/duckdb_extensions.test
 test/sql/table_function/duckdb_functions_window.test
 test/sql/table_function/duckdb_indexes.test
@@ -5453,6 +5468,7 @@ test/sql/upsert/upsert_unique_null.test
 test/sql/vacuum/vacuum_nested_types.test
 test/sql/variables/test_variable_assignment.test
 test/sql/variables/test_variable_syntax.test
+test/sql/variables/test_variables.test
 test/sql/variant/variant_comparator.test
 test/sql/variant/variant_nested_arrays.test
 test/sql/vector_types/list_vector_types.test
