@@ -515,6 +515,11 @@ impl BoundExpr {
     pub fn cast_to(mut self, target: &LogicalType, try_cast: bool) -> BoundExpr {
         if let BoundExprKind::Parameter { data, .. } = &self.kind {
             let data = data.clone();
+            if is_valid_type(target) && !is_complete_type(target) {
+                // a type such as ANY or a DECIMAL of no width is no type for a parameter: C++ throws
+                // `ParameterNotResolvedException` (`CastToFunctionArguments`), and the parameter stays as it is
+                return self;
+            }
             // a cast of a parameter gives the parameter its type instead (`AddCastToTypeInternal`)
             let mut shared = data.lock();
             if !is_valid_type(target) {
@@ -732,6 +737,21 @@ impl fmt::Display for BoundExpr {
 /// `LogicalType::IsValid`: whether a type is one a value can have, not INVALID or UNKNOWN.
 fn is_valid_type(ty: &LogicalType) -> bool {
     !matches!(ty.id(), LogicalTypeId::Invalid | LogicalTypeId::Unknown)
+}
+
+/// `LogicalType::IsComplete`: whether a type is fully specified, without ANY or a nested or DECIMAL type of no
+/// parameters.
+fn is_complete_type(ty: &LogicalType) -> bool {
+    use LogicalTypeId as T;
+    match ty.id() {
+        T::Any | T::Template | T::Invalid | T::Unknown => false,
+        T::Struct | T::Tuple | T::Union | T::List | T::Map | T::Array | T::Decimal if !ty.has_params() => {
+            false
+        }
+        T::Struct | T::Tuple | T::Union => ty.struct_children().iter().all(|(_, c)| is_complete_type(c)),
+        T::List | T::Map | T::Array => ty.child_type().is_some_and(is_complete_type),
+        _ => true,
+    }
 }
 
 /// What a parameter of a statement being prepared ([`BoundExprKind::Parameter`]) of type `ty` evaluates to: a NULL
