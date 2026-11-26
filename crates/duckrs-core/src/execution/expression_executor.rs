@@ -903,6 +903,10 @@ pub fn execute(expr: &BoundExpr, input: &DataChunk) -> Result<Vector> {
     let count = input.len();
     match &expr.kind {
         BoundExprKind::Constant(value) => Ok(Vector::constant(value)),
+        // a parameter of a statement being prepared, which binding may evaluate
+        BoundExprKind::Parameter { .. } => Ok(Vector::constant(&crate::planner::expression::parameter_null(
+            &expr.return_type,
+        ))),
         BoundExprKind::JoinFilter {
             child,
             filter,

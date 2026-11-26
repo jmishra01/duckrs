@@ -11,7 +11,7 @@ use crate::function::aggregates::AggregateFunction;
 use crate::planner::logical::LogicalOperator;
 use duckrs_common::Result;
 use duckrs_common::sort_key::OrderModifiers;
-use duckrs_common::types::LogicalType;
+use duckrs_common::types::{LogicalType, LogicalTypeId};
 use duckrs_common::value::Value;
 use duckrs_parser::ast::{ComparisonOp, WindowBoundary, WindowExclude};
 use parking_lot::Mutex;
@@ -203,6 +203,14 @@ pub enum BoundExprKind {
         children: Vec<BoundExpr>,
         is_operator: bool,
     },
+    /// `BoundParameterExpression`: a parameter of a statement being prepared, which has no value yet. Its type
+    /// starts UNKNOWN and is what a cast applied to it makes it ([`BoundExpr::cast_to`]); `data` is the type all
+    /// occurrences of the parameter share (`BoundParameterData::return_type`). Only binding while preparing makes
+    /// one; anything that evaluates it sees a NULL of its type.
+    Parameter {
+        identifier: String,
+        data: Arc<Mutex<LogicalType>>,
+    },
 }
 
 /// An aggregate of a query (`BoundAggregateExpression`); expressions refer to its result
@@ -358,7 +366,10 @@ impl BoundExpr {
     /// The direct children.
     pub fn children(&self) -> Vec<&BoundExpr> {
         match &self.kind {
-            BoundExprKind::Constant(_) | BoundExprKind::ColumnRef { .. } | BoundExprKind::Reference(_) => Vec::new(),
+            BoundExprKind::Constant(_)
+            | BoundExprKind::ColumnRef { .. }
+            | BoundExprKind::Reference(_)
+            | BoundExprKind::Parameter { .. } => Vec::new(),
             BoundExprKind::Cast { child, .. }
             | BoundExprKind::JoinFilter { child, .. }
             | BoundExprKind::TopNFilter { child, .. } => vec![child],
@@ -392,7 +403,10 @@ impl BoundExpr {
 
     pub fn children_mut(&mut self) -> Vec<&mut BoundExpr> {
         match &mut self.kind {
-            BoundExprKind::Constant(_) | BoundExprKind::ColumnRef { .. } | BoundExprKind::Reference(_) => Vec::new(),
+            BoundExprKind::Constant(_)
+            | BoundExprKind::ColumnRef { .. }
+            | BoundExprKind::Reference(_)
+            | BoundExprKind::Parameter { .. } => Vec::new(),
             BoundExprKind::Cast { child, .. }
             | BoundExprKind::JoinFilter { child, .. }
             | BoundExprKind::TopNFilter { child, .. } => vec![child],
@@ -448,7 +462,9 @@ impl BoundExpr {
             BoundExprKind::ColumnRef { .. }
             | BoundExprKind::Reference(_)
             | BoundExprKind::Sequence { .. }
-            | BoundExprKind::Subquery { .. } => false,
+            | BoundExprKind::Subquery { .. }
+            // `BoundParameterExpression::IsFoldable`: its value is not known yet
+            | BoundExprKind::Parameter { .. } => false,
             BoundExprKind::Function { function, .. }
                 if CONSISTENT_WITHIN_QUERY_FUNCTIONS.contains(&function.name.as_str()) =>
             {
@@ -496,7 +512,39 @@ impl BoundExpr {
 
     /// `BoundCastExpression::AddCastToType`: casts the expression to `target` unless it already
     /// has that type.
-    pub fn cast_to(self, target: &LogicalType, try_cast: bool) -> BoundExpr {
+    pub fn cast_to(mut self, target: &LogicalType, try_cast: bool) -> BoundExpr {
+        if let BoundExprKind::Parameter { data, .. } = &self.kind {
+            let data = data.clone();
+            // a cast of a parameter gives the parameter its type instead (`AddCastToTypeInternal`)
+            let mut shared = data.lock();
+            if !is_valid_type(target) {
+                // invalidate the parameter
+                *shared = LogicalType::INVALID;
+            } else if shared.id() == LogicalTypeId::Invalid || *shared == *target {
+                // its type can't be known, or is this one
+            } else if shared.id() == LogicalTypeId::Unknown {
+                // it has no type yet: it takes this one
+                *shared = target.clone();
+            } else if self.return_type == *shared {
+                // this occurrence was given the type by a cast inside this one (`CAST(CAST($1 AS A) AS B)`): the
+                // outer cast is a cast
+                drop(shared);
+                return self.add_cast(target, try_cast);
+            } else {
+                // two uses ask for different types: the parameter has no single type
+                *shared = LogicalType::INVALID;
+            }
+            self.return_type = target.clone();
+            return self;
+        }
+        if &self.return_type == target {
+            return self;
+        }
+        self.add_cast(target, try_cast)
+    }
+
+    /// `AddCastExpressionInternal`: a cast of the expression to `target`.
+    fn add_cast(self, target: &LogicalType, try_cast: bool) -> BoundExpr {
         if &self.return_type == target {
             return self;
         }
@@ -636,6 +684,8 @@ impl fmt::Display for BoundExpr {
                 write!(f, " ELSE {else_expr} END")
             }
             BoundExprKind::Subquery { .. } => f.write_str("SUBQUERY"),
+            // `BoundParameterExpression::ToString`
+            BoundExprKind::Parameter { identifier, .. } => write!(f, "${identifier}"),
             // `BoundFunctionExpression::ToString` of a lambda function: the list, the lambda with the
             // names of its parameters, and the initial value
             BoundExprKind::ListLambda {
@@ -677,6 +727,17 @@ impl fmt::Display for BoundExpr {
             }
         }
     }
+}
+
+/// `LogicalType::IsValid`: whether a type is one a value can have, not INVALID or UNKNOWN.
+fn is_valid_type(ty: &LogicalType) -> bool {
+    !matches!(ty.id(), LogicalTypeId::Invalid | LogicalTypeId::Unknown)
+}
+
+/// What a parameter of a statement being prepared ([`BoundExprKind::Parameter`]) of type `ty` evaluates to: a NULL
+/// of that type, or an untyped one while it has none.
+pub fn parameter_null(ty: &LogicalType) -> Value {
+    if is_valid_type(ty) { Value::null(ty.clone()) } else { Value::sql_null() }
 }
 
 /// `x IN (a, b, ...)` as `x = a OR x = b ...`, and `x NOT IN (...)` as the NOT of that, of the

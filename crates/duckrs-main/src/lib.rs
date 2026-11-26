@@ -1670,6 +1670,9 @@ pub struct PreparedStatementData {
     statement: Statement,
     /// the parameters, lowercase, in order of appearance
     parameters: Vec<String>,
+    /// the type of each parameter that binding found (`value_map` with `TryGetType`), by name; one that has no
+    /// type until a value is bound is not in it
+    parameter_types: HashMap<String, LogicalType>,
     /// what `duckdb_prepared_statements()` gives as its result types
     result_types: Option<Vec<String>>,
     /// the names and types of its result, when it bound when it was prepared (`PreparedStatement::GetNames`,
@@ -1688,6 +1691,17 @@ impl PreparedStatementData {
 
     pub fn parameter_names(&self) -> &[String] {
         &self.parameters
+    }
+
+    /// `PreparedStatement::TryGetParameterType`: the type preparing the statement found for parameter `name`
+    /// (lowercase, `1`, `2`, ... for positional ones), if it found one.
+    pub fn parameter_type(&self, name: &str) -> Option<&LogicalType> {
+        self.parameter_types.get(name)
+    }
+
+    /// `PreparedStatement::GetExpectedParameterTypes`: the parameters whose types preparing found, by name.
+    pub fn parameter_types(&self) -> &HashMap<String, LogicalType> {
+        &self.parameter_types
     }
 
     /// `PreparedStatement::GetStatementType` and `GetStatementProperties().return_type`.
@@ -2399,10 +2413,10 @@ impl ClientContext {
     }
 
     fn prepare_statement(&mut self, statement: Statement) -> Result<Arc<PreparedStatementData>> {
-        let parameters = Arc::new(ParameterValues {
-            declared: parameter_names(&statement.to_string()),
-            ..ParameterValues::default()
-        });
+        let declared = parameter_names(&statement.to_string());
+        // `BindingMode::PREPARE`: parameters bind as `BoundParameterExpression`s, which take the types their uses
+        // give them
+        let mut parameters = Arc::new(ParameterValues::inferring(declared.clone()));
         // these run without the binder, and have no parameters
         let client_statement = configuring_select(&statement).is_some()
             || matches!(
@@ -2417,30 +2431,22 @@ impl ClientContext {
         let mut bound_at_prepare = false;
         let mut result_types = None;
         let mut columns = None;
+        let mut parameter_types = HashMap::new();
         if !client_statement {
-            let catalog = self.catalog();
-            let mut binder = Binder::with_options(&catalog, self.bind_options());
-            binder.parameters = Some(parameters.clone());
-            binder.session = Some(self.session_values());
-            let bound = match dml_cte::split(&statement) {
-                Some((ctes, rest)) => self.bind_dml_ctes(&ctes, &rest, &parameters),
-                None => binder.bind(&statement).map(|bound| {
-                    columns = Some((bound.names.clone(), bound.types.clone()));
-                    use duckrs_core::planner::binder::StatementReturnType;
-                    // `DuckDBPreparedStatementsFunction`: the types of a plan that was kept, which one that reads
-                    // the data of the database is not (the statistics it was planned with could change)
-                    result_types = match bound.return_type {
-                        StatementReturnType::ChangedRows => Some(vec!["BIGINT".to_string()]),
-                        StatementReturnType::QueryResult if !reads_database(&bound.plan) => {
-                            Some(bound.types.iter().map(ToString::to_string).collect())
-                        }
-                        _ => None,
-                    };
-                }),
-            };
+            let mut bound = self.bind_to_prepare(&statement, &parameters);
+            parameter_types = parameters.inferred_types();
+            if bound.as_ref().is_err_and(|error| error.kind != ErrorKind::ParameterNotResolved) {
+                // what duckrs's binder does not handle yet with parameters of unknown types binds as before, with
+                // the parameters as NULLs: a statement it binds is then not refused
+                parameters = Arc::new(ParameterValues {
+                    declared,
+                    ..ParameterValues::default()
+                });
+                bound = self.bind_to_prepare(&statement, &parameters);
+            }
             match bound {
-                // `ParameterNotResolvedException`: bound again with the values on execution; the
-                // parameters after the one that stopped binding are found in the text
+                // `ParameterNotResolvedException`: bound again with the values on execution; the parameters after
+                // the one that stopped binding are found in the text
                 Err(error) if error.kind == ErrorKind::ParameterNotResolved => {
                     let mut seen = parameters.seen.lock();
                     for name in parameter_names(&statement.to_string()) {
@@ -2448,9 +2454,11 @@ impl ClientContext {
                             seen.push(name);
                         }
                     }
+                    // `Planner::CreatePlan`: the result is one column `unknown` of type UNKNOWN
+                    columns = Some((vec!["unknown".to_string()], vec![LogicalType::new(duckrs_common::types::LogicalTypeId::Unknown)]));
                 }
                 other => {
-                    other?;
+                    (columns, result_types) = other?;
                     bound_at_prepare = true;
                 }
             }
@@ -2467,19 +2475,58 @@ impl ClientContext {
         };
         let has_parameters = !seen.is_empty();
         // a statement whose parameters have no types until it runs keeps no plan (`bound_all_parameters`); duckrs
-        // binds parameters without their types, so it takes any statement with parameters to be one
+        // binds a statement with parameters again whenever it runs, so it takes any statement with parameters to be
+        // one
         if !bound_at_prepare || has_parameters {
             result_types = None;
         }
         Ok(Arc::new(PreparedStatementData {
             statement,
             parameters: seen,
+            parameter_types,
             result_types,
             columns,
             // with parameters, `RequireRebind` binds again whenever a value's type is not the one bound, which duckrs
             // does not track: such a statement is taken to be bound again
             default_collation: (bound_at_prepare && !has_parameters).then(|| self.setting_text("default_collation")),
         }))
+    }
+
+    /// Binds `statement` with `parameters` to prepare it: the names and types of its result, and what
+    /// `duckdb_prepared_statements()` gives as its result types. A column whose type depends on a parameter of a type
+    /// not known yet is a `ParameterNotResolvedException` (`ExpressionBinder::Bind` of a root expression).
+    #[allow(clippy::type_complexity)]
+    fn bind_to_prepare(
+        &mut self,
+        statement: &Statement,
+        parameters: &Arc<ParameterValues>,
+    ) -> Result<(Option<(Vec<String>, Vec<LogicalType>)>, Option<Vec<String>>)> {
+        if let Some((ctes, rest)) = dml_cte::split(statement) {
+            self.bind_dml_ctes(&ctes, &rest, parameters)?;
+            return Ok((None, None));
+        }
+        let catalog = self.catalog();
+        let mut binder = Binder::with_options(&catalog, self.bind_options());
+        binder.parameters = Some(parameters.clone());
+        binder.session = Some(self.session_values());
+        let bound = binder.bind(statement)?;
+        if bound.types.iter().any(|ty| ty.contains_id(duckrs_common::types::LogicalTypeId::Unknown)) {
+            return Err(Error::new(
+                ErrorKind::ParameterNotResolved,
+                "Could not determine the types of the prepared statement parameters",
+            ));
+        }
+        use duckrs_core::planner::binder::StatementReturnType;
+        // `DuckDBPreparedStatementsFunction`: the types of a plan that was kept, which one that reads the data of the
+        // database is not (the statistics it was planned with could change)
+        let result_types = match bound.return_type {
+            StatementReturnType::ChangedRows => Some(vec!["BIGINT".to_string()]),
+            StatementReturnType::QueryResult if !reads_database(&bound.plan) => {
+                Some(bound.types.iter().map(ToString::to_string).collect())
+            }
+            _ => None,
+        };
+        Ok((Some((bound.names, bound.types)), result_types))
     }
 
     /// `StatementProperties` of the last statement of `sql`: its type, and what its result holds. `None` when
