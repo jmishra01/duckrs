@@ -67,8 +67,34 @@ fn execute_table_alter(alter: BoundTableAlter) -> Result<()> {
     }
     table.generated = alter.generated;
     table.catalog = old.catalog.clone();
-    table.from_alter = std::sync::atomic::AtomicBool::new(true);
-    *table.type_dependencies.lock() = old.type_dependencies.lock().clone();
+    table.lineage = old.lineage;
+    // `RemoveColumn` and the others bind the table again: the types of the columns it keeps, by their new names
+    let old_name_of = |index: usize| -> Option<&str> {
+        match &alter.projection {
+            None => old.columns.get(index).map(|c| c.name.as_str()),
+            Some(projection) => match projection.get(index).map(|e| &e.kind) {
+                Some(crate::planner::expression::BoundExprKind::Reference(at)) if alter.retyped != Some(index) => {
+                    old.columns.get(*at).map(|c| c.name.as_str())
+                }
+                _ => None,
+            },
+        }
+    };
+    let kept: Vec<(String, String)> = {
+        let before = old.type_dependencies.lock();
+        let mut kept: Vec<(String, String)> = before.iter().filter(|(column, _)| column.is_empty()).cloned().collect();
+        for (index, column) in table.columns.iter().enumerate() {
+            let Some(was) = old_name_of(index) else { continue };
+            kept.extend(
+                before
+                    .iter()
+                    .filter(|(c, _)| c.eq_ignore_ascii_case(was))
+                    .map(|(_, t)| (column.name.clone(), t.clone())),
+            );
+        }
+        kept
+    };
+    *table.type_dependencies.lock() = kept;
     *table.comment.lock() = alter.comment;
     table
         .row_group_rows

@@ -8136,6 +8136,11 @@ mod tests {
             err(&mut context, "CREATE TYPE dup AS ENUM ('a', 'a')"),
             "Invalid Input Error: Attempted to create ENUM type with duplicate value a"
         );
+        // a table depends on the user types of its columns, an alias of VARCHAR too
+        assert!(err(&mut context, "DROP TYPE name_t").starts_with(
+            "Dependency Error: Cannot drop entry \"name_t\" because there are entries that depend on it."
+        ));
+        run(&mut context, "DROP TABLE t");
         run(&mut context, "DROP TYPE name_t");
         assert_eq!(
             err(&mut context, "DROP TYPE name_t"),

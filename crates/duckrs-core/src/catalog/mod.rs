@@ -524,12 +524,14 @@ pub struct TableCatalogEntry {
     /// index of a key from the committed rows, so those keys are checked against the transaction's rows at its
     /// commit (`LocalStorage::Commit`), as a DEFERRED key is.
     pub local_keys_from: Mutex<Option<usize>>,
-    /// Whether an ALTER made this entry in place of another, which a transaction that wrote to that one finds
-    /// `ALTERED` at its commit (where a table dropped and created again is `DROPPED`).
-    pub from_alter: std::sync::atomic::AtomicBool,
-    /// The user types of this catalog its columns name, by name (`LogicalDependencyList` of its `CreateInfo`): a type
-    /// of an alias of VARCHAR leaves no trace in the column's type.
-    pub type_dependencies: Mutex<Vec<String>>,
+    /// Which table this is: an ALTER, and the copy of a transaction, keep it (C++'s `DataTable` it shares, or that an
+    /// ALTER made from it). A transaction that wrote to a table finds it `ALTERED` at its commit where the entry of that
+    /// name is of its lineage, and else `DROPPED`.
+    pub lineage: u64,
+    /// The user types of this catalog its columns name, by column and type name (the `LogicalDependencyList` of its
+    /// `CreateInfo` names the types): a type that is an alias of VARCHAR leaves no trace in the column's type. A type
+    /// read from a file that no column shows is the table's, column "".
+    pub type_dependencies: Mutex<Vec<(String, String)>>,
     /// Which row is which. Rows added at the end are in here once somebody asks.
     row_ids: Mutex<Arc<RowIds>>,
     versions: Arc<Mutex<RowVersions>>,
@@ -982,7 +984,7 @@ impl TableCatalogEntry {
             origin: None,
             deleted_before_key: Mutex::default(),
             local_keys_from: Mutex::default(),
-            from_alter: Default::default(),
+            lineage: next_lineage(),
             type_dependencies: Mutex::default(),
             row_ids: Mutex::default(),
             versions: Arc::default(),
@@ -2742,16 +2744,28 @@ impl SchemaCatalogEntry {
     /// The tables with a column of the ENUM `name`, however deep in a nested type. A column does
     /// not remember the name of its type, so an ENUM is known by its type, and other user types
     /// are not tracked yet.
-    fn tables_using_type(&self, name: &str) -> Vec<String> {
-        fn mentions(ty: &LogicalType, target: &LogicalType, name: &str) -> bool {
-            (target.id() == LogicalTypeId::Enum && ty == target)
-                || ty.alias().is_some_and(|alias| alias.eq_ignore_ascii_case(name))
-                || ty.child_type().is_some_and(|child| mentions(child, target, name))
-                || ty
-                    .struct_children()
-                    .iter()
-                    .any(|(_, child)| mentions(child, target, name))
+    /// The dependencies of `table` on the types `names` that a file lists, by the columns that show them (an ENUM, or
+    /// an alias), and the table's for the others.
+    pub fn attach_type_dependencies(&self, table: &TableCatalogEntry, names: &[String]) {
+        let mut found = Vec::new();
+        for name in names {
+            let Some(target) = self.get_type(name) else { continue };
+            let columns: Vec<String> = table
+                .columns
+                .iter()
+                .filter(|c| type_mentions(&c.ty, &target, name))
+                .map(|c| c.name.clone())
+                .collect();
+            if columns.is_empty() {
+                found.push((String::new(), name.clone()));
+            }
+            found.extend(columns.into_iter().map(|column| (column, name.clone())));
         }
+        *table.type_dependencies.lock() = found;
+    }
+
+    fn tables_using_type(&self, name: &str) -> Vec<String> {
+        let mentions = type_mentions;
         let Some(target) = self.get_type(name) else {
             return Vec::new();
         };
@@ -2762,7 +2776,11 @@ impl SchemaCatalogEntry {
                 TableOrView::Table(table)
                     if !table.from_query.load(std::sync::atomic::Ordering::Relaxed)
                         && (table.columns.iter().any(|c| mentions(&c.ty, &target, name))
-                            || table.type_dependencies.lock().iter().any(|t| t.eq_ignore_ascii_case(name))) =>
+                            || table
+                                .type_dependencies
+                                .lock()
+                                .iter()
+                                .any(|(_, t)| t.eq_ignore_ascii_case(name))) =>
                 {
                     Some(table.name.clone())
                 }
@@ -2843,6 +2861,23 @@ impl SchemaCatalogEntry {
             )
             .collect()
     }
+}
+
+/// A lineage for a table that is new.
+fn next_lineage() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether `ty` is the user type `target` named `name`, or holds it.
+fn type_mentions(ty: &LogicalType, target: &LogicalType, name: &str) -> bool {
+    (target.id() == LogicalTypeId::Enum && ty == target)
+        || ty.alias().is_some_and(|alias| alias.eq_ignore_ascii_case(name))
+        || ty.child_type().is_some_and(|child| type_mentions(child, target, name))
+        || ty
+            .struct_children()
+            .iter()
+            .any(|(_, child)| type_mentions(child, target, name))
 }
 
 /// A database's catalog (`DuckCatalog`).

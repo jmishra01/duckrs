@@ -1393,6 +1393,7 @@ impl PlanWriter {
                 name,
                 table_index: index,
                 always,
+                never,
                 ..
             } => {
                 table_index(s, 200, *index);
@@ -1401,6 +1402,8 @@ impl PlanWriter {
                 s.write_property_with_default(202, "ctename", name.as_str());
                 let materialize = if *always {
                     "CTE_MATERIALIZE_ALWAYS"
+                } else if *never {
+                    "CTE_MATERIALIZE_NEVER"
                 } else {
                     "CTE_MATERIALIZE_DEFAULT"
                 };

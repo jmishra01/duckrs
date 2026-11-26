@@ -1203,7 +1203,12 @@ pub(super) fn table_info(
     );
     info.comment = table.comment.lock().clone().map(Value::varchar);
     // `LogicalDependencyList`: the user types its columns name
-    let types = table.type_dependencies.lock();
+    let mut types: Vec<String> = Vec::new();
+    for (_, name) in table.type_dependencies.lock().iter() {
+        if !types.contains(name) {
+            types.push(name.clone());
+        }
+    }
     if !types.is_empty() {
         info.dependencies = Some(g::LogicalDependencyList {
             set: types

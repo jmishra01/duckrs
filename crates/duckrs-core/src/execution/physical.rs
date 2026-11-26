@@ -5609,7 +5609,7 @@ pub struct PhysicalCreateTable {
     pub generated: Vec<GeneratedColumn>,
     pub constraints: Vec<TableConstraint>,
     pub on_conflict: OnCreateConflict,
-    pub type_dependencies: Vec<String>,
+    pub type_dependencies: Vec<(String, String)>,
 }
 
 impl PhysicalOperator for PhysicalCreateTable {

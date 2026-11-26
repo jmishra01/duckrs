@@ -948,7 +948,7 @@ impl<'a> Replay<'a> {
             .create_table(&name, columns, generated, constraints, on_conflict)?
             .expect("OnCreateConflict::Error fails or creates");
         *entry.comment.lock() = comment;
-        *entry.type_dependencies.lock() = type_dependencies;
+        schema.attach_type_dependencies(&entry, &type_dependencies);
         entry.set_source(disk.clone());
         // the deleted rows of the file are known only by scanning it
         let ids = crate::catalog::TableSource::row_ids(&*disk);

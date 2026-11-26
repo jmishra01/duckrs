@@ -288,10 +288,7 @@ impl TableCatalogEntry {
         table.generated.clone_from(&self.generated);
         *table.comment.lock() = self.comment.lock().clone();
         *table.type_dependencies.lock() = self.type_dependencies.lock().clone();
-        table.from_alter.store(
-            self.from_alter.load(std::sync::atomic::Ordering::Relaxed),
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        table.lineage = self.lineage;
         table.from_query.store(
             self.from_query.load(std::sync::atomic::Ordering::Relaxed),
             std::sync::atomic::Ordering::Relaxed,
@@ -879,12 +876,16 @@ impl Fork {
                         return Err(conflict(how));
                     }
                 }
-                // ALTER gives a new entry, as does dropping a table and creating it again
-                Some(TableOrView::Table(current))
-                    if current.columns.len() != origin.table.columns.len()
-                        || current.from_alter.load(std::sync::atomic::Ordering::Relaxed) =>
-                {
-                    return Err(conflict("altered"));
+                // an ALTER gives a new entry of the same table: one that rewrote its columns made it a new `DataTable`,
+                // which the append finds (`AppendLock`); a COMMENT or RENAME shares it, which the commit finds
+                Some(TableOrView::Table(current)) if current.lineage == origin.table.lineage => {
+                    let rewritten = current.columns.len() != origin.table.columns.len()
+                        || current.columns.iter().zip(&origin.table.columns).any(|(a, b)| a.ty != b.ty);
+                    return Err(if rewritten {
+                        conflict("altered")
+                    } else {
+                        gone_table(&table.name, "altered")
+                    });
                 }
                 _ => return Err(gone_table(&table.name, "dropped")),
             }
@@ -1014,7 +1015,7 @@ impl Fork {
             live.link_foreign_keys();
         }
         let mut versions = self.database.versions.lock();
-        versions.note_dropped(&entries);
+        versions.note_dropped(entries);
         for entry in entries {
             versions.changed.insert(entry.key.clone(), now);
         }
