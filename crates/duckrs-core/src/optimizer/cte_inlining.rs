@@ -3,8 +3,9 @@
 //! `CTEInlining`: a materialized CTE that is read once, or that is cheap to run again, becomes
 //! its definition in place of each scan of it.
 //!
-//! The binder here plans each reference of a CTE by itself, so the CTEs this sees are those of the
-//! optimizer (`DisjunctiveJoinRewriter`). `LogicalOperatorDeepCopy` is [`deep_copy`], which gives
+//! The binder plans the CTEs of a query as materialized ones, as C++'s does, including those that
+//! say NOT MATERIALIZED (`CTE_MATERIALIZE_NEVER`), which only this pass inlines; others come from
+//! the optimizer (`DisjunctiveJoinRewriter`). `LogicalOperatorDeepCopy` is [`deep_copy`], which gives
 //! up, as C++'s does for what it cannot copy, on plans with subqueries, DELIM joins, recursive and
 //! materialized CTEs.
 
@@ -124,7 +125,10 @@ fn try_inlining(op: &mut LogicalOperator, next: &mut usize) {
         try_inlining(child, next);
     }
     let K::MaterializedCte {
-        table_index, always, ..
+        table_index,
+        always,
+        never,
+        ..
     } = op.kind
     else {
         return;
@@ -150,6 +154,11 @@ fn try_inlining(op: &mut LogicalOperator, next: &mut usize) {
     }
     if ref_count == 1 {
         inline_references(op, table_index, false, next);
+        return;
+    }
+    if never {
+        // referenced more than once, but it may not be materialized: inline it if it can be copied
+        inline_references(op, table_index, true, next);
         return;
     }
     if prevents_inlining(&op.children[0]) || ends_in_aggregate_or_distinct(&op.children[0]) {

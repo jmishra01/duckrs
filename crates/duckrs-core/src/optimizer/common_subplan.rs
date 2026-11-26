@@ -1153,6 +1153,7 @@ impl Finder {
                     table_index: cte_index,
                     data,
                     always: false,
+                    never: false,
                 },
                 vec![definition, rest],
             );

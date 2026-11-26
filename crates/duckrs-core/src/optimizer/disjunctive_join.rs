@@ -130,6 +130,7 @@ impl Rewriter {
                 table_index: right_cte.table_index,
                 data: right_cte.data.clone(),
                 always: right_always,
+                never: false,
             },
             vec![right_child, epilogue],
         );
@@ -139,6 +140,7 @@ impl Rewriter {
                 table_index: left_cte.table_index,
                 data: left_cte.data.clone(),
                 always: left_always,
+                never: false,
             },
             vec![left_child, epilogue],
         );

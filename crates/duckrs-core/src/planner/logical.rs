@@ -252,8 +252,11 @@ pub enum LogicalOperatorKind {
         name: String,
         table_index: usize,
         data: Arc<Mutex<ColumnDataCollection>>,
-        /// `CTE_MATERIALIZE_ALWAYS`: `CTEInlining` must leave it; otherwise `CTE_MATERIALIZE_DEFAULT`
+        /// `CTE_MATERIALIZE_ALWAYS`: `CTEInlining` must leave it
         always: bool,
+        /// `CTE_MATERIALIZE_NEVER` (`NOT MATERIALIZED`): `CTEInlining` inlines it, copying the
+        /// definition, wherever it can. Neither flag is `CTE_MATERIALIZE_DEFAULT`.
+        never: bool,
     },
     /// `LogicalCTERef` of a materialized CTE: the rows of the CTE `cte_index`, from its `data`.
     CteRef {
