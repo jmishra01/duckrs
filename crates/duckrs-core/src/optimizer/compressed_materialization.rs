@@ -777,7 +777,7 @@ fn integral_compress_with(input: BoundExpr, stats: &ColumnStatistics, offset_onl
     for target in [preferred, alternate] {
         if !offset_only && fits(&target) {
             return Some(Compressed {
-                expression: input.cast_to(&target, false),
+                expression: input.cast_to(&target, false).mark_compressed_cast(),
                 how: Compression::Cast,
                 range: (!all_null).then_some((min, max)),
             });
@@ -1052,7 +1052,7 @@ fn restore(input: BoundExpr, how: &Compression, original: &LogicalType) -> Bound
                 callback,
             )
         }
-        Compression::Cast => input.cast_to(original, false),
+        Compression::Cast => input.cast_to(original, false).mark_compressed_cast(),
         Compression::Offset(min) => {
             let callback = decompress_callback(&input.return_type, original).expect("a compressed type");
             let name = format!("__internal_decompress_integral_{}", type_name(original));
