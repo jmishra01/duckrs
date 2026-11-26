@@ -958,6 +958,15 @@ impl Exporter<'_> {
                 {
                     return Err("VALUES over a relation has no SQL export".into());
                 }
+                // `LogicalExpressionGet::ExportSQLInput`: VALUES that read their input (LATERAL) run once per row
+                // of it as SQL, so they must not have effects or fail
+                fn reads_columns(e: &BoundExpr) -> bool {
+                    matches!(e.kind, BoundExprKind::ColumnRef { .. }) || e.children().into_iter().any(reads_columns)
+                }
+                let all = || expressions.iter().flatten();
+                if all().any(reads_columns) && all().any(|e| has_effects(e) || (self.can_throw)(e)) {
+                    return Err("VALUES with input requires nonvolatile, nonthrowing expressions".into());
+                }
                 let scope = Scope::default();
                 let mut rows = Vec::new();
                 for row in expressions {
@@ -971,7 +980,18 @@ impl Exporter<'_> {
                     }
                     rows.push(values);
                 }
-                self.values(rows, types.len())
+                if rows.is_empty() {
+                    // VALUES has a row at least: no rows are those of a SELECT that keeps none
+                    let columns = types
+                        .iter()
+                        .map(|ty| self.constant(&Value::null(ty.clone())).map(Column::plain))
+                        .collect::<Res<Vec<_>>>()?;
+                    let mut select = Select::new(TableRef::empty(), columns);
+                    select.filters.push(Expr::constant(Literal::boolean(false)));
+                    Body::Select(select)
+                } else {
+                    self.values(rows, types.len())
+                }
             }
             Op::ChunkGet { types, chunks, .. } => {
                 let total: usize = chunks.iter().map(|c| c.len()).sum();
@@ -1769,16 +1789,20 @@ impl Exporter<'_> {
                 .collect(),
         );
         let through_scope = Scope::of(&read_through, &fields);
+        // (what has no SQL read through a subquery can still have it composed: then it is no identity)
         let through = expressions
             .iter()
             .map(|e| self.expr(&through_scope, e))
-            .collect::<Res<Vec<_>>>()?;
+            .collect::<Res<Vec<_>>>()
+            .ok();
         // `ComposeProjection`: one that passes every column on as it is goes
-        let identity = through.len() == fields.len()
-            && through
-                .iter()
-                .enumerate()
-                .all(|(i, e)| *e == Expr::column(vec!["r".into(), field_name(i)]));
+        let identity = through.as_ref().is_some_and(|through| {
+            through.len() == fields.len()
+                && through
+                    .iter()
+                    .enumerate()
+                    .all(|(i, e)| *e == Expr::column(vec!["r".into(), field_name(i)]))
+        });
         if identity && matches!(&child.body, Body::Select(s) if s.composable()) {
             return Ok(child.body);
         }
@@ -1851,7 +1875,7 @@ impl Exporter<'_> {
         for e in expressions {
             columns.push(self.column(&scope, e)?);
         }
-        if ok && !select.columns.is_empty() {
+        if let Some(through) = through.as_ref().filter(|_| ok && !select.columns.is_empty()) {
             // `ComposeProjection`: composing must not grow the SQL, as repeating what a column computes would
             let old: usize = select.columns.iter().map(|c| expr_size(&c.expr)).sum::<usize>()
                 + through.iter().map(expr_size).sum::<usize>();
@@ -2728,6 +2752,9 @@ impl Exporter<'_> {
             // `TryExportCompressedMaterialization`: what compressed materialization casts to is the value as it was
             BoundExprKind::Cast { child, try_cast: false } if e.is_compressed_cast() => self.expr(scope, child)?,
             BoundExprKind::Cast { child, try_cast } => {
+                if !representable(&e.return_type) || !representable(&child.return_type) {
+                    return Err("The cast type has no SQL type representation".into());
+                }
                 if has_nested_collation(&e.return_type) {
                     return Err("This cast cannot preserve nested collations through SQL".into());
                 }
@@ -2805,6 +2832,21 @@ impl Exporter<'_> {
                 }
                 if let Some(expr) = self.extract_call(scope, &function.name, children)? {
                     return Ok(expr);
+                }
+                // `write_log` binds its named arguments in order after the message and the session's log target
+                // (`bind_write_log`): SQL names them again, without the target
+                if function.name == "write_log" && (6..=7).contains(&children.len()) {
+                    let mut call = FunctionExpr::new("write_log", vec![self.expr(scope, &children[0])?]);
+                    call.name.qualification = vec!["system".into(), "main".into()];
+                    let names = ["level", "log_type", "scope", "disable_logging", "return_value"];
+                    for (name, child) in names.iter().zip(&children[2..]) {
+                        let expr = self.expr(scope, child)?;
+                        call.args.push(FunctionArgument {
+                            name: (*name).into(),
+                            expr: expr.with_alias(*name),
+                        });
+                    }
+                    return Ok(call.into());
                 }
                 let mut args = Vec::new();
                 for (i, c) in children.iter().enumerate() {
@@ -3080,9 +3122,41 @@ fn string_cast(value: &Value) -> Res<(Expr, bool)> {
 }
 
 /// A value as SQL, and whether it is cast to its type already.
+/// `HasUnsupportedVariantKeys`: a struct literal needs keys that are there and differ ignoring case.
+fn unsupported_variant_keys(node: &duckrs_common::variant::VariantNode) -> bool {
+    use duckrs_common::variant::VariantNode as N;
+    match node {
+        N::Object(children) => {
+            let mut names = BTreeSet::new();
+            children
+                .iter()
+                .any(|(key, child)| key.is_empty() || !names.insert(key.to_lowercase()) || unsupported_variant_keys(child))
+        }
+        N::Array(items) => items.iter().any(unsupported_variant_keys),
+        _ => false,
+    }
+}
+
+/// `TypeExpression::CanRepresent`: whether SQL can spell `ty`, which it cannot where it holds an ENUM of no values.
+fn representable(ty: &LogicalType) -> bool {
+    if ty.id() == LogicalTypeId::Enum && ty.enum_values().is_empty() {
+        return false;
+    }
+    ty.child_type().is_none_or(representable) && ty.struct_children().iter().all(|(_, t)| representable(t))
+}
+
 fn from_value(value: &Value) -> Res<(Expr, bool)> {
     use LogicalTypeId as T;
     let ty = value.logical_type();
+    if !representable(ty) {
+        return Err("The nested value type has no SQL constructor".into());
+    }
+    if let (T::Variant, ValueData::Bytes(bytes)) = (ty.id(), value.data()) {
+        let node = duckrs_common::variant::VariantNode::decode(bytes).map_err(|e| e.to_string())?;
+        if unsupported_variant_keys(&node) {
+            return Err("VARIANT object keys cannot be represented by a struct literal".into());
+        }
+    }
     if ty.is_aggregate_state() {
         return Err("Aggregate state SQL parameters are not representable".into());
     }
@@ -3202,6 +3276,25 @@ fn from_value(value: &Value) -> Res<(Expr, bool)> {
         }
         (T::Type | T::Table | T::Pointer | T::Lambda | T::Validity | T::LegacyAggregateState, _) => {
             Err("The value type has no SQL constructor".into())
+        }
+        // `ConstantExpression::FromValue`: the member its tag selects, by name, as a value of the type
+        (T::Union, ValueData::Struct(fields)) => {
+            let tag = fields
+                .first()
+                .and_then(|t| t.as_i128())
+                .and_then(|t| usize::try_from(t).ok())
+                .ok_or("A UNION value without a tag has no SQL constructor")?;
+            let (Some((name, _)), Some(member)) = (ty.struct_children().get(tag + 1), fields.get(tag + 1)) else {
+                return Err("A UNION value without its member has no SQL constructor".into());
+            };
+            let (expr, _) = from_value(member)?;
+            let mut function = FunctionExpr::new("union_value", Vec::new());
+            function.name.qualification = vec!["system".into(), "main".into()];
+            function.args = vec![FunctionArgument {
+                name: name.clone(),
+                expr: expr.with_alias(name.clone()),
+            }];
+            Ok((cast(ty, function.into(), false), true))
         }
         (T::Union, _) => Err("A UNION value has no SQL constructor".into()),
         _ => string_cast(value),
