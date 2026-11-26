@@ -429,4 +429,48 @@ handles! {
     duckdb_error_data = _duckdb_error_data;
     duckdb_vector = _duckdb_vector;
     duckdb_selection_vector = _duckdb_selection_vector;
+    duckdb_expression = _duckdb_expression;
+    duckdb_function_info = _duckdb_function_info;
+    duckdb_bind_info = _duckdb_bind_info;
+    duckdb_init_info = _duckdb_init_info;
+    duckdb_scalar_function = _duckdb_scalar_function;
+    duckdb_scalar_function_set = _duckdb_scalar_function_set;
+    duckdb_aggregate_function = _duckdb_aggregate_function;
+    duckdb_aggregate_function_set = _duckdb_aggregate_function_set;
+    duckdb_aggregate_state = _duckdb_aggregate_state;
+    duckdb_table_function = _duckdb_table_function;
 }
+
+/// The callbacks of the user-defined functions. A null function pointer is `None`.
+pub type duckdb_delete_callback_t = Option<unsafe extern "C" fn(data: *mut c_void)>;
+pub type duckdb_copy_callback_t = Option<unsafe extern "C" fn(data: *mut c_void) -> *mut c_void>;
+pub type duckdb_scalar_function_bind_t = Option<unsafe extern "C" fn(info: duckdb_bind_info)>;
+pub type duckdb_scalar_function_init_t = Option<unsafe extern "C" fn(info: duckdb_init_info)>;
+pub type duckdb_scalar_function_t =
+    Option<unsafe extern "C" fn(info: duckdb_function_info, input: duckdb_data_chunk, output: duckdb_vector)>;
+pub type duckdb_aggregate_state_size = Option<unsafe extern "C" fn(info: duckdb_function_info) -> idx_t>;
+pub type duckdb_aggregate_init_t = Option<unsafe extern "C" fn(info: duckdb_function_info, state: duckdb_aggregate_state)>;
+pub type duckdb_aggregate_destroy_t = Option<unsafe extern "C" fn(states: *mut duckdb_aggregate_state, count: idx_t)>;
+pub type duckdb_aggregate_update_t = Option<
+    unsafe extern "C" fn(info: duckdb_function_info, input: duckdb_data_chunk, states: *mut duckdb_aggregate_state),
+>;
+pub type duckdb_aggregate_combine_t = Option<
+    unsafe extern "C" fn(
+        info: duckdb_function_info,
+        source: *mut duckdb_aggregate_state,
+        target: *mut duckdb_aggregate_state,
+        count: idx_t,
+    ),
+>;
+pub type duckdb_aggregate_finalize_t = Option<
+    unsafe extern "C" fn(
+        info: duckdb_function_info,
+        source: *mut duckdb_aggregate_state,
+        result: duckdb_vector,
+        count: idx_t,
+        offset: idx_t,
+    ),
+>;
+pub type duckdb_table_function_bind_t = Option<unsafe extern "C" fn(info: duckdb_bind_info)>;
+pub type duckdb_table_function_init_t = Option<unsafe extern "C" fn(info: duckdb_init_info)>;
+pub type duckdb_table_function_t = Option<unsafe extern "C" fn(info: duckdb_function_info, output: duckdb_data_chunk)>;

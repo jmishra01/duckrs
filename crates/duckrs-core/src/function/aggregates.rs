@@ -38,6 +38,8 @@ pub enum AggregateKind {
     Last,
     AnyValue,
     Holistic(Holistic),
+    /// a user-defined aggregate ([`AggregateFunction::user`])
+    User,
 }
 
 /// One overload of an aggregate function (`AggregateFunction`).
@@ -49,6 +51,8 @@ pub struct AggregateFunction {
     pub kind: AggregateKind,
     /// `EXPORT_STATE`: the result is the state, of this type
     pub export: Option<LogicalType>,
+    /// the callbacks of a user-defined aggregate ([`AggregateKind::User`])
+    pub user: Option<super::udf::UserAggregate>,
 }
 
 impl fmt::Display for AggregateFunction {
@@ -93,6 +97,7 @@ impl AggregateFunctionSet {
                     return_type,
                     kind,
                     export: None,
+                    user: None,
                 })
             })
             .collect();
@@ -404,6 +409,8 @@ pub enum AggregateState {
     /// the state of a [`Holistic`] aggregate as C++ keeps it, read from an `AGGREGATE_STATE`
     /// ([`super::holistic_states`]), as a value of its layout
     Exported(Box<Value>),
+    /// the state of a user-defined aggregate, `None` until the group's first row
+    User(Option<super::udf::UserAggregateState>),
 }
 
 impl AggregateKind {
@@ -441,6 +448,7 @@ impl AggregateKind {
             Min | Max => AggregateState::Extreme(None),
             First | Last | AnyValue | SumBignum => AggregateState::Value(None),
             List => AggregateState::List(None),
+            User => AggregateState::User(None),
         }
     }
 }
@@ -477,6 +485,8 @@ pub fn state_layout(kind: AggregateKind, arguments: &[LogicalType], result: &Log
         LogicalType::struct_type(vec![("count".into(), LogicalType::UBIGINT), ("value".into(), value)])
     };
     Some(match kind {
+        // a user-defined state is opaque
+        User => return None,
         // `int64_t`
         CountStar | Count => LogicalType::BIGINT,
         // `OptionalStateType<T>`
@@ -551,6 +561,7 @@ fn state_to_value_of(
             _ => return Err(state_failure()),
         },
         S::Exported(value) => Value::clone(value),
+        S::User(_) => return Err(state_failure()),
     };
     if value.is_null() {
         return Ok(Value::null(ty.clone()));
@@ -662,7 +673,7 @@ fn encode_state(state: &AggregateState) -> Result<Vec<u8>> {
         AggregateState::List(Some(values)) => (7, values_list(values)?, Value::sql_null()),
         AggregateState::List(None) => (8, Value::sql_null(), Value::sql_null()),
         AggregateState::Rows(rows) => (9, values_list(rows)?, Value::sql_null()),
-        AggregateState::Exported(_) => return Err(state_failure()),
+        AggregateState::Exported(_) | AggregateState::User(_) => return Err(state_failure()),
     };
     let fields = vec![
         ("tag".to_string(), Value::utinyint(tag)),
@@ -733,6 +744,9 @@ fn decode_state(bytes: &[u8]) -> Result<AggregateState> {
 pub fn combine_states(kind: AggregateKind, left: AggregateState, right: AggregateState) -> Result<AggregateState> {
     use AggregateState as S;
     let overflow = || Error::new(ErrorKind::OutOfRange, "Overflow in aggregate state combine");
+    if kind == AggregateKind::User {
+        return super::udf::combine_user_states(left, right);
+    }
     Ok(match (left, right) {
         (S::Count(a), S::Count(b)) => S::Count(a.checked_add(b).ok_or_else(overflow)?),
         (S::Integer { sum: a, count: x }, S::Integer { sum: b, count: y }) => S::Integer {
@@ -1213,6 +1227,7 @@ pub fn export_state(
         return_type: ty.clone(),
         kind: function.kind,
         export: Some(ty.clone()),
+        user: function.user.clone(),
     };
     Ok((exported, ty))
 }
@@ -1755,6 +1770,10 @@ impl AggregateFunction {
         keys: Option<&[Vec<u8>]>,
     ) -> Result<()> {
         use AggregateKind::*;
+        if self.kind == User && input.is_none() {
+            let user = self.user.as_ref().expect("a user-defined aggregate has its callbacks");
+            return user.update(self, None, count, rows, states);
+        }
         let Some(input) = input else {
             // count_star counts rows, whatever they hold: for few groups, counted apart and then added to the states
             if states.len() == 1 {
@@ -1783,6 +1802,10 @@ impl AggregateFunction {
             return Ok(());
         };
         match self.kind {
+            User => {
+                let user = self.user.as_ref().expect("a user-defined aggregate has its callbacks");
+                return user.update(self, Some(input), count, rows, states);
+            }
             Holistic(_) => {
                 for &(row, group) in rows {
                     let AggregateState::Rows(state) = &mut states[group] else {
@@ -1921,6 +1944,11 @@ impl AggregateFunction {
         input: Option<&LogicalType>,
         column: &mut Vector,
     ) -> Result<()> {
+        if let Some(user) = &self.user
+            && self.export.is_none()
+        {
+            return user.finalize(states, column);
+        }
         if self.export.is_some() && return_type.is_aggregate_state() {
             let layout = return_type.state_layout();
             for (row, state) in states.iter().enumerate() {
@@ -1942,6 +1970,11 @@ impl AggregateFunction {
         input: Option<&LogicalType>,
     ) -> Result<Value> {
         use AggregateKind::*;
+        if let Some(user) = &self.user
+            && self.export.is_none()
+        {
+            return user.finalize_one(state, return_type);
+        }
         if self.export.is_some() {
             return write_state(self.kind, state, return_type);
         }

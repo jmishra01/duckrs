@@ -463,7 +463,9 @@ impl BoundExpr {
     pub fn is_volatile(&self) -> bool {
         let volatile = match &self.kind {
             BoundExprKind::Sequence { .. } => true,
-            BoundExprKind::Function { function, .. } => VOLATILE_FUNCTIONS.contains(&function.name.as_str()),
+            BoundExprKind::Function { function, .. } => {
+                function.volatile || VOLATILE_FUNCTIONS.contains(&function.name.as_str())
+            }
             // the body has a scope of its own, so it is not among the children
             BoundExprKind::ListLambda { body, .. } => body.is_volatile(),
             _ => false,

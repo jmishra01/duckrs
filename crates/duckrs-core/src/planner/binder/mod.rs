@@ -32,6 +32,7 @@ mod statements;
 mod table_constraints;
 mod table_functions;
 mod tpc;
+mod user_functions;
 pub use table_functions::named_argument;
 mod window;
 
@@ -744,6 +745,9 @@ pub struct SessionValues {
     pub connection_count: u64,
     /// `duckdb_approx_database_count()`
     pub approx_database_count: u64,
+    /// the functions the client registered (`duckdb_register_scalar_function`, ...), which DuckDB has in its
+    /// system catalog
+    pub user_functions: Option<Arc<crate::function::udf::UserFunctions>>,
 }
 
 /// A row of `duckdb_prepared_statements()`.
