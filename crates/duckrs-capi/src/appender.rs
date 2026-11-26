@@ -17,6 +17,7 @@ const FLUSH_COUNT: usize = 204_800;
 /// A table `Appender`.
 struct Appender {
     connection: SharedConnection,
+    catalog: Option<String>,
     schema: Option<String>,
     table: String,
     /// the columns of the table, and what `AppendDefault` gives for each
@@ -48,18 +49,24 @@ fn invalid_input(message: impl Into<String>) -> Error {
 }
 
 impl Appender {
-    fn new(connection: SharedConnection, schema: Option<String>, table: String) -> duckrs::Result<Self> {
+    fn new(
+        connection: SharedConnection,
+        catalog: Option<String>,
+        schema: Option<String>,
+        table: String,
+    ) -> duckrs::Result<Self> {
         let (columns, defaults) = {
             let connection = connection.lock();
-            let columns = connection.table_columns(schema.as_deref(), &table)?;
+            let columns = connection.table_columns(catalog.as_deref(), schema.as_deref(), &table)?;
             let defaults = connection
-                .table_column_defaults(schema.as_deref(), &table)
+                .table_column_defaults(catalog.as_deref(), schema.as_deref(), &table)
                 .unwrap_or_else(|_| vec![None; columns.len()]);
             (columns, defaults)
         };
         let types: Vec<LogicalType> = columns.iter().map(|(_, ty)| ty.clone()).collect();
         Ok(Self {
             connection,
+            catalog,
             schema,
             table,
             columns,
@@ -236,7 +243,7 @@ impl Appender {
         let columns: Vec<(String, LogicalType)> =
             self.active_columns().into_iter().map(|i| self.columns[i].clone()).collect();
         let mut connection = self.connection.lock();
-        connection.append_chunks(self.schema.as_deref(), &self.table, columns, chunks)
+        connection.append_chunks(self.catalog.as_deref(), self.schema.as_deref(), &self.table, columns, chunks)
     }
 
     fn close(&mut self) -> duckrs::Result<()> {
@@ -331,7 +338,7 @@ pub unsafe extern "C" fn duckdb_appender_create(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn duckdb_appender_create_ext(
     connection: duckdb_connection,
-    _catalog: *const c_char,
+    catalog: *const c_char,
     schema: *const c_char,
     table: *const c_char,
     out_appender: *mut duckdb_appender,
@@ -345,10 +352,12 @@ pub unsafe extern "C" fn duckdb_appender_create_ext(
     }
     // SAFETY: C passes a NUL-terminated schema name, or none for the default one.
     let schema = unsafe { ffi::c_str(schema) }.map(|s| String::from_utf8_lossy(s).into_owned());
+    // SAFETY: C passes a NUL-terminated catalog name, or none for the connection's database.
+    let catalog = unsafe { ffi::c_str(catalog) }.map(|s| String::from_utf8_lossy(s).into_owned());
     let table = String::from_utf8_lossy(table).into_owned();
     let created = ffi::guard(
         Err(Error::new(ErrorKind::Internal, "Unknown create appender error")),
-        || Appender::new(connection.connection.clone(), schema, table),
+        || Appender::new(connection.connection.clone(), catalog, schema, table),
     );
     let (wrapper, state) = match created {
         Ok(appender) => (

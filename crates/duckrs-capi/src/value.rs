@@ -67,8 +67,9 @@ pub unsafe extern "C" fn duckdb_create_varchar(text: *const c_char) -> duckdb_va
     unsafe { duckdb_create_varchar_length(bytes.as_ptr().cast(), bytes.len() as idx_t) }
 }
 
+/// `NullValue<T>`: what a getter gives for a value that does not cast: the minimum of an integer, NaN for a float.
 macro_rules! scalar {
-    ($create:ident, $get:ident, $t:ty, $make:expr, $ty:expr, $variant:ident) => {
+    ($create:ident, $get:ident, $t:ty, $make:expr, $ty:expr, $variant:ident, $null:expr) => {
         #[unsafe(no_mangle)]
         pub extern "C" fn $create(input: $t) -> duckdb_value {
             new_value($make(input))
@@ -79,23 +80,23 @@ macro_rules! scalar {
             // SAFETY: C passes a live value.
             match unsafe { cast(value, &$ty) } {
                 Some(ValueData::$variant(v)) => v,
-                _ => <$t>::default(),
+                _ => $null,
             }
         }
     };
 }
 
-scalar!(duckdb_create_bool, duckdb_get_bool, bool, Value::boolean, LogicalType::BOOLEAN, Bool);
-scalar!(duckdb_create_int8, duckdb_get_int8, i8, Value::tinyint, LogicalType::TINYINT, Int8);
-scalar!(duckdb_create_uint8, duckdb_get_uint8, u8, Value::utinyint, LogicalType::UTINYINT, UInt8);
-scalar!(duckdb_create_int16, duckdb_get_int16, i16, Value::smallint, LogicalType::SMALLINT, Int16);
-scalar!(duckdb_create_uint16, duckdb_get_uint16, u16, Value::usmallint, LogicalType::USMALLINT, UInt16);
-scalar!(duckdb_create_int32, duckdb_get_int32, i32, Value::integer, LogicalType::INTEGER, Int32);
-scalar!(duckdb_create_uint32, duckdb_get_uint32, u32, Value::uinteger, LogicalType::UINTEGER, UInt32);
-scalar!(duckdb_create_int64, duckdb_get_int64, i64, Value::bigint, LogicalType::BIGINT, Int64);
-scalar!(duckdb_create_uint64, duckdb_get_uint64, u64, Value::ubigint, LogicalType::UBIGINT, UInt64);
-scalar!(duckdb_create_float, duckdb_get_float, f32, Value::float, LogicalType::FLOAT, Float);
-scalar!(duckdb_create_double, duckdb_get_double, f64, Value::double, LogicalType::DOUBLE, Double);
+scalar!(duckdb_create_bool, duckdb_get_bool, bool, Value::boolean, LogicalType::BOOLEAN, Bool, false);
+scalar!(duckdb_create_int8, duckdb_get_int8, i8, Value::tinyint, LogicalType::TINYINT, Int8, i8::MIN);
+scalar!(duckdb_create_uint8, duckdb_get_uint8, u8, Value::utinyint, LogicalType::UTINYINT, UInt8, 0);
+scalar!(duckdb_create_int16, duckdb_get_int16, i16, Value::smallint, LogicalType::SMALLINT, Int16, i16::MIN);
+scalar!(duckdb_create_uint16, duckdb_get_uint16, u16, Value::usmallint, LogicalType::USMALLINT, UInt16, 0);
+scalar!(duckdb_create_int32, duckdb_get_int32, i32, Value::integer, LogicalType::INTEGER, Int32, i32::MIN);
+scalar!(duckdb_create_uint32, duckdb_get_uint32, u32, Value::uinteger, LogicalType::UINTEGER, UInt32, 0);
+scalar!(duckdb_create_int64, duckdb_get_int64, i64, Value::bigint, LogicalType::BIGINT, Int64, i64::MIN);
+scalar!(duckdb_create_uint64, duckdb_get_uint64, u64, Value::ubigint, LogicalType::UBIGINT, UInt64, 0);
+scalar!(duckdb_create_float, duckdb_get_float, f32, Value::float, LogicalType::FLOAT, Float, f32::NAN);
+scalar!(duckdb_create_double, duckdb_get_double, f64, Value::double, LogicalType::DOUBLE, Double, f64::NAN);
 
 #[unsafe(no_mangle)]
 pub extern "C" fn duckdb_create_hugeint(input: duckdb_hugeint) -> duckdb_value {
@@ -107,7 +108,7 @@ pub unsafe extern "C" fn duckdb_get_hugeint(value: duckdb_value) -> duckdb_hugei
     // SAFETY: C passes a live value.
     match unsafe { cast(value, &LogicalType::HUGEINT) } {
         Some(ValueData::Int128(v)) => duckdb_hugeint::from_i128(v),
-        _ => duckdb_hugeint::default(),
+        _ => duckdb_hugeint::from_i128(i128::MIN),
     }
 }
 
@@ -151,7 +152,7 @@ pub unsafe extern "C" fn duckdb_get_bignum(value: duckdb_value) -> duckdb_bignum
 
 #[unsafe(no_mangle)]
 pub extern "C" fn duckdb_create_decimal(input: duckdb_decimal) -> duckdb_value {
-    if input.width < 1 || input.width > 38 || input.scale > input.width {
+    if !(1..=38).contains(&input.width) || input.scale > input.width {
         return std::ptr::null_mut();
     }
     match Value::decimal(input.value.to_i128(), input.width, input.scale) {
@@ -199,9 +200,8 @@ pub extern "C" fn duckdb_create_date(input: duckdb_date) -> duckdb_value {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn duckdb_get_date(value: duckdb_value) -> duckdb_date {
     // SAFETY: C passes a live value.
-    duckdb_date {
-        days: unsafe { get_i64(value, LogicalTypeId::Date) } as i32,
-    }
+    let days = unsafe { get_i64(value, LogicalTypeId::Date) } as i32;
+    duckdb_date { days }
 }
 
 #[unsafe(no_mangle)]
@@ -212,9 +212,8 @@ pub extern "C" fn duckdb_create_time(input: duckdb_time) -> duckdb_value {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn duckdb_get_time(value: duckdb_value) -> duckdb_time {
     // SAFETY: C passes a live value.
-    duckdb_time {
-        micros: unsafe { get_i64(value, LogicalTypeId::Time) },
-    }
+    let micros = unsafe { get_i64(value, LogicalTypeId::Time) };
+    duckdb_time { micros }
 }
 
 #[unsafe(no_mangle)]
@@ -225,9 +224,8 @@ pub extern "C" fn duckdb_create_time_tz_value(input: duckdb_time_tz) -> duckdb_v
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn duckdb_get_time_tz(value: duckdb_value) -> duckdb_time_tz {
     // SAFETY: C passes a live value.
-    duckdb_time_tz {
-        bits: unsafe { get_i64(value, LogicalTypeId::TimeTz) } as u64,
-    }
+    let bits = unsafe { get_i64(value, LogicalTypeId::TimeTz) } as u64;
+    duckdb_time_tz { bits }
 }
 
 #[unsafe(no_mangle)]
@@ -238,9 +236,8 @@ pub extern "C" fn duckdb_create_time_ns(input: duckdb_time_ns) -> duckdb_value {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn duckdb_get_time_ns(value: duckdb_value) -> duckdb_time_ns {
     // SAFETY: C passes a live value.
-    duckdb_time_ns {
-        nanos: unsafe { get_i64(value, LogicalTypeId::TimeNs) },
-    }
+    let nanos = unsafe { get_i64(value, LogicalTypeId::TimeNs) };
+    duckdb_time_ns { nanos }
 }
 
 #[unsafe(no_mangle)]
@@ -251,9 +248,8 @@ pub extern "C" fn duckdb_create_timestamp(input: duckdb_timestamp) -> duckdb_val
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn duckdb_get_timestamp(value: duckdb_value) -> duckdb_timestamp {
     // SAFETY: C passes a live value.
-    duckdb_timestamp {
-        micros: unsafe { get_i64(value, LogicalTypeId::Timestamp) },
-    }
+    let micros = unsafe { get_i64(value, LogicalTypeId::Timestamp) };
+    duckdb_timestamp { micros }
 }
 
 #[unsafe(no_mangle)]
@@ -264,9 +260,8 @@ pub extern "C" fn duckdb_create_timestamp_tz(input: duckdb_timestamp) -> duckdb_
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn duckdb_get_timestamp_tz(value: duckdb_value) -> duckdb_timestamp {
     // SAFETY: C passes a live value.
-    duckdb_timestamp {
-        micros: unsafe { get_i64(value, LogicalTypeId::TimestampTz) },
-    }
+    let micros = unsafe { get_i64(value, LogicalTypeId::TimestampTz) };
+    duckdb_timestamp { micros }
 }
 
 #[unsafe(no_mangle)]
@@ -277,9 +272,8 @@ pub extern "C" fn duckdb_create_timestamp_tz_ns(input: duckdb_timestamp_ns) -> d
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn duckdb_get_timestamp_tz_ns(value: duckdb_value) -> duckdb_timestamp_ns {
     // SAFETY: C passes a live value.
-    duckdb_timestamp_ns {
-        nanos: unsafe { get_i64(value, LogicalTypeId::TimestampTzNs) },
-    }
+    let nanos = unsafe { get_i64(value, LogicalTypeId::TimestampTzNs) };
+    duckdb_timestamp_ns { nanos }
 }
 
 #[unsafe(no_mangle)]
@@ -290,9 +284,8 @@ pub extern "C" fn duckdb_create_timestamp_s(input: duckdb_timestamp_s) -> duckdb
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn duckdb_get_timestamp_s(value: duckdb_value) -> duckdb_timestamp_s {
     // SAFETY: C passes a live value.
-    duckdb_timestamp_s {
-        seconds: unsafe { get_i64(value, LogicalTypeId::TimestampSec) },
-    }
+    let seconds = unsafe { get_i64(value, LogicalTypeId::TimestampSec) };
+    duckdb_timestamp_s { seconds }
 }
 
 #[unsafe(no_mangle)]
@@ -303,9 +296,8 @@ pub extern "C" fn duckdb_create_timestamp_ms(input: duckdb_timestamp_ms) -> duck
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn duckdb_get_timestamp_ms(value: duckdb_value) -> duckdb_timestamp_ms {
     // SAFETY: C passes a live value.
-    duckdb_timestamp_ms {
-        millis: unsafe { get_i64(value, LogicalTypeId::TimestampMs) },
-    }
+    let millis = unsafe { get_i64(value, LogicalTypeId::TimestampMs) };
+    duckdb_timestamp_ms { millis }
 }
 
 #[unsafe(no_mangle)]
@@ -316,9 +308,8 @@ pub extern "C" fn duckdb_create_timestamp_ns(input: duckdb_timestamp_ns) -> duck
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn duckdb_get_timestamp_ns(value: duckdb_value) -> duckdb_timestamp_ns {
     // SAFETY: C passes a live value.
-    duckdb_timestamp_ns {
-        nanos: unsafe { get_i64(value, LogicalTypeId::TimestampNs) },
-    }
+    let nanos = unsafe { get_i64(value, LogicalTypeId::TimestampNs) };
+    duckdb_timestamp_ns { nanos }
 }
 
 #[unsafe(no_mangle)]
@@ -339,7 +330,11 @@ pub unsafe extern "C" fn duckdb_get_interval(value: duckdb_value) -> duckdb_inte
             days: v.days,
             micros: v.micros,
         },
-        _ => duckdb_interval::default(),
+        _ => duckdb_interval {
+            months: i32::MIN,
+            days: i32::MIN,
+            micros: i64::MIN,
+        },
     }
 }
 

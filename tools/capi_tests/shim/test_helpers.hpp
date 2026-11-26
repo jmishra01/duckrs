@@ -121,8 +121,15 @@ struct StringUtil {
 		std::transform(str.begin(), str.end(), str.begin(), [](unsigned char c) { return std::toupper(c); });
 		return str;
 	}
+	//! As DuckDB's: of C strings, so up to the first NUL
+	static bool Equals(const char *l, const char *r) {
+		return strcmp(l, r) == 0;
+	}
+	static bool Equals(const char *l, const string &r) {
+		return Equals(l, r.c_str());
+	}
 	static bool Equals(const string &l, const string &r) {
-		return l == r;
+		return Equals(l.c_str(), r.c_str());
 	}
 	static bool CIEquals(const string &l, const string &r) {
 		return Lower(l) == Lower(r);
@@ -192,7 +199,12 @@ private:
 	template <class T, class... ARGS>
 	static void Render(vector<string> &rendered, T first, ARGS... rest) {
 		std::ostringstream stream;
-		stream << first;
+		if constexpr (std::is_integral<T>::value) {
+			// a uint8_t is a number to Format, not a character
+			stream << +first;
+		} else {
+			stream << first;
+		}
 		rendered.push_back(stream.str());
 		Render(rendered, rest...);
 	}

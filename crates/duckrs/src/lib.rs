@@ -162,31 +162,43 @@ impl Connection {
     }
 
     /// The text of each statement of `sql` (`Connection::ExtractStatements`), to prepare them one at a time.
-    pub fn extract_statements(&self, sql: &str) -> Result<Vec<String>> {
+    pub fn extract_statements(&mut self, sql: &str) -> Result<Vec<String>> {
         self.context.extract_statements(sql)
     }
 
-    /// The names and types of the columns of `schema.table` (`ClientContext::TableInfo`).
-    pub fn table_columns(&self, schema: Option<&str>, table: &str) -> Result<Vec<(String, LogicalType)>> {
-        self.context.table_columns(schema, table)
+    /// The names and types of the columns of `catalog.schema.table` (`ClientContext::TableInfo`); without a catalog,
+    /// of the database the connection uses.
+    pub fn table_columns(
+        &self,
+        catalog: Option<&str>,
+        schema: Option<&str>,
+        table: &str,
+    ) -> Result<Vec<(String, LogicalType)>> {
+        self.context.table_columns_in(catalog, schema, table)
     }
 
     /// The DEFAULT of each column of `schema.table` folded to a constant (NULL without one), or `None` for a
     /// default that does not fold, as `Appender::AppendDefault` reads them.
-    pub fn table_column_defaults(&self, schema: Option<&str>, table: &str) -> Result<Vec<Option<Value>>> {
-        self.context.table_column_defaults(schema, table)
+    pub fn table_column_defaults(
+        &self,
+        catalog: Option<&str>,
+        schema: Option<&str>,
+        table: &str,
+    ) -> Result<Vec<Option<Value>>> {
+        self.context.table_column_defaults(catalog, schema, table)
     }
 
     /// `ClientContext::Append`: inserts `chunks`, whose columns are `columns` of `schema.table` (names and types,
     /// as [`Connection::table_columns`] gives them), as one INSERT would.
     pub fn append_chunks(
         &mut self,
+        catalog: Option<&str>,
         schema: Option<&str>,
         table: &str,
         columns: Vec<(String, LogicalType)>,
         chunks: Vec<DataChunk>,
     ) -> Result<()> {
-        self.context.append(schema, table, columns, chunks)
+        self.context.append_in(catalog, schema, table, columns, chunks)
     }
 }
 
@@ -363,6 +375,11 @@ impl PreparedStatement {
     /// The names of its parameters, lowercase, in the order they appear: `1`, `2`, ... for `?` and `$1`.
     pub fn parameter_names(&self) -> &[String] {
         self.data.parameter_names()
+    }
+
+    /// The names and types of its result columns (`GetNames`, `GetTypes`), when it was bound as it was prepared.
+    pub fn result_columns(&self) -> Option<(&[String], &[LogicalType])> {
+        self.data.result_columns()
     }
 
     /// Its type, and what its result holds (`GetStatementType`, `GetStatementProperties`).

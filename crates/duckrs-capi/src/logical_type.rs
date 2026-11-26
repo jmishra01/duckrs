@@ -146,7 +146,7 @@ pub unsafe extern "C" fn duckdb_create_map_type(key_type: duckdb_logical_type, v
 #[unsafe(no_mangle)]
 pub extern "C" fn duckdb_create_decimal_type(width: u8, scale: u8) -> duckdb_logical_type {
     // `Decimal::IsValidWidthScale`
-    if width < 1 || width > 38 || scale > width {
+    if !(1..=38).contains(&width) || scale > width {
         return std::ptr::null_mut();
     }
     new_type(LogicalType::decimal(width, scale))

@@ -210,6 +210,67 @@ pub unsafe extern "C" fn duckdb_clear_bindings(prepared_statement: duckdb_prepar
     }
 }
 
+/// The names and types of the result of a statement, as far as duckrs knows them when it is prepared.
+///
+/// # Safety
+///
+/// As for [`prepared`].
+unsafe fn result_columns<'a>(prepared_statement: duckdb_prepared_statement) -> Option<(&'a [String], &'a [LogicalType])> {
+    // SAFETY: by the contract of this function.
+    let statement = unsafe { prepared(prepared_statement) }?.statement.as_ref().ok()?;
+    let (names, types) = statement.result_columns()?;
+    // a result with a column of a parameter whose type is not known yet (which duckrs binds as a NULL) is one
+    // column `unknown` of type INVALID (`PreparedStatementData::GetTypes` of an unbound statement)
+    static UNKNOWN_NAMES: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| vec!["unknown".to_string()]);
+    static UNKNOWN_TYPES: [LogicalType; 1] = [LogicalType::INVALID];
+    if !statement.parameter_names().is_empty() && types.iter().any(|ty| ty.id() == LogicalTypeId::SqlNull) {
+        return Some((UNKNOWN_NAMES.as_slice(), &UNKNOWN_TYPES));
+    }
+    Some((names, types))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn duckdb_prepared_statement_column_count(prepared_statement: duckdb_prepared_statement) -> idx_t {
+    // SAFETY: C passes a live prepared statement.
+    unsafe { result_columns(prepared_statement) }.map_or(0, |(names, _)| names.len() as idx_t)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn duckdb_prepared_statement_column_name(
+    prepared_statement: duckdb_prepared_statement,
+    col_idx: idx_t,
+) -> *const c_char {
+    // SAFETY: C passes a live prepared statement.
+    match unsafe { result_columns(prepared_statement) }.and_then(|(names, _)| names.get(col_idx as usize)) {
+        Some(name) => ffi::strdup(name),
+        None => std::ptr::null(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn duckdb_prepared_statement_column_logical_type(
+    prepared_statement: duckdb_prepared_statement,
+    col_idx: idx_t,
+) -> duckdb_logical_type {
+    // SAFETY: C passes a live prepared statement.
+    match unsafe { result_columns(prepared_statement) }.and_then(|(_, types)| types.get(col_idx as usize)) {
+        Some(ty) => ffi::into_handle(ty.clone()),
+        None => std::ptr::null_mut(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn duckdb_prepared_statement_column_type(
+    prepared_statement: duckdb_prepared_statement,
+    col_idx: idx_t,
+) -> duckdb_type {
+    // SAFETY: C passes a live prepared statement.
+    match unsafe { result_columns(prepared_statement) }.and_then(|(_, types)| types.get(col_idx as usize)) {
+        Some(ty) => crate::helper::type_id_to_c(ty.id()),
+        None => DUCKDB_TYPE_INVALID,
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn duckdb_prepared_statement_type(statement: duckdb_prepared_statement) -> duckdb_statement_type {
     // SAFETY: C passes a live prepared statement.

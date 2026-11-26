@@ -409,6 +409,41 @@ pub unsafe extern "C" fn duckdb_slice_vector(vector: duckdb_vector, sel: duckdb_
     });
 }
 
+/// `VectorOperations::Copy`: rows `sel[src_offset..src_count]` of `src` into rows `dst_offset..` of `dst`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn duckdb_vector_copy_sel(
+    src: duckdb_vector,
+    dst: duckdb_vector,
+    sel: duckdb_selection_vector,
+    src_count: idx_t,
+    src_offset: idx_t,
+    dst_offset: idx_t,
+) {
+    if src == dst {
+        return;
+    }
+    // SAFETY: C passes two live, distinct vectors and a live selection vector.
+    let (Some(source), Some(target), Some(sel)) =
+        (unsafe { ffi::get(src) }, unsafe { ffi::get_mut(dst) }, unsafe { ffi::get(sel) })
+    else {
+        return;
+    };
+    let (start, end) = (src_offset as usize, (src_count as usize).min(sel.len()));
+    if start >= end || source.logical_type() != target.logical_type() {
+        return;
+    }
+    ffi::guard((), || {
+        let selection = SelectionVector::from_vec(sel[start..end].to_vec());
+        target.copy_from(
+            source,
+            &selection,
+            end - start,
+            dst_offset as usize,
+            duckrs_common::vector::StringCopy::Deep,
+        );
+    });
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn duckdb_vector_reference_vector(to_vector: duckdb_vector, from_vector: duckdb_vector) {
     if to_vector == from_vector {

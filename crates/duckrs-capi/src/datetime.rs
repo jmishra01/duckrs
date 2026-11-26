@@ -124,7 +124,7 @@ pub extern "C" fn duckdb_uhugeint_to_double(value: duckdb_uhugeint) -> f64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn duckdb_double_to_hugeint(value: f64) -> duckdb_hugeint {
     const LIMIT: f64 = 170_141_183_460_469_231_731_687_303_715_884_105_728.0;
-    if !value.is_finite() || value <= -LIMIT || value >= LIMIT {
+    if !value.is_finite() || !(-LIMIT..LIMIT).contains(&value) {
         return duckdb_hugeint::default();
     }
     duckdb_hugeint::from_i128(value as i128)
@@ -134,7 +134,7 @@ pub extern "C" fn duckdb_double_to_hugeint(value: f64) -> duckdb_hugeint {
 #[unsafe(no_mangle)]
 pub extern "C" fn duckdb_double_to_uhugeint(value: f64) -> duckdb_uhugeint {
     const LIMIT: f64 = 340_282_366_920_938_463_463_374_607_431_768_211_456.0;
-    if !value.is_finite() || value < 0.0 || value >= LIMIT {
+    if !value.is_finite() || !(0.0..LIMIT).contains(&value) {
         return duckdb_uhugeint::default();
     }
     duckdb_uhugeint::from_u128(value as u128)
