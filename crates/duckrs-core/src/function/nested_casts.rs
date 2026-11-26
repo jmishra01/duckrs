@@ -461,8 +461,41 @@ pub(super) fn has_nested_cast(
 }
 
 /// Casts row by row, through [`cast_value`].
+/// `ArrayToArrayCast`: arrays of different sizes don't cast, whatever the values, also where a cast of nested types
+/// casts them (the member of a UNION no row uses too); the sizes of the first such pair.
+fn array_size_mismatch(source: &LogicalType, target: &LogicalType) -> Option<(u32, u32)> {
+    use LogicalTypeId as L;
+    match (source.id(), target.id()) {
+        (L::Array, L::Array) => match (source.array_size(), target.array_size()) {
+            (Some(from), Some(to)) if from != to => Some((from, to)),
+            _ => array_size_mismatch(source.child_type()?, target.child_type()?),
+        },
+        (L::List | L::Array, L::List | L::Array) => array_size_mismatch(source.child_type()?, target.child_type()?),
+        (L::Struct | L::Union, L::Struct | L::Union) if source.id() == target.id() => {
+            source.struct_children().iter().find_map(|(name, from)| {
+                let (_, to) = target
+                    .struct_children()
+                    .iter()
+                    .find(|(other, _)| !name.is_empty() && other.eq_ignore_ascii_case(name))?;
+                array_size_mismatch(from, to)
+            })
+        }
+        _ => None,
+    }
+}
+
 pub(super) fn nested_cast(source: &Vector, result: &mut Vector, count: usize, mode: CastMode) -> Result<()> {
     let target = result.logical_type().clone();
+    if count > 0
+        && let Some((from, to)) = array_size_mismatch(source.logical_type(), &target)
+    {
+        if mode == CastMode::Strict {
+            return Err(conversion_error(format!("Cannot cast array of size {from} to array of size {to}")));
+        }
+        // every row fails
+        *result = Vector::constant_null(target);
+        return Ok(());
+    }
     let constant = source.vector_type() == VectorType::Constant;
     let rows = if constant { 1 } else { count };
     result.prepare_flat(rows.max(1));
