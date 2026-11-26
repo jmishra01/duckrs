@@ -441,7 +441,14 @@ impl Binder<'_> {
         if cte.aliases.iter().any(String::is_empty) {
             return Err(binder_error("column alias cannot be empty"));
         }
+        // C++ flattens subqueries before `CTEInlining`, which then inlines a NOT MATERIALIZED CTE
+        // read in one; that pass here does not reach into subqueries, so such a reference binds
+        // the definition itself when the pass is on
+        let inline_here = materialized.as_ref().is_some_and(|state| state.lock().never)
+            && self.options.optimizer.cte_inlining
+            && self.outer_contexts.len() > outer_depth;
         if let Some(state) = &materialized
+            && !inline_here
             && !state.lock().inline
         {
             let bound_already = state.lock().bound.is_some();
