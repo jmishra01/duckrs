@@ -82,6 +82,8 @@ pub(crate) struct TableBindInfo {
     pub(crate) parameters: Vec<Value>,
     pub(crate) named_parameters: Vec<(String, Value)>,
     pub(crate) names: Vec<String>,
+    /// the names as C strings, made when C asks for them
+    pub(crate) c_names: Vec<Option<std::ffi::CString>>,
     pub(crate) types: Vec<LogicalType>,
     pub(crate) bind_data: Option<OwnedData>,
     pub(crate) cardinality: Option<(u64, bool)>,

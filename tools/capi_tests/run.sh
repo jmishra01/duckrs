@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Runs DuckDB's C API tests (test/api/capi/v1/test_capi*.cpp of the C++ checkout) against libduckrs_capi.
+# Runs DuckDB's C API tests (test/api/capi/v1/test_capi*.cpp and the capi_*_functions.cpp of user-defined functions,
+# of the C++ checkout) against libduckrs_capi.
 #
 # usage: tools/capi_tests/run.sh [--release] [test_capi.cpp ...]
 #

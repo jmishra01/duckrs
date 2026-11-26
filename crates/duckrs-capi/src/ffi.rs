@@ -193,12 +193,6 @@ unsafe impl Send for CPointer {}
 // SAFETY: as for `Send`: duckrs does nothing with the pointer itself but copy it.
 unsafe impl Sync for CPointer {}
 
-impl CPointer {
-    pub(crate) fn null() -> Self {
-        Self(std::ptr::null_mut())
-    }
-}
-
 /// Runs `body`, giving `fallback` if it panics, so a panic of duckrs does not unwind into C (where it would abort).
 pub(crate) fn guard<R>(fallback: R, body: impl FnOnce() -> R) -> R {
     catch_unwind(AssertUnwindSafe(body)).unwrap_or(fallback)

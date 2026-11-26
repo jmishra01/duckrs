@@ -148,6 +148,7 @@ impl Binder<'_> {
         let mut positional = Vec::new();
         let mut named: Vec<(String, Value)> = Vec::new();
         for argument in &call.args {
+            let argument = &super::table_functions::named_argument(argument);
             let value = self.constant_argument(&argument.expr)?;
             if argument.name.is_empty() {
                 positional.push(value);

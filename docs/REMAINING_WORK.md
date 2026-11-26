@@ -785,7 +785,20 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [ ] the engine gaps the prepared
     tests reach (preparing EXECUTE, EXPLAIN, CHECKPOINT, PIVOT), real streaming and pending results (duckrs
     finishes a query first), `duckdb_interrupt`, `duckdb_vector_reference_vector` sharing its buffer
-  - [ ] scalar, aggregate, table, cast and copy functions; Arrow; replacement scans; profiling and logging; the
+  - [x] user-defined scalar, aggregate and table functions (2026-11-26, phase 92): `duckdb_create_scalar_function`
+    and its setters (varargs, special handling, volatile, extra info, bind with argument expressions, init with a
+    local state per thread, errors), function sets, `duckdb_*_aggregate_function*` (state size / init / update /
+    combine / finalize / destructor, sets, extra info, errors), `duckdb_*_table_function*` with the bind, init and
+    function interfaces (parameters, named parameters cast to their types, result columns, cardinality, bind /
+    init / local init data, errors), plus `duckdb_client_context` (connection id) and `duckdb_expression`
+    (return type, foldable, fold). The engine side is `duckrs_core::function::udf`: the traits `ScalarUdf`,
+    `AggregateUdf` and `TableUdf` that the C API implements, and the `UserFunctions` registry of a database
+    instance, which the binder reads through `SessionValues::user_functions` (not the catalog, as C++'s system
+    catalog has them). The capi_scalar/aggregate/table_functions.cpp files: 18 of 18 cases
+  - [ ] user-defined functions: projection pushdown (a table function is always given every column), more than one
+    thread for a table function (`max_threads`), the copy callback of scalar bind data (bind data is shared),
+    functions in `duckdb_functions()`, calls qualified with a schema
+  - [ ] cast and copy functions; Arrow; replacement scans; profiling and logging; the
     table description, the instance cache; then v2 (`src/main/capi/v2`)
 - [ ] 42. **CLI shell** (`crates/duckrs-cli`, the `duckrs` binary). Against `tools/shell/tests` it passes
   150 of `test_shell_basics` (C++ 1.5.6: 141), all of `test_dump`, `test_errors`, `test_import`,
