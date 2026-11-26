@@ -4,8 +4,8 @@ What is still missing from the roadmap in [`RUST_PORT_PLAN.md`](../../RUST_PORT_
 The test numbers come from [`STATUS.md`](STATUS.md) at baseline `d4eea3f208d`.
 
 - Overall: 5484 of 6367 test files pass (**90.8%** of the 6038 that run), on 2026-11-26. The v1 target is ≥ 90%.
-- Phases 0–11 have code. Their gates are met except `test/parquet` (79.3%, gate 80%). `sql/cte` is at 84.0% against
-  85%, and counts as met for v1 (decided 2026-11-26; see item 23). The failing-file counts in the items below are from earlier runs; `STATUS.md` has the current ones.
+- Phases 0–11 have code, and their gates are met: `test/parquet` is at 85.6% (95 of 111, gate 80%) since
+  `bound_schema` (phase 82). `sql/cte` is at 84.0% against 85%, and counts as met for v1 (decided 2026-11-26; see item 23). The failing-file counts in the items below are from earlier runs; `STATUS.md` has the current ones.
 - Phase 12 is partly done. Phases 13 and 14 have not started.
 - In git, the branches named "Phase 13"–"Phase 21" are rounds of fixes against the test suite.
   They are not the plan's Phase 13 (Performance) or Phase 14 (Extensions).
@@ -76,7 +76,7 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] `case_insensitive_keys`, duplicate keys as errors, `RemoveDuplicateStructKeys`, keys that differ in case made
     unique column names; `read_single_json_file`; the format detected from the first line (`DetectFormatAndRecordType`)
   - [ ] map inference (`map_inference_threshold`, `field_appearance_threshold`): objects with many or inconsistent keys
-- [ ] 3. Parquet reader/writer: missing types, filter pushdown, delta encoding (`test/parquet`: 22 failing, `corrupt`: 5)
+- [ ] 3. Parquet reader/writer: missing types, filter pushdown, delta encoding (all of `test/parquet`: 16 of 111 failing, 85.6%; gate 80%)
   - [x] `utf8_validation` (`strict`, `replace`, `ignore`): strings read as bytes and repaired, their bounds not used;
     exact VARCHAR bounds that are not UTF-8 ignored; `decode(BLOB, error_option)`
   - [x] TIME values outside a day are errors, TIMETZ wraps into the day; INT96 timestamps read as microseconds (no
