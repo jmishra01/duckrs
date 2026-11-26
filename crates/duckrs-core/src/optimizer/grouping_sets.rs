@@ -390,6 +390,7 @@ fn expand(op: &mut LogicalOperator, next: &mut usize) -> Option<Replacements> {
             table_index: cte_index,
             data,
             always: false,
+            never: false,
         },
         vec![definition, union],
     );
@@ -623,6 +624,7 @@ fn cascade_rewrite(
                 table_index: level.cte_index,
                 data: level.data.clone(),
                 always: false,
+                never: false,
             },
             vec![identity(fresh(next), definition), result],
         );

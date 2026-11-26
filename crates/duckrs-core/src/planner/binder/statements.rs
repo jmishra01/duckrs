@@ -343,7 +343,9 @@ impl Binder<'_> {
     }
 
     /// `Binder::BindNode(QueryNode)`: the CTEs of a query are visible for what the query binds.
-    /// They are not materialized: each reference binds and plans the CTE's query again.
+    /// A CTE of a SELECT or set operation is planned once, as a `MaterializedCte` around the query
+    /// (`FinishCTE`), whatever its materialization hint; one that reads the queries around it is
+    /// bound again at each reference.
     pub(super) fn bind_query_node(&mut self, node: &QueryNode) -> Result<BoundStatement> {
         self.bind_query_node_with(node, |binder| match &node.kind {
             QueryNodeKind::Select(select) => binder.bind_select_node(select, &node.modifiers),
@@ -376,12 +378,12 @@ impl Binder<'_> {
                 }
             }
             // `PrepareCTE`: a CTE runs once, and `CTEInlining` puts its query back where that is
-            // better, unless it says MATERIALIZED
-            let materialized = (cte.materialized != ast::CteMaterialize::Never
-                && matches!(
-                    cte.query.kind,
-                    QueryNodeKind::Select(_) | QueryNodeKind::SetOperation(_)
-                ))
+            // better, unless it says MATERIALIZED. A NOT MATERIALIZED one is planned the same way, and
+            // `CTEInlining` inlines it wherever it can (and not at all when it is disabled).
+            let materialized = matches!(
+                cte.query.kind,
+                QueryNodeKind::Select(_) | QueryNodeKind::SetOperation(_)
+            )
             .then(|| {
                 Arc::new(Mutex::new(super::MaterializedCteState {
                     cte_index: self.generate_table_index(),
@@ -389,6 +391,7 @@ impl Binder<'_> {
                     bound: None,
                     inline: false,
                     always: cte.materialized == ast::CteMaterialize::Always,
+                    never: cte.materialized == ast::CteMaterialize::Never,
                 }))
             });
             self.ctes.push((
@@ -424,6 +427,7 @@ impl Binder<'_> {
                     table_index: state.cte_index,
                     data: state.data.clone(),
                     always: state.always,
+                    never: state.never,
                 },
                 vec![plan, query],
             );
