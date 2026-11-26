@@ -10,4 +10,10 @@ TO NumericCast(FROM value) {
 	return static_cast<TO>(value);
 }
 
+//! `UnsafeNumericCast`: a plain static_cast too (arrow_string_view_type.hpp uses it)
+template <class TO, class FROM>
+TO UnsafeNumericCast(FROM value) {
+	return static_cast<TO>(value);
+}
+
 } // namespace duckdb
