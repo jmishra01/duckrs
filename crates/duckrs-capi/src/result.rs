@@ -34,6 +34,9 @@ pub(crate) struct ResultData {
     chunks: Vec<usize>,
     /// the next of `chunks` that `duckdb_fetch_chunk` gives
     next_chunk: usize,
+    /// a result C reads as a stream (`QueryResultStream`): duckrs has all of its rows already, but C sees no row
+    /// count and reads it a chunk at a time, as it would a stream
+    streaming: bool,
 }
 
 impl ResultData {
@@ -55,6 +58,24 @@ pub(crate) fn translate_result(
     result: duckrs::Result<QueryResult>,
     properties: Option<StatementProperties>,
     out: Option<&mut duckdb_result>,
+) -> duckdb_state {
+    translate(result, properties, out, false)
+}
+
+/// `StreamsByDefault`: whether a statement executed to stream gives a stream; only a query does.
+pub(crate) fn streams_by_default(properties: &StatementProperties) -> bool {
+    matches!(
+        properties.statement_type,
+        duckrs::StatementType::Select | duckrs::StatementType::Pragma
+    ) && properties.return_type == duckrs::StatementReturnType::QueryResult
+}
+
+/// [`translate_result`], or `DuckDBTranslateStreamResult` when `streaming` is set and the statement streams.
+pub(crate) fn translate(
+    result: duckrs::Result<QueryResult>,
+    properties: Option<StatementProperties>,
+    out: Option<&mut duckdb_result>,
+    streaming: bool,
 ) -> duckdb_state {
     let state = if result.is_ok() { DuckDBSuccess } else { DuckDBError };
     let Some(out) = out else {
@@ -78,6 +99,7 @@ pub(crate) fn translate_result(
                 set_type: ResultSetType::None,
                 chunks,
                 next_chunk: 0,
+                streaming: streaming && streams_by_default(&properties),
             }
         }
         Err(error) => ResultData {
@@ -88,6 +110,7 @@ pub(crate) fn translate_result(
             set_type: ResultSetType::None,
             chunks: Vec::new(),
             next_chunk: 0,
+            streaming: false,
         },
     });
     if let Some((message, _)) = &data.error {
@@ -284,6 +307,8 @@ fn materialize(result: &mut duckdb_result, data: &mut ResultData) -> bool {
         ResultSetType::None => {}
     }
     data.set_type = ResultSetType::Deprecated;
+    // the deprecated result reads every row at once: a stream is drained into it
+    data.streaming = false;
     let Some(query_result) = &data.result else {
         return false;
     };
@@ -390,7 +415,11 @@ pub unsafe extern "C" fn duckdb_column_count(result: *mut duckdb_result) -> idx_
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn duckdb_row_count(result: *mut duckdb_result) -> idx_t {
     // SAFETY: C passes a result a query wrote.
-    unsafe { result_and_data(result) }.map_or(0, |(_, data)| data.row_count() as idx_t)
+    match unsafe { result_and_data(result) } {
+        // the rows of a stream are not known before it is read
+        Some((_, data)) if !data.streaming => data.row_count() as idx_t,
+        _ => 0,
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -401,6 +430,9 @@ pub unsafe extern "C" fn duckdb_rows_changed(result: *mut duckdb_result) -> idx_
     };
     if data.set_type == ResultSetType::Deprecated {
         return result.deprecated_rows_changed;
+    }
+    if data.streaming {
+        return 0;
     }
     let Some(query_result) = &data.result else {
         return 0;
@@ -467,7 +499,7 @@ pub unsafe extern "C" fn duckdb_result_error_type(result: *mut duckdb_result) ->
 pub unsafe extern "C" fn duckdb_result_chunk_count(result: duckdb_result) -> idx_t {
     // SAFETY: C passes a result a query wrote.
     match unsafe { data_at(result.internal_data) } {
-        Some(data) if data.set_type != ResultSetType::Deprecated => data.chunks.len() as idx_t,
+        Some(data) if data.set_type != ResultSetType::Deprecated && !data.streaming => data.chunks.len() as idx_t,
         _ => 0,
     }
 }
@@ -488,7 +520,8 @@ pub unsafe extern "C" fn duckdb_result_get_chunk(result: duckdb_result, chunk_in
     let Some(data) = (unsafe { data_at(result.internal_data) }) else {
         return std::ptr::null_mut();
     };
-    if data.set_type == ResultSetType::Deprecated {
+    // random access is for retained results only
+    if data.set_type == ResultSetType::Deprecated || data.streaming {
         return std::ptr::null_mut();
     }
     data.set_type = ResultSetType::Materialized;
@@ -521,10 +554,13 @@ pub unsafe extern "C" fn duckdb_stream_fetch_chunk(result: duckdb_result) -> duc
     unsafe { duckdb_fetch_chunk(result) }
 }
 
-/// duckrs materializes every result, so none streams.
 #[unsafe(no_mangle)]
-pub extern "C" fn duckdb_result_is_streaming(_result: duckdb_result) -> bool {
-    false
+pub unsafe extern "C" fn duckdb_result_is_streaming(result: duckdb_result) -> bool {
+    // SAFETY: C passes a result a query wrote.
+    match unsafe { data_at(result.internal_data) } {
+        Some(data) => data.error.is_none() && data.streaming,
+        None => false,
+    }
 }
 
 #[unsafe(no_mangle)]

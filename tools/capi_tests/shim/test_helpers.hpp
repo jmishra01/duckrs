@@ -36,8 +36,18 @@
 #define D_ASSERT(x) assert(x)
 #endif
 
+#ifndef STANDARD_VECTOR_SIZE
+#define STANDARD_VECTOR_SIZE 2048
+#endif
+
 namespace duckdb {
 
+//! `BaseAppender::DEFAULT_FLUSH_COUNT`
+struct BaseAppender {
+	static constexpr idx_t DEFAULT_FLUSH_COUNT = 204800;
+};
+
+using std::atomic;
 using std::make_pair;
 using std::move;
 using std::pair;
@@ -85,6 +95,13 @@ void TestCreateDirectory(string path);
 void TestDeleteDirectory(string path);
 string TestJoinPath(string path1, string path2);
 
+//! `Printer::Print`: to stderr.
+struct Printer {
+	static void Print(const string &message) {
+		fprintf(stderr, "%s\n", message.c_str());
+	}
+};
+
 //! `StringUtil`: the helpers the C API tests use.
 struct StringUtil {
 	static bool Contains(const string &haystack, const string &needle) {
@@ -103,6 +120,9 @@ struct StringUtil {
 	static string Upper(string str) {
 		std::transform(str.begin(), str.end(), str.begin(), [](unsigned char c) { return std::toupper(c); });
 		return str;
+	}
+	static bool Equals(const string &l, const string &r) {
+		return l == r;
 	}
 	static bool CIEquals(const string &l, const string &r) {
 		return Lower(l) == Lower(r);
@@ -186,6 +206,27 @@ struct hugeint_t {
 	}
 	hugeint_t(int64_t upper_p, uint64_t lower_p) : lower(lower_p), upper(upper_p) {
 	}
+	static hugeint_t FromInt128(__int128 value) {
+		return hugeint_t(static_cast<int64_t>(value >> 64), static_cast<uint64_t>(value));
+	}
+	__int128 ToInt128() const {
+		return (static_cast<__int128>(upper) << 64) | static_cast<__int128>(lower);
+	}
+	hugeint_t operator-(const hugeint_t &rhs) const {
+		return FromInt128(ToInt128() - rhs.ToInt128());
+	}
+	hugeint_t operator+(const hugeint_t &rhs) const {
+		return FromInt128(ToInt128() + rhs.ToInt128());
+	}
+	hugeint_t operator*(const hugeint_t &rhs) const {
+		return FromInt128(ToInt128() * rhs.ToInt128());
+	}
+	hugeint_t operator-() const {
+		return FromInt128(-ToInt128());
+	}
+	bool operator==(const hugeint_t &rhs) const {
+		return lower == rhs.lower && upper == rhs.upper;
+	}
 };
 
 struct uhugeint_t {
@@ -199,6 +240,7 @@ struct uhugeint_t {
 };
 
 struct Hugeint {
+	static const hugeint_t POWERS_OF_TEN[39];
 	static bool TryConvert(int64_t value, hugeint_t &result) {
 		result = hugeint_t(value);
 		return true;

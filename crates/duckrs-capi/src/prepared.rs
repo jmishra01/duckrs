@@ -6,11 +6,11 @@ use crate::database::SharedConnection;
 use crate::error::c_string;
 use crate::ffi::{self, Handle};
 use crate::helper::statement_type_to_c;
-use crate::result::translate_result;
+use crate::result::translate;
 use crate::types::*;
 use duckrs::{LogicalType, LogicalTypeId, PreparedStatement, Value};
 use duckrs_common::types::{Date, Interval, Time, Timestamp};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::{CString, c_char};
 
 /// `PreparedStatementWrapper`: a statement prepared on a connection, and the values bound to its parameters.
@@ -20,8 +20,8 @@ pub struct PreparedWrapper {
     statement: Result<PreparedStatement, CString>,
     /// the values bound so far, by parameter name
     values: HashMap<String, Value>,
-    /// `param_index_to_name`: the name of parameter `1`, `2`, ...
-    names: Vec<String>,
+    /// `param_index_to_name`: the name of each parameter by its index
+    names: BTreeMap<idx_t, String>,
     /// `error_data` of a bind to a parameter that isn't there (`success = false`), which stays
     bind_error: Option<CString>,
 }
@@ -44,7 +44,7 @@ impl PreparedWrapper {
     fn new(connection: SharedConnection, statement: duckrs::Result<PreparedStatement>) -> Self {
         let names = match &statement {
             Ok(statement) => parameter_order(statement.parameter_names()),
-            Err(_) => Vec::new(),
+            Err(_) => BTreeMap::new(),
         };
         Self {
             connection,
@@ -60,23 +60,27 @@ impl PreparedWrapper {
         self.statement.as_ref().ok()
     }
 
-    /// The name of parameter `index` (from 1).
+    /// The name of parameter `index`.
     fn name(&self, index: idx_t) -> Option<&str> {
-        let index = usize::try_from(index).ok()?.checked_sub(1)?;
-        self.names.get(index).map(String::as_str)
+        self.names.get(&index).map(String::as_str)
+    }
+
+    /// `duckdb_execute_prepared`, or `_streaming`.
+    fn execute(&self, out_result: Option<&mut duckdb_result>, streaming: bool) -> duckdb_state {
+        let Some((result, properties)) = self.run() else {
+            return DuckDBError;
+        };
+        translate(result, Some(properties), out_result, streaming)
     }
 }
 
-/// `GetNamedParameterMap`: `?` and `$1` are parameters by number; named parameters are numbered in the order they
-/// first appear.
-fn parameter_order(names: &[String]) -> Vec<String> {
-    let numbers: Option<Vec<usize>> = names.iter().map(|name| name.parse().ok()).collect();
+/// `GetNamedParameterMap`: `?` and `$1` are parameters by their number; named parameters are numbered in the order
+/// they first appear.
+fn parameter_order(names: &[String]) -> BTreeMap<idx_t, String> {
+    let numbers: Option<Vec<idx_t>> = names.iter().map(|name| name.parse().ok()).collect();
     match numbers {
-        Some(numbers) => {
-            let count = numbers.iter().copied().max().unwrap_or(0);
-            (1..=count).map(|n| n.to_string()).collect()
-        }
-        None => names.to_vec(),
+        Some(numbers) => numbers.into_iter().zip(names.iter().cloned()).collect(),
+        None => names.iter().cloned().enumerate().map(|(i, name)| (i as idx_t + 1, name)).collect(),
     }
 }
 
@@ -261,11 +265,11 @@ pub unsafe extern "C" fn duckdb_bind_parameter_index(
         return DuckDBError;
     };
     let name = String::from_utf8_lossy(name);
-    let Some(index) = wrapper.names.iter().position(|n| n.eq_ignore_ascii_case(&name)) else {
+    let Some((&index, _)) = wrapper.names.iter().find(|(_, n)| n.eq_ignore_ascii_case(&name)) else {
         return DuckDBError;
     };
     // SAFETY: C passes where to write the index.
-    if unsafe { ffi::write(param_idx_out, index as idx_t + 1) } { DuckDBSuccess } else { DuckDBError }
+    if unsafe { ffi::write(param_idx_out, index) } { DuckDBSuccess } else { DuckDBError }
 }
 
 macro_rules! bind_scalar {
@@ -402,29 +406,47 @@ pub unsafe extern "C" fn duckdb_execute_prepared(
     let Some(wrapper) = (unsafe { prepared(prepared_statement) }) else {
         return DuckDBError;
     };
-    let Some(statement) = wrapper.prepared() else {
-        return DuckDBError;
-    };
-    let outcome = ffi::guard(None, || {
-        let mut connection = wrapper.connection.lock();
-        Some(connection.execute_named(statement, wrapper.values.clone()))
-    });
-    let Some(result) = outcome else {
-        return DuckDBError;
-    };
     // SAFETY: C passes where to write the result, or no place.
-    let out = unsafe { ffi::reference_mut(out_result) };
-    translate_result(result, Some(statement.properties()), out)
+    wrapper.execute(unsafe { ffi::reference_mut(out_result) }, false)
 }
 
-/// duckrs materializes every result, so a statement executed to stream gives the whole result at once.
+/// duckrs runs a statement to its end, so a stream is a result with all of its rows that C reads as a stream.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn duckdb_execute_prepared_streaming(
     prepared_statement: duckdb_prepared_statement,
     out_result: *mut duckdb_result,
 ) -> duckdb_state {
-    // SAFETY: C passes what `duckdb_execute_prepared` takes.
-    unsafe { duckdb_execute_prepared(prepared_statement, out_result) }
+    // SAFETY: C passes a live prepared statement.
+    let Some(wrapper) = (unsafe { prepared(prepared_statement) }) else {
+        return DuckDBError;
+    };
+    // SAFETY: C passes where to write the result, or no place.
+    let out = unsafe { ffi::reference_mut(out_result) };
+    let streaming = out.is_some();
+    wrapper.execute(out, streaming)
+}
+
+/// The statement behind a handle, for `pending.rs`.
+///
+/// # Safety
+///
+/// As for [`prepared`].
+pub(crate) unsafe fn prepared_wrapper<'a>(prepared_statement: duckdb_prepared_statement) -> Option<&'a PreparedWrapper> {
+    // SAFETY: by the contract of this function.
+    unsafe { prepared(prepared_statement) }.map(|w| &*w)
+}
+
+impl PreparedWrapper {
+    /// Runs the statement with the values bound now, for a pending result: the result and the statement's
+    /// properties.
+    pub(crate) fn run(&self) -> Option<(duckrs::Result<duckrs::QueryResult>, duckrs::StatementProperties)> {
+        let statement = self.prepared()?;
+        let result = ffi::guard(
+            Err(duckrs::Error::new(duckrs::ErrorKind::Internal, "executing the statement panicked")),
+            || self.connection.lock().execute_named(statement, self.values.clone()),
+        );
+        Some((result, statement.properties()))
+    }
 }
 
 #[unsafe(no_mangle)]

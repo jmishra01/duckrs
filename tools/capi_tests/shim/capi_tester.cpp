@@ -174,6 +174,22 @@ duckdb_uhugeint CAPIResult::Fetch(idx_t col, idx_t row) {
 
 // test_helpers.hpp
 
+static hugeint_t PowerOfTen(int exponent) {
+	__int128 value = 1;
+	for (int i = 0; i < exponent; i++) {
+		value *= 10;
+	}
+	return hugeint_t::FromInt128(value);
+}
+
+const hugeint_t Hugeint::POWERS_OF_TEN[39] = {
+    PowerOfTen(0),  PowerOfTen(1),  PowerOfTen(2),  PowerOfTen(3),  PowerOfTen(4),  PowerOfTen(5),  PowerOfTen(6),
+    PowerOfTen(7),  PowerOfTen(8),  PowerOfTen(9),  PowerOfTen(10), PowerOfTen(11), PowerOfTen(12), PowerOfTen(13),
+    PowerOfTen(14), PowerOfTen(15), PowerOfTen(16), PowerOfTen(17), PowerOfTen(18), PowerOfTen(19), PowerOfTen(20),
+    PowerOfTen(21), PowerOfTen(22), PowerOfTen(23), PowerOfTen(24), PowerOfTen(25), PowerOfTen(26), PowerOfTen(27),
+    PowerOfTen(28), PowerOfTen(29), PowerOfTen(30), PowerOfTen(31), PowerOfTen(32), PowerOfTen(33), PowerOfTen(34),
+    PowerOfTen(35), PowerOfTen(36), PowerOfTen(37), PowerOfTen(38)};
+
 bool ApproxEqual(float ldecimal, float rdecimal) {
 	if (std::isnan(ldecimal) && std::isnan(rdecimal)) {
 		return true;

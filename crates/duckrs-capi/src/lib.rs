@@ -20,6 +20,7 @@ pub mod error;
 mod ffi;
 pub mod helper;
 pub mod logical_type;
+pub mod pending;
 pub mod prepared;
 pub mod result;
 pub mod types;
