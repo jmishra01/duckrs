@@ -44,6 +44,16 @@ impl ValidityMask {
         self.bits.as_deref().map(Vec::as_slice)
     }
 
+    /// The 64-row entries for writing, allocating an all-valid bitmap first (`ValidityMask::EnsureWritable`).
+    pub fn entries_mut(&mut self) -> &mut [u64] {
+        self.bits_mut()
+    }
+
+    /// The 64-row entries for writing if a bitmap is allocated, copying it first if it is shared.
+    pub fn allocated_entries_mut(&mut self) -> Option<&mut [u64]> {
+        self.bits.as_mut().map(|bits| Arc::make_mut(bits).as_mut_slice())
+    }
+
     fn bits_mut(&mut self) -> &mut Vec<u64> {
         let capacity = self.capacity;
         let bits = self

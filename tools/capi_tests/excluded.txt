@@ -1,0 +1,3 @@
+# Test cases of DuckDB's C API tests that cannot compile without DuckDB's C++ internals, and are left out of the run.
+# <file>|<test case name>|<why>
+test_capi.cpp|Test C API config|reads DBConfig::options behind the duckdb_config handle

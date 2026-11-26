@@ -13,6 +13,24 @@ pub use duckrs_common::vector::DataChunk;
 pub use duckrs_common::{Error, ErrorKind, Result};
 pub use duckrs_main::MaterializedQueryResult as QueryResult;
 pub use duckrs_main::with_error_location;
+pub use duckrs_main::{StatementProperties, StatementReturnType, StatementType};
+
+/// The configuration options (`DBConfig::GetOptionByIndex` / `GetOptionByName`).
+pub mod settings {
+    pub use duckrs_main::settings::{SettingDefinition, all_settings, find_setting};
+}
+
+/// `Value::DefaultCastAs`: `value` cast to `ty`, as a SQL `CAST` would.
+pub fn cast_value(value: &Value, ty: &LogicalType) -> Result<Value> {
+    duckrs_core::function::cast::cast_value(value, ty)
+}
+
+/// `VectorOperations::Cast`: the first `count` rows of `source` cast to `ty`, as a SQL `CAST` would.
+pub fn cast_vector(source: &duckrs_common::vector::Vector, ty: &LogicalType, count: usize) -> Result<duckrs_common::vector::Vector> {
+    let mut result = duckrs_common::vector::Vector::new(ty.clone(), count);
+    duckrs_core::function::cast::cast_vector(source, &mut result, count, duckrs_core::function::cast::CastMode::Strict)?;
+    Ok(result)
+}
 
 mod arrow_export;
 pub use arrow_export::{arrow_schema, arrow_type, record_batches};
@@ -126,6 +144,49 @@ impl Connection {
     /// Runs a prepared statement with values for its parameters, in order.
     pub fn execute(&mut self, statement: &PreparedStatement, values: &[Value]) -> Result<QueryResult> {
         self.context.execute_prepared(&statement.data, values)
+    }
+
+    /// Runs a prepared statement with values for its parameters by name ([`PreparedStatement::parameter_names`]).
+    pub fn execute_named(
+        &mut self,
+        statement: &PreparedStatement,
+        values: std::collections::HashMap<String, Value>,
+    ) -> Result<QueryResult> {
+        self.context.execute_prepared_named(&statement.data, values)
+    }
+
+    /// The type of the last statement of `sql`, and what its result holds (`StatementProperties`); `None` when it
+    /// doesn't parse.
+    pub fn statement_properties(&self, sql: &str) -> Option<StatementProperties> {
+        self.context.statement_properties(sql)
+    }
+
+    /// The text of each statement of `sql` (`Connection::ExtractStatements`), to prepare them one at a time.
+    pub fn extract_statements(&self, sql: &str) -> Result<Vec<String>> {
+        self.context.extract_statements(sql)
+    }
+
+    /// The names and types of the columns of `schema.table` (`ClientContext::TableInfo`).
+    pub fn table_columns(&self, schema: Option<&str>, table: &str) -> Result<Vec<(String, LogicalType)>> {
+        self.context.table_columns(schema, table)
+    }
+
+    /// The DEFAULT of each column of `schema.table` folded to a constant (NULL without one), or `None` for a
+    /// default that does not fold, as `Appender::AppendDefault` reads them.
+    pub fn table_column_defaults(&self, schema: Option<&str>, table: &str) -> Result<Vec<Option<Value>>> {
+        self.context.table_column_defaults(schema, table)
+    }
+
+    /// `ClientContext::Append`: inserts `chunks`, whose columns are `columns` of `schema.table` (names and types,
+    /// as [`Connection::table_columns`] gives them), as one INSERT would.
+    pub fn append_chunks(
+        &mut self,
+        schema: Option<&str>,
+        table: &str,
+        columns: Vec<(String, LogicalType)>,
+        chunks: Vec<DataChunk>,
+    ) -> Result<()> {
+        self.context.append(schema, table, columns, chunks)
     }
 }
 
@@ -296,6 +357,18 @@ impl Iterator for ChunkedResult {
 #[derive(Debug, Clone)]
 pub struct PreparedStatement {
     data: Arc<PreparedStatementData>,
+}
+
+impl PreparedStatement {
+    /// The names of its parameters, lowercase, in the order they appear: `1`, `2`, ... for `?` and `$1`.
+    pub fn parameter_names(&self) -> &[String] {
+        self.data.parameter_names()
+    }
+
+    /// Its type, and what its result holds (`GetStatementType`, `GetStatementProperties`).
+    pub fn properties(&self) -> StatementProperties {
+        self.data.properties()
+    }
 }
 
 #[cfg(test)]

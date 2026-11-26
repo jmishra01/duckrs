@@ -14,6 +14,8 @@ mod external_resources;
 mod logging;
 mod secret;
 pub mod settings;
+mod statement_type;
+pub use statement_type::{StatementProperties, StatementReturnType, StatementType};
 mod settings_table;
 mod tpc;
 
@@ -1675,6 +1677,18 @@ pub struct PreparedStatementData {
     default_collation: Option<String>,
 }
 
+impl PreparedStatementData {
+    /// The names of its parameters, lowercase, in the order they appear (`1`, `2`, ... for `?` and `$1`).
+    pub fn parameter_names(&self) -> &[String] {
+        &self.parameters
+    }
+
+    /// `PreparedStatement::GetStatementType` and `GetStatementProperties().return_type`.
+    pub fn properties(&self) -> StatementProperties {
+        statement_type::statement_properties(&self.statement, &|_| None)
+    }
+}
+
 impl ClientContext {
     pub fn new(db: Arc<DatabaseInstance>) -> Self {
         let list: Arc<dyn DatabaseList> = db.clone();
@@ -2044,6 +2058,23 @@ impl ClientContext {
             .collect())
     }
 
+    /// `Appender`'s `default_values`: the DEFAULT of each column of a table folded to a constant, NULL for a column
+    /// without one, and `None` for a default that does not fold (as `nextval` or `now()`).
+    pub fn table_column_defaults(&self, schema: Option<&str>, table: &str) -> Result<Vec<Option<Value>>> {
+        let catalog = self.catalog();
+        let _search_path = duckrs_core::catalog::SearchPathGuard::set(self.search_path_for(&self.db.name.clone()));
+        let entry = catalog.get_table(schema, table)?;
+        Ok(entry
+            .columns
+            .iter()
+            .map(|column| match &column.default_value {
+                None => Some(Value::null(column.ty.clone())),
+                Some(default) if default.is_foldable() => evaluate_scalar(default).ok(),
+                Some(_) => None,
+            })
+            .collect())
+    }
+
     /// Adds a replacement scan: tables the catalog does not have that `scan` gives rows for.
     pub fn add_replacement_scan(&mut self, scan: duckrs_core::planner::binder::ReplacementScan) {
         self.replacement_scans.0.push(scan);
@@ -2395,6 +2426,37 @@ impl ClientContext {
             // does not track: such a statement is taken to be bound again
             default_collation: (bound_at_prepare && !has_parameters).then(|| self.setting_text("default_collation")),
         }))
+    }
+
+    /// `StatementProperties` of the last statement of `sql`: its type, and what its result holds. `None` when
+    /// `sql` doesn't parse.
+    pub fn statement_properties(&self, sql: &str) -> Option<StatementProperties> {
+        let statements = duckrs_parser::parse_ast_with(sql, &self.parser_options()).ok()?;
+        Some(self.properties_of(statements.last()?))
+    }
+
+    /// `Connection::ExtractStatements`: the text of each statement of `sql`, to prepare one at a time.
+    pub fn extract_statements(&self, sql: &str) -> Result<Vec<String>> {
+        let statements = duckrs_parser::parse_ast_with_text(sql, &self.parser_options())?;
+        Ok(statements.into_iter().map(|(_, text)| text).collect())
+    }
+
+    fn properties_of(&self, statement: &Statement) -> StatementProperties {
+        statement_type::statement_properties(statement, &|name| {
+            let prepared = self.prepared_statements.get(&name.to_lowercase())?;
+            Some(self.properties_of(&prepared.statement))
+        })
+    }
+
+    /// `PreparedStatement::Execute` with values for parameters by name (`1`, `2`, ... for positional ones).
+    pub fn execute_prepared_named(
+        &mut self,
+        prepared: &PreparedStatementData,
+        values: HashMap<String, Value>,
+    ) -> Result<MaterializedQueryResult> {
+        let _temp = SessionTemp::enter(&self.temp);
+        let values = values.into_iter().map(|(name, value)| (name.to_lowercase(), value)).collect();
+        self.execute_with(prepared, values, HashSet::new())
     }
 
     /// `PreparedStatement::Execute` with values for parameters `1`, `2`, ...
