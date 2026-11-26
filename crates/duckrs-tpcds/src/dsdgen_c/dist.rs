@@ -10,6 +10,11 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 /// The binary distribution file the generator reads its distributions from.
+///
+/// C++ compiles in `include/tpcds_idx.hpp` (`tpcds_idx[]`), not `dsdgen/tpcds.idx`, and the two
+/// differ in 9 bytes: the hpp has 75 rows of `reason` at every scale (the file has 35 to 65) and
+/// names the 30th reason "reason 30" (the file says "reason 31" twice). `data/tpcds.idx` holds the
+/// bytes of the hpp, so the generator matches C++.
 static TPCDS_IDX: &[u8] = include_bytes!("../../data/tpcds.idx");
 
 const D_NAME_LEN: usize = 20;

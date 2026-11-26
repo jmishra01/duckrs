@@ -57,7 +57,7 @@ pub(crate) fn city_hash(_n_table: i32, name: &[u8]) -> i32 {
         hash_value -= i64::from(b'A');
         // `char` is signed
         hash_value += i64::from(c as i8);
-        if hash_value > MAXINT || hash_value < -MAXINT {
+        if !(-MAXINT..=MAXINT).contains(&hash_value) {
             hash_value = (twothirtytwo * 27 + hash_value) % twothirtytwo;
         }
         if hash_value > MAXINT {

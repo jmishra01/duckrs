@@ -87,11 +87,7 @@ impl Ctx {
         let mut n_count = (n_offset / 365) * CP_CATALOGS_PER_YEAR;
         n_offset %= 365;
         match n_type {
-            1 => {
-                if n_offset > 183 {
-                    n_count += 1;
-                }
-            }
+            1 if n_offset > 183 => n_count += 1,
             2 => n_count += n_offset / 91,
             3 => n_count += n_offset / 31,
             _ => {}

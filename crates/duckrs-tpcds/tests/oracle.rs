@@ -79,6 +79,13 @@ fn matches_cpp_dsdgen() {
     let cpp_time = start.elapsed();
 
     let start = Instant::now();
+    let rows: usize = duckrs_tpcds::dsdgen(sf)
+        .expect("a valid scale factor")
+        .map(|(_, chunk)| chunk.len())
+        .sum();
+    println!("sf {sf}: Rust dsdgen generates {rows} rows in {:?}", start.elapsed());
+
+    let start = Instant::now();
     let rust = common::render_all(sf);
     let rust_time = start.elapsed();
     println!("sf {sf}: C++ dsdgen {cpp_time:?}, Rust dsdgen (with rendering) {rust_time:?}");
