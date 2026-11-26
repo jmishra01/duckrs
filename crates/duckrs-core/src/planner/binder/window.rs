@@ -178,10 +178,18 @@ impl Binder<'_> {
         } else {
             name.as_str()
         };
+        // an aggregate the client registered (`duckdb_register_aggregate_function`)
+        let user_set = match (function, BuiltinFunctions::get().aggregate(aggregate_name)) {
+            (None, None) if BuiltinFunctions::get().scalar(aggregate_name).is_none() => {
+                self.user_aggregate(aggregate_name)
+            }
+            _ => None,
+        };
         let set = match function {
             Some(_) => None,
             None => match BuiltinFunctions::get().aggregate(aggregate_name) {
                 Some(set) => Some(set),
+                None if user_set.is_some() => user_set.as_deref(),
                 None if BuiltinFunctions::get().scalar(aggregate_name).is_some()
                     || is_generic_function(aggregate_name) =>
                 {

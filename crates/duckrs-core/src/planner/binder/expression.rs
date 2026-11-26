@@ -2118,7 +2118,9 @@ impl Binder<'_> {
             }
             ExprKind::Function(function)
                 if builtin_qualification(&function.name.qualification)
-                    && BuiltinFunctions::get().aggregate(&function.name.name).is_some() =>
+                    && (BuiltinFunctions::get().aggregate(&function.name.name).is_some()
+                        || (BuiltinFunctions::get().scalar(&function.name.name).is_none()
+                            && self.user_aggregate(&function.name.name).is_some())) =>
             {
                 // `BindAggregate`: the column of the aggregate has the name of its alias
                 let bound = self.bind_aggregate(function)?;
@@ -2579,6 +2581,12 @@ impl Binder<'_> {
                     if let Some(entry) = crate::catalog::defaults::default_macro(schema, &function.name.name, false) {
                         return self.bind_macro(function, &entry);
                     }
+                }
+                // a function the client registered (`duckdb_register_scalar_function`)
+                if BuiltinFunctions::get().scalar(&function.name.name).is_none()
+                    && let Some(set) = self.user_scalar(&function.name.name)
+                {
+                    return self.bind_user_scalar(function, &set);
                 }
                 if function.args.iter().any(|a| !a.name.is_empty()) {
                     return Err(crate::unported("named function arguments"));
@@ -3572,9 +3580,17 @@ impl Binder<'_> {
             .iter()
             .map(|a| self.bind_expression(&a.expr))
             .collect::<Result<Vec<_>>>()?;
-        let set = BuiltinFunctions::get()
-            .aggregate(&function.name.name)
-            .expect("checked by the caller");
+        // a built-in aggregate, or one the client registered (`duckdb_register_aggregate_function`)
+        let user_set = match BuiltinFunctions::get().aggregate(&function.name.name) {
+            Some(_) => None,
+            None => self.user_aggregate(&function.name.name),
+        };
+        let set = match &user_set {
+            Some(set) => set,
+            None => BuiltinFunctions::get()
+                .aggregate(&function.name.name)
+                .expect("checked by the caller"),
+        };
         // ordered-set aggregates: the single ORDER BY expression moves to the front of the arguments
         let ordered_set = match (function.order_by.len(), function.name.name.as_str()) {
             (1, "mode") => 1,
@@ -3837,6 +3853,7 @@ impl Binder<'_> {
                         crate::function::holistic::Holistic::Sorted,
                     ),
                     export: Some(ty.clone()),
+                    user: None,
                 };
                 aggregate.function = Arc::new(sorted);
                 aggregate.children = vec![pack];

@@ -13,16 +13,20 @@
 
 #![allow(clippy::missing_safety_doc)]
 
+pub mod aggregate_function;
 pub mod appender;
 pub mod database;
 pub mod datetime;
 pub mod error;
 mod ffi;
+pub mod function_info;
 pub mod helper;
 pub mod logical_type;
 pub mod pending;
 pub mod prepared;
 pub mod result;
+pub mod scalar_function;
+pub mod table_function;
 pub mod types;
 pub mod value;
 pub mod vector;

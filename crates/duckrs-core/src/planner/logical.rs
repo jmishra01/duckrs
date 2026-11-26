@@ -113,6 +113,13 @@ pub enum LogicalOperatorKind {
         types: Vec<LogicalType>,
         chunks: Arc<Vec<duckrs_common::vector::DataChunk>>,
     },
+    /// `LogicalGet` of a table function the client registered ([`crate::function::udf`]): what its bind gave, scanned
+    /// when the plan runs.
+    UserTableScan {
+        table_index: usize,
+        types: Vec<LogicalType>,
+        scan: crate::function::udf::UserTableScan,
+    },
     /// `LogicalExpressionGet`: rows of expressions (VALUES), evaluated once per row.
     ExpressionGet {
         table_index: usize,
@@ -640,9 +647,9 @@ impl LogicalOperator {
             LogicalOperatorKind::EmptyResult { types, .. } => types.clone(),
             // the dummy scan's single column is never read
             LogicalOperatorKind::DummyScan { .. } => vec![LogicalType::INTEGER],
-            LogicalOperatorKind::ExpressionGet { types, .. } | LogicalOperatorKind::ChunkGet { types, .. } => {
-                types.clone()
-            }
+            LogicalOperatorKind::ExpressionGet { types, .. }
+            | LogicalOperatorKind::ChunkGet { types, .. }
+            | LogicalOperatorKind::UserTableScan { types, .. } => types.clone(),
             LogicalOperatorKind::MatchRecognize { data, .. } => data.output_types.clone(),
             LogicalOperatorKind::Window { windows, .. } => {
                 let mut types = self.children[0].types();
@@ -783,7 +790,8 @@ impl LogicalOperator {
                 numbered(*table_index, 1)
             }
             LogicalOperatorKind::ExpressionGet { table_index, types, .. }
-            | LogicalOperatorKind::ChunkGet { table_index, types, .. } => numbered(*table_index, types.len()),
+            | LogicalOperatorKind::ChunkGet { table_index, types, .. }
+            | LogicalOperatorKind::UserTableScan { table_index, types, .. } => numbered(*table_index, types.len()),
             LogicalOperatorKind::ParquetScan { table_index, scan } => {
                 numbered(*table_index, scan.emitted_types().len())
             }

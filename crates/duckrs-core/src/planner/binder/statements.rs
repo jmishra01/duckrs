@@ -3415,6 +3415,13 @@ impl Binder<'_> {
                         .bind_system_table(table_ref, &call.name.name)
                         .map(|op| table_function_rows(op, &call.name.name));
                 }
+                // a table function the client registered (`duckdb_register_table_function`)
+                if let ExprKind::Function(call) = &function.kind
+                    && call.name.qualification.is_empty()
+                    && let Some(set) = self.user_table(&call.name.name)
+                {
+                    return self.bind_user_table(call, &set, table_ref);
+                }
                 self.bind_range(function, table_ref)
             }
             TableRefKind::Pivot(pivot) => self.bind_pivot(table_ref, pivot),

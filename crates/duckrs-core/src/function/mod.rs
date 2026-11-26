@@ -41,6 +41,7 @@ mod tdigest;
 pub mod test_all_types;
 pub mod test_vector_types;
 pub(crate) mod time_casts;
+pub mod udf;
 pub mod variant;
 
 pub(crate) use strings::decode_base64;
@@ -80,6 +81,9 @@ pub struct ScalarFunction {
     /// The callback with the function's bind data (`FunctionData`), run in place of `function`:
     /// what a function reads of the client, such as the search path of `in_search_path`.
     pub bound: Option<BoundCallback>,
+    /// `FunctionStability::VOLATILE` of a function that is not one of [`crate::planner::expression::VOLATILE_FUNCTIONS`]:
+    /// a user-defined one
+    pub volatile: bool,
 }
 
 /// [`ScalarFunction::bound`].
@@ -103,6 +107,7 @@ impl ScalarFunction {
             cannot_error: false,
             random: None,
             bound: None,
+            volatile: false,
         }
     }
 
@@ -119,6 +124,7 @@ impl ScalarFunction {
             cannot_error: true,
             random: self.random.clone(),
             bound: self.bound.clone(),
+            volatile: self.volatile,
         }
     }
 
@@ -135,6 +141,7 @@ impl ScalarFunction {
             cannot_error: self.cannot_error,
             random: self.random.clone(),
             bound: self.bound.clone(),
+            volatile: self.volatile,
         }
     }
 

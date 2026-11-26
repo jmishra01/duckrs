@@ -32,6 +32,20 @@ pub fn cast_vector(source: &duckrs_common::vector::Vector, ty: &LogicalType, cou
     Ok(result)
 }
 
+/// User-defined functions: scalar, aggregate and table functions a client registers on a database
+/// ([`Connection::register_scalar_functions`], ...) and implements through the traits here, which the engine calls
+/// on whole chunks.
+pub mod udf {
+    pub use duckrs_core::function::udf::*;
+    /// A bound expression, as a scalar function's bind sees its arguments (`duckdb_expression`).
+    pub use duckrs_core::planner::expression::BoundExpr as Expression;
+
+    /// `ExpressionExecutor::EvaluateScalar`: the value of a foldable expression.
+    pub fn fold(expression: &Expression) -> crate::Result<crate::Value> {
+        duckrs_core::execution::expression_executor::evaluate_scalar(expression)
+    }
+}
+
 mod arrow_export;
 pub use arrow_export::{arrow_schema, arrow_type, record_batches};
 mod relation;
@@ -139,6 +153,30 @@ impl Connection {
         + 'static,
     ) {
         self.context.add_replacement_scan(std::sync::Arc::new(scan));
+    }
+
+    /// `ClientContext::GetConnectionId`: what tells this connection apart from the others of the process.
+    pub fn connection_id(&self) -> u64 {
+        self.context.connection_id()
+    }
+
+    /// Registers scalar functions under one name (`duckdb_register_scalar_function_set`): each overload joins
+    /// those registered before, taking the place of one with the same parameters. Every connection to the database
+    /// can call them.
+    pub fn register_scalar_functions(&mut self, set: udf::ScalarUdfSet) -> Result<()> {
+        self.context.user_functions().register_scalar(set)
+    }
+
+    /// Registers aggregate functions under one name (`duckdb_register_aggregate_function_set`); a name that has
+    /// them already is an error.
+    pub fn register_aggregate_functions(&mut self, set: udf::AggregateFunctionSet) -> Result<()> {
+        self.context.user_functions().register_aggregate(set)
+    }
+
+    /// Registers table functions under one name (`duckdb_register_table_function`): each overload joins those
+    /// registered before, taking the place of one with the same parameters.
+    pub fn register_table_functions(&mut self, set: udf::TableUdfSet) -> Result<()> {
+        self.context.user_functions().register_table(set)
     }
 
     /// Runs a prepared statement with values for its parameters, in order.

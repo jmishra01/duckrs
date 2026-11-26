@@ -993,6 +993,9 @@ impl Exporter<'_> {
                     self.values(rows, types.len())
                 }
             }
+            Op::UserTableScan { .. } => {
+                return Err("A table function the client registered has no SQL export".into());
+            }
             Op::ChunkGet { types, chunks, .. } => {
                 let total: usize = chunks.iter().map(|c| c.len()).sum();
                 if total * types.len().max(1) > MAX_INLINE_VALUES {

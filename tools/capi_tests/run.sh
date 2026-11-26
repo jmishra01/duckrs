@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Runs DuckDB's C API tests (test/api/capi/v1/test_capi*.cpp of the C++ checkout) against libduckrs_capi.
+# Runs DuckDB's C API tests (test/api/capi/v1/test_capi*.cpp and the capi_*_functions.cpp of user-defined functions,
+# of the C++ checkout) against libduckrs_capi.
 #
 # usage: tools/capi_tests/run.sh [--release] [test_capi.cpp ...]
 #
@@ -42,7 +43,8 @@ TESTS=("$@")
 if [[ ${#TESTS[@]} -eq 0 ]]; then
 	TESTS=(test_capi.cpp test_capi_data_chunk.cpp test_capi_prepared.cpp test_capi_appender.cpp test_capi_values.cpp
 		test_capi_complex_types.cpp test_capi_vector.cpp test_capi_website.cpp test_capi_extract.cpp
-		test_capi_append_data_chunk.cpp test_capi_to_decimal.cpp)
+		test_capi_append_data_chunk.cpp test_capi_to_decimal.cpp capi_scalar_functions.cpp capi_aggregate_functions.cpp
+		capi_table_functions.cpp)
 fi
 
 BUILD=${CAPI_TEST_BUILD:-$ROOT/target/capi_tests}
