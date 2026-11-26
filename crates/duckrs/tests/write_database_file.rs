@@ -407,9 +407,10 @@ fn a_commit_that_fails_loses_nothing_else() {
     run(&mut connection, "CREATE TABLE kept (i INTEGER)");
     run(&mut connection, "BEGIN");
     run(&mut connection, "INSERT INTO kept VALUES (1)");
-    run(&mut connection, "CREATE TABLE unstorable (v VARIANT)");
+    // a view that duckrs can't write to the log yet (SHOW and DESCRIBE in a stored query)
+    run(&mut connection, "CREATE VIEW unstorable AS SELECT * FROM (DESCRIBE kept)");
     assert!(connection.query("COMMIT").is_err());
-    run(&mut connection, "DROP TABLE unstorable");
+    run(&mut connection, "DROP VIEW IF EXISTS unstorable");
     run(&mut connection, "INSERT INTO kept VALUES (2)");
     drop(connection);
     drop(db);
