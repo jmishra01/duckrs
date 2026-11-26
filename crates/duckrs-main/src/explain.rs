@@ -402,12 +402,12 @@ fn order_text(orders: &[BoundOrderByNode]) -> String {
     }))
 }
 
-/// A physical aggregate reads its child by position: a column without a name shows as one
+/// A physical aggregate or projection reads its child by position: a column without a name shows as one
 /// (`BoundReferenceExpression::ToString`).
 fn resolve_unnamed(op: &LogicalOperator) -> Option<LogicalOperator> {
-    let K::Aggregate { .. } = &op.kind else {
+    if !matches!(op.kind, K::Aggregate { .. } | K::Projection { .. }) {
         return None;
-    };
+    }
     let bindings = op.children.first()?.column_bindings();
     let mut resolved = LogicalOperator::new(op.kind.clone(), Vec::new());
     let mut changed = false;
@@ -658,7 +658,13 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
                 entry("Projections", lines(expressions.iter().map(|e| e.to_string())))
             } else {
                 // `LogicalOperator::ParamsToString`: `Expression::GetName`, the alias where there is one
-                let name = |e: &BoundExpr| if e.alias.is_empty() { e.to_string() } else { e.alias.clone() };
+                let name = |e: &BoundExpr| {
+                    if e.alias.is_empty() || e.is_compressed_cast() {
+                        e.to_string()
+                    } else {
+                        e.alias.clone()
+                    }
+                };
                 entry("Expressions", lines(expressions.iter().map(name)))
             }
         }

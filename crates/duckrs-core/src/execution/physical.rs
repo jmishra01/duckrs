@@ -2044,6 +2044,9 @@ pub struct PhysicalRecursiveCte {
     data: Mutex<ColumnDataCollection>,
     /// what UNION has seen so far
     seen: Mutex<HashSet<Vec<u8>>>,
+    /// whether the recursive part ran yet: it runs once even over an anchor of no rows, where an aggregate without
+    /// groups still makes one
+    recursed: std::sync::atomic::AtomicBool,
 }
 
 // The USING KEY recursion below is ported from
@@ -2106,6 +2109,7 @@ impl PhysicalRecursiveCte {
             recursive,
             data,
             seen: Mutex::default(),
+            recursed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -2321,6 +2325,7 @@ impl PhysicalOperator for PhysicalRecursiveCte {
         // the recurring rows or the seen rows of the last run
         self.recurring.lock().reset();
         self.seen.lock().clear();
+        self.recursed.store(false, std::sync::atomic::Ordering::SeqCst);
         if !self.key.is_empty() {
             return self.run_keyed();
         }
@@ -2346,7 +2351,8 @@ impl PhysicalOperator for PhysicalRecursiveCte {
                 return Ok(None);
             }
             let round = std::mem::replace(&mut *self.data.lock(), ColumnDataCollection::new(self.types.clone()));
-            if round.is_empty() {
+            let first = !self.recursed.swap(true, std::sync::atomic::Ordering::SeqCst);
+            if round.is_empty() && !first {
                 return Ok(None);
             }
             {

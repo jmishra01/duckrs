@@ -1026,7 +1026,28 @@ pub fn distinct_in_two_steps(
     (aggregates.iter().all(same) && physical::parallel_expression(argument)).then(|| argument.clone())
 }
 
+/// What `PhysicalPlanGenerator::CreatePlan` refuses of a logical plan, which nothing before it does: a plan that is
+/// only exported (`EXPLAIN (SQL)`) never gets here.
+pub fn check_plan(op: &LogicalOperator) -> Result<()> {
+    if let LogicalOperatorKind::Sample { options } = &op.kind
+        && options.method == duckrs_parser::ast::SampleMethod::Bernoulli
+        && !options.is_percentage
+    {
+        // `CreatePlan(LogicalSample &)`
+        return Err(duckrs_common::Error::new(
+            duckrs_common::ErrorKind::Parser,
+            format!(
+                "Sample method {} cannot be used with a discrete sample count, either switch to reservoir sampling \
+                 or use a sample_size",
+                options.method.name()
+            ),
+        ));
+    }
+    op.children.iter().try_for_each(check_plan)
+}
+
 pub fn run_plan(plan: LogicalOperator) -> Result<ColumnDataCollection> {
+    check_plan(&plan)?;
     let collector = PhysicalResultCollector::new(create_plan(plan));
     // what the statement runs on its own (e.g. statistics) is not part of its profile
     profiler::with_profiler(None, || execute_plan(&collector))?;
@@ -1035,6 +1056,7 @@ pub fn run_plan(plan: LogicalOperator) -> Result<ColumnDataCollection> {
 
 /// [`run_plan`] for a plan that is part of the query, on as many threads as the query has.
 pub fn run_plan_on_threads(plan: LogicalOperator) -> Result<ColumnDataCollection> {
+    check_plan(&plan)?;
     let collector = PhysicalResultCollector::new(create_plan(plan));
     let threads = temporary::current().threads();
     profiler::with_profiler(None, || execute_plan_with(&collector, threads))?;

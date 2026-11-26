@@ -198,13 +198,28 @@ impl Select {
         self.groups.is_none() && !self.distinct && self.order.is_empty() && self.limit.is_none()
     }
 
+    /// `CompositionScope`: a SELECT that what reads it can be merged into, which a sample keeps to itself.
+    fn composable(&self) -> bool {
+        self.sample.is_none() && self.from.sample.is_none()
+    }
+
+    /// `PlainScope`: a SELECT of the columns of its FROM, as they are, with no more than a WHERE.
+    fn is_plain_scope(&self) -> bool {
+        self.is_simple()
+            && self.sample.is_none()
+            && self.from.sample.is_none()
+            && !matches!(self.from.kind, TableRefKind::Empty)
+            && self.columns.iter().all(|c| matches!(c.expr.kind, ExprKind::ColumnRef(_)))
+    }
+
     /// `PlainScope`: columns of the FROM clause, filtered.
     fn is_plain(&self) -> bool {
         // (a filter that can fail must not see the rows another one removes)
         self.is_simple()
             && self.sample.is_none()
+            && self.from.sample.is_none()
             && !self.unsafe_filters
-            && self.columns.iter().all(|c| c.kind == Kind::Column)
+            && self.columns.iter().all(is_leaf)
     }
 }
 
@@ -271,6 +286,49 @@ fn system_function(name: &str, args: Vec<Expr>) -> Expr {
     let mut function = FunctionExpr::new(name, args);
     function.name.qualification = vec!["system".into(), "main".into()];
     function.into()
+}
+
+/// `ExpressionSize`: how many expressions `expr` is, itself and those nested in it.
+fn expr_size(expr: &Expr) -> usize {
+    let mut copy = expr.clone();
+    let mut size = 0;
+    duckrs_parser::transformer::visit_expr_mut(&mut copy, &mut |_| size += 1);
+    size
+}
+
+/// `IsLeaf`: a column read as it is, which can be written again anywhere; a bare integer cannot, as GROUP BY and
+/// ORDER BY would read it as a position.
+fn is_leaf(column: &Column) -> bool {
+    match &column.expr.kind {
+        ExprKind::ColumnRef(_) => true,
+        ExprKind::Constant(literal) => literal.kind == ast::LiteralKind::Null,
+        _ => false,
+    }
+}
+
+/// `SQLExportHelpers::IsConstantOrderKey`: a key that sorts nothing, bound or as it exports. Written out, a
+/// constant can be a column position, or an error where `order_by_non_integer_literal` is off.
+fn constant_key(bound: &BoundExpr, exported: &Expr) -> bool {
+    matches!(bound.kind, BoundExprKind::Constant(_)) || matches!(exported.kind, ExprKind::Constant(_))
+}
+
+/// The arguments of an aggregate as it was called: a holistic one with several keeps them packed in
+/// one STRUCT of fields `a0`, `a1`, ... (`bind_aggregate`), which SQL spells as the arguments again.
+fn holistic_arguments(a: &BoundAggregate) -> &[BoundExpr] {
+    if let (crate::function::aggregates::AggregateKind::Holistic(_), [packed]) = (&a.function.kind, a.children.as_slice())
+        && let BoundExprKind::Function { function, children, .. } = &packed.kind
+        && function.name == "struct_pack"
+        && children.len() > 1
+        && packed
+            .return_type
+            .struct_children()
+            .iter()
+            .enumerate()
+            .all(|(i, (name, _))| *name == format!("a{i}"))
+    {
+        return children;
+    }
+    &a.children
 }
 
 fn order_node(modifiers: OrderModifiers, expr: Expr) -> OrderByNode {
@@ -766,6 +824,11 @@ impl Exporter<'_> {
             };
             return select;
         }
+        self.subquery(relation)
+    }
+
+    /// The relation as a subquery, even where it is a plain SELECT.
+    fn subquery(&mut self, relation: Relation) -> Select {
         let count = relation.fields.len();
         let alias = self.alias();
         let node = self.query(relation);
@@ -812,15 +875,40 @@ impl Exporter<'_> {
                 projection,
                 table_index,
                 extracts,
+                sample,
                 ..
-            } => self.get(
-                table,
-                *table_index,
-                column_ids,
-                filters,
-                projection.as_deref(),
-                extracts,
-            )?,
+            } => {
+                let body = self.get(
+                    table,
+                    *table_index,
+                    column_ids,
+                    filters,
+                    projection.as_deref(),
+                    extracts,
+                )?;
+                match sample {
+                    // `LogicalGet::ToSQL`: a sample the scan takes (`SamplingPushdown`) is that of a SELECT of it
+                    Some(sample) => {
+                        let mut options = sample.options.clone();
+                        if !options.repeatable {
+                            options.seed = None;
+                        }
+                        if options.repeatable && options.seed.is_none() {
+                            return Err("SQL sampling seeds imply repeatable sampling".into());
+                        }
+                        if options.seed.is_some_and(|seed| seed > i64::MAX as u64) {
+                            return Err("The sampling seed has no SQL spelling".into());
+                        }
+                        let mut select = self.subquery(Relation {
+                            body,
+                            fields: fields.clone(),
+                        });
+                        select.sample = Some(options);
+                        Body::Select(select)
+                    }
+                    None => body,
+                }
+            }
             Op::Range {
                 start,
                 increment,
@@ -870,6 +958,15 @@ impl Exporter<'_> {
                 {
                     return Err("VALUES over a relation has no SQL export".into());
                 }
+                // `LogicalExpressionGet::ExportSQLInput`: VALUES that read their input (LATERAL) run once per row
+                // of it as SQL, so they must not have effects or fail
+                fn reads_columns(e: &BoundExpr) -> bool {
+                    matches!(e.kind, BoundExprKind::ColumnRef { .. }) || e.children().into_iter().any(reads_columns)
+                }
+                let all = || expressions.iter().flatten();
+                if all().any(reads_columns) && all().any(|e| has_effects(e) || (self.can_throw)(e)) {
+                    return Err("VALUES with input requires nonvolatile, nonthrowing expressions".into());
+                }
                 let scope = Scope::default();
                 let mut rows = Vec::new();
                 for row in expressions {
@@ -883,7 +980,18 @@ impl Exporter<'_> {
                     }
                     rows.push(values);
                 }
-                self.values(rows, types.len())
+                if rows.is_empty() {
+                    // VALUES has a row at least: no rows are those of a SELECT that keeps none
+                    let columns = types
+                        .iter()
+                        .map(|ty| self.constant(&Value::null(ty.clone())).map(Column::plain))
+                        .collect::<Res<Vec<_>>>()?;
+                    let mut select = Select::new(TableRef::empty(), columns);
+                    select.filters.push(Expr::constant(Literal::boolean(false)));
+                    Body::Select(select)
+                } else {
+                    self.values(rows, types.len())
+                }
             }
             Op::ChunkGet { types, chunks, .. } => {
                 let total: usize = chunks.iter().map(|c| c.len()).sum();
@@ -956,13 +1064,13 @@ impl Exporter<'_> {
             }
             Op::Order { orders } => {
                 let child = self.export_child(op, 0)?;
-                Body::Select(self.order(child, orders)?)
+                Body::Select(self.order(child, orders, false)?)
             }
             Op::TopN {
                 orders, limit, offset, ..
             } => {
                 let child = self.export_child(op, 0)?;
-                let mut select = self.order(child, orders)?;
+                let mut select = self.order(child, orders, true)?;
                 select.limit = Some(self.limit_values(Some(*limit), *offset, false)?);
                 Body::Select(select)
             }
@@ -1000,52 +1108,36 @@ impl Exporter<'_> {
                 select.sample = Some(options.clone());
                 Body::Select(select)
             }
+            // `LogicalDistinct::ToSQL`: DISTINCT ON its targets, over its input as a subquery; the ORDER BY picks the
+            // row of each it keeps
             Op::Distinct { targets, orders, .. } => {
-                let mut child = self.export_child(op, 0)?;
+                let child = self.export_child(op, 0)?;
                 let child_fields = child.fields.clone();
-                // the ORDER BY of a DISTINCT ON picks the row it keeps, so it goes on the SELECT
-                if !orders.is_empty() {
-                    child = Relation {
-                        body: Body::Select(self.order(child, orders)?),
-                        fields: child_fields.clone(),
-                    };
+                let mut select = self.subquery(child);
+                let scope = Scope::of(&select, &child_fields);
+                let mut on = Vec::new();
+                for t in targets {
+                    on.push(self.expr(&scope, t)?);
                 }
-                let all_columns = targets.len() == child_fields.len()
-                    && targets.iter().zip(&child_fields).all(|(t, f)| {
-                        matches!(&t.kind, BoundExprKind::ColumnRef { binding, depth: 0 } if *binding == f.binding)
-                    });
-                // DISTINCT ON keeps the first row of each in the order of the ORDER BY of its SELECT
-                let mut select = match child.body {
-                    Body::Select(select)
-                        if select.limit.is_none()
-                            && !select.distinct
-                            && (select.order.is_empty() || !all_columns)
-                            && select.columns.iter().all(|c| !c.volatile) =>
-                    {
-                        select
+                let mut order = Vec::new();
+                for o in orders {
+                    let expr = self.expr(&scope, &o.expr)?;
+                    if !constant_key(&o.expr, &expr) {
+                        order.push(order_node(o.modifiers, expr));
                     }
-                    body => self.wrap(Relation {
-                        body,
-                        fields: child_fields.clone(),
-                    }),
-                };
-                if !all_columns {
-                    let scope = Scope::of(&select, &child_fields);
-                    let mut on = Vec::new();
-                    for t in targets {
-                        on.push(self.expr(&scope, t)?);
-                    }
-                    select.distinct_on = on;
                 }
+                select.distinct_on = on;
                 select.distinct = true;
+                select.order = order;
                 Body::Select(select)
             }
             Op::Unnest { expressions, .. } => {
                 let child = self.export_child(op, 0)?;
                 let child_fields = child.fields.clone();
+                // `ExportContextExpressions`, as of a window
                 let mut select = match child.body {
-                    Body::Select(s) if s.is_simple() && s.columns.iter().all(|c| c.kind <= Kind::Computed) => s,
-                    body => self.wrap(Relation {
+                    Body::Select(s) if s.is_plain_scope() => s,
+                    body => self.subquery(Relation {
                         body,
                         fields: child_fields.clone(),
                     }),
@@ -1657,9 +1749,11 @@ impl Exporter<'_> {
         let movable = positions.iter().all(|&p| select.columns[p].kind == Kind::Column)
             && select.columns.iter().all(|c| c.kind <= Kind::Computed)
             && (!effects || select.filters.is_empty())
+            && select.composable()
             && !select.unsafe_filters;
         if !movable {
-            select = self.wrap(Relation {
+            // (a subquery even of a plain SELECT: its WHERE is what the filter must not run beside)
+            select = self.subquery(Relation {
                 body: Body::Select(select),
                 fields: fields.clone(),
             });
@@ -1673,18 +1767,45 @@ impl Exporter<'_> {
         Ok(Body::Select(select))
     }
 
-    /// Whether the columns at `positions` can be read again where `positions` says: none twice that
-    /// gives something else each time, none that only a SELECT list can have.
+    /// Whether the columns at `positions` can be read again where `positions` says: none that only a SELECT
+    /// list can have, and none twice that is computed (`ComposeInput`, `ComposeProjection`: a computation read
+    /// twice stays shared), except an aggregate's result, which is the same each time.
     fn substitutable(select: &Select, read: &[usize], allow: Kind) -> bool {
         let mut seen = BTreeSet::new();
         read.iter().all(|&p| {
             let column = &select.columns[p];
-            column.kind <= allow && (!column.volatile || seen.insert(p))
+            let repeatable = !column.volatile && (is_leaf(column) || column.kind == Kind::Aggregate);
+            column.kind <= allow && (repeatable || seen.insert(p))
         })
     }
 
     fn projection(&mut self, child: Relation, expressions: &[BoundExpr]) -> Res<Body> {
         let fields = child.fields.clone();
+        // the projection as SQL over its input read as a subquery `r`, as `ComposeProjection` compares it
+        let read_through = Select::new(
+            TableRef::empty(),
+            (0..fields.len())
+                .map(|i| Column::plain(Expr::column(vec!["r".into(), field_name(i)])))
+                .collect(),
+        );
+        let through_scope = Scope::of(&read_through, &fields);
+        // (what has no SQL read through a subquery can still have it composed: then it is no identity)
+        let through = expressions
+            .iter()
+            .map(|e| self.expr(&through_scope, e))
+            .collect::<Res<Vec<_>>>()
+            .ok();
+        // `ComposeProjection`: one that passes every column on as it is goes
+        let identity = through.as_ref().is_some_and(|through| {
+            through.len() == fields.len()
+                && through
+                    .iter()
+                    .enumerate()
+                    .all(|(i, e)| *e == Expr::column(vec!["r".into(), field_name(i)]))
+        });
+        if identity && matches!(&child.body, Body::Select(s) if s.composable()) {
+            return Ok(child.body);
+        }
         let fromless = matches!(&child.body, Body::Select(s) if matches!(s.from.kind, TableRefKind::Empty) && s.is_simple() && s.filters.is_empty());
         let mut select = match child.body {
             Body::Select(s) if !s.distinct => s,
@@ -1721,11 +1842,28 @@ impl Exporter<'_> {
                 uses != 1 || !forwarded || expressions.iter().any(has_effects)
             }
         });
+        // an aggregate without groups is one row only while its SELECT keeps an aggregate: one that reads none
+        // of them reads that row from a subquery
+        let ungrouped = select
+            .groups
+            .as_ref()
+            .is_some_and(|g| g.group_expressions.is_empty() && g.grouping_sets.is_empty());
+        // `ComposeProjection`: a computed column nothing reads stays, as what computes it can fail (an aggregate
+        // too, whatever its arguments)
+        let drops_computed = select
+                .columns
+                .iter()
+                .enumerate()
+                .any(|(p, c)| !is_leaf(c) && !positions.contains(&p));
         let ok = (fromless || !matches!(select.from.kind, TableRefKind::Empty) || select.columns.is_empty())
+            && select.composable()
+            && !(ungrouped && positions.is_empty())
+            && !drops_computed
             && (select.limit.is_none() || pure)
             && !barrier
             && !failing
-            && Self::substitutable(&select, &positions, Kind::Window);
+            // (`OutputProperties` knows nothing of what a window or UNNEST computes, so it is not composed)
+            && Self::substitutable(&select, &positions, Kind::Aggregate);
         if !ok {
             select = self.wrap(Relation {
                 body: Body::Select(select),
@@ -1736,6 +1874,23 @@ impl Exporter<'_> {
         let mut columns = Vec::new();
         for e in expressions {
             columns.push(self.column(&scope, e)?);
+        }
+        if let Some(through) = through.as_ref().filter(|_| ok && !select.columns.is_empty()) {
+            // `ComposeProjection`: composing must not grow the SQL, as repeating what a column computes would
+            let old: usize = select.columns.iter().map(|c| expr_size(&c.expr)).sum::<usize>()
+                + through.iter().map(expr_size).sum::<usize>();
+            let new: usize = columns.iter().map(|c| expr_size(&c.expr)).sum();
+            if new > old {
+                select = self.subquery(Relation {
+                    body: Body::Select(select),
+                    fields: fields.clone(),
+                });
+                let scope = Scope::of(&select, &fields);
+                columns.clear();
+                for e in expressions {
+                    columns.push(self.column(&scope, e)?);
+                }
+            }
         }
         select.columns = columns;
         Ok(Body::Select(select))
@@ -1793,6 +1948,8 @@ impl Exporter<'_> {
         };
         let mut read = Vec::new();
         for g in groups {
+            // a group key is in the SELECT list and in GROUP BY both
+            read_bindings(g, &mut read);
             read_bindings(g, &mut read);
         }
         for a in aggregates {
@@ -1817,6 +1974,7 @@ impl Exporter<'_> {
             .any(has_composition_barrier)
             && positions.iter().any(|&p| select.columns.get(p).is_some_and(|c| c.kind != Kind::Column));
         if !Self::substitutable(&select, &positions, Kind::Computed)
+            || !select.composable()
             || matches!(select.from.kind, TableRefKind::Empty)
             || failing
             || barrier
@@ -1884,24 +2042,27 @@ impl Exporter<'_> {
     }
 
     fn aggregate_call(&mut self, scope: &Scope, a: &BoundAggregate) -> Res<Expr> {
-        if a.function.export.is_some() {
-            return Err("EXPORT_STATE has no SQL export".into());
-        }
         let mut args = Vec::new();
-        for c in &a.children {
+        for c in holistic_arguments(a) {
             args.push(self.expr(scope, c)?);
         }
         let mut function = FunctionExpr::new(a.function.name.clone(), args);
         function.name.qualification = vec!["system".into(), "main".into()];
         function.distinct = a.distinct;
+        // `BuildAggregateCall`: a state the aggregate hands on, as a combine or finalize reads it
+        function.export_state = a.function.export.is_some();
         if let Some(filter) = &a.filter {
             function.filter = Some(Box::new(self.expr(scope, filter)?));
         }
         for (e, modifiers) in &a.order_by {
-            function.order_by.push(order_node(*modifiers, self.expr(scope, e)?));
+            let expr = self.expr(scope, e)?;
+            if !constant_key(e, &expr) {
+                function.order_by.push(order_node(*modifiers, expr));
+            }
         }
         // `ExportAggregate`: a result type that binding specialized is restored with a cast
-        let specialized = a.function.return_type != a.return_type
+        let specialized = !function.export_state
+            && a.function.return_type != a.return_type
             && a.return_type.id() == LogicalTypeId::Decimal
             && a.function.return_type.id() == LogicalTypeId::Decimal;
         if specialized {
@@ -1912,26 +2073,15 @@ impl Exporter<'_> {
 
     fn window(&mut self, child: Relation, windows: &[BoundWindow]) -> Res<Body> {
         let fields = child.fields.clone();
+        // `ExportContextExpressions`: the windows go into the SELECT below only where it is a `PlainScope`, its
+        // columns those of its FROM as they are
         let mut select = match child.body {
-            Body::Select(s)
-                if !s.distinct
-                    && s.order.is_empty()
-                    && s.limit.is_none()
-                    && s.columns.iter().all(|c| c.kind <= Kind::Aggregate && !c.volatile) =>
-            {
-                s
-            }
-            body => self.wrap(Relation {
+            Body::Select(s) if s.is_plain_scope() => s,
+            body => self.subquery(Relation {
                 body,
                 fields: fields.clone(),
             }),
         };
-        if matches!(select.from.kind, TableRefKind::Empty) && select.groups.is_none() {
-            select = self.wrap(Relation {
-                body: Body::Select(select),
-                fields: fields.clone(),
-            });
-        }
         let scope = Scope::of(&select, &fields);
         for w in windows {
             let expr = self.window_call(&scope, w)?;
@@ -1975,11 +2125,29 @@ impl Exporter<'_> {
         for p in &w.partitions {
             window.partitions.push(self.expr(scope, p)?);
         }
+        // RANGE offsets and GROUPS frames are defined by the ORDER BY
+        let order_dependent = |b: &ast::WindowBoundary| {
+            matches!(
+                b,
+                B::ExprPrecedingRange
+                    | B::ExprFollowingRange
+                    | B::CurrentRowGroups
+                    | B::ExprPrecedingGroups
+                    | B::ExprFollowingGroups
+            )
+        };
+        let frame_needs_order = order_dependent(&w.start) || order_dependent(&w.end);
         for (e, m) in &w.orders {
-            window.orders.push(order_node(*m, self.expr(scope, e)?));
+            let expr = self.expr(scope, e)?;
+            if frame_needs_order || !constant_key(e, &expr) {
+                window.orders.push(order_node(*m, expr));
+            }
         }
         for (e, m) in &w.arg_orders {
-            window.arg_orders.push(order_node(*m, self.expr(scope, e)?));
+            let expr = self.expr(scope, e)?;
+            if !constant_key(e, &expr) {
+                window.arg_orders.push(order_node(*m, expr));
+            }
         }
         if let Some(filter) = &w.filter {
             window.filter = Some(Box::new(self.expr(scope, filter)?));
@@ -2015,7 +2183,8 @@ impl Exporter<'_> {
     }
 
     /// ORDER BY over a relation: the SELECT, with the order instead of any it had.
-    fn order(&mut self, child: Relation, orders: &[BoundOrderByNode]) -> Res<Select> {
+    /// An ORDER BY over `child`, with a LIMIT to come where `top_n`.
+    fn order(&mut self, child: Relation, orders: &[BoundOrderByNode], top_n: bool) -> Res<Select> {
         let fields = child.fields.clone();
         let mut select = match child.body {
             Body::Select(s) if !s.distinct && s.limit.is_none() => s,
@@ -2032,7 +2201,23 @@ impl Exporter<'_> {
             .iter()
             .filter_map(|b| fields.iter().position(|f| f.binding == *b))
             .collect();
-        if !Self::substitutable(&select, &positions, Kind::Window)
+        // `ComposeOrder`: the keys go into the SELECT only as columns it reads as they are (a literal key would be a
+        // position, or rejected), and a LIMIT only after a SELECT none of whose columns can fail or aggregate
+        let plain_keys = orders.iter().all(|o| match &o.expr.kind {
+            BoundExprKind::ColumnRef { binding, depth: 0 } => fields
+                .iter()
+                .position(|f| f.binding == *binding)
+                .and_then(|p| select.columns.get(p))
+                .is_some_and(|c| matches!(c.expr.kind, ExprKind::ColumnRef(_))),
+            _ => false,
+        });
+        let limit_safe = !top_n || (select.groups.is_none() && select.columns.iter().all(|c| !c.throws));
+        if !plain_keys || !limit_safe || !select.composable() {
+            select = self.subquery(Relation {
+                body: Body::Select(select),
+                fields: fields.clone(),
+            });
+        } else if !Self::substitutable(&select, &positions, Kind::Window)
             || positions.iter().any(|&p| select.columns[p].volatile)
             || (matches!(select.from.kind, TableRefKind::Empty) && select.groups.is_none())
         {
@@ -2045,8 +2230,7 @@ impl Exporter<'_> {
         let mut order = Vec::new();
         for o in orders {
             let expr = self.expr(&scope, &o.expr)?;
-            // a constant sorts nothing, and a bare integer would be a column position
-            if matches!(o.expr.kind, BoundExprKind::Constant(_)) {
+            if constant_key(&o.expr, &expr) {
                 continue;
             }
             order.push(order_node(o.modifiers, expr));
@@ -2565,7 +2749,12 @@ impl Exporter<'_> {
                 };
                 return Ok(expr.clone());
             }
+            // `TryExportCompressedMaterialization`: what compressed materialization casts to is the value as it was
+            BoundExprKind::Cast { child, try_cast: false } if e.is_compressed_cast() => self.expr(scope, child)?,
             BoundExprKind::Cast { child, try_cast } => {
+                if !representable(&e.return_type) || !representable(&child.return_type) {
+                    return Err("The cast type has no SQL type representation".into());
+                }
                 if has_nested_collation(&e.return_type) {
                     return Err("This cast cannot preserve nested collations through SQL".into());
                 }
@@ -2643,6 +2832,21 @@ impl Exporter<'_> {
                 }
                 if let Some(expr) = self.extract_call(scope, &function.name, children)? {
                     return Ok(expr);
+                }
+                // `write_log` binds its named arguments in order after the message and the session's log target
+                // (`bind_write_log`): SQL names them again, without the target
+                if function.name == "write_log" && (6..=7).contains(&children.len()) {
+                    let mut call = FunctionExpr::new("write_log", vec![self.expr(scope, &children[0])?]);
+                    call.name.qualification = vec!["system".into(), "main".into()];
+                    let names = ["level", "log_type", "scope", "disable_logging", "return_value"];
+                    for (name, child) in names.iter().zip(&children[2..]) {
+                        let expr = self.expr(scope, child)?;
+                        call.args.push(FunctionArgument {
+                            name: (*name).into(),
+                            expr: expr.with_alias(*name),
+                        });
+                    }
+                    return Ok(call.into());
                 }
                 let mut args = Vec::new();
                 for (i, c) in children.iter().enumerate() {
@@ -2918,9 +3122,41 @@ fn string_cast(value: &Value) -> Res<(Expr, bool)> {
 }
 
 /// A value as SQL, and whether it is cast to its type already.
+/// `HasUnsupportedVariantKeys`: a struct literal needs keys that are there and differ ignoring case.
+fn unsupported_variant_keys(node: &duckrs_common::variant::VariantNode) -> bool {
+    use duckrs_common::variant::VariantNode as N;
+    match node {
+        N::Object(children) => {
+            let mut names = BTreeSet::new();
+            children
+                .iter()
+                .any(|(key, child)| key.is_empty() || !names.insert(key.to_lowercase()) || unsupported_variant_keys(child))
+        }
+        N::Array(items) => items.iter().any(unsupported_variant_keys),
+        _ => false,
+    }
+}
+
+/// `TypeExpression::CanRepresent`: whether SQL can spell `ty`, which it cannot where it holds an ENUM of no values.
+fn representable(ty: &LogicalType) -> bool {
+    if ty.id() == LogicalTypeId::Enum && ty.enum_values().is_empty() {
+        return false;
+    }
+    ty.child_type().is_none_or(representable) && ty.struct_children().iter().all(|(_, t)| representable(t))
+}
+
 fn from_value(value: &Value) -> Res<(Expr, bool)> {
     use LogicalTypeId as T;
     let ty = value.logical_type();
+    if !representable(ty) {
+        return Err("The nested value type has no SQL constructor".into());
+    }
+    if let (T::Variant, ValueData::Bytes(bytes)) = (ty.id(), value.data()) {
+        let node = duckrs_common::variant::VariantNode::decode(bytes).map_err(|e| e.to_string())?;
+        if unsupported_variant_keys(&node) {
+            return Err("VARIANT object keys cannot be represented by a struct literal".into());
+        }
+    }
     if ty.is_aggregate_state() {
         return Err("Aggregate state SQL parameters are not representable".into());
     }
@@ -3040,6 +3276,25 @@ fn from_value(value: &Value) -> Res<(Expr, bool)> {
         }
         (T::Type | T::Table | T::Pointer | T::Lambda | T::Validity | T::LegacyAggregateState, _) => {
             Err("The value type has no SQL constructor".into())
+        }
+        // `ConstantExpression::FromValue`: the member its tag selects, by name, as a value of the type
+        (T::Union, ValueData::Struct(fields)) => {
+            let tag = fields
+                .first()
+                .and_then(|t| t.as_i128())
+                .and_then(|t| usize::try_from(t).ok())
+                .ok_or("A UNION value without a tag has no SQL constructor")?;
+            let (Some((name, _)), Some(member)) = (ty.struct_children().get(tag + 1), fields.get(tag + 1)) else {
+                return Err("A UNION value without its member has no SQL constructor".into());
+            };
+            let (expr, _) = from_value(member)?;
+            let mut function = FunctionExpr::new("union_value", Vec::new());
+            function.name.qualification = vec!["system".into(), "main".into()];
+            function.args = vec![FunctionArgument {
+                name: name.clone(),
+                expr: expr.with_alias(name.clone()),
+            }];
+            Ok((cast(ty, function.into(), false), true))
         }
         (T::Union, _) => Err("A UNION value has no SQL constructor".into()),
         _ => string_cast(value),
