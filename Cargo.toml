@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/duckrs", "crates/duckrs-cli", "crates/duckrs-common", "crates/duckrs-core", "crates/duckrs-main", "crates/duckrs-parser", "crates/duckrs-tpch", "tools/benchmark", "tools/sqllogictest"]
+members = ["crates/duckrs", "crates/duckrs-cli", "crates/duckrs-common", "crates/duckrs-core", "crates/duckrs-main", "crates/duckrs-parser", "crates/duckrs-tpch", "crates/duckrs-tpcds", "tools/benchmark", "tools/sqllogictest"]
 
 [workspace.package]
 version = "0.0.1"
@@ -23,6 +23,7 @@ duckrs-core = { path = "crates/duckrs-core" }
 duckrs-main = { path = "crates/duckrs-main" }
 duckrs-parser = { path = "crates/duckrs-parser" }
 duckrs-tpch = { path = "crates/duckrs-tpch" }
+duckrs-tpcds = { path = "crates/duckrs-tpcds" }
 parking_lot = "0.13"
 proptest = "1.12"
 criterion = "0.8"

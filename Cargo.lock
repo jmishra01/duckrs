@@ -835,6 +835,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "duckrs-tpcds"
+version = "0.0.1"
+dependencies = [
+ "duckrs-common",
+]
+
+[[package]]
 name = "duckrs-tpch"
 version = "0.0.1"
 dependencies = [
