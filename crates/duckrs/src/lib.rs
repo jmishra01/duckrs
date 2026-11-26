@@ -155,6 +155,11 @@ impl Connection {
         self.context.add_replacement_scan(std::sync::Arc::new(scan));
     }
 
+    /// The current value of setting `name` for this connection (`current_setting`), or `None` for no such setting.
+    pub fn setting(&self, name: &str) -> Option<Value> {
+        self.context.setting(name)
+    }
+
     /// `ClientContext::GetConnectionId`: what tells this connection apart from the others of the process.
     pub fn connection_id(&self) -> u64 {
         self.context.connection_id()

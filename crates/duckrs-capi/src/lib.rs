@@ -15,6 +15,7 @@
 
 pub mod aggregate_function;
 pub mod appender;
+pub mod arrow_c;
 pub mod database;
 pub mod datetime;
 pub mod error;
