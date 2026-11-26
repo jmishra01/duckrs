@@ -3969,6 +3969,7 @@ test/sql/sql_export/constant_values.test
 test/sql/sql_export/copy_empty_filename_pattern.test
 test/sql/sql_export/correlated_sql_export.test
 test/sql/sql_export/cte_names.test
+test/sql/sql_export/cte_result_matrices.test
 test/sql/sql_export/empty_enum.test
 test/sql/sql_export/execution_once.test
 test/sql/sql_export/explain_sql_formatting.test

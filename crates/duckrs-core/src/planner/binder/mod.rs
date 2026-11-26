@@ -98,6 +98,8 @@ pub(super) struct MaterializedCteState {
     pub inline: bool,
     /// `CTE_MATERIALIZE_ALWAYS`
     pub always: bool,
+    /// `CTE_MATERIALIZE_NEVER`
+    pub never: bool,
 }
 
 /// The columns a FROM clause entry makes visible (`TableBinding`).
