@@ -772,7 +772,19 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [ ] row groups of local storage, memory metrics, secure views
   - [ ] the `query_tree` text output, `duckdb_available_metrics()`, `enable_profiling()` / `disable_profiling()`
     as table functions, the profiler log entries
-- [ ] 41. **C API** (`duckrs-capi`): implement `duckdb.h`, then pass `test/api/capi/*`. There is no code for this yet.
+- [ ] 41. **C API** (`duckrs-capi`): implement `duckdb.h`, then pass `test/api/capi/*`
+  - [x] v1 core (2026-11-26): 319 of the 548 functions of `duckdb.h` (database, connection, config, query results and
+    `duckdb_value_*`, data chunks and vectors, logical types, prepared statements and binding, extracted statements,
+    appender, `duckdb_value`, date/time helpers, pending results, error data); `unsafe` only at the FFI boundary
+    (`src/ffi.rs`), struct layouts checked against `duckdb.h` (`tests/layout.rs`)
+  - [x] `tools/capi_tests/run.sh` builds DuckDB's Catch2 C API tests against `libduckrs_capi` (missing functions are
+    weak stubs that fail only the cases calling them): 96 of 115 test cases of the 11 core files pass; 6 cases that
+    read C++ internals are excluded (`tools/capi_tests/excluded.txt`)
+  - [ ] parameter types before binding (`duckdb_param_type`: the binder infers none), the engine gaps the prepared
+    tests reach (preparing EXECUTE, EXPLAIN, CHECKPOINT, PIVOT), real streaming and pending results (duckrs
+    finishes a query first), `duckdb_interrupt`, `duckdb_vector_reference_vector` sharing its buffer
+  - [ ] scalar, aggregate, table, cast and copy functions; Arrow; replacement scans; profiling and logging; the
+    table description, the instance cache; then v2 (`src/main/capi/v2`)
 - [ ] 42. **CLI shell** (`crates/duckrs-cli`, the `duckrs` binary). Against `tools/shell/tests` it passes
   150 of `test_shell_basics` (C++ 1.5.6: 141), all of `test_dump`, `test_errors`, `test_import`,
   `test_table_metadata_rendering` and `test_shell_rendering`
