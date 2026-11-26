@@ -341,6 +341,10 @@ pub struct DatabaseListing {
     pub options: Vec<(String, String)>,
     /// `Catalog::GetEncryptionCipher`, of an encrypted file
     pub cipher: Option<String>,
+    /// `MetadataManager::GetMetadataInfo`: each metadata block, with the mask of its free sub-blocks
+    pub metadata_blocks: Vec<(u64, u64)>,
+    /// of a database in a file, the blocks its buffer manager caches now and how many it ever cached
+    pub cached_blocks: Option<(u64, u64)>,
 }
 
 /// `TypeVisitor`: `visit` for a type and all types in it.

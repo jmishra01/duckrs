@@ -65,6 +65,8 @@ pub struct DatabaseInstance {
     /// Shared with the databases that are attached to this one.
     settings: Arc<RwLock<SettingValues>>,
     transactions: Mutex<OpenTransactions>,
+    /// `ConnectionManager::GetConnectionCount`: the connections made to this database that are open
+    connections: AtomicU64,
     /// held to read while a SELECT runs, and to write while anything else does
     statements: RwLock<()>,
     /// Set when this database came from a file that takes no writes.
@@ -302,6 +304,7 @@ impl DatabaseInstance {
             catalog: Arc::new(Catalog::new(DEFAULT_CATALOG)),
             settings: Arc::default(),
             transactions: Mutex::new(OpenTransactions::default()),
+            connections: AtomicU64::new(0),
             statements: RwLock::new(()),
             file_access,
             file: None,
@@ -635,6 +638,8 @@ impl DatabaseInstance {
             storage_version: None,
             options: self.attach_options.clone(),
             cipher: None,
+            metadata_blocks: Vec::new(),
+            cached_blocks: None,
         };
         if let Some(file) = &self.file {
             listing.storage_version = Some(file.storage_version.display_name(true));
@@ -645,6 +650,8 @@ impl DatabaseInstance {
             listing.free_blocks = blocks.free_list().len() as u64;
             listing.wal_size = storage::log_writer::log_size(&file.path);
             listing.cipher = blocks.encryption().map(|encryption| encryption.cipher.name().to_string());
+            listing.metadata_blocks = blocks.metadata_blocks().into_iter().collect();
+            listing.cached_blocks = Some(file.buffer.eviction_queue());
         }
         listing
     }
@@ -1672,6 +1679,7 @@ impl ClientContext {
         db.catalog.set_database_list(Arc::downgrade(&list));
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        db.connections.fetch_add(1, AtomicOrdering::SeqCst);
         let log_target = Self::new_log_target(&db, id);
         let log_target_id = duckrs_core::logging::register_target(&log_target);
         let context = Self {
@@ -1802,6 +1810,12 @@ impl ClientContext {
                     "search_path" => Ok(Value::varchar(search_path.clone())),
                     // `EnableProfilingSetting::GetSetting`: nothing while profiling is off, which keeps the format
                     "enable_profiling" | "enable_profile" if !profiling => Ok(Value::sql_null()),
+                    // `ProfilingModeSetting::GetSetting`: every mode is the standard one, while profiling is on
+                    "profiling_mode" => Ok(if profiling {
+                        Value::varchar("standard")
+                    } else {
+                        Value::null(LogicalType::VARCHAR)
+                    }),
                     _ => settings::get_setting(name, &db.settings.read(), &session),
                 })
             },
@@ -1814,6 +1828,9 @@ impl ClientContext {
             current_query: self.current_query.clone(),
             appended: self.appended.clone(),
             replacement_scans: self.replacement_scans.0.clone(),
+            connection_count: self.home.connections.load(AtomicOrdering::SeqCst),
+            // `DatabaseManager::ApproxDatabaseCount`: the system and temporary catalogs with the attached ones
+            approx_database_count: 3 + self.home.attached.read().len() as u64,
             prepared_statements: self
                 .prepared_statements
                 .iter()
@@ -2128,6 +2145,136 @@ impl ClientContext {
         Ok(result)
     }
 
+    /// `EnableProfiling` and `DisableProfiling`: the options are the profiling settings, set as SET sets them.
+    fn profiling_call(&mut self, name: &str, call: &duckrs_parser::ast::FunctionExpr) -> Result<MaterializedQueryResult> {
+        if name == "disable_profiling" {
+            if !call.args.is_empty() {
+                return Err(Error::new(
+                    ErrorKind::Binder,
+                    "No function matches the given name and argument types 'disable_profiling'",
+                ));
+            }
+            self.profiling = false;
+            return Ok(Self::success());
+        }
+        let catalog = self.catalog();
+        let constant = |expr: &Expr| -> Result<Value> {
+            match &expr.kind {
+                // `TableFunctionBinder`: a bare name is its text
+                ExprKind::ColumnRef(names) if names.len() == 1 => Ok(Value::varchar(names[0].clone())),
+                _ => evaluate_scalar(&bind_constant_expression(&catalog, expr)?),
+            }
+        };
+        let (mut format, mut coverage, mut save_location, mut mode, mut metrics) = (None, None, None, None, None);
+        // one parameter, `metrics`: a second positional argument matches no overload
+        if call.args.iter().filter(|argument| duckrs_core::planner::binder::named_argument(argument).name.is_empty()).count() > 1 {
+            return Err(Error::new(
+                ErrorKind::Binder,
+                "No function matches the given name and argument types 'enable_profiling(VARCHAR, VARCHAR)'. You might \
+                 need to add explicit type casts.",
+            ));
+        }
+        let mut named_seen = false;
+        for argument in call.args.iter().map(duckrs_core::planner::binder::named_argument) {
+            if argument.name.is_empty() && named_seen {
+                return Err(Error::new(
+                    ErrorKind::Invalid,
+                    "Unnamed parameters cannot come after named parameters",
+                ));
+            }
+            named_seen |= !argument.name.is_empty();
+            let value = constant(&argument.expr)?;
+            if value.is_null() {
+                continue;
+            }
+            let text = || value.try_to_string();
+            match argument.name.to_lowercase().as_str() {
+                // the parameter `metrics`: a pattern, or a list of names
+                "" | "metrics" => {
+                    let ty = value.logical_type();
+                    let varchar = |ty: &LogicalType| {
+                        matches!(ty.id(), duckrs_common::types::LogicalTypeId::Varchar | duckrs_common::types::LogicalTypeId::StringLiteral)
+                    };
+                    let list_of_names = ty.id() == duckrs_common::types::LogicalTypeId::List && ty.child_type().is_some_and(varchar);
+                    if !varchar(ty) && !list_of_names {
+                        return Err(Error::new(
+                            ErrorKind::Binder,
+                            format!(
+                                "No function matches the given name and argument types 'enable_profiling({ty})'. You \
+                                 might need to add explicit type casts.\n\tCandidate functions:\n\tenable_profiling(metrics \
+                                 VARCHAR, format VARCHAR, coverage VARCHAR, save_location VARCHAR, mode VARCHAR)\n\t\
+                                 enable_profiling(metrics VARCHAR[], format VARCHAR, coverage VARCHAR, save_location \
+                                 VARCHAR, mode VARCHAR)"
+                            ),
+                        ));
+                    }
+                    metrics = Some(value.clone());
+                }
+                "format" => format = Some(text()?.to_lowercase()),
+                "coverage" => coverage = Some(text()?.to_lowercase()),
+                "save_location" => save_location = Some(text()?),
+                "mode" => mode = Some(text()?.to_lowercase()),
+                other => {
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        format!("Invalid named parameter \"{other}\" for function enable_profiling"),
+                    ));
+                }
+            }
+        }
+        let quoted = |text: &str| format!("'{}'", text.replace('\'', "''"));
+        let run = |context: &mut Self, sql: String| -> Result<()> {
+            let statement = duckrs_parser::parse_ast(&sql)?.remove(0);
+            context.execute_statement(&statement).map(drop)
+        };
+        if let (Some(format), Some(location)) = (&format, &save_location) {
+            let file_type = file_extension(location);
+            if file_type != "txt" && &file_type != format {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "EnableProfiling: the save_location must be a .txt file or match the specified format.",
+                ));
+            }
+            run(self, "RESET profiling_output".to_string())?;
+        }
+        if let Some(format) = &format {
+            if check_print_format(format).is_err() {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("\"{format}\" is not a valid FORMAT argument"),
+                ));
+            }
+            run(self, format!("SET enable_profiling = {}", quoted(format)))?;
+        } else {
+            // `client_config.enable_profiler = true`, in the format the setting has
+            let current = match self.setting_text("enable_profiling") {
+                format if format.is_empty() => "query_tree".to_string(),
+                format => format,
+            };
+            run(self, format!("SET enable_profiling = {}", quoted(&current)))?;
+        }
+        if let Some(coverage) = &coverage {
+            run(self, format!("SET profiling_coverage = {}", quoted(coverage)))?;
+        }
+        if let Some(location) = &save_location {
+            run(self, format!("SET profiling_output = {}", quoted(location)))?;
+        }
+        if let Some(mode) = &mode {
+            run(self, format!("SET profiling_mode = {}", quoted(mode)))?;
+        }
+        if let Some(metrics) = metrics {
+            let list = match metrics.data() {
+                duckrs_common::value::ValueData::List(items) => items
+                    .iter()
+                    .map(|item| item.try_to_string().map(|text| quoted(&text)))
+                    .collect::<Result<Vec<_>>>()?,
+                _ => vec![quoted(&metrics.try_to_string()?)],
+            };
+            run(self, format!("SET tracked_metrics = [{}]", list.join(", ")))?;
+        }
+        Ok(Self::success())
+    }
+
     /// `SubmitStatementInternal`: a statement run directly has no values for its parameters (`VerifyParameters`);
     /// a named one can read the user variable of its name.
     fn verify_no_parameters(&self, statement: &Statement) -> Result<()> {
@@ -2173,7 +2320,8 @@ impl ClientContext {
             ..ParameterValues::default()
         });
         // these run without the binder, and have no parameters
-        let client_statement = matches!(
+        let client_statement = configuring_select(&statement).is_some()
+            || matches!(
             statement,
             Statement::SetVariable { .. }
                 | Statement::ResetVariable { .. }
@@ -4365,6 +4513,10 @@ impl ClientContext {
 
     /// `ClientContext::PendingStatementOrPreparedStatement` + `ExecutePendingQueryInternal`.
     fn execute_statement(&mut self, statement: &Statement) -> Result<MaterializedQueryResult> {
+        // `SELECT * FROM enable_logging(...)` is the CALL it is short for, of the functions that configure
+        if let Some(call) = configuring_select(statement) {
+            return self.execute_statement(&Statement::Call(Box::new(call)));
+        }
         match statement {
             Statement::Export { database, info } => return self.export_database(database, info),
             // statistics here are made when they are needed, and in-memory tables have nothing to
@@ -4413,6 +4565,13 @@ impl ClientContext {
                 // a query, because the value can be a subquery
                 let query = duckrs_parser::parse_ast(&format!("SELECT {value}"))?.remove(0);
                 let result = self.execute_statement(&query)?;
+                // `PhysicalSetVariable::Sink`
+                if result.row_count() > 1 {
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        "PhysicalSetVariable can only handle a single value",
+                    ));
+                }
                 let value = if result.row_count() == 0 {
                     Value::sql_null()
                 } else {
@@ -4627,6 +4786,12 @@ impl ClientContext {
                         }
                     }
                     settings::set_variable(name, *scope, &Value::varchar(format), &mut global, &mut self.settings)?;
+                    self.profiling = true;
+                    return Ok(Self::success());
+                }
+                // `ProfilingModeSetting::SetLocal`: deprecated, any mode turns profiling on
+                if name.eq_ignore_ascii_case("profiling_mode") && !value.is_null() {
+                    settings::set_variable(name, *scope, &value, &mut global, &mut self.settings)?;
                     self.profiling = true;
                     return Ok(Self::success());
                 }
@@ -4944,6 +5109,9 @@ impl ClientContext {
                 settings::check_lock(&name, &self.home.settings.read(), &self.settings)?;
                 if logging::logging_call(function).is_some() {
                     return self.run_logging_call(function);
+                }
+                if name == "enable_profiling" || name == "disable_profiling" {
+                    return self.profiling_call(&name, call);
                 }
                 return Err(duckrs_core::unported(format!("the table function {name}")));
             }
@@ -5421,6 +5589,7 @@ impl Drop for ClientContext {
         if let Some(transaction) = self.transaction.take() {
             self.end_transaction(transaction);
         }
+        self.home.connections.fetch_sub(1, AtomicOrdering::SeqCst);
     }
 }
 
@@ -10432,3 +10601,35 @@ fn reads_database(plan: &duckrs_core::planner::logical::LogicalOperator) -> bool
 
 /// What EXECUTE runs: the statement, the values of its parameters, and those given as other than literals.
 type BoundExecute = (Arc<PreparedStatementData>, HashMap<String, Value>, HashSet<String>);
+
+/// The call of a configuring table function that a `SELECT * FROM f(...)` is, and nothing more (CALL f(...) is that
+/// SELECT).
+fn configuring_select(statement: &Statement) -> Option<Expr> {
+    use duckrs_parser::ast::{QueryNodeKind, TableRefKind};
+    let Statement::Select(select) = statement else {
+        return None;
+    };
+    let QueryNodeKind::Select(node) = &select.node.kind else {
+        return None;
+    };
+    if !select.node.modifiers.is_empty() || !select.node.cte_map.0.is_empty() {
+        return None;
+    }
+    let TableRefKind::TableFunction { function, .. } = &node.from_table.kind else {
+        return None;
+    };
+    let ExprKind::Function(call) = &function.kind else {
+        return None;
+    };
+    let plain = node.select_list.len() == 1
+        && matches!(&node.select_list[0].kind, ExprKind::Star(star) if star.relation_name.is_empty() && star.expr.is_none())
+        && node.where_clause.is_none()
+        && node.having.is_none()
+        && node.qualify.is_none()
+        && node.groups.group_expressions.is_empty();
+    let configuring = call.name.qualification.iter().all(String::is_empty)
+        && ["enable_logging", "disable_logging", "truncate_duckdb_logs", "enable_profiling", "disable_profiling"]
+            .iter()
+            .any(|name| call.name.name.eq_ignore_ascii_case(name));
+    (plain && configuring).then(|| (**function).clone())
+}

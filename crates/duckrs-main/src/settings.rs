@@ -547,6 +547,28 @@ fn on_set(setting: &SettingDefinition, value: Value) -> Result<Value> {
     let invalid = |message: String| Err(Error::new(ErrorKind::InvalidInput, message));
     let number = || value.try_to_string().ok().and_then(|s| s.parse::<f64>().ok());
     match setting.name {
+        // `ProfilingModeSetting::SetLocal`
+        "profiling_mode" if !value.is_null() => {
+            let mode = value.try_to_string()?.to_lowercase();
+            if !matches!(mode.as_str(), "standard" | "detailed" | "all") {
+                return Err(Error::new(
+                    ErrorKind::Parser,
+                    format!("Unrecognized profiling mode \"{mode}\", supported formats: [standard, detailed, all]"),
+                ));
+            }
+            return Ok(Value::varchar(mode));
+        }
+        // `ProfilingCoverageSetting::SetLocal`: an enum, which `GetSetting` names as its value is called
+        "profiling_coverage" if !value.is_null() => {
+            let given = value.try_to_string()?;
+            return match given.to_uppercase().as_str() {
+                coverage @ ("SELECT" | "ALL") => Ok(Value::varchar(coverage)),
+                _ => Err(Error::new(
+                    ErrorKind::NotImplemented,
+                    format!("Enum value of type ProfilingCoverage: '{given}' not implemented"),
+                )),
+            };
+        }
         // `ParseMemoryLimit` and `StringUtil::BytesToHumanReadableString`: a size, kept as its bytes; a negative
         // one, `none` or `null` is no limit
         "max_streaming_buffer_size" | "operator_memory_limit" | "write_buffer_row_group_memory_limit" => {
