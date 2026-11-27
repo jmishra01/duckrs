@@ -1159,7 +1159,6 @@ fn parsed_directly(ty: &LogicalType) -> bool {
 }
 
 /// The scan of one row that didn't parse: a line of its own in the rejects, or the error.
-#[allow(clippy::too_many_arguments)] // each says something else of the row
 /// The row at `before` that has a value with text after its closing quote, as a scanner that is not strict reads it,
 /// where it ends on its own line (a quote that is not closed takes no more of the file).
 fn unquoted_row<'a>(data: &'a [u8], file: &CsvFile, before: usize) -> Option<super::csv_state_machine::Row<'a>> {
@@ -1181,6 +1180,7 @@ fn reads_column(scan: &CsvScanData, column: usize) -> bool {
     !scan.empty_projection && scan.projection.as_ref().is_none_or(|columns| columns.contains(&column))
 }
 
+#[allow(clippy::too_many_arguments)] // each says something else of the row
 fn bad_line(
     data: &[u8],
     scan: &CsvScanData,
