@@ -184,8 +184,14 @@ fn visit(op: &mut LogicalOperator, by_position: bool, used: &mut HashSet<ColumnB
         && !by_position
         && let Some(read) = pushed_projection(*table_index, &scan.projected_columns(), &scan.column_order, used)
     {
+        // (`pushed_projection` keeps one column where nothing is read, for the rows to have a count)
+        let none_read = !scan
+            .projected_columns()
+            .iter()
+            .any(|&column| used.contains(&ColumnBinding::new(*table_index, column)));
         let mut narrowed = super::type_pushdown::clone_scan(scan);
         narrowed.projection = Some(read);
+        narrowed.empty_projection = none_read;
         *scan = std::sync::Arc::new(narrowed);
     }
     if let K::JsonScan { table_index, scan } = &mut op.kind

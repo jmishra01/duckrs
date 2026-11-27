@@ -1010,7 +1010,12 @@ impl Binder<'_> {
 
     /// `CSVSchemaDiscovery::SchemaDiscovery`: the files after the first are sniffed until enough lines are, or
     /// `files_to_sniff` files, and the types of those with rows are merged into the first's.
-    fn merge_sniffed_schemas(arguments: &CsvArguments, first: &Sniffed, types: &mut [LogicalType]) -> Result<()> {
+    fn merge_sniffed_schemas(
+        arguments: &CsvArguments,
+        first: &Sniffed,
+        names: &mut Vec<String>,
+        types: &mut Vec<LogicalType>,
+    ) -> Result<()> {
         let rows_read = |sniffed: &Sniffed| {
             sniffed
                 .lines_sniffed
@@ -1039,6 +1044,11 @@ impl Binder<'_> {
                 continue;
             }
             merge_schema_types(types, &file.types);
+            // `CSVSchema::MergeSchemas`: with null padding, the columns a later file has more of join the schema
+            if arguments.options.null_padding && file.types.len() > types.len() {
+                names.extend(file.names[types.len()..].iter().cloned());
+                types.extend(file.types[types.len()..].iter().cloned());
+            }
         }
         Ok(())
     }
@@ -1207,7 +1217,7 @@ impl Binder<'_> {
             }
         } else {
             if arguments.columns.is_none() {
-                Self::merge_sniffed_schemas(&arguments, &first, &mut types)?;
+                Self::merge_sniffed_schemas(&arguments, &first, &mut names, &mut types)?;
             }
             replace_null_with_varchar(&mut types);
             for path in &arguments.files {
@@ -1303,6 +1313,7 @@ impl Binder<'_> {
             filename: arguments.filename.is_some(),
             first_data: std::sync::Mutex::new(first_data.map(std::sync::Arc::new)),
             projection: None,
+            empty_projection: false,
             column_order: self.column_order(table_index),
             file_filters: String::new(),
             total_files: None,
@@ -1357,6 +1368,7 @@ impl Binder<'_> {
             rejects: None,
             first_data: std::sync::Mutex::new(None),
             projection: None,
+            empty_projection: false,
             column_order: Default::default(),
             file_filters: String::new(),
             total_files: None,

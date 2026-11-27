@@ -253,6 +253,9 @@ pub struct CsvScanData {
     /// the columns of `output_types` the scan outputs, in order (`column_ids`); `None` for all.
     /// The others are not converted, so their values cannot fail.
     pub projection: Option<Vec<usize>>,
+    /// Nothing reads any column (`COLUMN_IDENTIFIER_EMPTY`, a `count(*)`): the one column of `projection` is there for
+    /// the rows to have a count, and is not converted, so no row fails.
+    pub empty_projection: bool,
     /// the order the binder read the columns in, which projection pushdown keeps
     pub column_order: crate::execution::multi_file::ColumnOrder,
     /// `ExtraOperatorInfo::file_filters`: the filters that left files out, as text
@@ -1107,6 +1110,22 @@ fn parsed_directly(ty: &LogicalType) -> bool {
 
 /// The scan of one row that didn't parse: a line of its own in the rejects, or the error.
 #[allow(clippy::too_many_arguments)] // each says something else of the row
+/// The row at `before` that has a value with text after its closing quote, as a scanner that is not strict reads it,
+/// where it ends on its own line (a quote that is not closed takes no more of the file).
+fn unquoted_row<'a>(data: &'a [u8], file: &CsvFile, before: usize) -> Option<super::csv_state_machine::Row<'a>> {
+    let mut dialect = file.dialect.clone();
+    dialect.strict = false;
+    let line_end = data[before..]
+        .iter()
+        .position(|&b| b == b'\n' || b == b'\r')
+        .map_or(data.len(), |at| before + at);
+    let mut scanner = ValueScanner::new(Machine::new(dialect, before));
+    match scanner.next(data) {
+        Some(Scanned::Row(row)) if row.start == before && row.end <= line_end => Some(row),
+        _ => None,
+    }
+}
+
 fn bad_line(
     data: &[u8],
     scan: &CsvScanData,
@@ -1236,9 +1255,10 @@ fn read_rows(
             if margin.is_some_and(|margin| data.len() - before < margin) {
                 break;
             }
-            let row = match scanner.next(data) {
+            // `prior`: the line of a row whose unquoted value was already reported, rescanned to check the rest
+            let (row, prior) = match scanner.next(data) {
                 None => break,
-                Some(Scanned::Row(row)) => row,
+                Some(Scanned::Row(row)) => (row, None),
                 Some(Scanned::EmptyLine) => {
                     let position = scanner.machine.position;
                     state.line += count_lines(data, before, position);
@@ -1266,6 +1286,7 @@ fn read_rows(
                          to empty or to a different value (e.g., quote='')\n",
                         strict_fix(scan)
                     );
+                    let line = state.line + 1;
                     bad_line(
                         data,
                         scan,
@@ -1276,7 +1297,12 @@ fn read_rows(
                         "Value with unterminated quote found.".to_string(),
                         fixes,
                     )?;
-                    continue;
+                    // `StringValueScanner`: the scanner goes on past the quote to the end of the line, whose other
+                    // values are checked too, so their errors are reported with it; the row does not stay
+                    match unquoted_row(data, file, before) {
+                        Some(row) => (row, Some(line)),
+                        None => continue,
+                    }
                 }
                 Some(Scanned::Invalid) => {
                     let fixes = if scan.options.strict_mode {
@@ -1299,16 +1325,30 @@ fn read_rows(
                     continue;
                 }
             };
-            let position = scanner.machine.position;
-            let mut row_fields = row.fields;
-            let span = RowSpan {
-                line: state.line + count_lines(data, before, row.start.max(before)) + 1,
-                start: row.start,
-                end: row.end,
+            let (position, span) = match prior {
+                // (`bad_line` took the scanner past it and counted its lines)
+                Some(line) => (
+                    row.end,
+                    RowSpan {
+                        line,
+                        start: row.start,
+                        end: row.end,
+                    },
+                ),
+                None => {
+                    let position = state.scanner.as_ref().expect("a scan has a scanner").machine.position;
+                    let span = RowSpan {
+                        line: state.line + count_lines(data, before, row.start.max(before)) + 1,
+                        start: row.start,
+                        end: row.end,
+                    };
+                    state.line += count_lines(data, before, position);
+                    (position, span)
+                }
             };
-            state.line += count_lines(data, before, position);
+            let mut row_fields = row.fields;
             let line_size = position.saturating_sub(span.start);
-            let mut doomed_row = false;
+            let mut doomed_row = prior.is_some();
             if line_size > scan.options.maximum_line_size() {
                 // `CSVError::LineSizeError` of the scanner: the size of the line without its new line
                 let text = span.text(data);
@@ -1596,10 +1636,11 @@ fn typed_chunk(
     let mut bad: std::collections::BTreeSet<usize> = (0..count).filter(|&row| doomed[row]).collect();
     for (index, (ty, column)) in scan.types.iter().zip(&file.mapping).enumerate() {
         // a column nothing reads is not converted (`column_ids` of the scan)
-        if scan
-            .projection
-            .as_ref()
-            .is_some_and(|columns| !columns.contains(&index))
+        if scan.empty_projection
+            || scan
+                .projection
+                .as_ref()
+                .is_some_and(|columns| !columns.contains(&index))
         {
             result.push(Vector::constant_null(ty.clone()));
             continue;
