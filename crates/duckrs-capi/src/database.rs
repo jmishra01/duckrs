@@ -14,6 +14,13 @@ pub struct DatabaseWrapper {
     database: Database,
 }
 
+impl DatabaseWrapper {
+    /// The database (`DatabaseWrapper::database`).
+    pub(crate) fn database(&self) -> &Database {
+        &self.database
+    }
+}
+
 /// A connection (`Connection`). Prepared statements and appenders share it, as C++'s share its `ClientContext`.
 pub struct ConnectionWrapper {
     pub(crate) connection: SharedConnection,

@@ -32,3 +32,6 @@ pub mod value;
 pub mod vector;
 
 pub use types::*;
+
+pub mod replacement_scan;
+pub mod table_description;

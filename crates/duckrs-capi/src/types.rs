@@ -474,3 +474,11 @@ pub type duckdb_aggregate_finalize_t = Option<
 pub type duckdb_table_function_bind_t = Option<unsafe extern "C" fn(info: duckdb_bind_info)>;
 pub type duckdb_table_function_init_t = Option<unsafe extern "C" fn(info: duckdb_init_info)>;
 pub type duckdb_table_function_t = Option<unsafe extern "C" fn(info: duckdb_function_info, output: duckdb_data_chunk)>;
+
+handles! {
+    duckdb_replacement_scan_info = _duckdb_replacement_scan_info;
+}
+
+/// The callback of a replacement scan (`duckdb_add_replacement_scan`).
+pub type duckdb_replacement_callback_t =
+    Option<unsafe extern "C" fn(info: duckdb_replacement_scan_info, table_name: *const c_char, data: *mut c_void)>;

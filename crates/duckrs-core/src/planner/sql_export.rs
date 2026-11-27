@@ -3032,16 +3032,22 @@ impl Exporter<'_> {
 
     /// `ExportConstant`: the value, cast to its type.
     fn constant(&mut self, value: &Value) -> Res<Expr> {
-        let ty = value.logical_type();
-        let (expr, typed) = from_value(value)?;
-        if typed || ty.id() == LogicalTypeId::SqlNull {
-            return Ok(expr);
-        }
-        if ty.id() == LogicalTypeId::Varchar && ty.collation().is_some_and(|c| !c.is_empty()) {
-            return Ok(expr);
-        }
-        Ok(cast(ty, expr, false))
+        constant_expression(value)
     }
+}
+
+/// `ConstantExpression::FromValue` as `ExportConstant` spells it: an expression that binds to the value, of its
+/// type.
+pub(crate) fn constant_expression(value: &Value) -> Res<Expr> {
+    let ty = value.logical_type();
+    let (expr, typed) = from_value(value)?;
+    if typed || ty.id() == LogicalTypeId::SqlNull {
+        return Ok(expr);
+    }
+    if ty.id() == LogicalTypeId::Varchar && ty.collation().is_some_and(|c| !c.is_empty()) {
+        return Ok(expr);
+    }
+    Ok(cast(ty, expr, false))
 }
 
 /// How many values a plan may spell out in its SQL, beyond which it has none.

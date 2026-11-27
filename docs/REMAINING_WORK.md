@@ -798,8 +798,18 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [ ] user-defined functions: projection pushdown (a table function is always given every column), more than one
     thread for a table function (`max_threads`), the copy callback of scalar bind data (bind data is shared),
     functions in `duckdb_functions()`, calls qualified with a schema
-  - [ ] cast and copy functions; Arrow; replacement scans; profiling and logging; the
-    table description, the instance cache; then v2 (`src/main/capi/v2`)
+  - [x] replacement scans and table descriptions (2026-11-26, phase 94): `duckdb_add_replacement_scan` registers the
+    C callback on the database (`DBConfig::replacement_scans`, so every connection sees it, after its own scans;
+    the extra data is freed with the database), and the function name, parameters and error it sets become a
+    table function call under the table's name, as `TableFunctionRef` (`Error in replacement scan: ...` as a
+    Binder Error). The engine's `ReplacementScan` gives a `Replacement`: rows, or a table function with constant
+    parameters (`Binder::bind_replacement_function`); `Database::add_replacement_scan` in the Rust API.
+    `duckdb_table_description_create(_ext)`, `_destroy`, `_error`, `_get_column_count/_name/_type` and
+    `duckdb_column_has_default` read `ClientContext::table_info` (a view is no table). The
+    test_capi_replacement_scan.cpp and test_capi_table_description.cpp files: 4 of 5 cases (the default harness
+    set: 123 of 138)
+  - [ ] `duckdb_get_table_names` (needs the binder's `EXTRACT_NAMES` binding mode)
+  - [ ] cast and copy functions; Arrow; profiling and logging; the instance cache; then v2 (`src/main/capi/v2`)
 - [ ] 42. **CLI shell** (`crates/duckrs-cli`, the `duckrs` binary). Against `tools/shell/tests` it passes
   150 of `test_shell_basics` (C++ 1.5.6: 141), all of `test_dump`, `test_errors`, `test_import`,
   `test_table_metadata_rendering` and `test_shell_rendering`
