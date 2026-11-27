@@ -372,6 +372,11 @@ impl DatabaseInstance {
             .map(|database| database.catalog.clone())
     }
 
+    /// `DBConfig::TryGetCurrentSetting`: the database's value of a setting, or its default.
+    pub fn lookup_setting(&self, name: &str) -> Option<(Value, settings::SettingLookupScope)> {
+        settings::lookup_setting(name, &self.settings.read(), &SettingValues::default())
+    }
+
     /// `LogManager::RegisterLogStorage`: a log storage `SET logging_storage` can name; false when one has the name.
     pub fn register_log_storage(&self, name: &str, storage: Arc<dyn duckrs_core::logging::LogStorageCallback>) -> bool {
         self.log_manager
@@ -1814,6 +1819,17 @@ impl ClientContext {
     /// The current value of a setting (`Settings::Get` / `current_setting`).
     pub fn setting(&self, name: &str) -> Option<Value> {
         settings::current_value(name, &self.home.settings.read(), &self.settings)
+    }
+
+    /// `ClientContext::TryGetCurrentSetting`: the current value of a setting and where it comes from.
+    pub fn lookup_setting(&self, name: &str) -> Option<(Value, settings::SettingLookupScope)> {
+        settings::lookup_setting(name, &self.home.settings.read(), &self.settings)
+    }
+
+    /// `DBConfig::AddExtensionOption` of the database: an option SET, RESET, `current_setting` and
+    /// `duckdb_settings()` know from now on, on every connection.
+    pub fn add_extension_option(&self, option: settings::ExtensionOption) -> Result<()> {
+        settings::add_extension_option(option, &mut self.home.settings.write())
     }
 
     /// What spilling operators may hold, from `memory_limit`, and where they spill to, from

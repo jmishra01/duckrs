@@ -20,7 +20,8 @@ pub use duckrs_core::planner::binder::Replacement;
 
 /// The configuration options (`DBConfig::GetOptionByIndex` / `GetOptionByName`).
 pub mod settings {
-    pub use duckrs_main::settings::{SettingDefinition, all_settings, find_setting};
+    pub use duckrs_main::settings::{ExtensionOption, SettingDefinition, SettingLookupScope, all_settings, find_setting};
+    pub use duckrs_main::settings::SetScope;
 }
 
 /// `Value::DefaultCastAs`: `value` cast to `ty`, as a SQL `CAST` would.
@@ -179,6 +180,12 @@ impl Database {
         }
     }
 
+    /// `DBConfig::TryGetCurrentSetting`: the database's value of setting `name` (not that of a connection), or its
+    /// default.
+    pub fn lookup_setting(&self, name: &str) -> Option<(Value, settings::SettingLookupScope)> {
+        self.instance.lookup_setting(name)
+    }
+
     /// Registers a log storage (`duckdb_register_log_storage`) under `name`, which `SET logging_storage` can then
     /// select: each log entry goes to it. False when a storage has the name already.
     pub fn register_log_storage(&self, name: &str, storage: Arc<dyn logging::LogStorageCallback>) -> bool {
@@ -271,6 +278,18 @@ impl Connection {
     /// The current value of setting `name` for this connection (`current_setting`), or `None` for no such setting.
     pub fn setting(&self, name: &str) -> Option<Value> {
         self.context.setting(name)
+    }
+
+    /// `ClientContext::TryGetCurrentSetting`: the current value of setting `name` for this connection and whether it
+    /// is the connection's own (`Local`) or the database's or the default (`Global`).
+    pub fn lookup_setting(&self, name: &str) -> Option<(Value, settings::SettingLookupScope)> {
+        self.context.lookup_setting(name)
+    }
+
+    /// Registers a configuration option on the database (`DBConfig::AddExtensionOption`,
+    /// `duckdb_register_config_option`); one of that name registered before is an error.
+    pub fn register_config_option(&self, option: settings::ExtensionOption) -> Result<()> {
+        self.context.add_extension_option(option)
     }
 
     /// `ClientContext::GetConnectionId`: what tells this connection apart from the others of the process.
