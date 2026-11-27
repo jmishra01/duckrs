@@ -30,7 +30,7 @@ use crate::planner::expression::{BoundExpr, BoundExprKind, ColumnBinding};
 use crate::planner::logical::{LogicalOperator, LogicalOperatorKind as K};
 use duckrs_common::Result;
 use duckrs_common::executor;
-use duckrs_common::types::{LogicalType, LogicalTypeId, NativeType};
+use duckrs_common::types::{LogicalType, LogicalTypeId, NativeType, StringT};
 use duckrs_common::value::Value;
 use duckrs_common::vector::{DataChunk, Vector};
 use std::collections::{HashMap, HashSet};
@@ -934,8 +934,9 @@ fn compress_string<R: Packed>(args: &DataChunk, result: &mut Vector) -> Result<(
 
 /// `MiniStringCompress`: the length plus the byte of a string of at most one.
 fn compress_mini_string(args: &DataChunk, result: &mut Vector) -> Result<()> {
-    executor::unary_str::<u8>(args.column(0), result, args.len(), |bytes| {
-        (bytes.len() as u8).wrapping_add(bytes.first().copied().unwrap_or(0))
+    // the length and the first byte, which the string's header has: its prefix is zero past the length
+    executor::unary::<StringT, u8>(args.column(0), result, args.len(), |string| {
+        (string.len() as u8).wrapping_add(string.prefix()[0])
     });
     Ok(())
 }
