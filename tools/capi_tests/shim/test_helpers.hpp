@@ -22,6 +22,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -48,6 +49,7 @@ struct BaseAppender {
 };
 
 using std::atomic;
+using std::mutex;
 using std::make_pair;
 using std::move;
 using std::pair;
@@ -59,6 +61,13 @@ using std::unordered_set;
 
 template <class T>
 using vector = std::vector<T>;
+template <class K, class V, class C = std::less<K>>
+using map = std::map<K, V, C>;
+
+//! `DConstants`
+struct DConstants {
+	static constexpr idx_t INVALID_INDEX = idx_t(-1);
+};
 template <class T, class D = std::default_delete<T>>
 using unique_ptr = std::unique_ptr<T, D>;
 template <class T>

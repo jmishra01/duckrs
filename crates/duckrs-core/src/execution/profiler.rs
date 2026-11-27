@@ -505,9 +505,10 @@ fn seconds(duration: Duration) -> Metric {
     Metric::Double(duration.as_secs_f64())
 }
 
-/// `OperatorToResultTree`: an operator's tracked metrics, and its children.
-fn operator_json(node: &ProfileNode, tracked: &TrackedMetrics, legacy: bool) -> JsonObject {
-    let mut object = JsonObject::default();
+/// `OperatorMetrics::GetMetrics`: an operator's tracked metrics by name, under their legacy names with `legacy`
+/// (followed by the cumulative ones of `LegacyOperatorToResultTree`).
+fn operator_metrics(node: &ProfileNode, tracked: &TrackedMetrics, legacy: bool) -> Vec<(String, Metric)> {
+    let mut result = Vec::new();
     let scan = node.op_type == "TABLE_SCAN";
     let mut metrics = vec![
         ("type", Metric::Text(node.op_type.clone()), "operator_type"),
@@ -544,14 +545,10 @@ fn operator_json(node: &ProfileNode, tracked: &TrackedMetrics, legacy: bool) -> 
         }
         if legacy {
             if !legacy_name.is_empty() {
-                object
-                    .entries
-                    .push((legacy_name.to_string(), JsonEntry::Value(metric_json(&value))));
+                result.push((legacy_name.to_string(), value));
             }
         } else {
-            object
-                .entries
-                .push((name.to_string(), JsonEntry::Value(metric_json(&value))));
+            result.push((name.to_string(), value));
         }
     }
     if legacy {
@@ -561,10 +558,17 @@ fn operator_json(node: &ProfileNode, tracked: &TrackedMetrics, legacy: bool) -> 
             ("cumulative_cardinality", Metric::UBigInt(totals.rows)),
             ("cumulative_rows_scanned", Metric::UBigInt(totals.rows_scanned)),
         ] {
-            object
-                .entries
-                .push((name.to_string(), JsonEntry::Value(metric_json(&value))));
+            result.push((name.to_string(), value));
         }
+    }
+    result
+}
+
+/// `OperatorToResultTree`: an operator's tracked metrics, and its children.
+fn operator_json(node: &ProfileNode, tracked: &TrackedMetrics, legacy: bool) -> JsonObject {
+    let mut object = JsonObject::default();
+    for (name, value) in operator_metrics(node, tracked, legacy) {
+        object.entries.push((name, JsonEntry::Value(metric_json(&value))));
     }
     let children: Vec<String> = node
         .children
@@ -610,7 +614,167 @@ const LEGACY_NAMES: [(&str, &str); 14] = [
     ("cumulative_rows_scanned", "query.total_rows_scanned"),
 ];
 
+/// `QueryProfileResult`: a node of the tree of a profile, which `QueryProfiler::ToJSON` renders as JSON and the C API
+/// walks (`duckdb_get_profiling_info`).
+#[derive(Debug, Clone)]
+pub struct ProfileResult {
+    /// the key in the object it is in; empty for an item of a list and for the root
+    pub key: String,
+    pub kind: ProfileResultKind,
+}
+
+/// `QueryProfileResultKind`, with what each kind holds.
+#[derive(Debug, Clone)]
+pub enum ProfileResultKind {
+    Value(duckrs_common::value::Value),
+    List(Vec<ProfileResult>),
+    Object(Vec<ProfileResult>),
+}
+
+impl ProfileResult {
+    fn object(key: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            kind: ProfileResultKind::Object(Vec::new()),
+        }
+    }
+
+    /// The children of an object or a list; none of a value.
+    pub fn children(&self) -> &[ProfileResult] {
+        match &self.kind {
+            ProfileResultKind::List(children) | ProfileResultKind::Object(children) => children,
+            ProfileResultKind::Value(_) => &[],
+        }
+    }
+
+    fn push(&mut self, child: ProfileResult) {
+        if let ProfileResultKind::List(children) | ProfileResultKind::Object(children) = &mut self.kind {
+            children.push(child);
+        }
+    }
+
+    /// `AddValue`.
+    fn add_value(&mut self, key: &str, metric: &Metric) {
+        self.push(ProfileResult {
+            key: key.to_string(),
+            kind: ProfileResultKind::Value(metric_value(metric)),
+        });
+    }
+
+    /// `MetricsToProfileResult` of one metric: under the objects its dotted name names.
+    fn add_metric(&mut self, key: &str, metric: &Metric) {
+        match key.split_once('.') {
+            None => self.add_value(key, metric),
+            Some((prefix, rest)) => {
+                let ProfileResultKind::Object(children) = &mut self.kind else {
+                    return;
+                };
+                let index = match children
+                    .iter()
+                    .position(|c| c.key == prefix && matches!(c.kind, ProfileResultKind::Object(_)))
+                {
+                    Some(index) => index,
+                    None => {
+                        children.push(ProfileResult::object(prefix));
+                        children.len() - 1
+                    }
+                };
+                children[index].add_metric(rest, metric);
+            }
+        }
+    }
+}
+
+/// The value of a metric (`Value` of `GetMetrics`): an `extra_info` is a MAP of VARCHARs.
+fn metric_value(metric: &Metric) -> duckrs_common::value::Value {
+    use duckrs_common::types::LogicalType;
+    use duckrs_common::value::{Value, ValueData};
+    match metric {
+        Metric::Double(value) => Value::double(*value),
+        Metric::UBigInt(value) => Value::ubigint(*value),
+        Metric::Text(text) => Value::varchar(text.as_str()),
+        Metric::Map(entries) => {
+            let ty = LogicalType::map(LogicalType::VARCHAR, LogicalType::VARCHAR);
+            let entry_type = ty.child_type().cloned().unwrap_or(LogicalType::SQLNULL);
+            let entries = entries
+                .iter()
+                .filter_map(|(key, value)| {
+                    Value::new(
+                        entry_type.clone(),
+                        ValueData::Struct(vec![Value::varchar(key.as_str()), Value::varchar(value.as_str())]),
+                    )
+                    .ok()
+                })
+                .collect();
+            Value::new(ty, ValueData::List(entries)).unwrap_or_else(|_| Value::sql_null())
+        }
+    }
+}
+
+/// `OperatorToResultTree` (and `LegacyOperatorToResultTree`) into `result`, an object.
+fn operator_result(node: &ProfileNode, tracked: &TrackedMetrics, legacy: bool, result: &mut ProfileResult) {
+    for (name, value) in operator_metrics(node, tracked, legacy) {
+        result.add_value(&name, &value);
+    }
+    if !node.children.is_empty() {
+        let mut children = ProfileResult {
+            key: "children".to_string(),
+            kind: ProfileResultKind::List(Vec::new()),
+        };
+        for child in &node.children {
+            let mut child_result = ProfileResult::object("");
+            operator_result(child, tracked, legacy, &mut child_result);
+            children.push(child_result);
+        }
+        result.push(children);
+    }
+}
+
 impl QueryProfile {
+    /// `QueryProfiler::ToResultTree` (or `ToLegacyResultTree`): the tree [`QueryProfile::to_json`] renders.
+    pub fn to_result_tree(&self, tracked: &TrackedMetrics, legacy: bool) -> ProfileResult {
+        let mut result = ProfileResult::object("");
+        if self.root.is_none() && !self.metrics.contains_key("query.sql") {
+            result.add_value("result", &Metric::Text("empty".to_string()));
+        } else if legacy {
+            for (legacy_name, name) in LEGACY_NAMES {
+                if let Some(value) = self.metrics.get(name) {
+                    result.add_value(legacy_name, value);
+                }
+            }
+            if let Some(root) = &self.root {
+                result.add_value("rows_returned", &Metric::UBigInt(root.metrics.rows));
+                let mut children = ProfileResult {
+                    key: "children".to_string(),
+                    kind: ProfileResultKind::List(Vec::new()),
+                };
+                let mut operator = ProfileResult::object("");
+                operator_result(root, tracked, true, &mut operator);
+                children.push(operator);
+                result.push(children);
+            }
+        } else {
+            for (name, value) in &self.metrics {
+                if tracked.is_tracked(name) {
+                    result.add_metric(name, value);
+                }
+            }
+            if let Some(root) = &self.root
+                && tracked.any_operator_metric()
+            {
+                let mut operators = ProfileResult {
+                    key: "operator".to_string(),
+                    kind: ProfileResultKind::List(Vec::new()),
+                };
+                let mut operator = ProfileResult::object("");
+                operator_result(root, tracked, false, &mut operator);
+                operators.push(operator);
+                result.push(operators);
+            }
+        }
+        result
+    }
+
     /// `QueryProfiler::ToJSON` of `ToResultTree`, or of `ToLegacyResultTree`.
     pub fn to_json(&self, tracked: &TrackedMetrics, legacy: bool) -> String {
         let mut object = JsonObject::default();

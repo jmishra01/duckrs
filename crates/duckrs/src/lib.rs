@@ -38,6 +38,16 @@ pub fn cast_vector(source: &duckrs_common::vector::Vector, ty: &LogicalType, cou
 /// User-defined functions: scalar, aggregate and table functions a client registers on a database
 /// ([`Connection::register_scalar_functions`], ...) and implements through the traits here, which the engine calls
 /// on whole chunks.
+/// Log storages a client registers.
+pub mod logging {
+    pub use duckrs_core::logging::{LogLevel, LogStorageCallback};
+}
+
+/// The profile of a statement (`QueryProfileResult`), as `duckdb_get_profiling_info` walks it.
+pub mod profiling {
+    pub use duckrs_core::execution::profiler::{ProfileResult, ProfileResultKind};
+}
+
 pub mod udf {
     pub use duckrs_core::function::udf::*;
     /// A bound expression, as a scalar function's bind sees its arguments (`duckdb_expression`).
@@ -116,6 +126,12 @@ impl Database {
     /// ([`Connection::add_replacement_scan`]); an error from it fails the query.
     pub fn add_replacement_scan(&self, scan: impl Fn(&str) -> Option<Result<Replacement>> + Send + Sync + 'static) {
         self.instance.add_replacement_scan(Arc::new(scan));
+    }
+
+    /// Registers a log storage (`duckdb_register_log_storage`) under `name`, which `SET logging_storage` can then
+    /// select: each log entry goes to it. False when a storage has the name already.
+    pub fn register_log_storage(&self, name: &str, storage: Arc<dyn logging::LogStorageCallback>) -> bool {
+        self.instance.register_log_storage(name, storage)
     }
 }
 
@@ -202,6 +218,12 @@ impl Connection {
     /// keeps that one.
     pub fn register_cast(&mut self, cast: udf::UserCast) {
         self.context.user_functions().register_cast(cast)
+    }
+
+    /// The profile of the last statement (`QueryProfiler::GetResult`), while profiling is on and that statement was
+    /// profiled with a plan; `None` else.
+    pub fn profiling_info(&self) -> Option<Arc<profiling::ProfileResult>> {
+        self.context.profiling_info()
     }
 
     /// Registers a copy function (`duckdb_register_copy_function`): COPY TO and COPY FROM with its name as the FORMAT
