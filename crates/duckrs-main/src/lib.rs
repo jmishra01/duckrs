@@ -1487,6 +1487,8 @@ pub struct ClientContext {
     current_query: String,
     /// the rows of an `Appender` that is flushing
     appended: Option<duckrs_core::planner::binder::AppendedRows>,
+    /// the name the statement an appender flushes with reads its rows under (`BaseAppender::ParseStatement`'s CTE)
+    appended_name: Option<String>,
     /// `DBConfig::replacement_scans` of this connection
     replacement_scans: duckrs_core::planner::binder::ReplacementScans,
     /// `ConnectionSecretStorage`: the secrets `CREATE SECRET ... IN connection` made, which only
@@ -1796,6 +1798,7 @@ impl ClientContext {
             search_path: Vec::new(),
             current_query: String::new(),
             appended: None,
+            appended_name: None,
             replacement_scans: Default::default(),
             connection_secrets: Arc::default(),
             nested: false,
@@ -2278,29 +2281,102 @@ impl ClientContext {
         columns: Vec<(String, LogicalType)>,
         chunks: Vec<duckrs_common::vector::DataChunk>,
     ) -> Result<()> {
-        let quote = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
-        let mut target = match schema {
-            Some(schema) => format!("{}.{}", quote(schema), quote(table)),
-            None => quote(table),
+        use duckrs_parser::ast::sql_identifier;
+        // `Appender::ConstructQuery`: the table by catalog, schema and name (`TableDescription::qualified_name`),
+        // with the columns only when the appender chose some (`GetExpectedNames`)
+        let description = self.table_info(catalog, schema, table)?;
+        let target = match &description {
+            Some(found) => format!(
+                "{}.{}.{}",
+                sql_identifier(catalog.filter(|c| !c.is_empty()).unwrap_or(&found.catalog)),
+                sql_identifier(&found.schema),
+                sql_identifier(&found.table)
+            ),
+            None => [catalog, schema, Some(table)]
+                .into_iter()
+                .flatten()
+                .filter(|part| !part.is_empty())
+                .map(sql_identifier)
+                .collect::<Vec<_>>()
+                .join("."),
         };
-        if let Some(catalog) = catalog.filter(|c| !c.is_empty()) {
-            if schema.is_none() {
-                target = format!("{}.{}", quote("main"), target);
-            }
-            target = format!("{}.{target}", quote(catalog));
+        let all_columns = self.table_columns_in(catalog, schema, table).ok();
+        let every_column = all_columns.is_some_and(|all| {
+            all.len() == columns.len() && all.iter().zip(&columns).all(|((a, _), (b, _))| a == b)
+        });
+        let mut query = format!("INSERT INTO {target}");
+        if !every_column {
+            let list: Vec<String> = columns.iter().map(|(name, _)| sql_identifier(name)).collect();
+            query += &format!("({})", list.join(", "));
         }
-        let column_list = columns
-            .iter()
-            .map(|(name, _)| quote(name))
-            .collect::<Vec<_>>()
-            .join(", ");
+        const APPENDED: &str = "__duckdb_internal_appended_data";
+        query += &format!(" FROM {APPENDED}");
         let (names, types): (Vec<String>, Vec<LogicalType>) = columns.into_iter().unzip();
+        let names = if every_column { Vec::new() } else { names };
+        self.append_query(&query, APPENDED, names, types, chunks)
+    }
+
+    /// `QueryAppender::FlushInternal` (`BaseAppender::ParseStatement` and `ClientContext::Append`): runs the single
+    /// INSERT, DELETE or UPDATE statement of `query`, which reads the rows (of `types`) as the table `table_name`
+    /// (`appended_data` without one), a CTE of the statement. The columns are `names`, then `col1`, `col2`, ...
+    pub fn append_query(
+        &mut self,
+        query: &str,
+        table_name: &str,
+        mut names: Vec<String>,
+        types: Vec<LogicalType>,
+        chunks: Vec<duckrs_common::vector::DataChunk>,
+    ) -> Result<()> {
+        let alias = if table_name.is_empty() { "appended_data" } else { table_name };
+        // `Binder::Bind(ColumnDataRef &)`
+        for i in names.len()..types.len() {
+            names.push(format!("col{}", i + 1));
+        }
+        names.truncate(types.len());
         self.appended = Some((names, types, Arc::new(chunks)));
-        let result = self.query(&format!(
-            "INSERT INTO {target} ({column_list}) SELECT * FROM __internal_appender_chunks()"
-        ));
+        self.appended_name = Some(alias.to_string());
+        let result = self.query(query);
         self.appended = None;
+        self.appended_name = None;
         result.map(drop)
+    }
+
+    /// `BaseAppender::ParseStatement`: the appender's rows as a CTE `alias` of the one statement, not materialized.
+    fn add_appended_cte(statements: &mut [(Statement, String)], alias: &str) -> Result<()> {
+        use duckrs_parser::ast::{CteInfo, CteMaterialize};
+        let [(statement, _)] = statements else {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "Expected exactly one query for appending data.",
+            ));
+        };
+        let cte_map = match statement {
+            Statement::Insert(insert) => &mut insert.cte_map,
+            Statement::Delete(delete) => &mut delete.cte_map,
+            Statement::Update(update) => &mut update.cte_map,
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "Unsupported statement type for appender: expected INSERT, DELETE, UPDATE or MERGE INTO",
+                ));
+            }
+        };
+        let Some(Statement::Select(select)) = duckrs_parser::parse_ast("SELECT * FROM __internal_appender_chunks()")?
+            .into_iter()
+            .next()
+        else {
+            return Err(Error::new(ErrorKind::Internal, "the appender's CTE does not parse"));
+        };
+        let info = CteInfo {
+            aliases: Vec::new(),
+            query: Box::new(select.node),
+            key_targets: Vec::new(),
+            materialized: CteMaterialize::Never,
+        };
+        // first, so that the statement's own CTEs can read it too
+        cte_map.0.retain(|(name, _)| !name.eq_ignore_ascii_case(alias));
+        cte_map.0.insert(0, (alias.to_string(), info));
+        Ok(())
     }
 
     pub fn query(&mut self, sql: &str) -> Result<MaterializedQueryResult> {
@@ -2318,7 +2394,7 @@ impl ClientContext {
 
     fn query_text(&mut self, sql: &str) -> Result<MaterializedQueryResult> {
         let _temp = SessionTemp::enter(&self.temp);
-        let statements = match duckrs_parser::parse_ast_with_text(sql, &self.parser_options()) {
+        let mut statements = match duckrs_parser::parse_ast_with_text(sql, &self.parser_options()) {
             Ok(statements) => statements,
             Err(error) => {
                 if let Some(transaction) = &mut self.transaction {
@@ -2327,6 +2403,9 @@ impl ClientContext {
                 return Err(error);
             }
         };
+        if let Some(alias) = self.appended_name.take() {
+            Self::add_appended_cte(&mut statements, &alias)?;
+        }
         let mut result = MaterializedQueryResult {
             names: Vec::new(),
             types: Vec::new(),

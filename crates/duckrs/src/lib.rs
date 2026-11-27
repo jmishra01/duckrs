@@ -417,6 +417,20 @@ impl Connection {
     ) -> Result<()> {
         self.context.append_in(catalog, schema, table, columns, chunks)
     }
+
+    /// `QueryAppender::FlushInternal`: runs `query`, a single INSERT, DELETE or UPDATE, which reads `chunks` (of
+    /// `types`) as the table `table_name` (`appended_data` when empty), with the columns `names` (`col1`, `col2`, ...
+    /// for those not named).
+    pub fn append_query(
+        &mut self,
+        query: &str,
+        table_name: &str,
+        names: Vec<String>,
+        types: Vec<LogicalType>,
+        chunks: Vec<DataChunk>,
+    ) -> Result<()> {
+        self.context.append_query(query, table_name, names, types, chunks)
+    }
 }
 
 impl Connection {
@@ -620,6 +634,57 @@ impl PreparedStatement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn append_chunks_and_query_appender() {
+        let db = Database::open_in_memory().unwrap();
+        let mut con = db.connect().unwrap();
+        let dir = std::env::temp_dir().join(format!("duckrs_append_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("other.db");
+        let _ = std::fs::remove_file(&path);
+        con.query(&format!("ATTACH '{}' AS other", path.display())).unwrap();
+        con.query("CREATE TABLE other.tbl (i INTEGER, j VARCHAR DEFAULT 'x'); CREATE TABLE t (i INTEGER PRIMARY KEY, v VARCHAR)")
+            .unwrap();
+        let chunk = |values: &[i32]| {
+            let mut chunk = DataChunk::new(&[LogicalType::INTEGER]);
+            for (row, value) in values.iter().enumerate() {
+                chunk.column_mut(0).data_mut::<i32>()[row] = *value;
+            }
+            chunk.set_len(values.len());
+            chunk
+        };
+        let columns = vec![("i".to_string(), LogicalType::INTEGER)];
+        con.append_chunks(Some("other"), Some("main"), "tbl", columns, vec![chunk(&[1, 2])])
+            .unwrap();
+        let result = con.query("SELECT sum(i)::BIGINT, min(j) FROM other.tbl").unwrap();
+        assert_eq!(result.value(0, 0), Value::bigint(3));
+        assert_eq!(result.value(1, 0), Value::varchar("x"));
+        // a query appender: the rows as the named table of the one statement, unnamed columns as col1, ...
+        con.append_query(
+            "INSERT INTO t SELECT col1, 'v' || col1 FROM rows",
+            "rows",
+            Vec::new(),
+            vec![LogicalType::INTEGER],
+            vec![chunk(&[5, 6])],
+        )
+        .unwrap();
+        con.append_query(
+            "INSERT OR REPLACE INTO t SELECT k, 'w' FROM appended_data",
+            "",
+            vec!["k".to_string()],
+            vec![LogicalType::INTEGER],
+            vec![chunk(&[6])],
+        )
+        .unwrap();
+        let result = con.query("SELECT string_agg(v, ',' ORDER BY i) FROM t").unwrap();
+        assert_eq!(result.value(0, 0), Value::varchar("v5,w"));
+        let err = con
+            .append_query("SELECT 1", "", Vec::new(), vec![LogicalType::INTEGER], vec![chunk(&[1])])
+            .unwrap_err();
+        assert!(err.message.contains("Unsupported statement type for appender"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn queries_run() {
