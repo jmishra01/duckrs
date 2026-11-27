@@ -270,6 +270,10 @@ pub struct TableUdfBindInput {
     pub parameters: Vec<Value>,
     pub named_parameters: Vec<(String, Value)>,
     pub connection_id: u64,
+    /// the columns a COPY FROM reads into (`expected_names` and `expected_types` of `CCopyFromBind`), which are the
+    /// function's columns; empty for a call in a query
+    pub expected_names: Vec<String>,
+    pub expected_types: Vec<LogicalType>,
 }
 
 /// What a table function's bind gives: its columns, how many rows it expects to give (and whether that is
@@ -346,6 +350,70 @@ impl fmt::Debug for TableUdfOverload {
 pub struct TableUdfSet {
     pub name: String,
     pub functions: Vec<Arc<TableUdfOverload>>,
+}
+
+// --------------------------------------------------------------------------------------------------------------
+// Copy functions
+// --------------------------------------------------------------------------------------------------------------
+
+/// What the bind of a COPY TO sees (`CopyFunctionBindInput` and the names and types to write): the columns, the
+/// options of the COPY by name as written (without FORMAT), each with the values it was given, and the connection.
+pub struct CopyToBindInput {
+    pub names: Vec<String>,
+    pub types: Vec<LogicalType>,
+    pub options: Vec<(String, Vec<Value>)>,
+    pub connection_id: u64,
+}
+
+/// The COPY TO callbacks of a user-defined copy function.
+pub trait CopyToUdf: Send + Sync {
+    /// `copy_to_bind`. An error is a binder error of the query.
+    fn bind(&self, input: CopyToBindInput) -> Result<Arc<dyn CopyToBound>>;
+}
+
+/// A bound COPY TO of a user-defined copy function (its `FunctionData`).
+pub trait CopyToBound: Send + Sync {
+    /// `copy_to_initialize_global`: the state that writes the file at `path`, made before the first rows.
+    fn initialize(&self, path: &str) -> Result<Box<dyn CopyToSink>>;
+}
+
+/// A running COPY TO (its global state).
+pub trait CopyToSink: Send {
+    /// `copy_to_sink`: the rows of `chunk`.
+    fn sink(&mut self, chunk: &DataChunk) -> Result<()>;
+    /// `copy_to_finalize`: after the last rows.
+    fn finalize(&mut self) -> Result<()>;
+}
+
+/// [`crate::planner::logical::LogicalOperatorKind::UserCopyTo`]: a bound COPY TO of a user-defined copy function.
+#[derive(Clone)]
+pub struct UserCopyTo {
+    /// the name of the function (the FORMAT)
+    pub name: String,
+    pub path: String,
+    pub bound: Arc<dyn CopyToBound>,
+}
+
+impl fmt::Debug for UserCopyTo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "UserCopyTo({}, {})", self.name, self.path)
+    }
+}
+
+/// A user-defined copy function (`CopyFunction` with the callbacks of copy_function-c.cpp): what COPY TO and COPY
+/// FROM with its name as the FORMAT run.
+#[derive(Clone)]
+pub struct UserCopyFunction {
+    pub name: String,
+    pub copy_to: Option<Arc<dyn CopyToUdf>>,
+    /// the table function that reads a file for COPY FROM (`copy_from_function`)
+    pub copy_from: Option<Arc<TableUdfOverload>>,
+}
+
+impl fmt::Debug for UserCopyFunction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "UserCopyFunction({})", self.name)
+    }
 }
 
 // --------------------------------------------------------------------------------------------------------------
@@ -443,6 +511,7 @@ pub struct UserFunctions {
     aggregate: RwLock<HashMap<String, Arc<AggregateFunctionSet>>>,
     table: RwLock<HashMap<String, Arc<TableUdfSet>>>,
     casts: RwLock<Vec<UserCast>>,
+    copy: RwLock<HashMap<String, Arc<UserCopyFunction>>>,
     /// by lower-case name: the name as registered, and the type (with that name as its alias)
     types: RwLock<HashMap<String, (String, LogicalType)>>,
 }
@@ -454,6 +523,7 @@ impl fmt::Debug for UserFunctions {
             .field("aggregate", &self.aggregate.read().keys().collect::<Vec<_>>())
             .field("table", &self.table.read().keys().collect::<Vec<_>>())
             .field("casts", &*self.casts.read())
+            .field("copy", &self.copy.read().keys().collect::<Vec<_>>())
             .field("types", &self.types.read().keys().collect::<Vec<_>>())
             .finish()
     }
@@ -544,6 +614,18 @@ impl UserFunctions {
 
     pub fn table(&self, name: &str) -> Option<Arc<TableUdfSet>> {
         self.table.read().get(&name.to_ascii_lowercase()).cloned()
+    }
+
+    /// `CreateCopyFunctionInfo` with `ALTER_ON_CONFLICT`: the function takes the place of one with its name.
+    pub fn register_copy(&self, function: UserCopyFunction) {
+        self.copy
+            .write()
+            .insert(function.name.to_ascii_lowercase(), Arc::new(function));
+    }
+
+    /// The copy function `name` (a FORMAT of COPY), if a client registered one.
+    pub fn copy(&self, name: &str) -> Option<Arc<UserCopyFunction>> {
+        self.copy.read().get(&name.to_ascii_lowercase()).cloned()
     }
 
     /// `CastFunctionSet::RegisterCastFunction`: a cast from `source` to `target`. As C++'s map insert, a pair that

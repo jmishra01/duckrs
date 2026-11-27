@@ -4,10 +4,13 @@
 //
 //! Binding calls of the functions a client registered ([`crate::function::udf`]).
 
-use super::Binder;
+use super::{Binder, BoundStatement, StatementReturnType};
 use crate::function::aggregates::AggregateFunctionSet;
 use crate::function::binder::{expression_return_type, select_function};
-use crate::function::udf::{ScalarUdfBindInput, ScalarUdfSet, TableUdfBindInput, TableUdfSet, UserFunctions};
+use crate::function::udf::{
+    CopyToBindInput, ScalarUdfBindInput, ScalarUdfSet, TableUdfBindInput, TableUdfSet, UserCopyFunction, UserCopyTo,
+    UserFunctions,
+};
 use crate::function::{ScalarFunction, ScalarFunctionSet};
 use crate::planner::expression::{BoundExpr, BoundExprKind};
 use crate::planner::logical::{LogicalOperator, LogicalOperatorKind};
@@ -15,7 +18,7 @@ use duckrs_common::types::{LogicalType, LogicalTypeId};
 use duckrs_common::value::Value;
 use duckrs_common::vector::{DataChunk, Vector};
 use duckrs_common::{Error, ErrorKind, Result};
-use duckrs_parser::ast::{FunctionExpr, TableRef};
+use duckrs_parser::ast::{CopyInfo, FunctionExpr, InsertStatement, InsertValues, TableRef};
 use std::sync::Arc;
 
 fn binder_error(message: impl Into<String>) -> Error {
@@ -271,6 +274,8 @@ impl Binder<'_> {
             parameters,
             named_parameters,
             connection_id: self.connection_id(),
+            expected_names: Vec::new(),
+            expected_types: Vec::new(),
         })?;
         if binding.types.is_empty() {
             return Err(binder_error(format!(
@@ -307,5 +312,221 @@ impl Binder<'_> {
             },
             vec![],
         ))
+    }
+
+    /// `Binder::BindCopyTo` and `Binder::BindCopyFrom` with a copy function a client registered under the FORMAT
+    /// of the COPY (`Catalog::GetEntry<CopyFunctionCatalogEntry>`); `None` when there is none.
+    pub(super) fn bind_user_copy(&mut self, info: &CopyInfo) -> Option<Result<BoundStatement>> {
+        if info.format.is_empty() {
+            return None;
+        }
+        let function = self.user_functions()?.copy(&info.format)?;
+        Some(if info.is_from {
+            self.bind_user_copy_from(info, &function)
+        } else {
+            self.bind_user_copy_to(info, &function)
+        })
+    }
+
+    /// The file of a COPY: its expression's value, or the path it names, expanded (`FileSystem::ExpandPath`).
+    fn user_copy_path(&mut self, info: &CopyInfo) -> Result<String> {
+        let path = match &info.file_path_expression {
+            Some(expression) => {
+                let value = self.constant_argument(expression)?;
+                if value.logical_type().id() != LogicalTypeId::Varchar || value.is_null() {
+                    return Err(binder_error(
+                        "Unsupported parameter type for filename: expected e.g. TARGET 'file.parquet'",
+                    ));
+                }
+                super::copy::text(&value)?
+            }
+            None => info.file_path.clone(),
+        };
+        let path = crate::execution::file_system::expand_path(&path);
+        self.check_file_access(&path)?;
+        Ok(path)
+    }
+
+    /// The options of a COPY by name (`CopyInfo::options`): each with its values, none for an option without one.
+    fn user_copy_options(&mut self, info: &CopyInfo) -> Result<Vec<(String, Vec<Value>)>> {
+        let bare: Vec<String> = info
+            .parsed_options
+            .iter()
+            .filter(|(_, e)| e.is_none())
+            .map(|(n, _)| n.to_lowercase())
+            .chain(info.options.iter().filter(|(_, l)| l.is_empty()).map(|(n, _)| n.to_lowercase()))
+            .collect();
+        Ok(self
+            .copy_options(info)?
+            .into_iter()
+            .filter(|(name, _)| name != "format")
+            .map(|(name, value)| {
+                let values = if bare.contains(&name) { Vec::new() } else { vec![value] };
+                (name, values)
+            })
+            .collect())
+    }
+
+    /// `Binder::BindCopyTo` with `CCopyToBind`: the function's bind sees the columns of the query and the options.
+    fn bind_user_copy_to(&mut self, info: &CopyInfo, function: &UserCopyFunction) -> Result<BoundStatement> {
+        let Some(copy_to) = &function.copy_to else {
+            return Err(Error::not_implemented(format!(
+                "COPY TO is not supported for FORMAT \"{}\"",
+                info.format
+            )));
+        };
+        let path = self.user_copy_path(info)?;
+        let select = self.copy_to_select(info)?;
+        let bound = self.bind_select_statement(&select)?;
+        let names = super::copy::unique_names(&bound.names);
+        let options = self.user_copy_options(info)?;
+        let copy = copy_to.bind(CopyToBindInput {
+            names: names.clone(),
+            types: bound.types.clone(),
+            options,
+            connection_id: self.connection_id(),
+        })?;
+        let plan = LogicalOperator::new(
+            LogicalOperatorKind::UserCopyTo {
+                names,
+                copy: UserCopyTo {
+                    name: function.name.clone(),
+                    path,
+                    bound: copy,
+                },
+            },
+            vec![bound.plan],
+        );
+        Ok(BoundStatement {
+            plan,
+            names: vec!["Count".to_string()],
+            types: vec![LogicalType::BIGINT],
+            column_aliases: Vec::new(),
+            return_type: StatementReturnType::ChangedRows,
+        })
+    }
+
+    /// `Binder::BindCopyFrom` with `CCopyFromBind`: an INSERT into the table of the rows of the function's table
+    /// function, which takes the file as its parameter and the options as its named parameters.
+    fn bind_user_copy_from(&mut self, info: &CopyInfo, function: &UserCopyFunction) -> Result<BoundStatement> {
+        if info.table.name.is_empty() {
+            return Err(Error::new(
+                ErrorKind::Parser,
+                "COPY FROM requires a table name to be specified",
+            ));
+        }
+        let Some(overload) = &function.copy_from else {
+            return Err(Error::not_implemented(format!(
+                "COPY FROM is not supported for FORMAT \"{}\"",
+                info.format
+            )));
+        };
+        let path = self.user_copy_path(info)?;
+        let table = self
+            .catalog
+            .get_table(self.schema_of(&info.table)?.as_deref(), &info.table.name)?;
+        // `BindInsertColumnList`
+        let names: Vec<String> = if info.select_list.is_empty() {
+            table.columns.iter().map(|c| c.name.clone()).collect()
+        } else {
+            info.select_list.clone()
+        };
+        let mut types = Vec::with_capacity(names.len());
+        for name in &names {
+            let Some(index) = table.column_index(name) else {
+                return Err(binder_error(format!(
+                    "Table \"{}\" does not have a column with name \"{name}\"",
+                    table.name
+                )));
+            };
+            types.push(table.columns[index].ty.clone());
+        }
+        // the INSERT, of rows that stand in for those of the function (`ColumnDataRef` `__copy_from`)
+        let row: Vec<String> = types
+            .iter()
+            .map(|ty| format!("NULL::{}", ty.to_string()))
+            .collect();
+        let select = super::table_functions::parse_select(
+            &format!("SELECT * FROM (VALUES ({})) __copy_from", row.join(", ")),
+            "Expected a single SELECT statement",
+        )?;
+        let mut insert = self.bind_insert(&InsertStatement {
+            cte_map: Default::default(),
+            table: info.table.clone(),
+            table_alias: None,
+            by_name: false,
+            columns: names.clone(),
+            values: InsertValues::Select(Box::new(select)),
+            on_conflict: None,
+            returning: Vec::new(),
+        })?;
+        // `CCopyFromBind`: the options are named parameters of the table function, and the file its parameter
+        let mut named_parameters = Vec::new();
+        for (option, values) in self.user_copy_options(info)? {
+            let Some((parameter, _)) = overload
+                .named_parameters
+                .iter()
+                .find(|(parameter, _)| parameter.eq_ignore_ascii_case(&option))
+            else {
+                return Err(binder_error(format!(
+                    "'{option}' is not a supported option for copy function '{}'",
+                    overload.name
+                )));
+            };
+            let value = match values.as_slice() {
+                [] => continue,
+                [value] => value.clone(),
+                [first, ..] => {
+                    let ty = first.logical_type();
+                    if values.iter().any(|v| v.logical_type() != ty) {
+                        return Err(binder_error(format!(
+                            "Cannot pass multiple values of different types for copy option '{option}'"
+                        )));
+                    }
+                    Value::list(ty.clone(), values)?
+                }
+            };
+            named_parameters.push((parameter.clone(), value));
+        }
+        let binding = overload.function.bind(TableUdfBindInput {
+            parameters: vec![Value::varchar(path)],
+            named_parameters,
+            connection_id: self.connection_id(),
+            expected_names: names,
+            expected_types: types.clone(),
+        })?;
+        // `FindCopySource`: the stand-in rows give way to the function's scan
+        fn replace(op: &mut LogicalOperator, scan: &mut Option<crate::function::udf::UserTableScan>, types: &[LogicalType]) {
+            if let LogicalOperatorKind::ExpressionGet { table_index, types: get_types, .. } = &op.kind
+                && get_types == types
+                && let Some(scan) = scan.take()
+            {
+                *op = LogicalOperator::new(
+                    LogicalOperatorKind::UserTableScan {
+                        table_index: *table_index,
+                        types: types.to_vec(),
+                        scan,
+                    },
+                    vec![],
+                );
+                return;
+            }
+            for child in &mut op.children {
+                replace(child, scan, types);
+            }
+        }
+        let mut scan = Some(crate::function::udf::UserTableScan {
+            name: overload.name.clone(),
+            scan: binding.scan,
+            cardinality: binding.cardinality,
+        });
+        replace(&mut insert.plan, &mut scan, &types);
+        if scan.is_some() {
+            return Err(Error::new(
+                ErrorKind::Internal,
+                "Failed to find the source operator for COPY FROM",
+            ));
+        }
+        Ok(insert)
     }
 }

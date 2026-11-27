@@ -1858,6 +1858,10 @@ impl Binder<'_> {
                 "Option partition_path is not supported for reading - only for writing",
             ));
         }
+        // a copy function a client registered under the FORMAT
+        if let Some(bound) = self.bind_user_copy(info) {
+            return bound;
+        }
         if let Some(path) = self.parquet_copy_path(info)? {
             self.check_file_access(&path)?;
             if !info.is_from {

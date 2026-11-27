@@ -89,7 +89,7 @@ fn logical_name(op: &LogicalOperator) -> &'static str {
         K::CsvScan { .. } => "READ_CSV",
         K::ParquetScan { .. } => "READ_PARQUET",
         K::JsonScan { .. } => "READ_JSON",
-        K::CopyToFile { .. } | K::CopyToParquet { .. } => "COPY_TO_FILE",
+        K::CopyToFile { .. } | K::CopyToParquet { .. } | K::UserCopyTo { .. } => "COPY_TO_FILE",
     }
 }
 

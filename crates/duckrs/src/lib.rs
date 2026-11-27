@@ -204,6 +204,12 @@ impl Connection {
         self.context.user_functions().register_cast(cast)
     }
 
+    /// Registers a copy function (`duckdb_register_copy_function`): COPY TO and COPY FROM with its name as the FORMAT
+    /// run it. It takes the place of one registered before under its name.
+    pub fn register_copy_function(&mut self, function: udf::UserCopyFunction) {
+        self.context.user_functions().register_copy(function)
+    }
+
     /// Registers a type under `name` in the system catalog (`duckdb_register_logical_type`); a name that has a type
     /// there already is an error.
     pub fn register_type(&mut self, name: &str, ty: LogicalType) -> Result<()> {

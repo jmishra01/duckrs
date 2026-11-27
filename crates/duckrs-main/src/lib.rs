@@ -4643,7 +4643,10 @@ impl ClientContext {
         use duckrs_core::planner::logical::LogicalOperatorKind as K;
         let mut created_in = None;
         let (names, source) = match (&plan.kind, plan.children.first()) {
-            (K::CopyToFile { names, .. } | K::CopyToParquet { names, .. }, Some(child)) => (names.clone(), child),
+            (
+                K::CopyToFile { names, .. } | K::CopyToParquet { names, .. } | K::UserCopyTo { names, .. },
+                Some(child),
+            ) => (names.clone(), child),
             (K::CreateTableAs { columns, schema, .. }, Some(child)) => {
                 created_in = Some(schema.clone());
                 (columns.iter().map(|c| c.name.clone()).collect(), child)

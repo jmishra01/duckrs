@@ -93,9 +93,10 @@ impl TableUdf for SharedUdf {
             connection_id: input.connection_id,
             parameters: input.parameters,
             named_parameters: input.named_parameters,
-            names: Vec::new(),
+            // a COPY FROM's columns are the function's (`CTableInternalBindInfo` of `CCopyFromBind`)
+            names: input.expected_names,
             c_names: Vec::new(),
-            types: Vec::new(),
+            types: input.expected_types,
             bind_data: None,
             cardinality: None,
             error: None,
@@ -281,6 +282,41 @@ fn contains_invalid(ty: &LogicalType) -> bool {
             && ty.struct_children().iter().any(|(_, child)| contains_invalid(child)))
 }
 
+/// The checks of `duckdb_register_table_function` (and `duckdb_copy_function_set_copy_from_function`): the overload
+/// of `function` the engine can register under `name`, or `None` without its callbacks or with an invalid
+/// parameter type.
+pub(crate) fn overload(function: &TableFunctionHandle, name: &str) -> Option<TableUdfOverload> {
+    let (Some(bind), Some(init), Some(execute)) = (function.bind, function.init, function.function) else {
+        return None;
+    };
+    if function.arguments.iter().any(contains_invalid)
+        || function.named_parameters.iter().any(|(_, ty)| contains_invalid(ty))
+    {
+        return None;
+    }
+    let udf = Arc::new(CTableUdf {
+        bind,
+        init,
+        local_init: function.local_init,
+        function: execute,
+        extra: function.extra.clone(),
+    });
+    Some(TableUdfOverload {
+        name: name.to_string(),
+        arguments: function.arguments.clone(),
+        named_parameters: function.named_parameters.clone(),
+        projection_pushdown: function.projection_pushdown,
+        function: Arc::new(SharedUdf(udf)),
+    })
+}
+
+impl TableFunctionHandle {
+    /// The name `duckdb_table_function_set_name` gave, empty without one.
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn duckdb_register_table_function(
     connection: duckdb_connection,
@@ -293,31 +329,15 @@ pub unsafe extern "C" fn duckdb_register_table_function(
         return DuckDBError;
     };
     let ConnectionWrapper { connection } = connection;
-    let (Some(bind), Some(init), Some(execute)) = (function.bind, function.init, function.function) else {
-        return DuckDBError;
-    };
-    if function.name.is_empty()
-        || function.arguments.iter().any(contains_invalid)
-        || function.named_parameters.iter().any(|(_, ty)| contains_invalid(ty))
-    {
+    if function.name.is_empty() {
         return DuckDBError;
     }
-    let udf = Arc::new(CTableUdf {
-        bind,
-        init,
-        local_init: function.local_init,
-        function: execute,
-        extra: function.extra.clone(),
-    });
+    let Some(overload) = overload(function, &function.name) else {
+        return DuckDBError;
+    };
     let set = TableUdfSet {
         name: function.name.clone(),
-        functions: vec![Arc::new(TableUdfOverload {
-            name: function.name.clone(),
-            arguments: function.arguments.clone(),
-            named_parameters: function.named_parameters.clone(),
-            projection_pushdown: function.projection_pushdown,
-            function: Arc::new(SharedUdf(udf)),
-        })],
+        functions: vec![Arc::new(overload)],
     };
     match ffi::guard(None, || Some(connection.lock().register_table_functions(set))) {
         Some(Ok(())) => DuckDBSuccess,

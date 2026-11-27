@@ -92,6 +92,11 @@ pub enum LogicalOperatorKind {
         names: Vec<String>,
         options: crate::execution::parquet::ParquetWriteOptions,
     },
+    /// `LogicalCopyToFile` with a copy function a client registered: its child's rows go to the function's sink.
+    UserCopyTo {
+        names: Vec<String>,
+        copy: crate::function::udf::UserCopyTo,
+    },
     /// `LogicalCopyToFile`: writes the rows of its child to a CSV file.
     CopyToFile {
         path: String,
@@ -642,6 +647,7 @@ impl LogicalOperator {
             }
             LogicalOperatorKind::CopyToParquet { options, .. } => options.output.types(),
             LogicalOperatorKind::CopyToFile { options, .. } => options.output.types(),
+            LogicalOperatorKind::UserCopyTo { .. } => vec![LogicalType::BIGINT],
             LogicalOperatorKind::Range { .. } => vec![LogicalType::BIGINT],
             LogicalOperatorKind::JsonScan { scan, .. } => scan.projected_types(),
             LogicalOperatorKind::ParquetScan { scan, .. } => scan.emitted_types(),
@@ -904,6 +910,7 @@ impl LogicalOperator {
             LogicalOperatorKind::CreateTable { .. } | LogicalOperatorKind::CreateTableAs { .. } => numbered(0, 1),
             LogicalOperatorKind::CopyToParquet { options, .. } => numbered(0, options.output.types().len()),
             LogicalOperatorKind::CopyToFile { options, .. } => numbered(0, options.output.types().len()),
+            LogicalOperatorKind::UserCopyTo { .. } => numbered(0, 1),
         }
     }
 
