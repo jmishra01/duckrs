@@ -1025,12 +1025,17 @@ impl Binder<'_> {
         let mut total = first.lines_sniffed;
         let mut best_rows = rows_read(first);
         let count = arguments.files.len().min(arguments.files_to_sniff);
+        // `CSVSchemaDiscovery`: files that are all empty leave no schema at all
+        let mut all_empty = first.lines_sniffed == 0;
+        let mut sniffed_files = 1;
         for path in arguments.files.iter().take(count).skip(1) {
             if total >= required {
                 break;
             }
             let (file, data) = Self::csv_sniff(arguments, path)?;
+            sniffed_files += 1;
             total += file.lines_sniffed;
+            all_empty &= file.lines_sniffed == 0;
             let rows = rows_read(&file);
             if data.as_ref().is_some_and(Vec::is_empty) || rows == 0 {
                 continue;
@@ -1049,6 +1054,13 @@ impl Binder<'_> {
                 names.extend(file.names[types.len()..].iter().cloned());
                 types.extend(file.types[types.len()..].iter().cloned());
             }
+        }
+        if all_empty && sniffed_files > 1 {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "No columns found in CSV files. Provide the columns option or ensure at least one file contains a \
+                 header or data row.",
+            ));
         }
         Ok(())
     }
@@ -3300,7 +3312,7 @@ fn replace_null_with_varchar(types: &mut [LogicalType]) {
 }
 
 /// `CSVSchema::CanWeCastIt`, for the types the sniffer detects.
-fn can_we_cast_it(source: LogicalTypeId, destination: LogicalTypeId) -> bool {
+pub(crate) fn can_we_cast_it(source: LogicalTypeId, destination: LogicalTypeId) -> bool {
     use LogicalTypeId as T;
     if destination == T::Varchar || source == destination {
         return true;

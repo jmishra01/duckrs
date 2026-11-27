@@ -6,6 +6,7 @@
 mod alter;
 mod alter_fields;
 mod copy;
+pub(crate) use copy::can_we_cast_it;
 mod create_index;
 mod expression;
 mod external_resources;

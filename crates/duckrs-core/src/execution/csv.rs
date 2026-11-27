@@ -527,7 +527,36 @@ fn sniff_next_file(scan: &CsvScanData, file: &CsvFile, data: &[u8]) -> Result<Cs
             mapping: (0..scan.names.len()).map(Some).collect(),
         });
     }
-    let mapping = if by_name.iter().all(Option::is_some) {
+    // `CSVSchema::SchemasMatch`: a column it has by name has to cast to the type of the schema
+    let mistyped: Vec<String> = scan
+        .names
+        .iter()
+        .zip(&by_name)
+        .enumerate()
+        .filter_map(|(column, (name, found))| {
+            let found = (*found)?;
+            let (has, expected) = (sniffed.types.get(found)?, scan.types.get(column)?);
+            (!crate::planner::binder::can_we_cast_it(has.id(), expected.id())).then(|| {
+                format!("Column with name: \"{name}\" is expected to have type: {expected} But has type: {has}\n")
+            })
+        })
+        .collect();
+    let mapping = if by_name.iter().all(Option::is_some)
+        && !mistyped.is_empty()
+        && !scan.columns_set
+        && !scan.filename
+        && scan.hive.is_empty()
+        && !scan.options.ignore_errors
+    {
+        let mut error = format!(
+            "Schema mismatch between globbed files.\nMain file schema: {}\nCurrent file: {}\n",
+            first.path, file.path
+        );
+        error.extend(mistyped);
+        error += "Potential Fixes \n* Consider setting union_by_name=true.\n* Consider setting files_to_sniff to a \
+                  higher value (e.g., files_to_sniff = -1)\n";
+        return Err(Error::new(ErrorKind::InvalidInput, error));
+    } else if by_name.iter().all(Option::is_some) {
         by_name
     } else if same_shape && (!sniffed.header || !first.header) {
         (0..scan.names.len()).map(Some).collect()
