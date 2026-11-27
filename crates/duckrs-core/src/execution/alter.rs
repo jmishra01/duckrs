@@ -178,7 +178,21 @@ pub fn execute_create_index(table: &Arc<TableCatalogEntry>, index: IndexCatalogE
     table.indexes.write().push(index.clone());
     *table.unique_keys.lock() = None;
     let rows = table.rows()?;
-    let result = constraints::current_keys(table, &rows).map(drop);
+    // `PhysicalCreateARTIndex`: the keys of every row, which can fail, also where the index is not unique
+    let evaluated = if index.unique {
+        Ok(())
+    } else {
+        let key = crate::catalog::TableKey {
+            columns: index.columns.clone(),
+            expressions: Some(index.expressions.clone()),
+            names: index.names.clone(),
+            primary_key: false,
+            deferred: false,
+        };
+        rows.chunks()
+            .try_for_each(|chunk| constraints::keys_of(&key, chunk).map(drop))
+    };
+    let result = evaluated.and_then(|()| constraints::current_keys(table, &rows).map(drop));
     drop(rows);
     result.map_err(|error| {
         table.indexes.write().retain(|other| !Arc::ptr_eq(other, &index));
