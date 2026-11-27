@@ -372,6 +372,12 @@ impl DatabaseInstance {
             .map(|database| database.catalog.clone())
     }
 
+    /// The value a setting that can't change while the database runs (`duckdb_api`, `custom_user_agent`) starts with,
+    /// as the configuration a database opens with sets it.
+    pub fn set_startup_setting(&self, name: &str, value: Value) {
+        settings::store_global(name, value, &mut self.settings.write());
+    }
+
     /// `DBConfig::TryGetCurrentSetting`: the database's value of a setting, or its default.
     pub fn lookup_setting(&self, name: &str) -> Option<(Value, settings::SettingLookupScope)> {
         settings::lookup_setting(name, &self.settings.read(), &SettingValues::default())
@@ -1087,6 +1093,29 @@ const DEPRECATED_PRAGMAS: &[&str] = &[
     "enable_object_cache",
     "disable_object_cache",
 ];
+
+/// `Binder::BindPragma`: the error of a PRAGMA no pragma function has (the logging functions are table functions).
+fn unknown_pragma(name: &str) -> Option<Error> {
+    if ["enable_logging", "disable_logging", "truncate_duckdb_logs"]
+        .iter()
+        .any(|f| f.eq_ignore_ascii_case(name))
+    {
+        return Some(Error::new(
+            ErrorKind::Catalog,
+            format!(
+                "Pragma Function with name \"{name}\" does not exist, but a table function with the same \
+                 name exists, try `CALL \"{name}\"(...)`"
+            ),
+        ));
+    }
+    if PRAGMA_FUNCTIONS.iter().chain(NO_OP_PRAGMAS).any(|f| f.eq_ignore_ascii_case(name)) {
+        return None;
+    }
+    Some(Error::new(
+        ErrorKind::Catalog,
+        format!("Pragma Function with name {name} does not exist!"),
+    ))
+}
 
 const NO_OP_PRAGMAS: &[&str] = &[
     "force_checkpoint",
@@ -2629,6 +2658,12 @@ impl ClientContext {
     }
 
     fn prepare_statement(&mut self, statement: Statement) -> Result<Arc<PreparedStatementData>> {
+        // `PragmaHandler::HandlePragmaStatements`: a PRAGMA is expanded, its function looked up, while preparing
+        if let Statement::Pragma(PragmaInfo { name, .. }) = &statement
+            && let Some(error) = unknown_pragma(name)
+        {
+            return Err(error);
+        }
         let declared = parameter_names(&statement.to_string());
         // `BindingMode::PREPARE`: parameters bind as `BoundParameterExpression`s, which take the types their uses
         // give them
@@ -5514,7 +5549,7 @@ impl ClientContext {
                     ("table_info" | "show" | "storage_info", [table]) => {
                         Some(format!("SELECT * FROM pragma_{lower}({})", pragma_argument(table)))
                     }
-                    ("version" | "platform" | "database_size" | "metadata_info", []) => {
+                    ("version" | "platform" | "database_size" | "metadata_info" | "user_agent", []) => {
                         Some(format!("SELECT * FROM pragma_{lower}()"))
                     }
                     // `PragmaFunctionsQuery`
@@ -5547,24 +5582,9 @@ impl ClientContext {
                     }
                     return self.execute_statement(&query);
                 }
-                if ["enable_logging", "disable_logging", "truncate_duckdb_logs"]
-                    .iter()
-                    .any(|f| f.eq_ignore_ascii_case(name))
-                {
-                    return Err(Error::new(
-                        ErrorKind::Catalog,
-                        format!(
-                            "Pragma Function with name \"{name}\" does not exist, but a table function with the same \
-                             name exists, try `CALL \"{name}\"(...)`"
-                        ),
-                    ));
-                }
                 // `Binder::BindPragma`: a name no pragma function has
-                if !PRAGMA_FUNCTIONS.iter().any(|f| f.eq_ignore_ascii_case(name)) {
-                    return Err(Error::new(
-                        ErrorKind::Catalog,
-                        format!("Pragma Function with name {name} does not exist!"),
-                    ));
+                if let Some(error) = unknown_pragma(name) {
+                    return Err(error);
                 }
                 // `FunctionBinder::BindPragmaFunction`: a pragma called with the wrong arguments
                 let arity = match lower.as_str() {

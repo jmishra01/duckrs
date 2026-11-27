@@ -180,6 +180,12 @@ impl Database {
         }
     }
 
+    /// The value of a setting that can't change while the database runs (`duckdb_api`, `custom_user_agent`), as the
+    /// configuration it opens with gives it.
+    pub fn set_startup_setting(&self, name: &str, value: &str) {
+        self.instance.set_startup_setting(name, Value::varchar(value));
+    }
+
     /// `DBConfig::TryGetCurrentSetting`: the database's value of setting `name` (not that of a connection), or its
     /// default.
     pub fn lookup_setting(&self, name: &str) -> Option<(Value, settings::SettingLookupScope)> {
