@@ -2425,11 +2425,13 @@ impl ClientContext {
                     let old_casting = duckrs_core::function::cast_rules::set_old_implicit_casting(
                         self.setting_text("old_implicit_casting") == "true",
                     );
+                    let casts = duckrs_core::function::cast_rules::RegisteredCastsGuard::set(&self.home.user_functions);
                     let result = match self.verify_no_parameters(statement).and_then(|()| self.verification_statement(statement)) {
                         Ok(Some(replacement)) => self.run_statement(&replacement),
                         Ok(None) => self.run_statement(statement),
                         Err(error) => Err(error),
                     };
+                    drop(casts);
                     duckrs_core::function::cast_rules::set_old_implicit_casting(old_casting);
                     result
                 })
@@ -2622,6 +2624,7 @@ impl ClientContext {
                 "Cannot prepare multiple statements at once!",
             ));
         }
+        let _casts = duckrs_core::function::cast_rules::RegisteredCastsGuard::set(&self.home.user_functions);
         self.prepare_statement(statements.remove(0))
     }
 
@@ -2826,6 +2829,7 @@ impl ClientContext {
         values: HashMap<String, Value>,
         typed: HashSet<String>,
     ) -> Result<MaterializedQueryResult> {
+        let _casts = duckrs_core::function::cast_rules::RegisteredCastsGuard::set(&self.home.user_functions);
         let mut excess: Vec<&str> = values
             .keys()
             .filter(|k| !prepared.parameters.contains(*k))

@@ -4,7 +4,9 @@
 //! converted to another without an explicit CAST, or -1 if it cannot. Function overload
 //! resolution and type unification pick the cheapest option.
 
+use super::udf::{UserCast, UserFunctions};
 use duckrs_common::types::{LogicalType, LogicalTypeId};
+use std::sync::Arc;
 
 /// `AnyType::GetCastScore` of a plain `ANY` parameter.
 const ANY_CAST_SCORE: i64 = 5;
@@ -153,9 +155,40 @@ pub fn old_implicit_casting() -> bool {
     OLD_IMPLICIT_CASTING.with(std::cell::Cell::get)
 }
 
-/// `CastFunctionSet::ImplicitCastCost`: the rules, and with `old_implicit_casting` anything
-/// but a BLOB casts to VARCHAR, at a cost that keeps it the last resort.
+thread_local! {
+    // the casts a client registered (`CastFunctionSet::map_info`), of the database whose statement binds on this
+    // thread; none while it has none
+    static REGISTERED_CASTS: std::cell::RefCell<Option<Arc<UserFunctions>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The registered casts of `functions` for what binds on this thread, while the guard lives; then those before.
+pub struct RegisteredCastsGuard(Option<Arc<UserFunctions>>);
+
+impl RegisteredCastsGuard {
+    pub fn set(functions: &Arc<UserFunctions>) -> Self {
+        let functions = functions.has_casts().then(|| functions.clone());
+        Self(REGISTERED_CASTS.with(|casts| casts.replace(functions)))
+    }
+}
+
+impl Drop for RegisteredCastsGuard {
+    fn drop(&mut self) {
+        let before = self.0.take();
+        REGISTERED_CASTS.with(|casts| casts.replace(before));
+    }
+}
+
+/// `MapCastInfo::GetEntry` of the casts registered for this thread: the one from `from` to `to`, if there is one.
+pub fn registered_cast(from: &LogicalType, to: &LogicalType) -> Option<UserCast> {
+    REGISTERED_CASTS.with(|casts| casts.borrow().as_ref()?.cast(from, to))
+}
+
+/// `CastFunctionSet::ImplicitCastCost`: the cost of a registered cast, else the rules, and with
+/// `old_implicit_casting` anything but a BLOB casts to VARCHAR, at a cost that keeps it the last resort.
 pub fn implicit_cast(from: &LogicalType, to: &LogicalType) -> i64 {
+    if let Some(cast) = registered_cast(from, to) {
+        return cast.implicit_cast_cost;
+    }
     let score = implicit_cast_rules(from, to);
     if score < 0 && from.id() != LogicalTypeId::Blob && to.id() == LogicalTypeId::Varchar && old_implicit_casting() {
         return 10_000_000_000;

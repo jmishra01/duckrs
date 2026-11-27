@@ -636,6 +636,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn registered_casts_cast_implicitly() {
+        /// BOOLEAN to VARCHAR as `yes` / `no`.
+        struct YesNo;
+        impl udf::CastUdf for YesNo {
+            fn cast(
+                &self,
+                source: &duckrs_common::vector::Vector,
+                result: &mut duckrs_common::vector::Vector,
+                count: usize,
+                _try_cast: bool,
+            ) -> Result<()> {
+                for row in 0..count {
+                    let value = match source.get_value(row).data() {
+                        duckrs_common::value::ValueData::Bool(true) => Value::varchar("yes"),
+                        duckrs_common::value::ValueData::Bool(false) => Value::varchar("no"),
+                        _ => Value::null(LogicalType::VARCHAR),
+                    };
+                    result.set_value(row, &value)?;
+                }
+                Ok(())
+            }
+        }
+        let db = Database::open_in_memory().unwrap();
+        let mut con = db.connect().unwrap();
+        // BOOLEAN does not cast to VARCHAR implicitly by the rules
+        assert!(con.query("SELECT strlen(true)").is_err());
+        con.register_cast(udf::UserCast {
+            source: LogicalType::BOOLEAN,
+            target: LogicalType::VARCHAR,
+            implicit_cast_cost: 1,
+            function: Arc::new(YesNo),
+        });
+        // the registered cast's cost lets strlen(VARCHAR) and upper(VARCHAR) take a BOOLEAN, and the cast is the registered one
+        let result = con.query("SELECT strlen(true), upper(false), true::VARCHAR").unwrap();
+        assert_eq!(result.value(0, 0), Value::bigint(3));
+        assert_eq!(result.value(1, 0), Value::varchar("NO"));
+        assert_eq!(result.value(2, 0), Value::varchar("yes"));
+        let prepared = con.prepare("SELECT strlen(true)").unwrap();
+        assert_eq!(con.execute(&prepared, &[]).unwrap().value(0, 0), Value::bigint(3));
+    }
+
+    #[test]
     fn append_chunks_and_query_appender() {
         let db = Database::open_in_memory().unwrap();
         let mut con = db.connect().unwrap();

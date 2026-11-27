@@ -33,6 +33,7 @@ mod table_constraints;
 mod table_functions;
 pub mod tpc;
 mod user_functions;
+pub(crate) use user_functions::user_cast_expression;
 mod extract_names;
 pub use extract_names::ExtractNames;
 pub use table_functions::named_argument;
