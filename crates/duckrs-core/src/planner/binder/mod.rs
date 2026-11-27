@@ -31,7 +31,7 @@ mod star;
 mod statements;
 mod table_constraints;
 mod table_functions;
-mod tpc;
+pub mod tpc;
 mod user_functions;
 pub use table_functions::named_argument;
 mod window;
@@ -751,6 +751,9 @@ pub struct SessionValues {
     /// the functions the client registered (`duckdb_register_scalar_function`, ...), which DuckDB has in its
     /// system catalog
     pub user_functions: Option<Arc<crate::function::udf::UserFunctions>>,
+    /// what runs `dbgen(...)` / `dsdgen(...)` in a FROM clause, which the client gives (generating data runs
+    /// INSERTs, which the binder can't); `None` where the client has none
+    pub tpc_generator: Option<Arc<tpc::TpcGenerator>>,
 }
 
 /// A row of `duckdb_prepared_statements()`.
