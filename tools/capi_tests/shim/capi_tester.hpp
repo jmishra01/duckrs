@@ -355,8 +355,16 @@ public:
 	duckdb_database database = nullptr;
 };
 
+//! The `ClientContext` of shim/duckdb/common/arrow/arrow_appender.hpp
+struct ShimClientContext;
+
 class Connection {
 public:
+	//! `Connection::context`, for the tests that read the client properties of the C API's connection through it
+	//! (`reinterpret_cast<Connection *>(tester.connection)->context->GetClientProperties()`): a static member, so
+	//! reading it does not read the C API's connection as a C++ one; GetClientProperties is static too.
+	static inline ShimClientContext *context = nullptr;
+
 	explicit Connection(DuckDB &db) {
 		if (duckdb_connect(db.database, &connection) != DuckDBSuccess) {
 			throw std::runtime_error("duckrs shim: could not connect");

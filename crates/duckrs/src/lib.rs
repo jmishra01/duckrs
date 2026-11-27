@@ -14,6 +14,9 @@ pub use duckrs_common::{Error, ErrorKind, Result};
 pub use duckrs_main::MaterializedQueryResult as QueryResult;
 pub use duckrs_main::with_error_location;
 pub use duckrs_main::{StatementProperties, StatementReturnType, StatementType};
+pub use duckrs_main::{TableDescription, TableDescriptionColumn};
+/// What a replacement scan reads in place of a table ([`Database::add_replacement_scan`]).
+pub use duckrs_core::planner::binder::Replacement;
 
 /// The configuration options (`DBConfig::GetOptionByIndex` / `GetOptionByName`).
 pub mod settings {
@@ -106,6 +109,14 @@ impl Database {
             context: ClientContext::new(self.instance.clone()),
         })
     }
+
+    /// Adds a replacement scan to the database (`DBConfig::replacement_scans`): for a table name the catalog does
+    /// not have, `scan` may give what to read instead, rows or a table function call. Every connection to the
+    /// database, those open now too, consults it after the scans of its own
+    /// ([`Connection::add_replacement_scan`]); an error from it fails the query.
+    pub fn add_replacement_scan(&self, scan: impl Fn(&str) -> Option<Result<Replacement>> + Send + Sync + 'static) {
+        self.instance.add_replacement_scan(Arc::new(scan));
+    }
 }
 
 /// A connection to a [`Database`].
@@ -152,7 +163,14 @@ impl Connection {
         + Sync
         + 'static,
     ) {
-        self.context.add_replacement_scan(std::sync::Arc::new(scan));
+        self.context.add_replacement_scan(std::sync::Arc::new(move |name: &str| {
+            scan(name).map(|rows| rows.map(Replacement::Rows))
+        }));
+    }
+
+    /// The current value of setting `name` for this connection (`current_setting`), or `None` for no such setting.
+    pub fn setting(&self, name: &str) -> Option<Value> {
+        self.context.setting(name)
     }
 
     /// `ClientContext::GetConnectionId`: what tells this connection apart from the others of the process.
@@ -224,6 +242,17 @@ impl Connection {
         table: &str,
     ) -> Result<Vec<Option<Value>>> {
         self.context.table_column_defaults(catalog, schema, table)
+    }
+
+    /// `ClientContext::TableInfo`: the table `catalog.schema.table` and its columns (without a catalog, in the
+    /// database the connection uses), or `None` when there is no such table, a view not being one.
+    pub fn table_info(
+        &self,
+        catalog: Option<&str>,
+        schema: Option<&str>,
+        table: &str,
+    ) -> Result<Option<TableDescription>> {
+        self.context.table_info(catalog, schema, table)
     }
 
     /// `ClientContext::Append`: inserts `chunks`, whose columns are `columns` of `schema.table` (names and types,

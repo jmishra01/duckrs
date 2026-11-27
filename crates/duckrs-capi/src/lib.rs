@@ -15,6 +15,7 @@
 
 pub mod aggregate_function;
 pub mod appender;
+pub mod arrow_c;
 pub mod database;
 pub mod datetime;
 pub mod error;
@@ -32,3 +33,6 @@ pub mod value;
 pub mod vector;
 
 pub use types::*;
+
+pub mod replacement_scan;
+pub mod table_description;

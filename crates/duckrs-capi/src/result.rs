@@ -147,6 +147,16 @@ unsafe fn result_and_data<'a>(result: *mut duckdb_result) -> Option<(&'a mut duc
     Some((result, data))
 }
 
+/// Whether `result` holds the result of a query that succeeded (`duckdb_result_get_arrow_options`).
+///
+/// # Safety
+///
+/// As for [`result_and_data`].
+pub(crate) unsafe fn has_query_result(result: *mut duckdb_result) -> bool {
+    // SAFETY: by the contract of this function.
+    unsafe { result_and_data(result) }.is_some_and(|(_, data)| data.result.is_some())
+}
+
 /// The deprecated array of the values of one column, written by [`translate_column`].
 fn write_values<S: NativeType, D: Copy>(
     result: &QueryResult,

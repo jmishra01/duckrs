@@ -72,6 +72,19 @@ pub struct Vector {
     repr: Repr,
     /// a VARIANT a scan read from shredded storage, which `vector_type` tells as `SHREDDED_VECTOR`
     shredded: bool,
+    /// what the vector keeps alive with its values ([`Vector::set_auxiliary`])
+    auxiliary: Option<VectorAuxiliary>,
+}
+
+/// Something a vector keeps alive for as long as it or a clone of it is alive (`VectorBuffer::auxiliary`, which
+/// C++'s Arrow import uses to keep the Arrow array it read the values from until no vector references it).
+#[derive(Clone)]
+pub struct VectorAuxiliary(pub Arc<dyn std::any::Any + Send + Sync>);
+
+impl std::fmt::Debug for VectorAuxiliary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("VectorAuxiliary")
+    }
 }
 
 impl Flat {
@@ -137,6 +150,7 @@ impl Vector {
             ty,
             repr: Repr::Flat(flat),
             shredded: false,
+            auxiliary: None,
         }
     }
 
@@ -166,6 +180,7 @@ impl Vector {
             ty,
             repr: Repr::Sequence { start, increment },
             shredded: false,
+            auxiliary: None,
         })
     }
 
@@ -176,6 +191,16 @@ impl Vector {
     /// Marks a flat VARIANT as read from shredded storage (`VectorType::SHREDDED_VECTOR`).
     pub fn set_shredded(&mut self) {
         self.shredded = true;
+    }
+
+    /// Keeps `auxiliary` alive for as long as this vector or a clone of it is (`VectorBuffer::SetAuxiliary`).
+    pub fn set_auxiliary(&mut self, auxiliary: Arc<dyn std::any::Any + Send + Sync>) {
+        self.auxiliary = Some(VectorAuxiliary(auxiliary));
+    }
+
+    /// What [`Vector::set_auxiliary`] keeps alive, if anything.
+    pub fn auxiliary(&self) -> Option<&VectorAuxiliary> {
+        self.auxiliary.as_ref()
     }
 
     /// Whether this is a flat VARIANT a scan read from shredded storage.
@@ -401,6 +426,7 @@ impl Vector {
                     increment: *increment,
                 },
                 shredded: false,
+                auxiliary: None,
             },
             Repr::Dictionary { sel, child } => Vector {
                 ty: self.ty.clone(),
@@ -410,6 +436,7 @@ impl Vector {
                     child: child.clone(),
                 },
                 shredded: false,
+                auxiliary: self.auxiliary.clone(),
             },
             Repr::Flat(_)
                 if !matches!(

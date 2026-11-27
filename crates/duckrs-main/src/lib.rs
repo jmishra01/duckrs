@@ -60,6 +60,26 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// `TableDescription`: a table and its columns, as [`ClientContext::table_info`] finds them.
+#[derive(Debug, Clone)]
+pub struct TableDescription {
+    /// where the table is: its catalog, schema and name
+    pub catalog: String,
+    pub schema: String,
+    pub table: String,
+    /// its columns as a query sees them (`ColumnList::Logical`), generated ones too
+    pub columns: Vec<TableDescriptionColumn>,
+}
+
+/// A column of a [`TableDescription`] (`ColumnDefinition`).
+#[derive(Debug, Clone)]
+pub struct TableDescriptionColumn {
+    pub name: String,
+    pub ty: LogicalType,
+    /// `ColumnDefinition::HasDefaultValue`
+    pub has_default: bool,
+}
+
 /// A database (`DatabaseInstance`): its catalog, its global settings and, with Phase 9, its
 /// storage.
 #[derive(Debug)]
@@ -109,6 +129,9 @@ pub struct DatabaseInstance {
     /// the functions the client registered (`duckdb_register_scalar_function`, ...), which DuckDB keeps in its
     /// system catalog
     user_functions: Arc<duckrs_core::function::udf::UserFunctions>,
+    /// `DBConfig::replacement_scans`: those the client registered on the database, which every connection to it
+    /// consults after its own
+    replacement_scans: RwLock<duckrs_core::planner::binder::ReplacementScans>,
 }
 
 /// What `ATTACH` can say of a file.
@@ -329,12 +352,19 @@ impl DatabaseInstance {
             hidden: false,
             attach_options: Vec::new(),
             user_functions: Arc::default(),
+            replacement_scans: RwLock::default(),
         }
     }
 
     pub fn new() -> Arc<Self> {
         duckrs_core::function::json::register_projjson_parser();
         Arc::new(Self::with_file_access(None))
+    }
+
+    /// Adds a replacement scan to the database (`DBConfig::replacement_scans.push_back`): every connection to it,
+    /// those open now too, consults it for a table name the catalog does not have, after the connection's own.
+    pub fn add_replacement_scan(&self, scan: duckrs_core::planner::binder::ReplacementScan) {
+        self.replacement_scans.write().0.push(scan);
     }
 
     /// A database with what is in the file at `path`. Without a database there it stays in memory
@@ -1868,7 +1898,14 @@ impl ClientContext {
                 .collect(),
             current_query: self.current_query.clone(),
             appended: self.appended.clone(),
-            replacement_scans: self.replacement_scans.0.clone(),
+            // `Binder::BindWithReplacementScan`: the connection's scans first, then the database's
+            replacement_scans: self
+                .replacement_scans
+                .0
+                .iter()
+                .chain(self.home.replacement_scans.read().0.iter())
+                .cloned()
+                .collect(),
             user_functions: Some(self.home.user_functions.clone()),
             connection_count: self.home.connections.load(AtomicOrdering::SeqCst),
             // `DatabaseManager::ApproxDatabaseCount`: the system and temporary catalogs with the attached ones
@@ -2103,6 +2140,38 @@ impl ClientContext {
             .iter()
             .map(|column| (column.name.to_string(), column.ty.clone()))
             .collect())
+    }
+
+    /// `ClientContext::TableInfo`: the columns of the table `catalog.schema.table` (the database the connection uses
+    /// without a catalog), or `None` when there is no such table (a view is not one); an error for a catalog there is
+    /// none of.
+    pub fn table_info(
+        &self,
+        catalog: Option<&str>,
+        schema: Option<&str>,
+        table: &str,
+    ) -> Result<Option<TableDescription>> {
+        let catalog = self.catalog_named(catalog)?;
+        let _search_path = duckrs_core::catalog::SearchPathGuard::set(self.search_path_for(&self.db.name.clone()));
+        let Ok(entry) = catalog.get_table(schema, table) else {
+            return Ok(None);
+        };
+        let columns = entry
+            .logical_columns()
+            .iter()
+            .map(|column| TableDescriptionColumn {
+                name: column.name.to_string(),
+                ty: column.ty.clone(),
+                // `ColumnDefinition::HasDefaultValue`: a generated column has none
+                has_default: column.definition.is_some_and(|definition| definition.default_value.is_some()),
+            })
+            .collect();
+        Ok(Some(TableDescription {
+            catalog: entry.catalog.clone(),
+            schema: entry.schema.clone(),
+            table: entry.name.clone(),
+            columns,
+        }))
     }
 
     /// `Appender`'s `default_values`: the DEFAULT of each column of a table folded to a constant, NULL for a column

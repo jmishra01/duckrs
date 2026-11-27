@@ -488,6 +488,32 @@ impl Binder<'_> {
         ))
     }
 
+    /// `Binder::BindWithReplacementScan` of a `TableFunctionRef` a replacement scan gave for the table `name`: a call
+    /// of `function` with a constant for each parameter, under the alias of the table reference (the table's name
+    /// without one) and with its column aliases.
+    pub(super) fn bind_replacement_function(
+        &mut self,
+        table_ref: &TableRef,
+        name: &str,
+        function: &str,
+        parameters: &[Value],
+    ) -> Result<LogicalOperator> {
+        let arguments = parameters
+            .iter()
+            .map(|value| crate::planner::sql_export::constant_expression(value).map_err(binder_error))
+            .collect::<Result<Vec<_>>>()?;
+        let call = duckrs_parser::ast::FunctionExpr::new(function, arguments);
+        let mut replacement = table_ref.clone();
+        replacement.kind = duckrs_parser::ast::TableRefKind::TableFunction {
+            function: Box::new(call.into()),
+            with_ordinality: false,
+        };
+        if replacement.alias.is_empty() {
+            replacement.alias = name.to_string();
+        }
+        self.bind_unsampled_table_ref(&replacement)
+    }
+
     /// `TestVectorTypesBind` and `TestVectorTypesInit`: a column `test_vector`, `test_vector2`, ...
     /// of the type of each argument, in chunks of each kind of vector.
     fn bind_test_vector_types(&mut self, args: &[FunctionArgument], table_ref: &TableRef) -> Result<LogicalOperator> {
