@@ -160,11 +160,25 @@ struct StringUtil {
 		}
 		return result;
 	}
-	//! `printf`-like, with every argument rendered as `operator<<` renders it (as DuckDB's Format does)
+	//! `printf`-like: a floating point number is rendered as its conversion says (`%f`, ...), anything else as
+	//! `operator<<` renders it (as DuckDB's Format does)
 	template <class... ARGS>
 	static string Format(const string &format, ARGS... args) {
+		vector<string> specs;
+		for (size_t i = 0; i < format.size(); i++) {
+			if (format[i] != '%') {
+				continue;
+			}
+			if (i + 1 < format.size() && format[i + 1] == '%') {
+				i++;
+				continue;
+			}
+			size_t j = SpecEnd(format, i);
+			specs.push_back(format.substr(i, j - i + 1));
+			i = j;
+		}
 		vector<string> rendered;
-		Render(rendered, args...);
+		Render(rendered, specs, args...);
 		string result;
 		size_t next = 0;
 		for (size_t i = 0; i < format.size(); i++) {
@@ -177,14 +191,7 @@ struct StringUtil {
 				i++;
 				continue;
 			}
-			// skip flags, width and length up to the conversion
-			size_t j = i + 1;
-			while (j < format.size() && !std::isalpha(static_cast<unsigned char>(format[j]))) {
-				j++;
-			}
-			while (j < format.size() && (format[j] == 'l' || format[j] == 'h' || format[j] == 'z')) {
-				j++;
-			}
+			size_t j = SpecEnd(format, i);
 			if (next < rendered.size()) {
 				result += rendered[next++];
 			}
@@ -194,19 +201,42 @@ struct StringUtil {
 	}
 
 private:
-	static void Render(vector<string> &) {
+	//! the conversion character of the spec at `i`: past flags, width and length
+	static size_t SpecEnd(const string &format, size_t i) {
+		size_t j = i + 1;
+		while (j < format.size() && !std::isalpha(static_cast<unsigned char>(format[j]))) {
+			j++;
+		}
+		while (j < format.size() && (format[j] == 'l' || format[j] == 'h' || format[j] == 'z')) {
+			j++;
+		}
+		return j;
+	}
+	static void Render(vector<string> &, const vector<string> &) {
 	}
 	template <class T, class... ARGS>
-	static void Render(vector<string> &rendered, T first, ARGS... rest) {
+	static void Render(vector<string> &rendered, const vector<string> &specs, T first, ARGS... rest) {
+		string spec = rendered.size() < specs.size() ? specs[rendered.size()] : string();
+		spec.erase(std::remove_if(spec.begin(), spec.end(), [](char c) { return c == 'l' || c == 'h' || c == 'z'; }),
+		           spec.end());
+		const char conversion = spec.empty() ? 's' : spec.back();
 		std::ostringstream stream;
-		if constexpr (std::is_integral<T>::value) {
+		if constexpr (std::is_floating_point<T>::value) {
+			if (std::strchr("fFeEgG", conversion) != nullptr) {
+				char buffer[512];
+				snprintf(buffer, sizeof(buffer), spec.c_str(), static_cast<double>(first));
+				stream << buffer;
+			} else {
+				stream << first;
+			}
+		} else if constexpr (std::is_integral<T>::value) {
 			// a uint8_t is a number to Format, not a character
 			stream << +first;
 		} else {
 			stream << first;
 		}
 		rendered.push_back(stream.str());
-		Render(rendered, rest...);
+		Render(rendered, specs, rest...);
 	}
 };
 

@@ -197,6 +197,19 @@ impl Connection {
         self.context.user_functions().register_table(set)
     }
 
+    /// Registers a cast (`CastFunctionSet::RegisterCastFunction`, `duckdb_register_cast_function`): an explicit
+    /// CAST or TRY_CAST from its source type to its target type runs it. A pair of types that has a registered cast
+    /// keeps that one.
+    pub fn register_cast(&mut self, cast: udf::UserCast) {
+        self.context.user_functions().register_cast(cast)
+    }
+
+    /// Registers a type under `name` in the system catalog (`duckdb_register_logical_type`); a name that has a type
+    /// there already is an error.
+    pub fn register_type(&mut self, name: &str, ty: LogicalType) -> Result<()> {
+        self.context.user_functions().register_type(name, ty)
+    }
+
     /// Runs a prepared statement with values for its parameters, in order.
     pub fn execute(&mut self, statement: &PreparedStatement, values: &[Value]) -> Result<QueryResult> {
         self.context.execute_prepared(&statement.data, values)

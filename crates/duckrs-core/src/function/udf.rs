@@ -349,15 +349,102 @@ pub struct TableUdfSet {
 }
 
 // --------------------------------------------------------------------------------------------------------------
+// Casts
+// --------------------------------------------------------------------------------------------------------------
+
+/// The callback of a user-defined cast (`CAPICastFunction` over a `duckdb_cast_function_t`).
+pub trait CastUdf: Send + Sync {
+    /// Casts the `count` rows of `source` into `result`, a vector of the target type. With `try_cast` (TRY_CAST) a
+    /// row that does not cast is NULL; else it is an error of the query (`HandleCastError::AssignError`).
+    fn cast(&self, source: &Vector, result: &mut Vector, count: usize, try_cast: bool) -> Result<()>;
+}
+
+/// A registered cast (`MapCastNode`): its function and what an implicit cast with it costs (-1: none).
+#[derive(Clone)]
+pub struct UserCast {
+    pub source: LogicalType,
+    pub target: LogicalType,
+    pub implicit_cast_cost: i64,
+    pub function: Arc<dyn CastUdf>,
+}
+
+impl fmt::Debug for UserCast {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} -> {} ({})", self.source, self.target, self.implicit_cast_cost)
+    }
+}
+
+/// `RelaxedTypeMatch`: the registered type a type without a cast of its own falls back to, a nested type matching
+/// one with ANY children, a DECIMAL or ENUM any of its kind, and anything else ANY.
+fn relaxed_match(registered: &LogicalType, ty: &LogicalType) -> bool {
+    use duckrs_common::types::LogicalTypeId as L;
+    let any = |t: &LogicalType| t.id() == L::Any;
+    match ty.id() {
+        L::List | L::Array => registered.id() == ty.id() && registered.child_type().is_some_and(any),
+        L::Struct | L::Tuple => {
+            registered.id() == ty.id() && matches!(registered.struct_children(), [(_, child)] if any(child))
+        }
+        // a UNION's children start with its tag
+        L::Union => {
+            registered.id() == L::Union && matches!(registered.struct_children(), [_, (_, child)] if any(child))
+        }
+        L::Map => {
+            let key_value = |t: &LogicalType| {
+                let children = t.child_type()?.struct_children();
+                Some((children.first()?.1.clone(), children.get(1)?.1.clone()))
+            };
+            let (Some((key, value)), Some((ty_key, ty_value))) = (key_value(registered), key_value(ty)) else {
+                return false;
+            };
+            registered.id() == L::Map && (any(&key) || key == ty_key) && (any(&value) || value == ty_value)
+        }
+        L::Decimal | L::Enum => registered.id() == ty.id(),
+        // a GEOMETRY with a CRS matches the casts of the GEOMETRY without one
+        L::Geometry => (registered.id() == L::Geometry && registered.crs().is_none()) || any(registered),
+        _ => any(registered),
+    }
+}
+
+/// `MapCastInfo::GetEntry` for one side: the exact type, else the relaxed match, among the casts of the side's type
+/// id (or of ANY when there are none).
+fn match_side<'a>(
+    casts: Vec<&'a UserCast>,
+    ty: &LogicalType,
+    side: fn(&UserCast) -> &LogicalType,
+) -> Vec<&'a UserCast> {
+    let mut of_id: Vec<&UserCast> = casts.iter().copied().filter(|c| side(c).id() == ty.id()).collect();
+    if of_id.is_empty() {
+        of_id = casts
+            .iter()
+            .copied()
+            .filter(|c| side(c).id() == duckrs_common::types::LogicalTypeId::Any)
+            .collect();
+    }
+    let exact: Vec<&UserCast> = of_id.iter().copied().filter(|c| side(c) == ty).collect();
+    if !exact.is_empty() {
+        return exact;
+    }
+    let relaxed = of_id.iter().copied().find(|c| relaxed_match(side(c), ty));
+    match relaxed {
+        Some(found) => of_id.into_iter().filter(|c| side(c) == side(found)).collect(),
+        None => Vec::new(),
+    }
+}
+
+// --------------------------------------------------------------------------------------------------------------
 // The registry
 // --------------------------------------------------------------------------------------------------------------
 
-/// The user-defined functions of a database instance, by lower-case name (their entries of the system catalog).
+/// The user-defined functions of a database instance, by lower-case name (their entries of the system catalog),
+/// and the casts and types a client registered (`DBConfig::GetCastFunctions` and the types of the system catalog).
 #[derive(Default)]
 pub struct UserFunctions {
     scalar: RwLock<HashMap<String, Arc<ScalarUdfSet>>>,
     aggregate: RwLock<HashMap<String, Arc<AggregateFunctionSet>>>,
     table: RwLock<HashMap<String, Arc<TableUdfSet>>>,
+    casts: RwLock<Vec<UserCast>>,
+    /// by lower-case name: the name as registered, and the type (with that name as its alias)
+    types: RwLock<HashMap<String, (String, LogicalType)>>,
 }
 
 impl fmt::Debug for UserFunctions {
@@ -366,6 +453,8 @@ impl fmt::Debug for UserFunctions {
             .field("scalar", &self.scalar.read().keys().collect::<Vec<_>>())
             .field("aggregate", &self.aggregate.read().keys().collect::<Vec<_>>())
             .field("table", &self.table.read().keys().collect::<Vec<_>>())
+            .field("casts", &*self.casts.read())
+            .field("types", &self.types.read().keys().collect::<Vec<_>>())
             .finish()
     }
 }
@@ -455,6 +544,57 @@ impl UserFunctions {
 
     pub fn table(&self, name: &str) -> Option<Arc<TableUdfSet>> {
         self.table.read().get(&name.to_ascii_lowercase()).cloned()
+    }
+
+    /// `CastFunctionSet::RegisterCastFunction`: a cast from `source` to `target`. As C++'s map insert, a pair that
+    /// has a cast keeps the one registered first.
+    pub fn register_cast(&self, cast: UserCast) {
+        let mut casts = self.casts.write();
+        if !casts.iter().any(|c| c.source == cast.source && c.target == cast.target) {
+            casts.push(cast);
+        }
+    }
+
+    /// `MapCastInfo::GetEntry`: the registered cast from `source` to `target`, if there is one.
+    pub fn cast(&self, source: &LogicalType, target: &LogicalType) -> Option<UserCast> {
+        if self.casts.read().is_empty() {
+            return None;
+        }
+        let casts = self.casts.read();
+        let sources = match_side(casts.iter().collect(), source, |c| &c.source);
+        match_side(sources, target, |c| &c.target)
+            .first()
+            .map(|c| UserCast::clone(c))
+    }
+
+    /// `Catalog::CreateType` in the system catalog (`duckdb_register_logical_type`): `ty` under the name `name`,
+    /// which no type of the system catalog may have yet.
+    pub fn register_type(&self, name: &str, ty: LogicalType) -> Result<()> {
+        let key = name.to_ascii_lowercase();
+        let builtin = crate::catalog::default_types::BUILTIN_TYPES
+            .iter()
+            .any(|(builtin, ..)| builtin.eq_ignore_ascii_case(name));
+        let mut types = self.types.write();
+        if builtin || types.contains_key(&key) {
+            return Err(exists("Type", name));
+        }
+        types.insert(key, (name.to_string(), ty));
+        Ok(())
+    }
+
+    /// The type registered under `name`, if there is one.
+    pub fn user_type(&self, name: &str) -> Option<LogicalType> {
+        self.types
+            .read()
+            .get(&name.to_ascii_lowercase())
+            .map(|(_, ty)| ty.clone())
+    }
+
+    /// The registered types with their names, by name.
+    pub fn user_types(&self) -> Vec<(String, LogicalType)> {
+        let mut types: Vec<_> = self.types.read().values().cloned().collect();
+        types.sort_by(|a, b| a.0.cmp(&b.0));
+        types
     }
 }
 

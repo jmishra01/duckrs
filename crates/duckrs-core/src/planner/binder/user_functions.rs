@@ -46,6 +46,51 @@ impl Binder<'_> {
         self.user_functions()?.table(name)
     }
 
+    /// The type a client registered under `name` (`duckdb_register_logical_type`), which the system catalog has.
+    pub(super) fn user_type(&self, name: &str) -> Option<LogicalType> {
+        self.user_functions()?.user_type(name)
+    }
+
+    /// The types a client registered, with their names.
+    pub(super) fn user_types(&self) -> Vec<(String, LogicalType)> {
+        self.user_functions().map(|f| f.user_types()).unwrap_or_default()
+    }
+
+    /// `CastFunctionSet::GetCastFunction` when a client registered a cast from the type of `child` to `target`
+    /// (`MapCastFunction`): the cast, as a call of the registered function. `Err(child)` when there is none.
+    pub(super) fn bind_user_cast(
+        &self,
+        child: BoundExpr,
+        target: &LogicalType,
+        try_cast: bool,
+    ) -> std::result::Result<BoundExpr, BoundExpr> {
+        if child.return_type == *target {
+            return Err(child);
+        }
+        let Some(cast) = self.user_functions().and_then(|f| f.cast(&child.return_type, target)) else {
+            return Err(child);
+        };
+        fn unbound(_: &DataChunk, _: &mut Vector) -> Result<()> {
+            Err(Error::new(
+                ErrorKind::Internal,
+                "a user-defined cast runs once it is bound",
+            ))
+        }
+        let mut scalar = ScalarFunction::new("CAST", vec![child.return_type.clone()], target.clone(), unbound);
+        let function = cast.function;
+        scalar.bound = Some(Arc::new(move |arguments, result| {
+            function.cast(arguments.column(0), result, arguments.len(), try_cast)
+        }));
+        Ok(BoundExpr::new(
+            BoundExprKind::Function {
+                function: Arc::new(scalar),
+                children: vec![child],
+                is_operator: false,
+            },
+            target.clone(),
+        ))
+    }
+
     /// `FunctionBinder::BindScalarFunction` of a call of a user-defined scalar function: the overload the
     /// arguments match, NULL for a NULL argument unless the function handles NULLs itself, and then the function's
     /// own bind (`CScalarFunctionBind`).

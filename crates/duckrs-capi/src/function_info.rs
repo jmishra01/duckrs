@@ -144,11 +144,20 @@ pub(crate) struct TableFunctionInfo {
     pub(crate) error: CallbackError,
 }
 
-/// The `duckdb_function_info` of a scalar, an aggregate or a table function.
+/// `CCastExecuteInfo`.
+pub(crate) struct CastFunctionInfo {
+    pub(crate) extra: CPointer,
+    /// `parameters.error_message != nullptr`: TRY_CAST
+    pub(crate) try_cast: bool,
+    pub(crate) error: CallbackError,
+}
+
+/// The `duckdb_function_info` of a scalar, an aggregate or a table function, or of a cast.
 pub(crate) enum FunctionInfo {
     Scalar(ScalarFunctionInfo),
     Aggregate(AggregateFunctionInfo),
     Table(TableFunctionInfo),
+    Cast(CastFunctionInfo),
 }
 
 impl Handle for _duckdb_bind_info {
