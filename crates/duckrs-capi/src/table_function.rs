@@ -328,7 +328,7 @@ pub unsafe extern "C" fn duckdb_register_table_function(
     else {
         return DuckDBError;
     };
-    let ConnectionWrapper { connection } = connection;
+    let ConnectionWrapper { connection, .. } = connection;
     if function.name.is_empty() {
         return DuckDBError;
     }

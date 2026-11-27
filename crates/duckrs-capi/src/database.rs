@@ -26,6 +26,20 @@ impl DatabaseWrapper {
 /// A connection (`Connection`). Prepared statements and appenders share it, as C++'s share its `ClientContext`.
 pub struct ConnectionWrapper {
     pub(crate) connection: SharedConnection,
+    /// `ClientContext::GetConnectionId`, which a callback of a query on the connection asks for while the query has
+    /// the connection
+    pub(crate) connection_id: u64,
+}
+
+/// What a client context (`duckdb_client_context`, which holds a connection id) reaches of its connection: the
+/// database and the connection, by connection id, for each connection `duckdb_connect` made until it is
+/// disconnected.
+static CONTEXTS: Mutex<Option<HashMap<u64, (duckrs::WeakDatabase, SharedConnection)>>> = Mutex::new(None);
+
+/// The database and the connection of the connection `connection_id`, while it is connected.
+pub(crate) fn context_of(connection_id: u64) -> Option<(duckrs::WeakDatabase, SharedConnection)> {
+    let contexts = CONTEXTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    contexts.as_ref()?.get(&connection_id).cloned()
 }
 
 /// A connection that statements and appenders made on it hold on to.
@@ -36,6 +50,11 @@ impl SharedConnection {
     /// The connection, to run something on; a connection whose last user panicked is still usable.
     pub fn lock(&self) -> MutexGuard<'_, Connection> {
         self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Whether something runs on the connection now (a query, whose callbacks ask): it is then in a transaction.
+    pub(crate) fn is_busy(&self) -> bool {
+        matches!(self.0.try_lock(), Err(std::sync::TryLockError::WouldBlock))
     }
 }
 
@@ -309,8 +328,16 @@ pub unsafe extern "C" fn duckdb_connect(database: duckdb_database, out_connectio
     let Some(Ok(connection)) = ffi::guard(None, || Some(database.database.connect())) else {
         return DuckDBError;
     };
+    let connection_id = connection.connection_id();
+    let shared = SharedConnection(Arc::new(Mutex::new(connection)));
+    CONTEXTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(connection_id, (database.database.downgrade(), shared.clone()));
     let handle = ffi::into_handle(ConnectionWrapper {
-        connection: SharedConnection(Arc::new(Mutex::new(connection))),
+        connection: shared,
+        connection_id,
     });
     // SAFETY: C passes where to write the connection; it is not null.
     unsafe { ffi::write(out_connection, handle) };
@@ -320,7 +347,13 @@ pub unsafe extern "C" fn duckdb_connect(database: duckdb_database, out_connectio
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn duckdb_disconnect(connection: *mut duckdb_connection) {
     // SAFETY: C passes a connection `duckdb_connect` made.
-    drop(unsafe { ffi::take(connection) });
+    let Some(connection) = (unsafe { ffi::take(connection) }) else {
+        return;
+    };
+    let mut contexts = CONTEXTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(contexts) = contexts.as_mut() {
+        contexts.remove(&connection.connection_id);
+    }
 }
 
 /// `Connection::Interrupt`. duckrs runs a query to its end, so there is nothing to interrupt yet.

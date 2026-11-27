@@ -361,6 +361,17 @@ impl DatabaseInstance {
         Arc::new(Self::with_file_access(None))
     }
 
+    /// `Catalog::GetCatalogEntry`: the committed catalog of this database, or of a database attached to it, by name.
+    pub fn catalog_named(&self, name: &str) -> Option<Arc<duckrs_core::catalog::Catalog>> {
+        if name.eq_ignore_ascii_case(&self.name) && !self.is_detached() {
+            return Some(self.catalog.clone());
+        }
+        self.attached
+            .read()
+            .get(&name.to_lowercase())
+            .map(|database| database.catalog.clone())
+    }
+
     /// `LogManager::RegisterLogStorage`: a log storage `SET logging_storage` can name; false when one has the name.
     pub fn register_log_storage(&self, name: &str, storage: Arc<dyn duckrs_core::logging::LogStorageCallback>) -> bool {
         self.log_manager

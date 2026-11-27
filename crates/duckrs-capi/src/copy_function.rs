@@ -343,7 +343,7 @@ pub unsafe extern "C" fn duckdb_register_copy_function(
     if copy_to.is_none() && function.copy_from.is_none() {
         return DuckDBError;
     }
-    let ConnectionWrapper { connection } = connection;
+    let ConnectionWrapper { connection, .. } = connection;
     let copy = UserCopyFunction {
         name: function.name.clone(),
         copy_to,

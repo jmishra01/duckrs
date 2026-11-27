@@ -128,6 +128,46 @@ impl Database {
         self.instance.add_replacement_scan(Arc::new(scan));
     }
 
+    /// Whether the database, or a database attached to it, has the name `name` (`Catalog::GetCatalogEntry`).
+    pub fn has_catalog(&self, name: &str) -> bool {
+        self.instance.catalog_named(name).is_some()
+    }
+
+    /// `Catalog::GetEntry` with `OnEntryNotFound::RETURN_NULL`: the kind and the name of the entry `name` of `kind`
+    /// in schema `schema` of the catalog `catalog` (a table's lookup finds views too, as their entries are in one
+    /// set); `None` when there is none.
+    pub fn catalog_entry(
+        &self,
+        catalog: &str,
+        kind: CatalogEntryKind,
+        schema: &str,
+        name: &str,
+    ) -> Option<(CatalogEntryKind, String)> {
+        use duckrs_core::catalog::TableOrView;
+        let catalog = self.instance.catalog_named(catalog)?;
+        match kind {
+            CatalogEntryKind::Schema => catalog
+                .get_schema(name)
+                .map(|schema| (CatalogEntryKind::Schema, schema.name.clone())),
+            CatalogEntryKind::Table | CatalogEntryKind::View => {
+                catalog.get_schema(schema)?;
+                match catalog.get_entry(Some(schema), None, name).ok()? {
+                    TableOrView::Table(table) => Some((CatalogEntryKind::Table, table.name.clone())),
+                    TableOrView::View(view) => Some((CatalogEntryKind::View, view.name.clone())),
+                }
+            }
+            CatalogEntryKind::Sequence => catalog
+                .get_schema(schema)?
+                .get_sequence(name)
+                .map(|sequence| (CatalogEntryKind::Sequence, sequence.name.clone())),
+            CatalogEntryKind::Type => catalog
+                .get_schema(schema)?
+                .get_type(name)
+                .map(|_| (CatalogEntryKind::Type, name.to_string())),
+            _ => None,
+        }
+    }
+
     /// A handle that does not keep the database alive (`weak_ptr<DatabaseInstance>`, as `DBInstanceCache` holds it):
     /// [`WeakDatabase::upgrade`] gives the database back while anything (a [`Database`], a [`Connection`]) still has
     /// it.
@@ -144,6 +184,20 @@ impl Database {
     pub fn register_log_storage(&self, name: &str, storage: Arc<dyn logging::LogStorageCallback>) -> bool {
         self.instance.register_log_storage(name, storage)
     }
+}
+
+/// The kind of a catalog entry (`CatalogType`), as `duckdb_catalog_entry_type` names them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogEntryKind {
+    Table,
+    Schema,
+    View,
+    Index,
+    PreparedStatement,
+    Sequence,
+    Collation,
+    Type,
+    Database,
 }
 
 /// [`Database::downgrade`].

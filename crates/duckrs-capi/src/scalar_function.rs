@@ -551,7 +551,7 @@ unsafe fn register(connection: duckdb_connection, name: &str, functions: &[Scala
     let Some(connection) = (unsafe { ffi::get::<_duckdb_connection>(connection) }) else {
         return DuckDBError;
     };
-    let ConnectionWrapper { connection } = connection;
+    let ConnectionWrapper { connection, .. } = connection;
     let Some(overloads) = functions.iter().map(|f| overload(name, f)).collect::<Option<Vec<_>>>() else {
         return DuckDBError;
     };

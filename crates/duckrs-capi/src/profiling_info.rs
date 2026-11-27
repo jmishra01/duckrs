@@ -34,7 +34,7 @@ fn navigable(node: &ProfileResult) -> impl Iterator<Item = &ProfileResult> {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn duckdb_get_profiling_info(connection: duckdb_connection) -> duckdb_profiling_info {
     // SAFETY: C passes a live connection.
-    let Some(ConnectionWrapper { connection }) = (unsafe { ffi::get::<_duckdb_connection>(connection) }) else {
+    let Some(ConnectionWrapper { connection, .. }) = (unsafe { ffi::get::<_duckdb_connection>(connection) }) else {
         return std::ptr::null_mut();
     };
     match ffi::guard(None, || connection.lock().profiling_info()) {

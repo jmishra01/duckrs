@@ -216,7 +216,7 @@ pub unsafe extern "C" fn duckdb_register_cast_function(
     if contains_invalid_or_any(source) || contains_invalid_or_any(target) {
         return DuckDBError;
     }
-    let ConnectionWrapper { connection } = connection;
+    let ConnectionWrapper { connection, .. } = connection;
     let user_cast = UserCast {
         source: source.clone(),
         target: target.clone(),
@@ -256,7 +256,7 @@ pub unsafe extern "C" fn duckdb_register_logical_type(
     if contains_invalid_or_any(ty) {
         return DuckDBError;
     }
-    let ConnectionWrapper { connection } = connection;
+    let ConnectionWrapper { connection, .. } = connection;
     match ffi::guard(None, || Some(connection.lock().register_type(name, ty.clone()))) {
         Some(Ok(())) => DuckDBSuccess,
         _ => DuckDBError,
