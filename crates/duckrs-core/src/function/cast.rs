@@ -922,12 +922,30 @@ fn decimal_at(data: &duckrs_common::vector::UnifiedFormat, physical: PhysicalTyp
     }
 }
 
+/// The digits and scale of a DECIMAL, or of an integer type as a decimal of scale 0 (`UHUGEINT`, whose values
+/// can be out of range of the `i128` this works in, is not one here).
+fn as_decimal(ty: &LogicalType) -> Option<(u8, u8)> {
+    use LogicalTypeId::*;
+    let digits = match ty.id() {
+        Decimal => return ty.decimal_properties(),
+        TinyInt | UTinyInt => 3,
+        SmallInt | USmallInt => 5,
+        Integer | UInteger => 10,
+        BigInt => 19,
+        UBigInt => 20,
+        HugeInt => 39,
+        _ => return None,
+    };
+    Some((digits, 0))
+}
+
 /// `DecimalScaleUpCheck` / `DecimalScaleUp` on whole vectors: a decimal to a decimal of the same or a
-/// larger scale, as integers multiplied by a power of ten. `false` (and nothing written) when a value
+/// larger scale, as integers multiplied by a power of ten; and an integer to a decimal
+/// (`StandardNumericToDecimalCast`), which is one of scale 0. `false` (and nothing written) when a value
 /// does not fit, which the cast by value then reports.
 fn decimal_scale_up(source: &Vector, result: &mut Vector, count: usize) -> Result<bool> {
     let (Some((from_width, from_scale)), Some((to_width, to_scale))) = (
-        source.logical_type().decimal_properties(),
+        as_decimal(source.logical_type()),
         result.logical_type().decimal_properties(),
     ) else {
         return Ok(false);
@@ -983,10 +1001,15 @@ fn decimal_scale_up(source: &Vector, result: &mut Vector, count: usize) -> Resul
         };
     }
     let fits = match source.physical_type() {
+        PhysicalType::Int8 => to_target!(i8),
         PhysicalType::Int16 => to_target!(i16),
         PhysicalType::Int32 => to_target!(i32),
         PhysicalType::Int64 => to_target!(i64),
         PhysicalType::Int128 => to_target!(i128),
+        PhysicalType::UInt8 => to_target!(u8),
+        PhysicalType::UInt16 => to_target!(u16),
+        PhysicalType::UInt32 => to_target!(u32),
+        PhysicalType::UInt64 => to_target!(u64),
         _ => return Ok(false),
     };
     if !fits {
@@ -1006,10 +1029,8 @@ fn decimal_scale_up(source: &Vector, result: &mut Vector, count: usize) -> Resul
 }
 
 fn decimal_cast(source: &Vector, result: &mut Vector, count: usize, mode: CastMode) -> Result<()> {
-    if source.logical_type().id() == LogicalTypeId::Decimal
-        && result.logical_type().id() == LogicalTypeId::Decimal
-        && decimal_scale_up(source, result, count)?
-    {
+    // a decimal or an integer to a decimal, on the typed data
+    if result.logical_type().id() == LogicalTypeId::Decimal && decimal_scale_up(source, result, count)? {
         return Ok(());
     }
     if decimal_to_double(source, result, count) || string_to_decimal_vector(source, result, count) {

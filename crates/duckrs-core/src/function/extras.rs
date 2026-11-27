@@ -1675,6 +1675,10 @@ fn from_binary(args: &DataChunk, result: &mut Vector) -> Result<()> {
 fn state_finalize(args: &DataChunk, result: &mut Vector) -> Result<()> {
     let ty = args.column(0).logical_type().clone();
     let finalizer = super::aggregates::StateFinalizer::new(&ty);
+    // counts and sums on their typed data; the other states a value at a time
+    if finalizer.finalize_vector(args.column(0), args.len(), result)? {
+        return Ok(());
+    }
     row_wise(args, result, |row| finalizer.finalize(&row[0]))
 }
 
