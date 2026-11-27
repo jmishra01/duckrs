@@ -1799,6 +1799,14 @@ impl Binder<'_> {
             if name.eq_ignore_ascii_case("partition_path") {
                 continue;
             }
+            // `CSVReaderOptions::SetReadOption`: a NULL given no strings is an empty list of them
+            if expression.is_none() && matches!(name.to_lowercase().as_str(), "null" | "nullstr") {
+                return Err(binder_error(format!(
+                    "CSV Reader function option \"{}\" requires a non-empty list of possible null strings (varchar) \
+                     as input",
+                    name.to_lowercase()
+                )));
+            }
             let value = match expression {
                 Some(expression) if expression.is_empty_star() => Value::varchar("*"),
                 Some(expression) => self.argument_value(expression, false)?,
@@ -1814,6 +1822,14 @@ impl Binder<'_> {
             result.push((name.to_lowercase(), value));
         }
         for (name, literals) in &info.options {
+            // `CSVReaderOptions::SetReadOption`: a NULL given no strings is an empty list of them
+            if literals.is_empty() && matches!(name.to_lowercase().as_str(), "null" | "nullstr") {
+                return Err(binder_error(format!(
+                    "CSV Reader function option \"{}\" requires a non-empty list of possible null strings (varchar) \
+                     as input",
+                    name.to_lowercase()
+                )));
+            }
             let value = match literals.as_slice() {
                 [] => Value::boolean(true),
                 [literal] => self.constant_argument(&Expr::constant(literal.clone()))?,

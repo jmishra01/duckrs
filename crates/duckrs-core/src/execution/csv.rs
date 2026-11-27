@@ -105,6 +105,10 @@ pub fn read_csv_file(path: &str, options: &CsvReadOptions) -> Result<Vec<u8>> {
     match encoding.as_str() {
         "utf-8" | "utf8" => Ok(data),
         "latin-1" | "latin1" => {
+            // `DecodeLatin1ToUTF8`: the C1 controls are taken for a file in another encoding
+            if data.iter().any(|&b| (0x80..=0x9f).contains(&b)) {
+                return Err(Error::new(ErrorKind::InvalidInput, "File is not latin-1 encoded"));
+            }
             let text: String = data.iter().map(|&b| char::from(b)).collect();
             Ok(text.into_bytes())
         }
@@ -527,9 +531,20 @@ fn sniff_next_file(scan: &CsvScanData, file: &CsvFile, data: &[u8]) -> Result<Cs
         by_name
     } else if same_shape && (!sniffed.header || !first.header) {
         (0..scan.names.len()).map(Some).collect()
+    } else if (scan.filename || !scan.hive.is_empty())
+        && !by_name.iter().enumerate().any(|(column, found)| found.is_none() && reads_column(scan, column))
+    {
+        // `MultiFileColumnMapper` maps the columns that are read: one that nothing reads is not missing
+        by_name
     } else if scan.filename || !scan.hive.is_empty() {
         // `MultiFileOptions::AnySet`: the sniffer leaves the mismatch to `MultiFileColumnMapper`
-        let missing = scan.names.iter().zip(&by_name).find(|(_, found)| found.is_none());
+        let missing = scan
+            .names
+            .iter()
+            .zip(&by_name)
+            .enumerate()
+            .find(|(column, (_, found))| found.is_none() && reads_column(scan, *column))
+            .map(|(_, pair)| pair);
         let missing = missing.map_or("", |(name, _)| name.as_str());
         return Err(Error::new(
             ErrorKind::InvalidInput,
@@ -542,6 +557,9 @@ fn sniff_next_file(scan: &CsvScanData, file: &CsvFile, data: &[u8]) -> Result<Cs
                 candidates = sniffed.names.join(", "),
             ),
         ));
+    } else if scan.options.ignore_errors {
+        // `AdaptiveSniff`: ignoring errors, the file goes on with its own schema, its columns found by name
+        by_name
     } else {
         let mut error = format!(
             "Schema mismatch between globbed files.\nMain file schema: {}\nCurrent file: {}\n",
@@ -923,7 +941,10 @@ fn scan_file_chunk(scan: &CsvScanData, state: &mut CsvScanState) -> Result<Optio
             if file.header {
                 let header_start = skip_rows(&data, &machine.dialect, &machine.transitions(), bom, rows - 1);
                 let header = &data[header_start..begin.max(header_start)];
-                let size = header.iter().rposition(|&c| c != b'\n' && c != b'\r').map_or(0, |at| at + 1);
+                let end = header.iter().rposition(|&c| c != b'\n' && c != b'\r').map_or(0, |at| at + 1);
+                // (the comment lines skipped before it are not part of its line)
+                let line_start = header[..end].iter().rposition(|&c| c == b'\n').map_or(0, |at| at + 1);
+                let size = end - line_start;
                 if size > scan.options.maximum_line_size() {
                     return Err(line_size_error(&scan.options, size));
                 }
@@ -1124,6 +1145,11 @@ fn unquoted_row<'a>(data: &'a [u8], file: &CsvFile, before: usize) -> Option<sup
         Some(Scanned::Row(row)) if row.start == before && row.end <= line_end => Some(row),
         _ => None,
     }
+}
+
+/// Whether the scan outputs column `column` of the file's schema (`column_ids`).
+fn reads_column(scan: &CsvScanData, column: usize) -> bool {
+    !scan.empty_projection && scan.projection.as_ref().is_none_or(|columns| columns.contains(&column))
 }
 
 fn bad_line(
@@ -1347,7 +1373,13 @@ fn read_rows(
                 }
             };
             let mut row_fields = row.fields;
-            let line_size = position.saturating_sub(span.start);
+            // (the comment lines skipped before the row are not part of its line)
+            let first_value = row_fields.first().map_or(span.start, |f| f.offset).clamp(span.start, data.len());
+            let line_start = data[span.start..first_value]
+                .iter()
+                .rposition(|&b| b == b'\n')
+                .map_or(span.start, |at| span.start + at + 1);
+            let line_size = position.saturating_sub(line_start);
             let mut doomed_row = prior.is_some();
             if line_size > scan.options.maximum_line_size() {
                 // `CSVError::LineSizeError` of the scanner: the size of the line without its new line

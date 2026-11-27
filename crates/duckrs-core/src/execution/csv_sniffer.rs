@@ -1340,16 +1340,18 @@ pub fn sniff(
         let mut scanner = ValueScanner::new(Machine::with_transitions(dialect.clone(), transitions, begin));
         let sample = parse_sample(&mut scanner, data, columns_found, options);
         sniffer.reached(scanner.machine.position);
-        // `CSVError::InvalidUTF8` of the header the options say there is
-        if sample.invalid_first && options.header == Some(true) && !options.ignore_errors {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                format!(
-                    "Invalid unicode (byte sequence mismatch) detected. This file is not utf-8 encoded.\nFile: \
-                     {path}\n",
-                    path = sniffer.path
-                ),
-            ));
+        // `CSVError::InvalidUTF8` of the first row, which the scanner that detects types meets before the header is
+        // known, unless the options say it is data (which the scan then reports with its line)
+        if sample.invalid_first && options.header != Some(false) && !options.ignore_errors {
+            let message = "Invalid unicode (byte sequence mismatch) detected. This file is not utf-8 encoded.";
+            // (one the options name is the header; one detection meets is a row, by its line)
+            let message = if options.header == Some(true) {
+                format!("{message}\nFile: {path}\n", path = sniffer.path)
+            } else {
+                let line = data[..begin.min(data.len())].iter().filter(|&&b| b == b'\n').count() + 1;
+                format!("CSV Error on Line: {line}\n{message}\nFile: {path}\n", path = sniffer.path)
+            };
+            return Err(Error::new(ErrorKind::InvalidInput, message));
         }
         if sample.errors > 0 && !options.ignore_errors {
             continue;
