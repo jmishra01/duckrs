@@ -444,7 +444,7 @@ impl Binder<'_> {
         // the INSERT, of rows that stand in for those of the function (`ColumnDataRef` `__copy_from`)
         let row: Vec<String> = types
             .iter()
-            .map(|ty| format!("NULL::{}", ty.to_string()))
+            .map(|ty| format!("NULL::{ty}"))
             .collect();
         let select = super::table_functions::parse_select(
             &format!("SELECT * FROM (VALUES ({})) __copy_from", row.join(", ")),

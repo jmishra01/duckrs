@@ -349,10 +349,11 @@ pub unsafe extern "C" fn duckdb_register_copy_function(
         copy_to,
         copy_from: function.copy_from.clone().map(Arc::new),
     };
-    match ffi::guard(None, || Some(connection.lock().register_copy_function(copy))) {
-        Some(()) => DuckDBSuccess,
-        None => DuckDBError,
-    }
+    let registered = ffi::guard(false, || {
+        connection.lock().register_copy_function(copy);
+        true
+    });
+    if registered { DuckDBSuccess } else { DuckDBError }
 }
 
 // --------------------------------------------------------------------------------------------------------------

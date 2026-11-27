@@ -226,10 +226,11 @@ pub unsafe extern "C" fn duckdb_register_cast_function(
             extra: cast.extra.clone(),
         }),
     };
-    match ffi::guard(None, || Some(connection.lock().register_cast(user_cast))) {
-        Some(()) => DuckDBSuccess,
-        None => DuckDBError,
-    }
+    let registered = ffi::guard(false, || {
+        connection.lock().register_cast(user_cast);
+        true
+    });
+    if registered { DuckDBSuccess } else { DuckDBError }
 }
 
 #[unsafe(no_mangle)]
