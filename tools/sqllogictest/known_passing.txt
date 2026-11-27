@@ -2285,6 +2285,7 @@ test/sql/cte/recursive_cte_parallel_union_distinct_sink.test
 test/sql/cte/recursive_cte_recurring_replay.test
 test/sql/cte/recursive_cte_shared_operator_lifecycle.test
 test/sql/cte/recursive_hang_2745.test
+test/sql/cte/recursive_inline_blocked_source.test
 test/sql/cte/test_bug_922.test
 test/sql/cte/test_cte.test
 test/sql/cte/test_cte_in_cte.test
