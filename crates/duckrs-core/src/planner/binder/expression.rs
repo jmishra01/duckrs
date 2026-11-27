@@ -500,6 +500,8 @@ impl Binder<'_> {
                 _ => None,
             },
         };
+        // the types a client registered are in the system catalog, at the end of the search path
+        let found = found.or_else(|| self.user_type(&name));
         if let Some(ty) = found {
             if !children.is_empty() {
                 return Err(binder_error(format!(
@@ -1728,6 +1730,10 @@ impl Binder<'_> {
                 }
             }
         }
+        // `BindingMode::EXTRACT_NAMES`: columns and scalar functions are NULL
+        if let Some(bound) = self.extract_names_expression(expr)? {
+            return Ok(bound);
+        }
         let bound = match &expr.kind {
             ExprKind::Constant(literal) => BoundExpr::constant(literal_to_value(literal)?),
             // outside of a function that takes a lambda, `a -> b` is the JSON operator
@@ -2132,6 +2138,11 @@ impl Binder<'_> {
                     // `AddCastToType`: the cast gives the parameter its type
                     return Ok(child.cast_to(&target, *try_cast));
                 }
+                // `CastFunctionSet::GetCastFunction`: a cast a client registered comes first
+                let child = match self.bind_user_cast(child, &target, *try_cast) {
+                    Ok(cast) => return Ok(cast),
+                    Err(child) => child,
+                };
                 if !crate::function::cast::has_cast(&child.return_type, &target) {
                     return Err(crate::unported(format!("casting {} to {target}", child.return_type)));
                 }

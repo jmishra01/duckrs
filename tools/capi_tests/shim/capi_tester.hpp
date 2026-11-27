@@ -9,6 +9,8 @@
 #include "catch.hpp"
 #include "duckdb.h"
 #include "test_helpers.hpp"
+// the Arrow C data interface structs, which DuckDB's capi_tester.hpp has through duckdb.hpp
+#include "duckdb/common/arrow/arrow.hpp"
 
 namespace duckdb {
 

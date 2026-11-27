@@ -38,6 +38,16 @@ pub fn cast_vector(source: &duckrs_common::vector::Vector, ty: &LogicalType, cou
 /// User-defined functions: scalar, aggregate and table functions a client registers on a database
 /// ([`Connection::register_scalar_functions`], ...) and implements through the traits here, which the engine calls
 /// on whole chunks.
+/// Log storages a client registers.
+pub mod logging {
+    pub use duckrs_core::logging::{LogLevel, LogStorageCallback};
+}
+
+/// The profile of a statement (`QueryProfileResult`), as `duckdb_get_profiling_info` walks it.
+pub mod profiling {
+    pub use duckrs_core::execution::profiler::{ProfileResult, ProfileResultKind};
+}
+
 pub mod udf {
     pub use duckrs_core::function::udf::*;
     /// A bound expression, as a scalar function's bind sees its arguments (`duckdb_expression`).
@@ -117,6 +127,96 @@ impl Database {
     pub fn add_replacement_scan(&self, scan: impl Fn(&str) -> Option<Result<Replacement>> + Send + Sync + 'static) {
         self.instance.add_replacement_scan(Arc::new(scan));
     }
+
+    /// Whether the database, or a database attached to it, has the name `name` (`Catalog::GetCatalogEntry`).
+    pub fn has_catalog(&self, name: &str) -> bool {
+        self.instance.catalog_named(name).is_some()
+    }
+
+    /// `Catalog::GetEntry` with `OnEntryNotFound::RETURN_NULL`: the kind and the name of the entry `name` of `kind`
+    /// in schema `schema` of the catalog `catalog` (a table's lookup finds views too, as their entries are in one
+    /// set); `None` when there is none.
+    pub fn catalog_entry(
+        &self,
+        catalog: &str,
+        kind: CatalogEntryKind,
+        schema: &str,
+        name: &str,
+    ) -> Option<(CatalogEntryKind, String)> {
+        use duckrs_core::catalog::TableOrView;
+        let catalog = self.instance.catalog_named(catalog)?;
+        match kind {
+            CatalogEntryKind::Schema => catalog
+                .get_schema(name)
+                .map(|schema| (CatalogEntryKind::Schema, schema.name.clone())),
+            CatalogEntryKind::Table | CatalogEntryKind::View => {
+                catalog.get_schema(schema)?;
+                match catalog.get_entry(Some(schema), None, name).ok()? {
+                    TableOrView::Table(table) => Some((CatalogEntryKind::Table, table.name.clone())),
+                    TableOrView::View(view) => Some((CatalogEntryKind::View, view.name.clone())),
+                }
+            }
+            CatalogEntryKind::Sequence => catalog
+                .get_schema(schema)?
+                .get_sequence(name)
+                .map(|sequence| (CatalogEntryKind::Sequence, sequence.name.clone())),
+            CatalogEntryKind::Type => catalog
+                .get_schema(schema)?
+                .get_type(name)
+                .map(|_| (CatalogEntryKind::Type, name.to_string())),
+            _ => None,
+        }
+    }
+
+    /// A handle that does not keep the database alive (`weak_ptr<DatabaseInstance>`, as `DBInstanceCache` holds it):
+    /// [`WeakDatabase::upgrade`] gives the database back while anything (a [`Database`], a [`Connection`]) still has
+    /// it.
+    pub fn downgrade(&self) -> WeakDatabase {
+        WeakDatabase {
+            instance: Arc::downgrade(&self.instance),
+            path: self.path.clone(),
+            read_only: self.read_only,
+        }
+    }
+
+    /// Registers a log storage (`duckdb_register_log_storage`) under `name`, which `SET logging_storage` can then
+    /// select: each log entry goes to it. False when a storage has the name already.
+    pub fn register_log_storage(&self, name: &str, storage: Arc<dyn logging::LogStorageCallback>) -> bool {
+        self.instance.register_log_storage(name, storage)
+    }
+}
+
+/// The kind of a catalog entry (`CatalogType`), as `duckdb_catalog_entry_type` names them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogEntryKind {
+    Table,
+    Schema,
+    View,
+    Index,
+    PreparedStatement,
+    Sequence,
+    Collation,
+    Type,
+    Database,
+}
+
+/// [`Database::downgrade`].
+#[derive(Debug, Clone)]
+pub struct WeakDatabase {
+    instance: std::sync::Weak<DatabaseInstance>,
+    path: Option<PathBuf>,
+    read_only: bool,
+}
+
+impl WeakDatabase {
+    /// The database, if it is still open.
+    pub fn upgrade(&self) -> Option<Database> {
+        Some(Database {
+            instance: self.instance.upgrade()?,
+            path: self.path.clone(),
+            read_only: self.read_only,
+        })
+    }
 }
 
 /// A connection to a [`Database`].
@@ -195,6 +295,37 @@ impl Connection {
     /// registered before, taking the place of one with the same parameters.
     pub fn register_table_functions(&mut self, set: udf::TableUdfSet) -> Result<()> {
         self.context.user_functions().register_table(set)
+    }
+
+    /// Registers a cast (`CastFunctionSet::RegisterCastFunction`, `duckdb_register_cast_function`): an explicit
+    /// CAST or TRY_CAST from its source type to its target type runs it. A pair of types that has a registered cast
+    /// keeps that one.
+    pub fn register_cast(&mut self, cast: udf::UserCast) {
+        self.context.user_functions().register_cast(cast)
+    }
+
+    /// `Connection::GetTableNames` (`duckdb_get_table_names`): the tables the single statement of `sql` reads, by
+    /// name, or as written with `qualified`; tables the catalog does not have count too.
+    pub fn get_table_names(&mut self, sql: &str, qualified: bool) -> Result<Vec<String>> {
+        self.context.get_table_names(sql, qualified)
+    }
+
+    /// The profile of the last statement (`QueryProfiler::GetResult`), while profiling is on and that statement was
+    /// profiled with a plan; `None` else.
+    pub fn profiling_info(&self) -> Option<Arc<profiling::ProfileResult>> {
+        self.context.profiling_info()
+    }
+
+    /// Registers a copy function (`duckdb_register_copy_function`): COPY TO and COPY FROM with its name as the FORMAT
+    /// run it. It takes the place of one registered before under its name.
+    pub fn register_copy_function(&mut self, function: udf::UserCopyFunction) {
+        self.context.user_functions().register_copy(function)
+    }
+
+    /// Registers a type under `name` in the system catalog (`duckdb_register_logical_type`); a name that has a type
+    /// there already is an error.
+    pub fn register_type(&mut self, name: &str, ty: LogicalType) -> Result<()> {
+        self.context.user_functions().register_type(name, ty)
     }
 
     /// Runs a prepared statement with values for its parameters, in order.

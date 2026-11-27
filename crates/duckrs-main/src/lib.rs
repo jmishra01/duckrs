@@ -361,6 +361,25 @@ impl DatabaseInstance {
         Arc::new(Self::with_file_access(None))
     }
 
+    /// `Catalog::GetCatalogEntry`: the committed catalog of this database, or of a database attached to it, by name.
+    pub fn catalog_named(&self, name: &str) -> Option<Arc<duckrs_core::catalog::Catalog>> {
+        if name.eq_ignore_ascii_case(&self.name) && !self.is_detached() {
+            return Some(self.catalog.clone());
+        }
+        self.attached
+            .read()
+            .get(&name.to_lowercase())
+            .map(|database| database.catalog.clone())
+    }
+
+    /// `LogManager::RegisterLogStorage`: a log storage `SET logging_storage` can name; false when one has the name.
+    pub fn register_log_storage(&self, name: &str, storage: Arc<dyn duckrs_core::logging::LogStorageCallback>) -> bool {
+        self.log_manager
+            .lock()
+            .map(|mut manager| manager.register_storage(name, storage))
+            .unwrap_or(false)
+    }
+
     /// Adds a replacement scan to the database (`DBConfig::replacement_scans.push_back`): every connection to it,
     /// those open now too, consults it for a table name the catalog does not have, after the connection's own.
     pub fn add_replacement_scan(&self, scan: duckrs_core::planner::binder::ReplacementScan) {
@@ -1486,6 +1505,8 @@ pub struct ClientContext {
     trigger_tables: Vec<String>,
     /// what the plan of the statement being profiled did: its phases and its operators
     pending_profile: Option<PendingProfile>,
+    /// `QueryProfiler::GetResult` of the last statement profiled with a plan (`HasRoot`), until the next one starts
+    last_profile: Option<Arc<duckrs_core::execution::profiler::ProfileResult>>,
     /// of the statement EXPLAIN ANALYZE ran: its profile tree, what the profiler saw, and how long it took
     analyzed_profile: Option<(
         Option<duckrs_core::execution::profiler::ProfileNode>,
@@ -1780,6 +1801,7 @@ impl ClientContext {
             statement_transaction: 0,
             profiling: false,
             pending_profile: None,
+            last_profile: None,
             analyzed_profile: None,
             trigger_tables: Vec::new(),
             capture_analyzed: false,
@@ -2301,6 +2323,7 @@ impl ClientContext {
             // `QueryProfiler::StartQuery`: a statement that starts with profiling on is profiled
             let profiled = self.profiling.then(std::time::Instant::now);
             self.pending_profile = None;
+            self.last_profile = None;
             let profiler = profiled.map(|_| Arc::new(duckrs_core::execution::profiler::OperatorProfiler::default()));
             let outcome = duckrs_core::execution::profiler::with_profiler(profiler.clone(), || {
                 duckrs_core::logging::with_file_logging(&target, || {
@@ -2495,6 +2518,8 @@ impl ClientContext {
     /// `ClientContext::Prepare`: checks one statement and keeps it to run later.
     pub fn prepare(&mut self, sql: &str) -> Result<Arc<PreparedStatementData>> {
         let _temp = SessionTemp::enter(&self.temp);
+        // `QueryProfiler::StartQuery`: preparing starts a query, which has no profile until it runs
+        self.last_profile = None;
         let mut statements = duckrs_parser::parse_ast_with(sql, &self.parser_options())?;
         if statements.len() != 1 {
             return Err(Error::new(
@@ -2622,6 +2647,22 @@ impl ClientContext {
         Ok((Some((bound.names, bound.types)), result_types))
     }
 
+    /// `ClientContext::GetTableNames`: the tables the single statement of `sql` reads, bound in
+    /// `BindingMode::EXTRACT_NAMES` (or `EXTRACT_QUALIFIED_NAMES`, which gives them as written), in order.
+    pub fn get_table_names(&mut self, sql: &str, qualified: bool) -> Result<Vec<String>> {
+        let _temp = SessionTemp::enter(&self.temp);
+        let statements = duckrs_parser::parse_ast_with(sql, &self.parser_options())?;
+        let [statement] = statements.as_slice() else {
+            return Err(Error::new(ErrorKind::InvalidInput, "Expected a single statement"));
+        };
+        let catalog = self.catalog();
+        let mut binder = Binder::with_options(&catalog, self.bind_options());
+        binder.session = Some(self.session_values());
+        let names = binder.extract_table_names(qualified);
+        binder.bind(statement)?;
+        Ok(names.names())
+    }
+
     /// `StatementProperties` of the last statement of `sql`: its type, and what its result holds. `None` when
     /// `sql` doesn't parse.
     pub fn statement_properties(&self, sql: &str) -> Option<StatementProperties> {
@@ -2731,10 +2772,31 @@ impl ClientContext {
             Some(collation) => self.prepared_collation.replace(collation.clone()),
             None => self.prepared_collation.take(),
         };
-        let result = self.run_statement(&prepared.statement);
+        // `QueryProfiler::StartQuery`: a statement that starts with profiling on is profiled
+        let profiled = self.profiling.then(std::time::Instant::now);
+        self.pending_profile = None;
+        self.last_profile = None;
+        let profiler = profiled.map(|_| Arc::new(duckrs_core::execution::profiler::OperatorProfiler::default()));
+        let result = duckrs_core::execution::profiler::with_profiler(profiler.clone(), || {
+            self.run_statement(&prepared.statement)
+        });
         self.prepared_collation = collation;
         self.parameters = None;
+        if let (Some(start), Some(profiler)) = (profiled, &profiler)
+            && self.profiling
+        {
+            self.write_profile(&prepared.statement.to_string(), start.elapsed(), profiler)?;
+        }
         result
+    }
+
+    /// `QueryProfiler::GetResult` of the last statement, if profiling is on and it was profiled with a plan
+    /// (`duckdb_get_profiling_info`).
+    pub fn profiling_info(&self) -> Option<Arc<duckrs_core::execution::profiler::ProfileResult>> {
+        if !self.profiling {
+            return None;
+        }
+        self.last_profile.clone()
     }
 
     /// `ClientContext::RunTransactionStatementInternal`.
@@ -4643,7 +4705,10 @@ impl ClientContext {
         use duckrs_core::planner::logical::LogicalOperatorKind as K;
         let mut created_in = None;
         let (names, source) = match (&plan.kind, plan.children.first()) {
-            (K::CopyToFile { names, .. } | K::CopyToParquet { names, .. }, Some(child)) => (names.clone(), child),
+            (
+                K::CopyToFile { names, .. } | K::CopyToParquet { names, .. } | K::UserCopyTo { names, .. },
+                Some(child),
+            ) => (names.clone(), child),
             (K::CreateTableAs { columns, schema, .. }, Some(child)) => {
                 created_in = Some(schema.clone());
                 (columns.iter().map(|c| c.name.clone()).collect(), child)
@@ -5804,6 +5869,11 @@ impl ClientContext {
         let format = self.setting_text("enable_profiling");
         let output = self.setting_text("profiling_output");
         let (phases, root) = self.pending_profile.take().unwrap_or_default();
+        let has_root = root.is_some();
+        let (profile, tracked, legacy) = self.profile(sql, total, profiler, phases, root);
+        if has_root {
+            self.last_profile = Some(Arc::new(profile.to_result_tree(&tracked, legacy)));
+        }
         if format != "json" || output.is_empty() {
             return Ok(());
         }
@@ -5811,7 +5881,7 @@ impl ClientContext {
         if let Some(access) = self.file_access() {
             access.check(&output, false)?;
         }
-        let json = self.profile_json(sql, total, profiler, phases, root);
+        let json = profile.to_json(&tracked, legacy);
         std::fs::write(&output, json)
             .map_err(|error| Error::new(ErrorKind::Io, format!("Cannot open file \"{output}\": {error}")))
     }
@@ -5826,6 +5896,24 @@ impl ClientContext {
         phases: Vec<(String, std::time::Duration)>,
         root: Option<duckrs_core::execution::profiler::ProfileNode>,
     ) -> String {
+        let (profile, tracked, legacy) = self.profile(sql, total, profiler, phases, root);
+        profile.to_json(&tracked, legacy)
+    }
+
+    /// The profile of a statement, with the metrics `tracked_metrics` asks for and whether `legacy_metrics_format`
+    /// is set, which `QueryProfiler::ToJSON` renders.
+    fn profile(
+        &self,
+        sql: &str,
+        total: std::time::Duration,
+        profiler: &duckrs_core::execution::profiler::OperatorProfiler,
+        phases: Vec<(String, std::time::Duration)>,
+        root: Option<duckrs_core::execution::profiler::ProfileNode>,
+    ) -> (
+        duckrs_core::execution::profiler::QueryProfile,
+        duckrs_core::execution::profiler::TrackedMetrics,
+        bool,
+    ) {
         use duckrs_core::execution::profiler::{Metric, QueryProfile, TrackedMetrics};
         // `QueryMetrics::FinalizeMetrics`: the live counters and the system peaks are always there,
         // the timings and counters only when something recorded them
@@ -5891,7 +5979,7 @@ impl ClientContext {
             _ => TrackedMetrics::new(vec!["*".to_string()]),
         };
         let legacy = self.setting_text("legacy_metrics_format") == "true";
-        QueryProfile { metrics, root }.to_json(&tracked, legacy)
+        (QueryProfile { metrics, root }, tracked, legacy)
     }
 }
 

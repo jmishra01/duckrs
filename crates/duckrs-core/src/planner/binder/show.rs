@@ -2044,6 +2044,12 @@ impl Binder<'_> {
                 };
                 let mut entries: Vec<Entry> = builtins("system", 2, 0);
                 let mut oid = 3000;
+                // the types a client registered (`duckdb_register_logical_type`): internal entries of the system
+                // catalog
+                for (name, ty) in self.user_types() {
+                    oid += 1;
+                    entries.push(("system".into(), 2, "main".into(), 0, oid, name, ty, true, USER, None));
+                }
                 // the schemas of every database (`GetAllSchemas`)
                 for (schema_oid, listed) in self.listed_schemas().iter().enumerate() {
                     let schema = &listed.schema;

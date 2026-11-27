@@ -3,7 +3,7 @@
 What is still missing from the roadmap in [`RUST_PORT_PLAN.md`](../../RUST_PORT_PLAN.md) §6.
 The test numbers come from [`STATUS.md`](STATUS.md) at baseline `d4eea3f208d`.
 
-- Overall: 5582 of 6367 test files pass (**91.7%** of the 6090 that run), on 2026-11-26. The v1 target is ≥ 90%.
+- Overall: 5592 of 6367 test files pass (**91.8%** of the 6090 that run), on 2026-11-27. The v1 target is ≥ 90%.
 - Phases 0–11 have code, and their gates are met: `test/parquet` is at 85.6% (95 of 111, gate 80%) since
   `bound_schema` (phase 82). `sql/cte` is at 84.0% against 85%, and counts as met for v1 (decided 2026-11-26; see item 23). The failing-file counts in the items below are from earlier runs; `STATUS.md` has the current ones.
 - Phase 12 is partly done. Phases 13 and 14 have not started.
@@ -808,7 +808,11 @@ Each item gives the number of failing files in `test/` that it should fix, where
     `duckdb_column_has_default` read `ClientContext::table_info` (a view is no table). The
     test_capi_replacement_scan.cpp and test_capi_table_description.cpp files: 4 of 5 cases (the default harness
     set: 123 of 138)
-  - [ ] `duckdb_get_table_names` (needs the binder's `EXTRACT_NAMES` binding mode)
+  - [x] `duckdb_get_table_names` (2026-11-27, phase 98): `ClientContext::get_table_names` binds the statement in
+    `BindingMode::EXTRACT_NAMES` / `EXTRACT_QUALIFIED_NAMES` (`planner/binder/extract_names.rs`): a base table, or a
+    name the catalog lacks, is noted (as written when qualified) and bound as a dummy scan, columns and scalar
+    functions bind as NULL; views bind as usual, CTEs are not tables. Not ported: PRAGMA expansion first, the names
+    of CREATE TABLE, clearing a star's EXCLUDE/REPLACE lists
   - [x] Arrow (2026-11-26, phase 95, `src/arrow_c/`): the deprecated `duckdb_query_arrow*` / `duckdb_arrow_*` /
     prepared-statement functions, `duckdb_result_arrow_array`, `duckdb_to_arrow_schema`,
     `duckdb_data_chunk_to_arrow`, `duckdb_schema_from_arrow`, `duckdb_data_chunk_from_arrow`, the arrow options,
@@ -820,9 +824,42 @@ Each item gives the number of failing files in `test/` that it should fix, where
     by its vectors (`Vector::set_auxiliary`). test_capi_arrow.cpp: 9 of 9 cases
   - [ ] Arrow: unions and run-end encoded arrays (import and export), geometry/variant/bignum import, decimal
     formats without the `,128` C++ writes, the options of a `duckdb_result` (`duckdb_result_get_arrow_options` and
-    `duckdb_result_arrow_array` use the defaults), zero-copy import, test_capi_streaming.cpp (needs `DConstants`
-    in the shim)
-  - [ ] cast and copy functions; profiling and logging; the instance cache; then v2 (`src/main/capi/v2`)
+    `duckdb_result_arrow_array` use the defaults), zero-copy import
+  - [x] cast functions and custom types (2026-11-27, phase 98): `duckdb_create_cast_function` and its setters,
+    `duckdb_register_cast_function` (cast mode, `set_error`, `set_row_error`, extra info) and
+    `duckdb_register_logical_type`. The engine keeps registered casts (`udf::UserCast`, looked up as
+    `MapCastInfo::GetEntry` with `RelaxedTypeMatch`) and types in `UserFunctions`; an explicit CAST / TRY_CAST
+    binds to a registered cast first (`Binder::bind_user_cast`), type names fall back to the registered types,
+    which `duckdb_types()` lists under `system.main`. Not ported: registered casts as implicit casts (their
+    `implicit_cast_cost` is kept but the function binder's cost rules don't read it), `duckdb_create_type_info`.
+    capi_custom_type.cpp: 2 of 2
+  - [x] copy functions and the file system (phase 98): `duckdb_create_copy_function` with bind / global init / sink
+    / finalize and their infos, `duckdb_copy_function_set_copy_from_function`, `duckdb_register_copy_function`;
+    COPY ... (FORMAT name) binds to a registered function (`Binder::bind_user_copy`): COPY TO plans
+    `LogicalOperatorKind::UserCopyTo` (`execution/user_copy.rs`), COPY FROM an INSERT from the function's table
+    function with the table's columns as its columns (`TableUdfBindInput::expected_*`). The file system of a client
+    context (open options, handles: read/write/seek/tell/size/sync/close, error data) is the local file system.
+    capi_copy_function.cpp and capi_file_system.cpp: 2 of 2
+  - [x] profiling and logging (phase 98): `duckdb_get_profiling_info` and `duckdb_profiling_info_*` walk the
+    `QueryProfileResult` tree (`QueryProfile::to_result_tree`) the connection keeps of its last profiled statement
+    (prepared statements are profiled too); `duckdb_create_log_storage`, its setters and
+    `duckdb_register_log_storage` (`logging::LogStorageCallback`, selectable with `SET logging_storage`).
+    test_capi_profiling.cpp 7 of 9 (both appender cases: `duckdb_appender_create_query`, and the SQL the
+    appender runs differs from C++'s), test_capi_logging.cpp 2 of 3 (a failed checkpoint at shutdown is not
+    logged), test_capi_streaming.cpp 3 of 5 (query progress, a partly read streaming result in a transaction)
+  - [x] the instance cache (phase 98): `duckdb_create_instance_cache`, `duckdb_get_or_create_from_cache` (the
+    `GetCacheKey` of the path, lower case on macOS/Windows; unnamed in-memory databases are not kept; a different
+    configuration is C++'s ConnectionException), `duckdb_destroy_instance_cache`. test_capi_instance_cache.cpp:
+    5 of 5
+  - [x] catalog, threading, `duckdb_geometry_type_get_crs` (phase 98): `duckdb_client_context_get_catalog` (while
+    a query runs on the context's connection, as C++ requires a transaction), `duckdb_catalog_get_entry` and the
+    entry getters; the threading functions (no task queue for client threads: `duckdb_execute_tasks_state` waits
+    for `duckdb_finish_execution`). capi_catalog.cpp 1 of 1, test_capi_geometry.cpp 3 of 3
+  - [ ] the rest of v1: `duckdb_create_config_option` and its setters, `duckdb_register_config_option` and
+    `duckdb_client_context_get_config_option` (needs extension options in the settings of a database instance;
+    capi_config_options.cpp 1 of 2), `duckdb_appender_create_query`. The default harness set (27 files): 161 of
+    179 cases, 538 of 548 functions
+  - [ ] then v2 (`src/main/capi/v2`)
 - [ ] 42. **CLI shell** (`crates/duckrs-cli`, the `duckrs` binary). Against `tools/shell/tests` it passes
   150 of `test_shell_basics` (C++ 1.5.6: 141), all of `test_dump`, `test_errors`, `test_import`,
   `test_table_metadata_rendering` and `test_shell_rendering`

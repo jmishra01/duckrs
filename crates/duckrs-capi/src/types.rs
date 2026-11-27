@@ -482,3 +482,68 @@ handles! {
 /// The callback of a replacement scan (`duckdb_add_replacement_scan`).
 pub type duckdb_replacement_callback_t =
     Option<unsafe extern "C" fn(info: duckdb_replacement_scan_info, table_name: *const c_char, data: *mut c_void)>;
+
+pub type duckdb_file_flag = u32;
+pub const DUCKDB_FILE_FLAG_INVALID: duckdb_file_flag = 0;
+pub const DUCKDB_FILE_FLAG_READ: duckdb_file_flag = 1;
+pub const DUCKDB_FILE_FLAG_WRITE: duckdb_file_flag = 2;
+pub const DUCKDB_FILE_FLAG_CREATE: duckdb_file_flag = 3;
+pub const DUCKDB_FILE_FLAG_CREATE_NEW: duckdb_file_flag = 4;
+pub const DUCKDB_FILE_FLAG_APPEND: duckdb_file_flag = 5;
+
+pub type duckdb_config_option_scope = u32;
+pub const DUCKDB_CONFIG_OPTION_SCOPE_INVALID: duckdb_config_option_scope = 0;
+pub const DUCKDB_CONFIG_OPTION_SCOPE_LOCAL: duckdb_config_option_scope = 1;
+pub const DUCKDB_CONFIG_OPTION_SCOPE_SESSION: duckdb_config_option_scope = 2;
+pub const DUCKDB_CONFIG_OPTION_SCOPE_GLOBAL: duckdb_config_option_scope = 3;
+
+pub type duckdb_catalog_entry_type = u32;
+pub const DUCKDB_CATALOG_ENTRY_TYPE_INVALID: duckdb_catalog_entry_type = 0;
+pub const DUCKDB_CATALOG_ENTRY_TYPE_TABLE: duckdb_catalog_entry_type = 1;
+pub const DUCKDB_CATALOG_ENTRY_TYPE_SCHEMA: duckdb_catalog_entry_type = 2;
+pub const DUCKDB_CATALOG_ENTRY_TYPE_VIEW: duckdb_catalog_entry_type = 3;
+pub const DUCKDB_CATALOG_ENTRY_TYPE_INDEX: duckdb_catalog_entry_type = 4;
+pub const DUCKDB_CATALOG_ENTRY_TYPE_PREPARED_STATEMENT: duckdb_catalog_entry_type = 5;
+pub const DUCKDB_CATALOG_ENTRY_TYPE_SEQUENCE: duckdb_catalog_entry_type = 6;
+pub const DUCKDB_CATALOG_ENTRY_TYPE_COLLATION: duckdb_catalog_entry_type = 7;
+pub const DUCKDB_CATALOG_ENTRY_TYPE_TYPE: duckdb_catalog_entry_type = 8;
+pub const DUCKDB_CATALOG_ENTRY_TYPE_DATABASE: duckdb_catalog_entry_type = 9;
+
+handles! {
+    duckdb_config_option = _duckdb_config_option;
+    duckdb_create_type_info = _duckdb_create_type_info;
+    duckdb_profiling_info = _duckdb_profiling_info;
+    duckdb_file_open_options = _duckdb_file_open_options;
+    duckdb_file_system = _duckdb_file_system;
+    duckdb_file_handle = _duckdb_file_handle;
+    duckdb_catalog = _duckdb_catalog;
+    duckdb_catalog_entry = _duckdb_catalog_entry;
+    duckdb_cast_function = _duckdb_cast_function;
+    duckdb_copy_function = _duckdb_copy_function;
+    duckdb_copy_function_bind_info = _duckdb_copy_function_bind_info;
+    duckdb_copy_function_global_init_info = _duckdb_copy_function_global_init_info;
+    duckdb_copy_function_sink_info = _duckdb_copy_function_sink_info;
+    duckdb_copy_function_finalize_info = _duckdb_copy_function_finalize_info;
+    duckdb_log_storage = _duckdb_log_storage;
+}
+
+/// `duckdb_task_state`: an opaque pointer.
+pub type duckdb_task_state = *mut c_void;
+
+pub type duckdb_cast_function_t = Option<
+    unsafe extern "C" fn(info: duckdb_function_info, count: idx_t, input: duckdb_vector, output: duckdb_vector) -> bool,
+>;
+pub type duckdb_copy_function_bind_t = Option<unsafe extern "C" fn(info: duckdb_copy_function_bind_info)>;
+pub type duckdb_copy_function_global_init_t = Option<unsafe extern "C" fn(info: duckdb_copy_function_global_init_info)>;
+pub type duckdb_copy_function_sink_t =
+    Option<unsafe extern "C" fn(info: duckdb_copy_function_sink_info, input: duckdb_data_chunk)>;
+pub type duckdb_copy_function_finalize_t = Option<unsafe extern "C" fn(info: duckdb_copy_function_finalize_info)>;
+pub type duckdb_logger_write_log_entry_t = Option<
+    unsafe extern "C" fn(
+        extra_data: *mut c_void,
+        timestamp: *mut duckdb_timestamp,
+        level: *const c_char,
+        log_type: *const c_char,
+        log_message: *const c_char,
+    ),
+>;

@@ -18,10 +18,14 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <functional>
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -48,6 +52,7 @@ struct BaseAppender {
 };
 
 using std::atomic;
+using std::mutex;
 using std::make_pair;
 using std::move;
 using std::pair;
@@ -59,6 +64,13 @@ using std::unordered_set;
 
 template <class T>
 using vector = std::vector<T>;
+template <class K, class V, class C = std::less<K>>
+using map = std::map<K, V, C>;
+
+//! `DConstants`
+struct DConstants {
+	static constexpr idx_t INVALID_INDEX = idx_t(-1);
+};
 template <class T, class D = std::default_delete<T>>
 using unique_ptr = std::unique_ptr<T, D>;
 template <class T>
@@ -94,6 +106,39 @@ void DeleteDatabase(string path);
 void TestCreateDirectory(string path);
 void TestDeleteDirectory(string path);
 string TestJoinPath(string path1, string path2);
+
+//! `FileSystem`: the local one, with what the C API tests call of it.
+class FileSystem {
+public:
+	virtual ~FileSystem() = default;
+	static unique_ptr<FileSystem> CreateLocal() {
+		return make_uniq<FileSystem>();
+	}
+	bool TryRemoveFile(const string &path) {
+		return unlink(path.c_str()) == 0;
+	}
+	bool FileExists(const string &path) {
+		struct stat info;
+		return stat(path.c_str(), &info) == 0 && S_ISREG(info.st_mode);
+	}
+	bool ListFiles(const string &directory, const std::function<void(const string &, bool)> &callback) {
+		DIR *dir = opendir(directory.c_str());
+		if (!dir) {
+			return false;
+		}
+		while (struct dirent *entry = readdir(dir)) {
+			string name = entry->d_name;
+			if (name == "." || name == "..") {
+				continue;
+			}
+			struct stat info;
+			bool is_directory = stat((directory + "/" + name).c_str(), &info) == 0 && S_ISDIR(info.st_mode);
+			callback(name, is_directory);
+		}
+		closedir(dir);
+		return true;
+	}
+};
 
 //! `Printer::Print`: to stderr.
 struct Printer {
@@ -160,11 +205,25 @@ struct StringUtil {
 		}
 		return result;
 	}
-	//! `printf`-like, with every argument rendered as `operator<<` renders it (as DuckDB's Format does)
+	//! `printf`-like: a floating point number is rendered as its conversion says (`%f`, ...), anything else as
+	//! `operator<<` renders it (as DuckDB's Format does)
 	template <class... ARGS>
 	static string Format(const string &format, ARGS... args) {
+		vector<string> specs;
+		for (size_t i = 0; i < format.size(); i++) {
+			if (format[i] != '%') {
+				continue;
+			}
+			if (i + 1 < format.size() && format[i + 1] == '%') {
+				i++;
+				continue;
+			}
+			size_t j = SpecEnd(format, i);
+			specs.push_back(format.substr(i, j - i + 1));
+			i = j;
+		}
 		vector<string> rendered;
-		Render(rendered, args...);
+		Render(rendered, specs, args...);
 		string result;
 		size_t next = 0;
 		for (size_t i = 0; i < format.size(); i++) {
@@ -177,14 +236,7 @@ struct StringUtil {
 				i++;
 				continue;
 			}
-			// skip flags, width and length up to the conversion
-			size_t j = i + 1;
-			while (j < format.size() && !std::isalpha(static_cast<unsigned char>(format[j]))) {
-				j++;
-			}
-			while (j < format.size() && (format[j] == 'l' || format[j] == 'h' || format[j] == 'z')) {
-				j++;
-			}
+			size_t j = SpecEnd(format, i);
 			if (next < rendered.size()) {
 				result += rendered[next++];
 			}
@@ -194,19 +246,42 @@ struct StringUtil {
 	}
 
 private:
-	static void Render(vector<string> &) {
+	//! the conversion character of the spec at `i`: past flags, width and length
+	static size_t SpecEnd(const string &format, size_t i) {
+		size_t j = i + 1;
+		while (j < format.size() && !std::isalpha(static_cast<unsigned char>(format[j]))) {
+			j++;
+		}
+		while (j < format.size() && (format[j] == 'l' || format[j] == 'h' || format[j] == 'z')) {
+			j++;
+		}
+		return j;
+	}
+	static void Render(vector<string> &, const vector<string> &) {
 	}
 	template <class T, class... ARGS>
-	static void Render(vector<string> &rendered, T first, ARGS... rest) {
+	static void Render(vector<string> &rendered, const vector<string> &specs, T first, ARGS... rest) {
+		string spec = rendered.size() < specs.size() ? specs[rendered.size()] : string();
+		spec.erase(std::remove_if(spec.begin(), spec.end(), [](char c) { return c == 'l' || c == 'h' || c == 'z'; }),
+		           spec.end());
+		const char conversion = spec.empty() ? 's' : spec.back();
 		std::ostringstream stream;
-		if constexpr (std::is_integral<T>::value) {
+		if constexpr (std::is_floating_point<T>::value) {
+			if (std::strchr("fFeEgG", conversion) != nullptr) {
+				char buffer[512];
+				snprintf(buffer, sizeof(buffer), spec.c_str(), static_cast<double>(first));
+				stream << buffer;
+			} else {
+				stream << first;
+			}
+		} else if constexpr (std::is_integral<T>::value) {
 			// a uint8_t is a number to Format, not a character
 			stream << +first;
 		} else {
 			stream << first;
 		}
 		rendered.push_back(stream.str());
-		Render(rendered, rest...);
+		Render(rendered, specs, rest...);
 	}
 };
 

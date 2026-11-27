@@ -29,6 +29,7 @@ pub mod parquet_writer;
 pub mod physical;
 pub mod profiler;
 pub mod temporary;
+pub mod user_copy;
 pub mod zone_map;
 
 use crate::planner::expression::{BoundAggregate, BoundExpr, BoundExprKind};
@@ -355,6 +356,7 @@ fn create_physical(mut op: LogicalOperator) -> Box<dyn PhysicalOperator> {
         LogicalOperatorKind::CopyToParquet { path, names, options } => Box::new(parquet::PhysicalCopyToParquet::new(
             types, path, names, options, children,
         )),
+        LogicalOperatorKind::UserCopyTo { copy, .. } => Box::new(user_copy::PhysicalUserCopyTo::new(copy, children)),
         LogicalOperatorKind::CopyToFile {
             path,
             names,

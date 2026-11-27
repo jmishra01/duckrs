@@ -1473,7 +1473,8 @@ impl Exporter<'_> {
             | Op::CreateTableAs { .. }
             | Op::CreateTable { .. }
             | Op::CopyToFile { .. }
-            | Op::CopyToParquet { .. } => {
+            | Op::CopyToParquet { .. }
+            | Op::UserCopyTo { .. } => {
                 return Err("The data-modifying statement has no SQL export".into());
             }
         };

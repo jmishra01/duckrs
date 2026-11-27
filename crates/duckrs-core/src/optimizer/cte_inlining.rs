@@ -99,6 +99,7 @@ pub(crate) fn has_side_effects(op: &LogicalOperator) -> bool {
             | K::MergeInto { .. }
             | K::CopyToFile { .. }
             | K::CopyToParquet { .. }
+            | K::UserCopyTo { .. }
             | K::CreateTableAs { .. }
             | K::CreateTable { .. }
     ) || op.children.iter().any(has_side_effects)
