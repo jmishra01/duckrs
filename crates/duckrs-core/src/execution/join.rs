@@ -45,7 +45,7 @@ use crate::planner::logical::{JoinAlgorithm, JoinCondition};
 use crate::storage::log_writer::can_serialize;
 use duckrs_common::column_data::ColumnDataCollection;
 use duckrs_common::sort_key::{KeyHasher, RowKey, create_row_keys};
-use duckrs_common::types::LogicalType;
+use duckrs_common::types::{LogicalType, LogicalTypeId, PhysicalType};
 use duckrs_common::value::{Value, ValueData};
 use duckrs_common::vector::{DataChunk, SelectionVector, StringCopy, Vector};
 use duckrs_common::{Error, ErrorKind, Result, STANDARD_VECTOR_SIZE};
@@ -318,8 +318,9 @@ struct JoinSpill {
 /// A build side has at least this many rows in memory before it spills.
 const MIN_SPILL_ROWS: usize = 16 * STANDARD_VECTOR_SIZE;
 
-/// Roughly what a build row takes besides its values: its key, and its place in a chain.
-const BYTES_PER_KEY: usize = 48;
+/// Roughly what a build row takes besides its values: its key, its place in a chain, and its two slots in the
+/// table of its partition.
+const BYTES_PER_KEY: usize = 56;
 
 /// A thread of the build side adds its rows once it has this many chunks, so that what threads
 /// hold apart stays small next to the memory limit.
@@ -331,9 +332,107 @@ const PARTITIONS: usize = 64;
 /// How many build rows it takes to look up their keys on more than one thread.
 const MIN_PARALLEL_BUILD_ROWS: usize = 100_000;
 
+/// A key of a hash join. A single integer key column (not `IS NOT DISTINCT FROM`, so never NULL) is its value as
+/// a word, which hashes and compares at once; a single VARCHAR key column is the bytes of its string; other keys are
+/// the bytes of [`create_row_keys`]. All keys of a join are of one kind, the one [`key_kind`] picks from the
+/// conditions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum JoinKey {
+    Word(u64),
+    Row(RowKey),
+}
+
+/// What the keys of a join's equality conditions are made of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyKind {
+    /// [`JoinKey::Word`]s: one equality, not null-safe, on both sides of the same type, whose values are integers of
+    /// at most 64 bits that are equal only when their bits are (not TIMETZ, which compares by instant, and not
+    /// floats, whose -0.0 and NaNs are not)
+    Word,
+    /// [`JoinKey::Row`]s of the bytes of the strings: one equality, not null-safe, of VARCHARs on both sides
+    String,
+    /// [`JoinKey::Row`]s of [`create_row_keys`]
+    Row,
+}
+
+fn key_kind(conditions: &[JoinCondition]) -> KeyKind {
+    let [condition] = conditions else {
+        return KeyKind::Row;
+    };
+    let ty = &condition.left.return_type;
+    if condition.null_safe() || *ty != condition.right.return_type {
+        KeyKind::Row
+    } else if ty.id() != LogicalTypeId::TimeTz && word_type(ty.physical_type()) {
+        KeyKind::Word
+    } else if ty.id() == LogicalTypeId::Varchar {
+        KeyKind::String
+    } else {
+        KeyKind::Row
+    }
+}
+
+fn word_type(physical: PhysicalType) -> bool {
+    matches!(
+        physical,
+        PhysicalType::Bool
+            | PhysicalType::Int8
+            | PhysicalType::Int16
+            | PhysicalType::Int32
+            | PhysicalType::Int64
+            | PhysicalType::UInt8
+            | PhysicalType::UInt16
+            | PhysicalType::UInt32
+            | PhysicalType::UInt64
+    )
+}
+
+/// The [`JoinKey::Word`] of each row of `vector`, or `None` for a NULL.
+fn word_keys_of(vector: &Vector, count: usize) -> Vec<Option<JoinKey>> {
+    let format = vector.to_unified(count);
+    macro_rules! words {
+        ($t:ty) => {{
+            let data = format.data::<$t>();
+            (0..count)
+                .map(|row| {
+                    let index = format.sel.get(row);
+                    format
+                        .validity
+                        .is_valid(index)
+                        .then(|| JoinKey::Word(data[index] as u64))
+                })
+                .collect()
+        }};
+    }
+    match vector.physical_type() {
+        PhysicalType::Bool => words!(bool),
+        PhysicalType::Int8 => words!(i8),
+        PhysicalType::Int16 => words!(i16),
+        PhysicalType::Int32 => words!(i32),
+        PhysicalType::Int64 => words!(i64),
+        PhysicalType::UInt8 => words!(u8),
+        PhysicalType::UInt16 => words!(u16),
+        PhysicalType::UInt32 => words!(u32),
+        PhysicalType::UInt64 => words!(u64),
+        other => unreachable!("{other} keys are not words"),
+    }
+}
+
+/// The [`JoinKey::Row`] of the bytes of each string of `vector`, or `None` for a NULL. For one column, the bytes
+/// alone tell the keys apart.
+fn string_keys_of(vector: &Vector, count: usize) -> Vec<Option<JoinKey>> {
+    let format = vector.to_unified(count);
+    (0..count)
+        .map(|row| {
+            format
+                .is_valid(row)
+                .then(|| JoinKey::Row(RowKey::from_bytes(format.str_at(row))))
+        })
+        .collect()
+}
+
 /// The partition of a key. The tables read the low and the high bits of the hash, so the
 /// partition is in the middle ones.
-fn partition_of(key: &RowKey) -> usize {
+fn partition_of(key: &JoinKey) -> usize {
     partition_of_hash(key_hash(key))
 }
 
@@ -342,14 +441,28 @@ fn partition_of_hash(hash: u64) -> usize {
 }
 
 /// The hash of a key, which picks both its partition and its slot in the partition's table.
-fn key_hash(key: &RowKey) -> u64 {
-    let mut hasher = KeyHasher::default();
-    key.hash(&mut hasher);
-    hasher.finish()
+fn key_hash(key: &JoinKey) -> u64 {
+    match key {
+        JoinKey::Word(word) => hash_word(*word),
+        JoinKey::Row(key) => {
+            let mut hasher = KeyHasher::default();
+            key.hash(&mut hasher);
+            hasher.finish()
+        }
+    }
+}
+
+/// The finalizer of MurmurHash3 (`MurmurHash64`), which spreads every bit of a word over the hash.
+fn hash_word(mut x: u64) -> u64 {
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    x ^ (x >> 33)
 }
 
 /// A key of the build side, with its partition (always 0 when one thread sinks), or `None` when a key that is not null-safe is NULL.
-type BuildKey = Option<(usize, RowKey)>;
+type BuildKey = Option<(usize, JoinKey)>;
 
 /// The build side, while it comes in.
 #[derive(Debug)]
@@ -359,7 +472,7 @@ pub struct JoinBuild {
     count: usize,
     /// per partition, the keys of the build rows and their rows, in the order they came in;
     /// rows with a NULL key that is not null-safe are not in there
-    keys: Vec<Vec<(RowKey, u32)>>,
+    keys: Vec<Vec<(JoinKey, u32)>>,
     /// whether a key that is not null-safe was NULL
     has_null_key: bool,
     /// whether the keys are in the partitions of their hash: threads put them there, and so does
@@ -450,15 +563,20 @@ impl JoinBuild {
 struct Partition {
     /// the group of each distinct key, found by its hash
     table: hashbrown::HashTable<u32>,
-    keys: Vec<RowKey>,
+    keys: Vec<JoinKey>,
     hashes: Vec<u64>,
     offsets: Vec<u32>,
     rows: Vec<u32>,
 }
 
 impl Partition {
-    fn new(keys: Vec<(RowKey, u32)>) -> Self {
-        let mut partition = Self::default();
+    fn new(keys: Vec<(JoinKey, u32)>) -> Self {
+        // twice the slots of the rows, as `JoinHashTable::PointerTableCapacity` has: a probe key that is not in
+        // the table, the usual case, finds an empty slot soon, which a table filled to hashbrown's 7/8 takes long to
+        let mut partition = Self {
+            table: hashbrown::HashTable::with_capacity(keys.len() * 2),
+            ..Self::default()
+        };
         let mut group_of = Vec::with_capacity(keys.len());
         let mut sizes: Vec<u32> = Vec::new();
         let mut rows_in_order = Vec::with_capacity(keys.len());
@@ -500,7 +618,7 @@ impl Partition {
     }
 
     /// The group of `key`, whose hash is `hash`.
-    fn group(&self, hash: u64, key: &RowKey) -> Option<usize> {
+    fn group(&self, hash: u64, key: &JoinKey) -> Option<usize> {
         self.table
             .find(hash, |&g| self.keys[g as usize] == *key)
             .map(|&g| g as usize)
@@ -550,10 +668,16 @@ struct FinishedBuild {
     total_count: usize,
     /// a range join: what finds the build rows of a probe row
     range: Option<RangeIndex>,
+    /// whether the tables are small enough to stay in the caches, so that looking a window of keys up twice, once to
+    /// fetch what the lookups read, only costs
+    cached: bool,
 }
 
+/// The distinct keys of the tables of a build side up to which [`FinishedBuild::find_all`] does not fetch ahead.
+const CACHED_KEYS: usize = 1 << 16;
+
 impl FinishedBuild {
-    fn find_hashed(&self, hash: u64, key: &RowKey) -> Option<(usize, usize)> {
+    fn find_hashed(&self, hash: u64, key: &JoinKey) -> Option<(usize, usize)> {
         // the hash picks the partition and the slot in its table both
         let partition = if self.partitioned { partition_of_hash(hash) } else { 0 };
         self.partitions[partition]
@@ -563,9 +687,16 @@ impl FinishedBuild {
 
     /// [`Self::find`] of each key, a window of them at a time: the keys of a window's candidate groups are
     /// fetched for all of its rows first, so that their reads from memory overlap rather than wait one by one.
-    fn find_all(&self, keys: &[Option<RowKey>]) -> Vec<Option<(usize, usize)>> {
+    fn find_all(&self, keys: &[Option<JoinKey>]) -> Vec<Option<(usize, usize)>> {
         const WINDOW: usize = 32;
         let hashes: Vec<u64> = keys.iter().map(|key| key.as_ref().map_or(0, key_hash)).collect();
+        if self.cached {
+            return keys
+                .iter()
+                .zip(hashes)
+                .map(|(key, hash)| key.as_ref().and_then(|key| self.find_hashed(hash, key)))
+                .collect();
+        }
         let mut groups = Vec::with_capacity(keys.len());
         for (keys, hashes) in keys.chunks(WINDOW).zip(hashes.chunks(WINDOW)) {
             for (key, &hash) in keys.iter().zip(hashes) {
@@ -875,7 +1006,7 @@ impl PhysicalJoin {
             return Ok(Vec::new());
         }
         let keys = self.keys(chunk, |c| &c.right)?;
-        let partition = |key: &RowKey| if partitioned { partition_of(key) } else { 0 };
+        let partition = |key: &JoinKey| if partitioned { partition_of(key) } else { 0 };
         Ok(keys
             .into_iter()
             .map(|key| key.map(|key| (partition(&key), key)))
@@ -1020,10 +1151,13 @@ impl PhysicalJoin {
     fn finish_build(build: &mut JoinBuild, threads: usize, total_count: usize, has_null_key: bool) -> FinishedBuild {
         build.materialize();
         let count = build.count;
+        let partitions = Self::partitions(std::mem::take(&mut build.keys), threads);
+        let keys: usize = partitions.iter().map(|partition| partition.keys.len()).sum();
         FinishedBuild {
             data: DataChunk::from_columns(std::mem::take(&mut build.columns), count),
             count,
-            partitions: Self::partitions(std::mem::take(&mut build.keys), threads),
+            partitions,
+            cached: keys <= CACHED_KEYS,
             partitioned: build.partitioned,
             has_null_key,
             matched: (0..count).map(|_| AtomicBool::new(false)).collect(),
@@ -1141,12 +1275,17 @@ impl PhysicalJoin {
 
     /// The key of each row of `chunk`, or `None` for a row that can match nothing because a key
     /// that is not null-safe is NULL.
-    fn keys(&self, chunk: &DataChunk, side: impl Fn(&JoinCondition) -> &BoundExpr) -> Result<Vec<Option<RowKey>>> {
+    fn keys(&self, chunk: &DataChunk, side: impl Fn(&JoinCondition) -> &BoundExpr) -> Result<Vec<Option<JoinKey>>> {
         let vectors = self
             .conditions
             .iter()
             .map(|c| execute(side(c), chunk))
             .collect::<Result<Vec<_>>>()?;
+        match key_kind(&self.conditions) {
+            KeyKind::Word => return Ok(word_keys_of(&vectors[0], chunk.len())),
+            KeyKind::String => return Ok(string_keys_of(&vectors[0], chunk.len())),
+            KeyKind::Row => {}
+        }
         let references: Vec<&Vector> = vectors.iter().collect();
         let keys = create_row_keys(&references, chunk.len())?;
         let nulls: Vec<_> = self
@@ -1159,7 +1298,7 @@ impl PhysicalJoin {
         Ok(keys
             .into_iter()
             .enumerate()
-            .map(|(row, key)| nulls.iter().all(|u| u.is_valid(row)).then_some(key))
+            .map(|(row, key)| nulls.iter().all(|u| u.is_valid(row)).then_some(JoinKey::Row(key)))
             .collect())
     }
 
@@ -1310,10 +1449,10 @@ impl PhysicalJoin {
         &self,
         build: &FinishedBuild,
         input: &DataChunk,
-        keys: Vec<Option<RowKey>>,
+        keys: Vec<Option<JoinKey>>,
         kept: &mut Option<DataChunk>,
         nulls: &mut Vec<bool>,
-    ) -> Result<Vec<Option<RowKey>>> {
+    ) -> Result<Vec<Option<JoinKey>>> {
         let spill = self.spill.as_ref().expect("spilled partitions come from spilling");
         let mut deferred: Vec<Vec<u32>> = vec![Vec::new(); PARTITIONS];
         let mut stay = Vec::new();
@@ -1348,11 +1487,11 @@ impl PhysicalJoin {
     }
 
     /// Looks up the keys of each partition, on up to `threads` threads.
-    fn partitions(keys: Vec<Vec<(RowKey, u32)>>, threads: usize) -> Vec<Partition> {
+    fn partitions(keys: Vec<Vec<(JoinKey, u32)>>, threads: usize) -> Vec<Partition> {
         if threads < 2 {
             return keys.into_iter().map(Partition::new).collect();
         }
-        let keys: Vec<Mutex<Vec<(RowKey, u32)>>> = keys.into_iter().map(Mutex::new).collect();
+        let keys: Vec<Mutex<Vec<(JoinKey, u32)>>> = keys.into_iter().map(Mutex::new).collect();
         let partitions: Vec<Mutex<Partition>> = (0..keys.len()).map(|_| Mutex::default()).collect();
         let next = AtomicUsize::new(0);
         std::thread::scope(|scope| {
