@@ -1652,6 +1652,7 @@ test/sql/copy/csv/19578.test
 test/sql/copy/csv/21248.test
 test/sql/copy/csv/25268.test
 test/sql/copy/csv/26049.test
+test/sql/copy/csv/7702.test
 test/sql/copy/csv/afl/fuzz_20250211_crash.test
 test/sql/copy/csv/afl/fuzz_20250226.test
 test/sql/copy/csv/afl/test_afl_ignore_errors.test
@@ -1698,8 +1699,11 @@ test/sql/copy/csv/auto/test_type_candidates.test
 test/sql/copy/csv/auto/test_type_detection.test
 test/sql/copy/csv/auto_glob_directory.test
 test/sql/copy/csv/code_cov/buffer_manager_finalize.test
+test/sql/copy/csv/code_cov/csv_core_encodings.test
 test/sql/copy/csv/code_cov/csv_dialect_detection.test
+test/sql/copy/csv/code_cov/csv_scanner_conversion.test
 test/sql/copy/csv/code_cov/csv_sniffer_header.test
+test/sql/copy/csv/code_cov/csv_state_machine_invalid_utf.test
 test/sql/copy/csv/code_cov/csv_type_detection.test
 test/sql/copy/csv/code_cov/csv_type_refinement.test
 test/sql/copy/csv/column_names.test
@@ -1772,6 +1776,7 @@ test/sql/copy/csv/read_ahead/csv_readahead_rejects.test
 test/sql/copy/csv/read_ahead/csv_readahead_single_file.test
 test/sql/copy/csv/read_csv_subquery.test
 test/sql/copy/csv/read_csv_variable.test
+test/sql/copy/csv/read_single_csv_file.test
 test/sql/copy/csv/recursive_csv_union_by_name.test
 test/sql/copy/csv/recursive_read_csv.test
 test/sql/copy/csv/rejects/csv_incorrect_columns_amount_rejects.test
@@ -1788,6 +1793,7 @@ test/sql/copy/csv/rejects/csv_unquoted_rejects.test
 test/sql/copy/csv/rejects/test_invalid_parameters.test
 test/sql/copy/csv/rejects/test_invalid_utf_rejects.test
 test/sql/copy/csv/rejects/test_mixed.test
+test/sql/copy/csv/rejects/test_multiple_errors_same_line.test
 test/sql/copy/csv/relaxed_quotes.test
 test/sql/copy/csv/sniff_csv_skip_overflow.test
 test/sql/copy/csv/struct.test
@@ -1814,6 +1820,7 @@ test/sql/copy/csv/test_copy_csv_multibyte_delimiter.test
 test/sql/copy/csv/test_copy_default.test
 test/sql/copy/csv/test_copy_gzip.test
 test/sql/copy/csv/test_copy_many_empty_lines.test
+test/sql/copy/csv/test_copy_null.test
 test/sql/copy/csv/test_csv_duplicate_columns.test
 test/sql/copy/csv/test_csv_error_message_type.test
 test/sql/copy/csv/test_csv_error_projection.test
@@ -1840,6 +1847,7 @@ test/sql/copy/csv/test_force_not_null.test
 test/sql/copy/csv/test_force_quote.test
 test/sql/copy/csv/test_glob_reorder_lineitem.test
 test/sql/copy/csv/test_glob_reorder_null.test
+test/sql/copy/csv/test_glob_type.test
 test/sql/copy/csv/test_greek_utf8.test
 test/sql/copy/csv/test_gzip_large_member_header.test
 test/sql/copy/csv/test_header_only.test
