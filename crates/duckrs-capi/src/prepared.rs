@@ -499,6 +499,16 @@ pub(crate) unsafe fn prepared_wrapper<'a>(prepared_statement: duckdb_prepared_st
 }
 
 impl PreparedWrapper {
+    /// The connection the statement was prepared on (for the Arrow functions, which read its options).
+    pub(crate) fn connection(&self) -> &SharedConnection {
+        &self.connection
+    }
+
+    /// `GetParameterCount`.
+    pub(crate) fn parameter_count(&self) -> usize {
+        self.names.len()
+    }
+
     /// Runs the statement with the values bound now, for a pending result: the result and the statement's
     /// properties.
     pub(crate) fn run(&self) -> Option<(duckrs::Result<duckrs::QueryResult>, duckrs::StatementProperties)> {

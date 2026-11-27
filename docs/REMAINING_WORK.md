@@ -809,7 +809,20 @@ Each item gives the number of failing files in `test/` that it should fix, where
     test_capi_replacement_scan.cpp and test_capi_table_description.cpp files: 4 of 5 cases (the default harness
     set: 123 of 138)
   - [ ] `duckdb_get_table_names` (needs the binder's `EXTRACT_NAMES` binding mode)
-  - [ ] cast and copy functions; Arrow; profiling and logging; the instance cache; then v2 (`src/main/capi/v2`)
+  - [x] Arrow (2026-11-26, phase 95, `src/arrow_c/`): the deprecated `duckdb_query_arrow*` / `duckdb_arrow_*` /
+    prepared-statement functions, `duckdb_result_arrow_array`, `duckdb_to_arrow_schema`,
+    `duckdb_data_chunk_to_arrow`, `duckdb_schema_from_arrow`, `duckdb_data_chunk_from_arrow`, the arrow options,
+    `duckdb_arrow_scan` / `duckdb_arrow_array_scan` (a temporary view over a user table function) and
+    `duckdb_destroy_arrow_stream`. Export goes through arrow-rs (`arrow::ffi`, a vector at a time, with C++'s
+    types and the options `arrow_lossless_conversion`, `produce_arrow_string_view`, `arrow_large_buffer_size`,
+    `arrow_output_list_view`, `arrow_output_version`); import reads the C structs directly (unaligned buffers,
+    views, dictionaries, decimals of 32/64/128 bits, nested types), copying the values, with the array kept alive
+    by its vectors (`Vector::set_auxiliary`). test_capi_arrow.cpp: 9 of 9 cases
+  - [ ] Arrow: unions and run-end encoded arrays (import and export), geometry/variant/bignum import, decimal
+    formats without the `,128` C++ writes, the options of a `duckdb_result` (`duckdb_result_get_arrow_options` and
+    `duckdb_result_arrow_array` use the defaults), zero-copy import, test_capi_streaming.cpp (needs `DConstants`
+    in the shim)
+  - [ ] cast and copy functions; profiling and logging; the instance cache; then v2 (`src/main/capi/v2`)
 - [ ] 42. **CLI shell** (`crates/duckrs-cli`, the `duckrs` binary). Against `tools/shell/tests` it passes
   150 of `test_shell_basics` (C++ 1.5.6: 141), all of `test_dump`, `test_errors`, `test_import`,
   `test_table_metadata_rendering` and `test_shell_rendering`

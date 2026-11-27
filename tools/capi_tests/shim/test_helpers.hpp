@@ -317,6 +317,14 @@ struct Timestamp {
 //! `Value`, for the few constants the tests compare results with: its text, rendered as DuckDB renders it.
 class Value {
 public:
+	Value() = default;
+	//! An INTEGER (`Value(int32_t)`), as the Arrow tests append them to a shim `DataChunk`
+	explicit Value(int32_t value) : text(std::to_string(value)), integer(value) {
+	}
+	//! The value of an integer `Value`
+	int64_t GetIntegerShim() const {
+		return integer;
+	}
 	static Value DATE(int32_t year, int32_t month, int32_t day);
 	static Value TIME(int32_t hour, int32_t minute, int32_t second, int32_t micros);
 	static Value TIME_NS(dtime_ns_t time);
@@ -326,6 +334,7 @@ public:
 
 private:
 	string text;
+	int64_t integer = 0;
 };
 
 } // namespace duckdb

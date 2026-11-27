@@ -11,6 +11,8 @@ name = "duckrs_capi"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
+# the Arrow C data interface (`arrow::ffi`) of the Arrow functions
+arrow = { workspace = true, features = ["ffi"] }
 duckrs.workspace = true
 duckrs-common.workspace = true
 libc.workspace = true
