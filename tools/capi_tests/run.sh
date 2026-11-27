@@ -46,7 +46,7 @@ if [[ ${#TESTS[@]} -eq 0 ]]; then
 		test_capi_append_data_chunk.cpp test_capi_to_decimal.cpp capi_scalar_functions.cpp capi_aggregate_functions.cpp
 		capi_table_functions.cpp test_capi_replacement_scan.cpp test_capi_table_description.cpp test_capi_arrow.cpp
 		capi_custom_type.cpp capi_copy_function.cpp capi_file_system.cpp test_capi_profiling.cpp test_capi_logging.cpp
-		test_capi_streaming.cpp)
+		test_capi_streaming.cpp test_capi_instance_cache.cpp)
 fi
 
 BUILD=${CAPI_TEST_BUILD:-$ROOT/target/capi_tests}

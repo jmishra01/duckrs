@@ -128,10 +128,40 @@ impl Database {
         self.instance.add_replacement_scan(Arc::new(scan));
     }
 
+    /// A handle that does not keep the database alive (`weak_ptr<DatabaseInstance>`, as `DBInstanceCache` holds it):
+    /// [`WeakDatabase::upgrade`] gives the database back while anything (a [`Database`], a [`Connection`]) still has
+    /// it.
+    pub fn downgrade(&self) -> WeakDatabase {
+        WeakDatabase {
+            instance: Arc::downgrade(&self.instance),
+            path: self.path.clone(),
+            read_only: self.read_only,
+        }
+    }
+
     /// Registers a log storage (`duckdb_register_log_storage`) under `name`, which `SET logging_storage` can then
     /// select: each log entry goes to it. False when a storage has the name already.
     pub fn register_log_storage(&self, name: &str, storage: Arc<dyn logging::LogStorageCallback>) -> bool {
         self.instance.register_log_storage(name, storage)
+    }
+}
+
+/// [`Database::downgrade`].
+#[derive(Debug, Clone)]
+pub struct WeakDatabase {
+    instance: std::sync::Weak<DatabaseInstance>,
+    path: Option<PathBuf>,
+    read_only: bool,
+}
+
+impl WeakDatabase {
+    /// The database, if it is still open.
+    pub fn upgrade(&self) -> Option<Database> {
+        Some(Database {
+            instance: self.instance.upgrade()?,
+            path: self.path.clone(),
+            read_only: self.read_only,
+        })
     }
 }
 
@@ -218,6 +248,12 @@ impl Connection {
     /// keeps that one.
     pub fn register_cast(&mut self, cast: udf::UserCast) {
         self.context.user_functions().register_cast(cast)
+    }
+
+    /// `Connection::GetTableNames` (`duckdb_get_table_names`): the tables the single statement of `sql` reads, by
+    /// name, or as written with `qualified`; tables the catalog does not have count too.
+    pub fn get_table_names(&mut self, sql: &str, qualified: bool) -> Result<Vec<String>> {
+        self.context.get_table_names(sql, qualified)
     }
 
     /// The profile of the last statement (`QueryProfiler::GetResult`), while profiling is on and that statement was

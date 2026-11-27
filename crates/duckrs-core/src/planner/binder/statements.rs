@@ -3080,6 +3080,10 @@ impl Binder<'_> {
                     }
                     entry => entry,
                 };
+                // `BindingMode::EXTRACT_NAMES`: a table, or a name the catalog lacks, is only noted
+                if let Some(dummy) = self.extract_base_table(table_ref, name, &entry) {
+                    return Ok(dummy);
+                }
                 // `Catalog::TryLookupDefaultTable`: the bare name of a database that has a default table stands for
                 // that table, once it is there; an entry of that name as well makes the name ambiguous
                 if name.qualification.is_empty()

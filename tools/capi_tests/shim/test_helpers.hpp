@@ -18,6 +18,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <functional>
 #include <limits>
 #include <map>
@@ -103,6 +106,39 @@ void DeleteDatabase(string path);
 void TestCreateDirectory(string path);
 void TestDeleteDirectory(string path);
 string TestJoinPath(string path1, string path2);
+
+//! `FileSystem`: the local one, with what the C API tests call of it.
+class FileSystem {
+public:
+	virtual ~FileSystem() = default;
+	static unique_ptr<FileSystem> CreateLocal() {
+		return make_uniq<FileSystem>();
+	}
+	bool TryRemoveFile(const string &path) {
+		return unlink(path.c_str()) == 0;
+	}
+	bool FileExists(const string &path) {
+		struct stat info;
+		return stat(path.c_str(), &info) == 0 && S_ISREG(info.st_mode);
+	}
+	bool ListFiles(const string &directory, const std::function<void(const string &, bool)> &callback) {
+		DIR *dir = opendir(directory.c_str());
+		if (!dir) {
+			return false;
+		}
+		while (struct dirent *entry = readdir(dir)) {
+			string name = entry->d_name;
+			if (name == "." || name == "..") {
+				continue;
+			}
+			struct stat info;
+			bool is_directory = stat((directory + "/" + name).c_str(), &info) == 0 && S_ISDIR(info.st_mode);
+			callback(name, is_directory);
+		}
+		closedir(dir);
+		return true;
+	}
+};
 
 //! `Printer::Print`: to stderr.
 struct Printer {

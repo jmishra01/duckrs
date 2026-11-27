@@ -1730,6 +1730,10 @@ impl Binder<'_> {
                 }
             }
         }
+        // `BindingMode::EXTRACT_NAMES`: columns and scalar functions are NULL
+        if let Some(bound) = self.extract_names_expression(expr)? {
+            return Ok(bound);
+        }
         let bound = match &expr.kind {
             ExprKind::Constant(literal) => BoundExpr::constant(literal_to_value(literal)?),
             // outside of a function that takes a lambda, `a -> b` is the JSON operator

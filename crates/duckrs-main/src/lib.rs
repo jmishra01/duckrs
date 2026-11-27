@@ -2636,6 +2636,22 @@ impl ClientContext {
         Ok((Some((bound.names, bound.types)), result_types))
     }
 
+    /// `ClientContext::GetTableNames`: the tables the single statement of `sql` reads, bound in
+    /// `BindingMode::EXTRACT_NAMES` (or `EXTRACT_QUALIFIED_NAMES`, which gives them as written), in order.
+    pub fn get_table_names(&mut self, sql: &str, qualified: bool) -> Result<Vec<String>> {
+        let _temp = SessionTemp::enter(&self.temp);
+        let statements = duckrs_parser::parse_ast_with(sql, &self.parser_options())?;
+        let [statement] = statements.as_slice() else {
+            return Err(Error::new(ErrorKind::InvalidInput, "Expected a single statement"));
+        };
+        let catalog = self.catalog();
+        let mut binder = Binder::with_options(&catalog, self.bind_options());
+        binder.session = Some(self.session_values());
+        let names = binder.extract_table_names(qualified);
+        binder.bind(statement)?;
+        Ok(names.names())
+    }
+
     /// `StatementProperties` of the last statement of `sql`: its type, and what its result holds. `None` when
     /// `sql` doesn't parse.
     pub fn statement_properties(&self, sql: &str) -> Option<StatementProperties> {
