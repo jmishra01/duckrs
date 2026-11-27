@@ -1907,6 +1907,14 @@ impl ClientContext {
                 .cloned()
                 .collect(),
             user_functions: Some(self.home.user_functions.clone()),
+            // `dbgen(...)` / `dsdgen(...)` in a FROM clause generate through the engine's scan
+            tpc_generator: Some(Arc::new(duckrs_core::planner::binder::tpc::TpcGenerator {
+                read_only: match &self.db.file_access {
+                    Some(FileAccess::ReadOnly(name)) => Some(name.clone()),
+                    _ => None,
+                },
+                scan: Box::new(duckrs_core::execution::tpc_generate::scan),
+            })),
             connection_count: self.home.connections.load(AtomicOrdering::SeqCst),
             // `DatabaseManager::ApproxDatabaseCount`: the system and temporary catalogs with the attached ones
             approx_database_count: 3 + self.home.attached.read().len() as u64,

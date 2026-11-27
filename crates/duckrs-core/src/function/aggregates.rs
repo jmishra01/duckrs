@@ -569,6 +569,222 @@ fn state_to_value_of(
     Value::new(ty.clone(), value.data().clone())
 }
 
+/// What a typed kernel below reads from one state: `None` for a state it does not handle (the
+/// caller then goes a value at a time), else the value to store, `None` for NULL.
+type TypedSlot<T> = Option<Result<Option<T>>>;
+
+/// Stores `read` of each of `states` in the typed data of `column` from its first row on.
+/// `column` is a flat vector of at least `states.len()` valid rows, as `Vector::new` makes. False,
+/// with the validity untouched, when `read` does not handle a state: the per-value path then
+/// writes every row again.
+fn write_states_typed<T: NativeType>(
+    states: &[AggregateState],
+    column: &mut Vector,
+    read: impl Fn(&AggregateState) -> TypedSlot<T>,
+) -> Result<bool> {
+    let mut nulls = Vec::new();
+    {
+        let out = column.data_mut::<T>();
+        if out.len() < states.len() {
+            return Ok(false);
+        }
+        for (row, (slot, state)) in out.iter_mut().zip(states).enumerate() {
+            match read(state) {
+                None => return Ok(false),
+                Some(value) => match value? {
+                    Some(value) => *slot = value,
+                    None => nulls.push(row),
+                },
+            }
+        }
+    }
+    let validity = column.validity_mut();
+    for row in nulls {
+        validity.set_invalid(row);
+    }
+    Ok(true)
+}
+
+/// [`state_to_value_of`] of each of `states` on the typed data of `column`, for the states whose
+/// layout is a number: a count's (BIGINT) and a sum's (`OptionalStateType<T>`, NULL until a row
+/// was added). False for the others.
+fn export_states_typed(kind: AggregateKind, states: &[AggregateState], column: &mut Vector) -> Result<bool> {
+    use AggregateKind::*;
+    use AggregateState as S;
+    match (kind, column.physical_type()) {
+        (CountStar | Count, PhysicalType::Int64) => write_states_typed::<i64>(states, column, |state| match state {
+            S::Count(n) => Some(Ok(Some(*n))),
+            _ => None,
+        }),
+        (SumInteger | SumNoOverflow | SumDecimal, PhysicalType::Int128) => {
+            write_states_typed::<i128>(states, column, |state| match state {
+                S::Integer { count: 0, .. } => Some(Ok(None)),
+                S::Integer { sum, .. } => Some(Ok(Some(*sum))),
+                _ => None,
+            })
+        }
+        (SumInteger | SumNoOverflow | SumDecimal, PhysicalType::Int64) => {
+            write_states_typed::<i64>(states, column, |state| match state {
+                S::Integer { count: 0, .. } => Some(Ok(None)),
+                S::Integer { sum, .. } => Some(i64::try_from(*sum).map(Some).map_err(|_| {
+                    Error::new(
+                        ErrorKind::OutOfRange,
+                        format!("Overflow in aggregate state: {sum} does not fit in a BIGINT"),
+                    )
+                })),
+                _ => None,
+            })
+        }
+        (SumDouble, PhysicalType::Double) => write_states_typed::<f64>(states, column, |state| match state {
+            S::Double { count: 0, .. } => Some(Ok(None)),
+            S::Double { sum, .. } => Some(Ok(Some(*sum))),
+            _ => None,
+        }),
+        _ => Ok(false),
+    }
+}
+
+/// [`AggregateFunction::finalize`] of each of `states` on the typed data of `column`, for counts,
+/// sums and averages whose result is of the type `finalize` makes. False for the others.
+fn finalize_states_typed(
+    kind: AggregateKind,
+    states: &[AggregateState],
+    return_type: &LogicalType,
+    input: Option<&LogicalType>,
+    column: &mut Vector,
+) -> Result<bool> {
+    use AggregateKind::*;
+    use AggregateState as S;
+    let max_width = duckrs_common::types::decimal::MAX_WIDTH;
+    match kind {
+        CountStar | Count if *return_type == LogicalType::BIGINT => {
+            write_states_typed::<i64>(states, column, |state| match state {
+                S::Count(n) => Some(Ok(Some(*n))),
+                _ => None,
+            })
+        }
+        SumInteger | SumNoOverflow if *return_type == LogicalType::HUGEINT => {
+            write_states_typed::<i128>(states, column, |state| match state {
+                S::Integer { count: 0, .. } => Some(Ok(None)),
+                S::Integer { sum, .. } => Some(Ok(Some(*sum))),
+                _ => None,
+            })
+        }
+        SumDecimal => {
+            let Some((_, scale)) = return_type.decimal_properties() else {
+                return Ok(false);
+            };
+            if *return_type != LogicalType::decimal(max_width, scale) || column.physical_type() != PhysicalType::Int128
+            {
+                return Ok(false);
+            }
+            let limit = 10u128.pow(max_width as u32);
+            write_states_typed::<i128>(states, column, |state| match state {
+                S::Integer { count: 0, .. } => Some(Ok(None)),
+                S::Integer { sum, .. } if sum.unsigned_abs() >= limit => Some(Err(Error::new(
+                    ErrorKind::OutOfRange,
+                    format!("Overflow in SUM of DECIMAL: the result does not fit in DECIMAL({max_width})"),
+                ))),
+                S::Integer { sum, .. } => Some(Ok(Some(*sum))),
+                _ => None,
+            })
+        }
+        AvgInteger if *return_type == LogicalType::DOUBLE => {
+            write_states_typed::<f64>(states, column, |state| match state {
+                S::Integer { count: 0, .. } => Some(Ok(None)),
+                S::Integer { sum, count } => Some(Ok(Some(int_to_double(*sum) / *count as f64))),
+                _ => None,
+            })
+        }
+        AvgDecimal if *return_type == LogicalType::DOUBLE => {
+            let Some((_, scale)) = input.and_then(|t| t.decimal_properties()) else {
+                return Ok(false);
+            };
+            let power = uhuge_to_double(10u128.pow(scale as u32));
+            write_states_typed::<f64>(states, column, |state| match state {
+                S::Integer { count: 0, .. } => Some(Ok(None)),
+                S::Integer { sum, count } => Some(Ok(Some(int_to_double(*sum) / (*count as f64 * power)))),
+                _ => None,
+            })
+        }
+        SumDouble | AvgDouble if *return_type == LogicalType::DOUBLE => {
+            let average = kind == AvgDouble;
+            write_states_typed::<f64>(states, column, |state| match state {
+                S::Double { count: 0, .. } => Some(Ok(None)),
+                S::Double { sum, count } if average => Some(Ok(Some(*sum / *count as f64))),
+                S::Double { sum, .. } => Some(Ok(Some(*sum))),
+                _ => None,
+            })
+        }
+        _ => Ok(false),
+    }
+}
+
+/// [`value_to_state_of`] of the first `count` rows of `vector`, a vector of exported states whose
+/// layout is a number ([`export_states_typed`]), read from its typed data; and the rows that are
+/// NULL. `None` for the other states.
+fn import_states_typed(
+    kind: AggregateKind,
+    vector: &Vector,
+    count: usize,
+) -> Option<(Vec<AggregateState>, Vec<usize>)> {
+    use AggregateKind::*;
+    use AggregateState as S;
+    let unified = vector.to_unified(count);
+    let mut nulls = Vec::new();
+    let mut read = |make: &dyn Fn(usize) -> AggregateState, initial: AggregateState| -> Vec<AggregateState> {
+        (0..count)
+            .map(|row| {
+                let at = unified.sel.get(row);
+                if unified.validity.is_valid(at) {
+                    make(at)
+                } else {
+                    nulls.push(row);
+                    initial.clone()
+                }
+            })
+            .collect()
+    };
+    let states = match (kind, vector.physical_type()) {
+        (CountStar | Count, PhysicalType::Int64) => {
+            let data = unified.data::<i64>();
+            read(&|at| S::Count(data[at]), S::Count(0))
+        }
+        (SumInteger | SumNoOverflow | SumDecimal, PhysicalType::Int128) => {
+            let data = unified.data::<i128>();
+            read(
+                &|at| S::Integer {
+                    sum: data[at],
+                    count: 1,
+                },
+                kind.initial_state(),
+            )
+        }
+        (SumInteger | SumNoOverflow | SumDecimal, PhysicalType::Int64) => {
+            let data = unified.data::<i64>();
+            read(
+                &|at| S::Integer {
+                    sum: i128::from(data[at]),
+                    count: 1,
+                },
+                kind.initial_state(),
+            )
+        }
+        (SumDouble, PhysicalType::Double) => {
+            let data = unified.data::<f64>();
+            read(
+                &|at| S::Double {
+                    sum: data[at],
+                    count: 1,
+                },
+                kind.initial_state(),
+            )
+        }
+        _ => return None,
+    };
+    Some((states, nulls))
+}
+
 /// An integral state field of type `ty` (BIGINT or HUGEINT).
 fn integer_of(value: i128, ty: &LogicalType) -> Result<Value> {
     if ty.id() == LogicalTypeId::BigInt {
@@ -882,19 +1098,53 @@ impl<'a> StateFinalizer<'a> {
         }
     }
 
+    /// The aggregate the state type names, its result type and the layout of its states, found once.
+    fn resolved(&self) -> Result<&(Arc<AggregateFunction>, LogicalType, LogicalType)> {
+        Ok(match self.resolved.get() {
+            Some(resolved) => resolved,
+            None => {
+                let (function, result) = resolve_state(self.ty)?;
+                self.resolved.get_or_init(|| (function, result, self.ty.state_layout()))
+            }
+        })
+    }
+
+    /// [`finalize`](Self::finalize) of the first `count` rows of `states` into `result`, on the vectors' typed data,
+    /// for the exported states of counts and sums. False, with `result` untouched, for the other states, which are
+    /// finalized a value at a time.
+    pub fn finalize_vector(&self, states: &Vector, count: usize, result: &mut Vector) -> Result<bool> {
+        let ty = self.ty;
+        if !ty.is_aggregate_state() || !ty.aggregate_state_orders().is_empty() {
+            return Ok(false);
+        }
+        let (.., arguments, _) = ty.aggregate_state_info().ok_or_else(state_failure)?;
+        let (function, result_type, _) = self.resolved()?;
+        if function.user.is_some() || function.export.is_some() || result.logical_type() != result_type {
+            return Ok(false);
+        }
+        let Some((imported, nulls)) = import_states_typed(function.kind, states, count) else {
+            return Ok(false);
+        };
+        let mut column = Vector::new(result_type.clone(), count.max(1));
+        if !finalize_states_typed(function.kind, &imported, result_type, arguments.first(), &mut column)? {
+            return Ok(false);
+        }
+        // a NULL state finalizes to NULL, a count's included
+        let validity = column.validity_mut();
+        for row in nulls {
+            validity.set_invalid(row);
+        }
+        *result = column;
+        Ok(true)
+    }
+
     pub fn finalize(&self, value: &Value) -> Result<Value> {
         let ty = self.ty;
         if !ty.aggregate_state_orders().is_empty() {
             return finalize_sorted(value, ty);
         }
         let (.., arguments, _) = ty.aggregate_state_info().ok_or_else(state_failure)?;
-        let (function, result, layout) = match self.resolved.get() {
-            Some(resolved) => resolved,
-            None => {
-                let (function, result) = resolve_state(ty)?;
-                self.resolved.get_or_init(|| (function, result, ty.state_layout()))
-            }
-        };
+        let (function, result, layout) = self.resolved()?;
         if value.is_null() {
             return Ok(Value::null(result.clone()));
         }
@@ -1950,10 +2200,16 @@ impl AggregateFunction {
             return user.finalize(states, column);
         }
         if self.export.is_some() && return_type.is_aggregate_state() {
+            if export_states_typed(self.kind, states, column)? {
+                return Ok(());
+            }
             let layout = return_type.state_layout();
             for (row, state) in states.iter().enumerate() {
                 column.set_value(row, &state_to_value_of(self.kind, state, return_type, &layout)?)?;
             }
+            return Ok(());
+        }
+        if self.export.is_none() && finalize_states_typed(self.kind, states, return_type, input, column)? {
             return Ok(());
         }
         for (row, state) in states.iter().enumerate() {
