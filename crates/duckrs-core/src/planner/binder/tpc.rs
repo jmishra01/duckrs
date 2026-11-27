@@ -21,6 +21,9 @@ impl Binder<'_> {
         args: &[FunctionArgument],
         table_ref: &TableRef,
     ) -> Result<Option<LogicalOperator>> {
+        if let Some(benchmark) = TpcBenchmark::of_generator(name) {
+            return self.bind_tpc_generator(benchmark, args, table_ref).map(Some);
+        }
         let (names, types, rows) = match name {
             "tpch_queries" => {
                 let sf = self.query_scale_factor(name, args)?;
@@ -220,4 +223,171 @@ fn no_match(function: &str, args: &[FunctionArgument]) -> Error {
 
 fn invalid_named_parameter(function: &str, name: &str) -> Error {
     binder_error(format!("Invalid named parameter \"{name}\" for function {function}"))
+}
+
+/// The benchmark of a TPC extension's generator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TpcBenchmark {
+    Tpch,
+    Tpcds,
+}
+
+impl TpcBenchmark {
+    fn of_generator(name: &str) -> Option<Self> {
+        match name {
+            "dbgen" => Some(TpcBenchmark::Tpch),
+            "dsdgen" => Some(TpcBenchmark::Tpcds),
+            _ => None,
+        }
+    }
+
+    /// The name of its generator, `dbgen` or `dsdgen`.
+    pub fn generator(self) -> &'static str {
+        match self {
+            TpcBenchmark::Tpch => "dbgen",
+            TpcBenchmark::Tpcds => "dsdgen",
+        }
+    }
+
+    /// The type of a named option of the generator (its `TypedKwargs`).
+    fn option_type(self, name: &str) -> Option<LogicalType> {
+        Some(match (self, name) {
+            (_, "sf") => LogicalType::DOUBLE,
+            (_, "overwrite") | (TpcBenchmark::Tpcds, "keys") => LogicalType::BOOLEAN,
+            (_, "catalog" | "schema" | "suffix") => LogicalType::VARCHAR,
+            (TpcBenchmark::Tpch, "children" | "step") => LogicalType::UINTEGER,
+            _ => return None,
+        })
+    }
+}
+
+/// `DBGenFunctionData` / `DSDGenFunctionData`: what a `dbgen(...)` or `dsdgen(...)` in a FROM clause generates,
+/// into the tables of `schema`.
+#[derive(Debug, Clone)]
+pub struct TpcGeneration {
+    pub benchmark: TpcBenchmark,
+    pub schema: std::sync::Arc<crate::catalog::SchemaCatalogEntry>,
+    pub sf: f64,
+    pub suffix: String,
+    pub overwrite: bool,
+    pub keys: bool,
+    pub children: u32,
+    pub step: Option<u32>,
+}
+
+/// The client's side of `dbgen(...)` / `dsdgen(...)` in a FROM clause: the scan that generates the data when the
+/// query runs (in `execution`, which the binder can't use), and whether the database takes writes.
+pub struct TpcGenerator {
+    /// the name of the database if it is read-only (`RegisterDBModify` refuses it)
+    pub read_only: Option<String>,
+    pub scan: Box<dyn Fn(TpcGeneration) -> std::sync::Arc<dyn crate::function::udf::TableUdfScan> + Send + Sync>,
+}
+
+impl Binder<'_> {
+    /// `DbgenBind` / `DsdgenBind` of a call in a FROM clause: a scan with the one column `Success` and no rows, whose
+    /// run creates the tables and fills them.
+    fn bind_tpc_generator(
+        &mut self,
+        benchmark: TpcBenchmark,
+        args: &[FunctionArgument],
+        table_ref: &TableRef,
+    ) -> Result<LogicalOperator> {
+        let function = benchmark.generator();
+        if args.iter().any(|a| a.name.is_empty()) {
+            return Err(no_match(function, args));
+        }
+        let mut sf = 0.0;
+        let (mut schema, mut suffix, mut overwrite, mut keys) = (None, String::new(), false, false);
+        let (mut children, mut step) = (1, None);
+        for argument in args {
+            let name = argument.name.to_lowercase();
+            let Some(ty) = benchmark.option_type(&name) else {
+                return Err(invalid_named_parameter(function, &argument.name));
+            };
+            let value = self.constant_argument(&argument.expr)?;
+            if value.is_null() {
+                return Err(binder_error("Cannot use NULL as function argument"));
+            }
+            let value = crate::function::cast::cast_value(&value, &ty)?;
+            match (name.as_str(), value.data()) {
+                ("sf", ValueData::Double(v)) => sf = *v,
+                ("schema", _) => schema = Some(value.try_to_string()?),
+                ("suffix", _) => suffix = value.try_to_string()?,
+                ("overwrite", ValueData::Bool(v)) => overwrite = *v,
+                ("keys", ValueData::Bool(v)) => keys = *v,
+                ("children", ValueData::UInt32(v)) => children = *v,
+                ("step", ValueData::UInt32(v)) => step = Some(*v),
+                // the tables go into the database the statement runs in
+                ("catalog", _) => {
+                    return Err(crate::unported(format!(
+                        "the catalog option of {function} in a FROM clause (use CALL {function}(...))"
+                    )));
+                }
+                _ => {}
+            }
+        }
+        if children != 1 && step.is_none() {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "Step must be defined when children are defined",
+            ));
+        }
+        let generator = self
+            .session
+            .as_ref()
+            .and_then(|session| session.tpc_generator.clone())
+            .ok_or_else(|| crate::unported(format!("{function} here")))?;
+        // `RegisterDBModify`
+        if let Some(database) = &generator.read_only {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "Cannot execute statement of type \"SELECT\" on database \"{database}\" which is attached in \
+                     read-only mode!"
+                ),
+            ));
+        }
+        let schema = self.catalog.schema_for(schema.as_deref())?;
+        let scan = (generator.scan)(TpcGeneration {
+            benchmark,
+            schema,
+            sf,
+            suffix,
+            overwrite,
+            keys,
+            children,
+            step,
+        });
+        let types = vec![LogicalType::BOOLEAN];
+        let alias = if table_ref.alias.is_empty() {
+            function.to_string()
+        } else {
+            table_ref.alias.clone()
+        };
+        let names = Self::alias_columns(table_ref, &alias, vec!["Success".to_string()])?;
+        let table_index = self.generate_table_index();
+        self.bind_context.add_binding(super::Binding {
+            alias,
+            schema: None,
+            catalog: None,
+            table_index,
+            names,
+            types: types.clone(),
+            row_id: None,
+            virtual_columns: Vec::new(),
+            generated: Vec::new(),
+        });
+        Ok(LogicalOperator::new(
+            LogicalOperatorKind::UserTableScan {
+                table_index,
+                types,
+                scan: crate::function::udf::UserTableScan {
+                    name: function.to_uppercase(),
+                    scan,
+                    cardinality: Some((0, true)),
+                },
+            },
+            vec![],
+        ))
+    }
 }

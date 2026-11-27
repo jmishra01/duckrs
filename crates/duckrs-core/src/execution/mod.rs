@@ -11,6 +11,7 @@ pub mod csv;
 pub mod csv_sniffer;
 pub mod csv_state_machine;
 pub mod expression_executor;
+pub mod tpc_generate;
 pub mod external_sort;
 pub mod file_system;
 pub mod interrupt;
