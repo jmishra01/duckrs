@@ -698,28 +698,52 @@ pub fn sort_collection(
     input: &ColumnDataCollection,
     orders: &[(usize, OrderModifiers)],
 ) -> Result<ColumnDataCollection> {
-    let mut keyed: Vec<(Vec<u8>, usize, usize)> = Vec::with_capacity(input.len());
-    for (c, chunk) in input.chunks().enumerate() {
-        let columns: Vec<(&Vector, OrderModifiers)> = orders.iter().map(|(i, m)| (chunk.column(*i), *m)).collect();
-        for (r, key) in create_sort_keys(&columns, chunk.len())?.into_iter().enumerate() {
-            keyed.push((key, c, r));
-        }
-    }
-    keyed.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut output = ColumnDataCollection::new(input.types().to_vec());
-    for batch in keyed.chunks(crate::STANDARD_VECTOR_SIZE) {
-        let mut out = DataChunk::with_capacity(input.types(), batch.len());
-        for (col, column) in out.columns_mut().iter_mut().enumerate() {
-            for (i, (_, c, r)) in batch.iter().enumerate() {
-                let source = input.chunk(*c).column(col);
-                column.copy_from(
-                    source,
-                    &SelectionVector::from_vec(vec![*r as u32]),
-                    1,
-                    i,
-                    crate::vector::StringCopy::Reference,
-                );
+    use crate::vector::StringCopy;
+    let total = input.len();
+    let types = input.types();
+    // the keys of every row, one after another in one buffer: row `r`'s is `keys[ends[r - 1]..ends[r]]`
+    let mut keys = Vec::new();
+    let mut ends = Vec::with_capacity(total);
+    // every row in one chunk, in input order, which the sorted rows are then gathered from
+    let mut all = DataChunk::with_capacity(types, total.max(1));
+    let mut at = 0;
+    for chunk in input.chunks() {
+        let count = chunk.len();
+        let prepared = orders
+            .iter()
+            .map(|(i, m)| {
+                Ok((
+                    KeyColumn::new_with(chunk.column(*i), count, *m, false)?,
+                    m.order == OrderType::Descending,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for row in 0..count {
+            for (column, flip) in &prepared {
+                column.encode(row, *flip, &mut keys);
             }
+            ends.push(keys.len());
+        }
+        for (column, source) in all.columns_mut().iter_mut().zip(chunk.columns()) {
+            column.copy_range_from(source, 0, count, at, StringCopy::Reference);
+        }
+        at += count;
+    }
+    all.set_len(total);
+    let key = |row: u32| {
+        let row = row as usize;
+        let start = if row == 0 { 0 } else { ends[row - 1] };
+        &keys[start..ends[row]]
+    };
+    // stable, so that rows with equal keys keep their input order
+    let mut rows: Vec<u32> = (0..total as u32).collect();
+    rows.sort_by(|&a, &b| key(a).cmp(key(b)));
+    let mut output = ColumnDataCollection::new(types.to_vec());
+    for batch in rows.chunks(crate::STANDARD_VECTOR_SIZE) {
+        let sel = SelectionVector::from_vec(batch.to_vec());
+        let mut out = DataChunk::with_capacity(types, batch.len());
+        for (column, source) in out.columns_mut().iter_mut().zip(all.columns()) {
+            column.copy_from(source, &sel, batch.len(), 0, StringCopy::Reference);
         }
         out.set_len(batch.len());
         output.append(&out);
