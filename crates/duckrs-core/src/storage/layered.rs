@@ -320,6 +320,7 @@ impl TableSource for LayeredTable {
                             block_id: -1,
                             block_offset: 0,
                             info: None,
+                            additional_blocks: None,
                         });
                     }
                     continue;
