@@ -375,7 +375,12 @@ fn open_builder(path: &str) -> Result<ParquetRecordBatchReaderBuilder<File>> {
     let file = File::open(path).map_err(|e| Error::new(ErrorKind::Io, format!("Cannot open file \"{path}\": {e}")))?;
     let builder = guarded(path, || {
         ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| read_error(path, "Invalid Parquet file", e))
-    })?;
+    });
+    // C++ checks what the footer says before anything reads it, and the crate stops at other things first
+    if let Some(error) = footer_error(path) {
+        return Err(error);
+    }
+    let builder = builder?;
     check_schema_depth(builder.parquet_schema().root_schema(), path)?;
     check_variant_groups(builder.parquet_schema().root_schema(), path)?;
     Ok(builder)
@@ -4508,6 +4513,119 @@ fn raw_footer(path: &str) -> Option<ThriftValue> {
     read_thrift_struct(&mut file, size as i64 - 8 - i64::from(length), length)
 }
 
+/// What C++ refuses in the footer of the file at `path`, as it says it, in the order it looks: while
+/// `ParquetReader::ParseSchema` walks the schema (the leaves of a VARIANT, then the elements outside the tree), and
+/// as `ColumnReader::InitializeRead` starts a column chunk. `None` if the footer is fine, or isn't one to read.
+fn footer_error(path: &str) -> Option<Error> {
+    let footer = raw_footer(path)?;
+    let schema = footer.field(2)?.items();
+    let text = |value: Option<&ThriftValue>| match value {
+        Some(ThriftValue::Binary(bytes)) => String::from_utf8_lossy(bytes).into_owned(),
+        _ => String::new(),
+    };
+    let children = |element: &ThriftValue| element.field(5).and_then(ThriftValue::int).unwrap_or(0).max(0) as usize;
+    // `ParseSchemaRecursive`, without recursion: each element and the next index after its subtree
+    let mut pending = vec![0usize];
+    let mut consumed = 0usize;
+    while let Some(index) = pending.pop() {
+        let element = schema.get(index)?;
+        consumed += 1;
+        let count = children(element);
+        // the children's indexes: each starts after the subtree of the one before
+        let mut child = index + 1;
+        let mut starts = Vec::with_capacity(count);
+        for _ in 0..count {
+            if child >= schema.len() {
+                return None;
+            }
+            starts.push(child);
+            child = subtree_end(schema, child, &children)?;
+        }
+        // `LogicalType::VARIANT` (field 16)
+        let is_variant = element.field(10).and_then(|logical| logical.field(16)).is_some();
+        if is_variant {
+            for &start in &starts {
+                let child = &schema[start];
+                let name = text(child.field(4));
+                if name != "metadata" && name != "value" {
+                    continue;
+                }
+                // BYTE_ARRAY (6), read as BLOB or VARCHAR: no logical type other than STRING (field 1)
+                let byte_array = child.field(1).and_then(ThriftValue::int) == Some(6);
+                let binary = child.field(10).is_none_or(|logical| logical.field(1).is_some());
+                if children(child) != 0 || !byte_array || !binary {
+                    return Some(Error::new(
+                        ErrorKind::DataCorruption,
+                        format!(
+                            "Failed to read Parquet file \"{path}\": the '{name}' column of VARIANT column \"{}\" \
+                             must be a binary BYTE_ARRAY column",
+                            text(element.field(4))
+                        ),
+                    ));
+                }
+            }
+        }
+        pending.extend(starts.into_iter().rev());
+    }
+    if consumed != schema.len() {
+        return Some(invalid(format!(
+            "Failed to read Parquet file \"{path}\": schema has elements that are not part of the schema tree"
+        )));
+    }
+    let groups = footer.field(4).map(ThriftValue::items).unwrap_or(&[]);
+    // `ParquetStatisticsUtils::TransformColumnStatistics` of GEOMETRY chunks (`GeometryStats::TryAddWKBType`): the
+    // geospatial types (`ColumnMetaData` field 17, its field 2) are WKB codes of 4 vertex types and 7 geometry types
+    for chunk in groups
+        .iter()
+        .flat_map(|group| group.field(1).map(ThriftValue::items).unwrap_or(&[]))
+    {
+        let types = chunk
+            .field(3)
+            .and_then(|meta| meta.field(17))
+            .and_then(|geo| geo.field(2));
+        for code in types
+            .map(ThriftValue::items)
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(ThriftValue::int)
+        {
+            let (vertex, geometry) = (code / 1000, code % 1000);
+            if !(0..4).contains(&vertex) || !(1..8).contains(&geometry) {
+                return Some(Error::new(
+                    ErrorKind::DataCorruption,
+                    "Invalid geometry type in Parquet file",
+                ));
+            }
+        }
+    }
+    // a footer of `PAR1` is not encrypted itself, so a chunk's crypto metadata has no file crypto metadata to go with
+    for group in groups {
+        for chunk in group.field(1).map(ThriftValue::items).unwrap_or(&[]) {
+            if chunk.field(8).is_some() {
+                return Some(invalid("File is encrypted but no file crypto metadata is set"));
+            }
+            if chunk.field(3).is_none() {
+                return Some(invalid(format!(
+                    "Failed to read file \"{path}\": column chunk is missing its metadata"
+                )));
+            }
+        }
+    }
+    None
+}
+
+/// The index after the subtree of schema element `index`; `None` if the schema ends inside it.
+fn subtree_end(schema: &[ThriftValue], index: usize, children: &dyn Fn(&ThriftValue) -> usize) -> Option<usize> {
+    let mut remaining = 1usize;
+    let mut at = index;
+    while remaining > 0 {
+        let element = schema.get(at)?;
+        remaining = remaining - 1 + children(element);
+        at += 1;
+    }
+    Some(at)
+}
+
 /// What the crate leaves out of a column chunk's metadata: its encodings in the order the file lists them (the
 /// crate keeps a set), and its deprecated and current bounds apart (the crate keeps one of them).
 #[derive(Default, Clone)]
@@ -4981,7 +5099,17 @@ pub fn page_index_rows(path: &str) -> Result<Vec<String>> {
                         .and_then(|l| l.field(3))
                         .and_then(ThriftValue::int)
                         .unwrap_or(row_group.num_rows());
-                    count = first.map(|f| next - f);
+                    count = match first {
+                        Some(first) => Some(next.checked_sub(first).ok_or_else(|| {
+                            Error::new(
+                                ErrorKind::DataCorruption,
+                                format!(
+                                    "Failed to read file \"{path}\": metadata is corrupt. Page row count overflows"
+                                ),
+                            )
+                        })?),
+                        None => None,
+                    };
                 }
                 let has_bounds = column_index.is_some()
                     && page < null_pages.len()
