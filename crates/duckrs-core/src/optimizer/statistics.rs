@@ -22,7 +22,7 @@ use crate::function::binder::bind_aggregate_function;
 use crate::function::{BuiltinFunctions, constant_or_null};
 use crate::planner::column_binding_resolver::resolve_column_bindings;
 use crate::planner::expression::{BoundAggregate, BoundExpr, BoundExprKind, BoundOperator, ColumnBinding};
-use crate::planner::logical::{COLUMN_IDENTIFIER_ROW_ID, LogicalOperator, LogicalOperatorKind as K};
+use crate::planner::logical::{COLUMN_IDENTIFIER_ROW_ID, LogicalOperator, LogicalOperatorKind as K, PerfectHashGroup};
 use duckrs_common::types::{LogicalType, LogicalTypeId, PhysicalType};
 use duckrs_common::value::{Value, ValueData};
 use duckrs_parser::ast::{ComparisonOp, JoinType};
@@ -379,7 +379,7 @@ fn compute_ordered_statistics(table: &Arc<TableCatalogEntry>, positions: Option<
             aggregates,
             grouping_sets: Vec::new(),
             grouping_functions: Vec::new(),
-            perfect_hash: false,
+            perfect_hash: None,
             domain_cap: None,
         },
         vec![scan],
@@ -3312,13 +3312,16 @@ impl StatisticsPropagator {
                 domain_cap,
                 ..
             } if grouping_sets.len() <= 1 && grouping_sets.iter().all(|set| set.len() == groups.len()) => {
-                *perfect_hash = !self.filter_simplification
+                let can = !self.filter_simplification
                     && grouping_functions.is_empty()
                     && !groups.is_empty()
-                    && !aggregates.iter().any(|a| a.distinct)
-                    && self
-                        .perfect_hash_bits(groups)
-                        .is_some_and(|bits| bits <= self.perfect_ht_threshold);
+                    && !aggregates.iter().any(|a| a.distinct);
+                *perfect_hash = can
+                    .then(|| self.perfect_hash_groups(groups))
+                    .flatten()
+                    .filter(|ranges| {
+                        ranges.iter().map(|g| u64::from(g.bits)).sum::<u64>() <= self.perfect_ht_threshold
+                    });
                 // the result has no more rows than the input (its maximum, not its estimate)
                 *domain_cap = (!self.filter_simplification)
                     .then(|| self.group_domain_bound(groups))
@@ -3461,12 +3464,12 @@ impl StatisticsPropagator {
         Some(bound as u64)
     }
 
-    /// The bits the groups take in a perfect hash table (`CanUsePerfectHashAggregate`): each needs
-    /// its range of values, plus one for NULL and one to count from one. Groups must be integers,
-    /// with statistics unless their type is small enough to take its whole range.
-    fn perfect_hash_bits(&mut self, groups: &[BoundExpr]) -> Option<u64> {
+    /// The ranges of the groups in a perfect hash table (`CanUsePerfectHashAggregate`): each needs
+    /// the bits of its range of values, plus one for NULL and one to count from one. Groups must be
+    /// integers, with statistics unless their type is small enough to take its whole range.
+    fn perfect_hash_groups(&mut self, groups: &[BoundExpr]) -> Option<Vec<PerfectHashGroup>> {
         use duckrs_common::types::PhysicalType::*;
-        let mut total = 0;
+        let mut ranges = Vec::with_capacity(groups.len());
         for group in groups {
             let ty = &group.return_type;
             let physical = ty.physical_type();
@@ -3495,9 +3498,12 @@ impl StatisticsPropagator {
                 return None;
             }
             // `RequiredBitsForValue`
-            total += u64::from(64 - (range + 2).leading_zeros());
+            ranges.push(PerfectHashGroup {
+                min,
+                bits: 64 - (range + 2).leading_zeros(),
+            });
         }
-        Some(total)
+        Some(ranges)
     }
 }
 

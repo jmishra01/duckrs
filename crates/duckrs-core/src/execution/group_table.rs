@@ -12,14 +12,19 @@ use duckrs_common::Result;
 use duckrs_common::comparison::ComparisonType;
 use duckrs_common::hash::{combine_hash, hash_vector};
 use duckrs_common::row::{RowMatcher, RowPtr, RowValidity, TupleDataCollection, TupleDataLayout};
-use duckrs_common::types::{LogicalType, LogicalTypeId};
+use duckrs_common::types::{LogicalType, LogicalTypeId, PhysicalType};
 use duckrs_common::vector::{DataChunk, SelectionVector};
+
+use crate::planner::logical::PerfectHashGroup;
 
 const SALT_SHIFT: u32 = 48;
 const ID_MASK: u64 = (1 << SALT_SHIFT) - 1;
 
 /// The entries a table starts with (`GroupedAggregateHashTable::InitialCapacity`).
 const INITIAL_CAPACITY: usize = 4096;
+
+/// The most bits the slots of a [`DirectIndex`] take, so that its ids stay a few megabytes at most.
+const MAX_DIRECT_BITS: u32 = 20;
 
 /// How many rows ahead a lookup asks for the entry it will read, so that the reads of a table larger than the
 /// caches overlap rather than wait one by one.
@@ -36,6 +41,74 @@ pub struct GroupTable {
     matcher: RowMatcher,
     /// what [`Self::find_or_create`] works in, kept so that a chunk allocates none of it
     scratch: Scratch,
+    /// for groups of small integer ranges, the groups by the slot their values make
+    direct: Option<DirectIndex>,
+}
+
+/// The groups of a table by the offsets of their values from the minima of their ranges, side by side in the bits
+/// of a slot (`PhysicalPerfectHashAggregate`): a row whose values are in their ranges finds its group by its slot,
+/// with no hash and no comparison. It has only ids the table gave out, so a slot without one, or a row out of the
+/// ranges, finds its group in the table as any row does.
+#[derive(Debug)]
+struct DirectIndex {
+    ranges: Vec<PerfectHashGroup>,
+    /// by slot, the id of its group plus one; 0 for a slot that has none yet
+    ids: Vec<u32>,
+}
+
+/// No slot: a row with a value out of its range.
+const NO_SLOT: u32 = u32::MAX;
+
+impl DirectIndex {
+    /// The slot of each row of `groups`, or [`NO_SLOT`]: per column `bits` bits of the value's offset from the
+    /// minimum plus one, where 0 is NULL.
+    fn slots(&self, groups: &DataChunk) -> Vec<u32> {
+        let count = groups.len();
+        let mut slots = vec![0u32; count];
+        let mut shift = 0;
+        for (column, range) in groups.columns().iter().zip(&self.ranges) {
+            let format = column.to_unified(count);
+            // the values offsets 1 to `2^bits - 1` stand for, in the column's type: an offset is the difference
+            // of two of them, which the type holds
+            let last = range.min + (1i128 << range.bits) - 2;
+            macro_rules! offsets {
+                ($t:ty) => {{
+                    let data = format.data::<$t>();
+                    let Ok(min) = <$t>::try_from(range.min) else {
+                        return vec![NO_SLOT; count];
+                    };
+                    let max = <$t>::try_from(last).unwrap_or(<$t>::MAX);
+                    let all_valid = format.validity.all_valid();
+                    for (row, slot) in slots.iter_mut().enumerate() {
+                        let index = format.sel.get(row);
+                        if !all_valid && !format.validity.is_valid(index) {
+                            continue;
+                        }
+                        let value = data[index];
+                        *slot = if (min..=max).contains(&value) {
+                            // under 2^20 apart, so their difference in 64 bits is exact, wrapped or not
+                            *slot | (((value as i64).wrapping_sub(min as i64) as u32 + 1) << shift)
+                        } else {
+                            NO_SLOT
+                        };
+                    }
+                }};
+            }
+            match column.physical_type() {
+                PhysicalType::Int8 => offsets!(i8),
+                PhysicalType::Int16 => offsets!(i16),
+                PhysicalType::Int32 => offsets!(i32),
+                PhysicalType::Int64 => offsets!(i64),
+                PhysicalType::UInt8 => offsets!(u8),
+                PhysicalType::UInt16 => offsets!(u16),
+                PhysicalType::UInt32 => offsets!(u32),
+                PhysicalType::UInt64 => offsets!(u64),
+                _ => return vec![NO_SLOT; count],
+            }
+            shift += range.bits;
+        }
+        slots
+    }
 }
 
 /// The buffers of a lookup, by row of the chunk or of the rows still looked for.
@@ -74,7 +147,73 @@ impl GroupTable {
             entries: vec![0; INITIAL_CAPACITY],
             matcher,
             scratch: Scratch::default(),
+            direct: None,
         })
+    }
+
+    /// Finds groups by their slot in `ranges` from here on, in [`Self::find_or_create_direct`]: for integer groups
+    /// with a range each, whose slots take few enough bits. Nothing changes for a table that does already, or whose
+    /// groups are not such.
+    pub fn enable_direct(&mut self, ranges: &[PerfectHashGroup]) {
+        if self.direct.is_some() {
+            return;
+        }
+        let types = self.data.layout().types();
+        let bits: u32 = ranges.iter().map(|range| range.bits).sum();
+        let integers = types.iter().all(|ty| {
+            matches!(
+                ty.physical_type(),
+                PhysicalType::Int8
+                    | PhysicalType::Int16
+                    | PhysicalType::Int32
+                    | PhysicalType::Int64
+                    | PhysicalType::UInt8
+                    | PhysicalType::UInt16
+                    | PhysicalType::UInt32
+                    | PhysicalType::UInt64
+            )
+        });
+        if ranges.len() != types.len() || bits > MAX_DIRECT_BITS || !integers {
+            return;
+        }
+        self.direct = Some(DirectIndex {
+            ranges: ranges.to_vec(),
+            ids: vec![0; 1 << bits],
+        });
+    }
+
+    /// [`Self::find_or_create`] for a table with a [`DirectIndex`]: rows whose slot has a group have it, and the
+    /// others, hashed, look for theirs in the table, whose slots then have them. `None` for a table without one.
+    pub fn find_or_create_direct(&mut self, groups: &DataChunk) -> Result<Option<(Vec<usize>, Vec<u32>)>> {
+        let Some(direct) = &self.direct else {
+            return Ok(None);
+        };
+        let count = groups.len();
+        let slots = direct.slots(groups);
+        let mut ids = vec![0usize; count];
+        let mut misses: Vec<u32> = Vec::new();
+        for (row, &slot) in slots.iter().enumerate() {
+            match direct.ids.get(slot as usize) {
+                Some(&id) if id != 0 => ids[row] = id as usize - 1,
+                _ => misses.push(row as u32),
+            }
+        }
+        if misses.is_empty() {
+            return Ok(Some((ids, Vec::new())));
+        }
+        let mut missed = groups.clone();
+        missed.slice(&SelectionVector::from_vec(misses.clone()), misses.len());
+        let hashes = Self::hash(&missed)?;
+        let (found, new_rows) = self.find_or_create(&missed, &hashes)?;
+        let direct = self.direct.as_mut().expect("checked above");
+        for (&row, &id) in misses.iter().zip(&found) {
+            ids[row as usize] = id;
+            if let (Some(entry), Ok(id)) = (direct.ids.get_mut(slots[row as usize] as usize), u32::try_from(id + 1)) {
+                *entry = id;
+            }
+        }
+        let new_rows = new_rows.into_iter().map(|index| misses[index as usize]).collect();
+        Ok(Some((ids, new_rows)))
     }
 
     /// Room for `groups` groups in all, so that a table that is to get them grows once rather than doubling its

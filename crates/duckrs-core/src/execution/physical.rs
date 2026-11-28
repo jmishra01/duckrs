@@ -25,6 +25,7 @@ use crate::function::aggregates::{AggregateState, combine_states, value_keys};
 use crate::planner::expression::{BoundAggregate, BoundExpr, BoundExprKind, ColumnBinding};
 use crate::planner::logical::{
     BoundOrderByNode, COLUMN_IDENTIFIER_ROW_ID, COLUMN_IDENTIFIER_ROW_NUMBER, CteKey, LogicalOperator, OnConflict,
+    PerfectHashGroup,
 };
 use crate::storage::log_writer::can_serialize;
 use duckrs_common::column_data::ColumnDataCollection;
@@ -3456,9 +3457,9 @@ pub struct PhysicalAggregate {
     output: Mutex<Vec<DataChunk>>,
     /// where rows go past the memory limit, for an aggregate that can spill
     spill: Option<AggregateSpill>,
-    /// `PhysicalPerfectHashAggregate`, which C++ plans for groups of small integer ranges; here
-    /// only its name, as the hash table does the same work
-    pub perfect_hash: bool,
+    /// `PhysicalPerfectHashAggregate`, which C++ plans for groups of small integer ranges: their ranges, by which
+    /// the tables of groups find most rows' groups at once ([`GroupTable::enable_direct`])
+    pub perfect_hash: Option<Vec<PerfectHashGroup>>,
 }
 
 /// From how many groups the states of threads are put together by partition, on threads.
@@ -3700,7 +3701,7 @@ impl PhysicalAggregate {
             aggregates,
             children,
             spill: None,
-            perfect_hash: false,
+            perfect_hash: None,
             grouping_sets: sets,
             state: Mutex::new(state),
             locals: Mutex::default(),
@@ -4070,8 +4071,16 @@ impl PhysicalAggregate {
         }
         if let Some(table) = &mut state.table {
             let groups = DataChunk::from_columns(columns.iter().map(|&column| column.clone()).collect(), count);
-            let hashes = GroupTable::hash(&groups)?;
-            let (ids, new_rows) = table.find_or_create(&groups, &hashes)?;
+            if let Some(ranges) = &self.perfect_hash {
+                table.enable_direct(ranges);
+            }
+            let (ids, new_rows) = match table.find_or_create_direct(&groups)? {
+                Some(found) => found,
+                None => {
+                    let hashes = GroupTable::hash(&groups)?;
+                    table.find_or_create(&groups, &hashes)?
+                }
+            };
             state.group_count = table.len();
             self.add_groups(set, vectors, count, new_rows, state)?;
             return Ok(ids);
@@ -4386,7 +4395,7 @@ impl PhysicalOperator for PhysicalAggregate {
     fn name(&self) -> &'static str {
         if self.groups.is_empty() && self.grouping_sets.len() == 1 {
             "UNGROUPED_AGGREGATE"
-        } else if self.perfect_hash {
+        } else if self.perfect_hash.is_some() {
             "PERFECT_HASH_GROUP_BY"
         } else {
             "HASH_GROUP_BY"
