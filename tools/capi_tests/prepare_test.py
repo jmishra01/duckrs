@@ -49,7 +49,7 @@ def remove_case(text, name):
         elif c == "}":
             depth -= 1
             if depth == 0:
-                return text[:start] + f"// duckrs: test case {name!r} left out, see excluded.txt\n" + text[i + 1:]
+                return text[:start] + f"// pintail: test case {name!r} left out, see excluded.txt\n" + text[i + 1:]
         i += 1
     raise SystemExit(f"test case {name!r} has no end")
 

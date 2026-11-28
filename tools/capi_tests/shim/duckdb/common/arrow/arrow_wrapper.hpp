@@ -1,4 +1,4 @@
-// duckrs shim: DuckDB's C++ header duckdb/common/arrow/arrow_wrapper.hpp is not used. The C API tests need the Arrow C
+// pintail shim: DuckDB's C++ header duckdb/common/arrow/arrow_wrapper.hpp is not used. The C API tests need the Arrow C
 // data interface structs of duckdb/common/arrow/arrow.hpp (a plain header, used as it is) and ArrowSchemaWrapper,
 // which releases the schema it holds when it goes away.
 #pragma once

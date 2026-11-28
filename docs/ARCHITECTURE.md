@@ -1,6 +1,6 @@
 # Architecture
 
-duckrs keeps DuckDB's design: columnar storage, vectorized execution over 2048-row vectors,
+pintail keeps DuckDB's design: columnar storage, vectorized execution over 2048-row vectors,
 push-based pipelines with morsel-driven parallelism, MVCC transactions, and a single-file database.
 
 ## Query path
@@ -13,35 +13,35 @@ SQL ─► parser (PEG grammar) ─► AST ─► binder ─► logical plan ─
 ## Crates
 
 Today the workspace has five members. Following the plan, the engine starts as one crate,
-`duckrs-core`, with a module per DuckDB `src/` directory; each module becomes its own crate
+`pintail-core`, with a module per DuckDB `src/` directory; each module becomes its own crate
 once its boundaries settle. The target layout follows DuckDB's `src/` modules, so any C++ file
 has an obvious Rust home:
 
 | Crate (target) | C++ source | Phase | Today |
 |---|---|---|---|
-| `duckrs-common` | `src/common` | 1 | crate |
-| `duckrs-parser` | `src/parser` | 2 | crate |
-| `duckrs-catalog` | `src/catalog` | 3 | `duckrs-core::catalog` |
-| `duckrs-planner` | `src/planner` | 3, 6 | `duckrs-core::planner` |
-| `duckrs-execution` | `src/execution` | 3 | `duckrs-core::execution` |
-| `duckrs-parallel` | `src/parallel` | 3, 8 | `duckrs-core::execution` (pipelines) |
-| `duckrs-function` | `src/function`, `extension/core_functions` | 4–5 | `duckrs-core::function` |
-| `duckrs-optimizer` | `src/optimizer` | 7 | |
-| `duckrs-storage` | `src/storage` | 9 | `duckrs-core::storage` |
-| `duckrs-transaction` | `src/transaction` | 10 | |
-| `duckrs-main` | `src/main` | 3, 12 | `duckrs-core::client` |
-| `duckrs` | public API facade | 0 | crate |
-| `duckrs-capi` | `src/main/capi`, `duckdb.h` | 12 | |
-| `duckrs-cli` | `tools/shell` | 12 | crate (the `duckrs` binary) |
+| `pintail-common` | `src/common` | 1 | crate |
+| `pintail-parser` | `src/parser` | 2 | crate |
+| `pintail-catalog` | `src/catalog` | 3 | `pintail-core::catalog` |
+| `pintail-planner` | `src/planner` | 3, 6 | `pintail-core::planner` |
+| `pintail-execution` | `src/execution` | 3 | `pintail-core::execution` |
+| `pintail-parallel` | `src/parallel` | 3, 8 | `pintail-core::execution` (pipelines) |
+| `pintail-function` | `src/function`, `extension/core_functions` | 4–5 | `pintail-core::function` |
+| `pintail-optimizer` | `src/optimizer` | 7 | |
+| `pintail-storage` | `src/storage` | 9 | `pintail-core::storage` |
+| `pintail-transaction` | `src/transaction` | 10 | |
+| `pintail-main` | `src/main` | 3, 12 | `pintail-core::client` |
+| `pintail` | public API facade | 0 | crate |
+| `pintail-capi` | `src/main/capi`, `duckdb.h` | 12 | |
+| `pintail-cli` | `tools/shell` | 12 | crate (the `pintail` binary) |
 | `sqllogictest` | `test/sqlite` | 0 | crate |
 | `benchmark` | `benchmark` | 13 | crate (`benchmark_runner`) |
 
 Dependencies point downward only:
-`common → parser → catalog → function → planner → optimizer → storage/transaction → execution → parallel → main → duckrs`.
+`common → parser → catalog → function → planner → optimizer → storage/transaction → execution → parallel → main → pintail`.
 Where the C++ modules reference each other (for example, a table catalog entry owning its
 storage), the lower crate defines a trait and the higher crate implements it.
 
-## Core data structures (`duckrs-common`)
+## Core data structures (`pintail-common`)
 
 - `Vector` is a column of up to 2048 rows. It is flat (one value per row), constant (one value
   for all rows), dictionary (a `SelectionVector` over a child vector) or sequence. Buffers are
@@ -54,7 +54,7 @@ storage), the lower crate defines a trait and the higher crate implements it.
 - Executors take closures (`|a: i32, b: i32| a + b`) and handle vector representations and
   NULLs; the closures are monomorphized and vectorize.
 
-## Parser (`duckrs-parser`)
+## Parser (`pintail-parser`)
 
 The parser runs DuckDB's grammar unchanged: the `.gram` rules are vendored and interpreted at
 run time, so grammar changes upstream are picked up by re-syncing, not re-porting. The C++
@@ -86,13 +86,13 @@ tool therefore checks that every rendering parses again and reports identical re
 separately. Known deviation: STAR EXCLUDE/REPLACE/RENAME lists keep input order, where C++
 uses unordered sets, and WITH, ATTACH and CREATE SECRET options and EXECUTE parameters keep
 input order (COPY sorts its options, as DuckDB does). A PIVOT whose values come from the data is
-preceded by a `CREATE TYPE` of an ENUM; DuckDB names it with a random UUID, duckrs with a
+preceded by a `CREATE TYPE` of an ENUM; DuckDB names it with a random UUID, pintail with a
 process-wide counter formatted as one, so renderings are reproducible. Statement transformers
 live in `transformer/statements.rs` (ALTER, COMMENT and SHOW in `statements/alter.rs`, COPY and the other option-driven statements
 in `statements/utility.rs`, PIVOT, MERGE and NEAREST in `statements/pivot.rs`, MATCH_RECOGNIZE in
 `statements/match_recognize.rs`); every statement the grammar accepts is transformed.
 
-## Engine (`duckrs-core`)
+## Engine (`pintail-core`)
 
 A statement goes `parse_ast` → `Binder` (bound expressions, `LogicalOperator` tree) →
 `ColumnBindingResolver` (column references become input positions) → `create_plan`
@@ -116,7 +116,7 @@ A statement goes `parse_ast` → `Binder` (bound expressions, `LogicalOperator` 
   select list entries (by position, alias, unaliased column name or equal expression, after
   qualifying column names), entries ORDER BY needs are appended and pruned by a final
   projection, and the modifiers apply in the order they were written. ORDER BY gathers and
-  sorts with the byte-comparable sort keys of `duckrs-common`; DISTINCT keeps the first row
+  sorts with the byte-comparable sort keys of `pintail-common`; DISTINCT keeps the first row
   per sort key. Select list entries and WHERE may use select list aliases.
 - **Aggregates** bind like `BaseSelectBinder`: groups naming a select list entry swap places with
   it, expressions matching a group or an aggregate become column references of the aggregate
@@ -131,7 +131,7 @@ A statement goes `parse_ast` → `Binder` (bound expressions, `LogicalOperator` 
   their aliases, types, scopes and defaults, and kept per database and per connection.
   Settings that only tune performance, storage, extensions or logging are stored; the
   default sort order and the expression depth limit take effect; the settings that would
-  change results in ways duckrs does not implement yet (`integer_division`, `search_path`,
+  change results in ways pintail does not implement yet (`integer_division`, `search_path`,
   `default_collation`, ...) fail as not yet ported when set to anything but their default.
   Pragmas that only switch DuckDB's debug verification, profiling or progress output are
   no-ops.
@@ -142,7 +142,7 @@ condition to a BOOLEAN vector rather than using DuckDB's specialized `Select`, a
 VARCHAR and from or to DECIMAL, CASE and COALESCE write row by row through `Value`. Tables and
 blocking operators are capped at about 2 GiB and fail as not yet ported beyond that, until
 out-of-core operators (Phase 8) and the rest of storage (Phase 9) exist. Errors for SQL beyond the slice
-say it `is not yet ported to duckrs`, wording DuckDB never uses, so that no test expecting an
+say it `is not yet ported to pintail`, wording DuckDB never uses, so that no test expecting an
 error passes because a feature is missing.
 
 ## Phase 6
@@ -176,7 +176,7 @@ blocking its gate directories: COLLATE (Phase 6 has no collation work) and `SET 
 
 ## Phase 7
 
-The optimizer (`crates/duckrs-core/src/optimizer`) runs between the binder and the
+The optimizer (`crates/pintail-core/src/optimizer`) runs between the binder and the
 `ColumnBindingResolver`. Subquery plans and the recursive part of a recursive CTE are resolved
 while binding, so the binder optimizes those itself. `PRAGMA disable_optimizer` turns it off, and
 `disabled_optimizers` turns off single passes.
@@ -201,7 +201,7 @@ while binding, so the binder optimizes those itself. `PRAGMA disable_optimizer` 
   correlated columns, FULL joins, grouping sets with an empty set, LIMIT with a percentage, SAMPLE,
   ASOF, recursive CTEs). C++ decorrelates nearly all of those. LATERAL joins are not flattened yet.
 - Hash joins, grouping, DISTINCT and delim joins key their rows with `RowKey`
-  (`duckrs-common/src/sort_key.rs`): the bytes of a sort key, built a column at a time, inline up to
+  (`pintail-common/src/sort_key.rs`): the bytes of a sort key, built a column at a time, inline up to
   30 bytes, and hashed with `KeyHasher`. Keys are not chosen to attack a hash table here, so it is
   a multiplicative hash and not SipHash. Other operators use the slower `group_keys`.
 - The **deliminator** (`optimizer/deliminator.rs`) runs right after filter pushdown. An equality
@@ -634,7 +634,7 @@ among them on 32 of its values; a value is an exception unless it decodes to the
 group has one ALPRD dictionary, so the vectors of its segments share it. ZSTD, Chimp and Patas are read
 and not written. Segments share blocks, as a block per column would make small tables
 large, which DuckDB has to be told of in `multi_use_blocks`. After the free list a file has the list of
-metadata blocks with their free sub-blocks: nothing in `duckrs` reads it, but C++ doesn't find them
+metadata blocks with their free sub-blocks: nothing in `pintail` reads it, but C++ doesn't find them
 otherwise. Numeric columns have bounds; strings say that nothing is known of them.
 
 `tools/check_written.py` has the v2.0.0 reference engine read a file from `write_database_file.rs`,
@@ -747,14 +747,14 @@ through the binder like `CREATE TABLE`, for its defaults, generated columns and 
 and macros aren't bound until they are used, as nothing in a file needs that. Types that a file has
 already are `CastType::Resolved`. A type that is only named, like a cast to a type of the catalog,
 is `LogicalType::unbound`, which keeps the SQL of the name and is resolved when bound. Parsed
-expressions are beyond `duckrs-common`, so reading one inside a `LogicalType` goes through
+expressions are beyond `pintail-common`, so reading one inside a `LogicalType` goes through
 `BinaryDeserializer::with_type_expressions`.
 
 Where this differs from C++: `lead` and `lag` from before v2.0.0 keep their offset and default,
 which the C++ reader drops. A constant from before v2.0.0 is a value and not text, so a type that
 no literal reads back as, like DOUBLE, becomes a cast of its text.
 
-`crates/duckrs/tests/read_database_file.rs` compares every row of files from the real DuckDB with what
+`crates/pintail/tests/read_database_file.rs` compares every row of files from the real DuckDB with what
 DuckDB reads from them; `tests/fixtures/generate.sh` makes both. `damaged_database_file.rs` changes
 bytes of a block and fixes its checksum, to get past that to the decoders. Layout checks match C++
 exactly and not just bounds: an FSST symbol table in the wrong place is corruption even if it is in
@@ -886,13 +886,13 @@ Not ported: `json_serialize_sql` and its kin, `json_serialize_plan`, GeoJSON, `j
 
 The gate is not met: `test/sql/copy` is at about 51% against 85%, now that the Parquet tests in it run.
 
-## Shell (`duckrs-cli`)
+## Shell (`pintail-cli`)
 
-The `duckrs` binary ports `tools/shell`. `main.rs` holds `ShellState`: the command-line options
+The `pintail` binary ports `tools/shell`. `main.rs` holds `ShellState`: the command-line options
 (two passes, as C++: those needed to open the database, then the rest after the init file),
 `ProcessInput` (lines are gathered until a statement ends in a `;` outside quotes and comments,
 and a line starting with `.` is a dot command), and `ExecuteStatement`. Each statement runs on its
-own through `Connection::query`. The statement's kind (from `duckrs_parser`) decides whether its
+own through `Connection::query`. The statement's kind (from `pintail_parser`) decides whether its
 result is rows to show: DDL, `SET` and the like answer with an empty `Success` column, and INSERT,
 UPDATE and DELETE with a `Count` that only `.changes` reports.
 
@@ -913,7 +913,7 @@ Interactive input goes through `rustyline`, with the history in `~/.duckdb_histo
 `$DUCKDB_HISTORY`). The shell's pytest suite (`duckdb/tools/shell/tests`) runs against the binary:
 
 ```
-cd ../duckdb && PYTHONPATH=. pytest tools/shell/tests --shell-binary ../duckrs/target/release/duckrs
+cd ../duckdb && PYTHONPATH=. pytest tools/shell/tests --shell-binary ../duckrs/target/release/pintail
 ```
 
 ## Benchmarks (`tools/benchmark`)
@@ -933,24 +933,24 @@ the generators of the checkout, whose `.tbl` files are copied into tables of the
 ```
 cargo run --release -p benchmark -- 'benchmark/tpch/sf1/.*'
 cargo run --release -p benchmark --features reference -- --engine=both --threads=8 'benchmark/micro/.*'
-cargo bench -p duckrs --bench kernels
+cargo bench -p pintail --bench kernels
 ```
 
 Larger scale factors go through `--sf N`. The benchmark measures SF10 on the file C++ writes: run the reference
 engine once (`--engine=reference --sf 10`), copy `duckdb_benchmark_data/reference/tpch_sf10.duckdb` to
-`duckdb_benchmark_data/duckrs/`, then `--engine=both --sf 10`. duckrs can load SF10 into a file of its own too
+`duckdb_benchmark_data/pintail/`, then `--engine=both --sf 10`. pintail can load SF10 into a file of its own too
 (CREATE TABLE and `COPY ... FROM` the `.tbl` files, about 35 seconds, under 800MB at the most, as appends write
-their full row groups to blocks as they fill), and `TPCH_DATABASE=<file> cargo run --release -p duckrs --example
+their full row groups to blocks as they fill), and `TPCH_DATABASE=<file> cargo run --release -p pintail --example
 tpch -- - ../duckdb/extension/tpch/dbgen 10` checks the 22 queries on it against `answers/sf10`.
 
 ## Testing
 
 The DuckDB sqllogictest corpus is the acceptance oracle. `tools/sqllogictest` runs it against
-duckrs, or against the C++ library (`--engine reference`, behind the `reference` cargo feature).
+pintail, or against the C++ library (`--engine reference`, behind the `reference` cargo feature).
 CI fails when a file in `tools/sqllogictest/known_passing.txt` stops passing.
 
 `--diff-against` is the plan's differential tester, as a mode of the runner and not a crate of its
-own: every statement also runs on a second engine, either duckrs with the optimizer off
+own: every statement also runs on a second engine, either pintail with the optimizer off
 (`unoptimized`) or C++ (`reference`, which is v2.0.0 and not the baseline), and differences go to
 `--diff-out`. It needs `--isolate`. Rows are sorted unless the query has ORDER BY, LIMIT without
 ORDER BY is skipped, and floats compare within 1e-6. Tests with `random()` or concurrent loops

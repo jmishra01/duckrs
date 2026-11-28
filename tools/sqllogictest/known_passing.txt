@@ -1,4 +1,4 @@
-# Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these
+# Test files (relative to the DuckDB checkout) that pintail passes. CI fails if any of these
 # stop passing. Regenerate with:
 #   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt
 test/common/test_cast_hugeint.test

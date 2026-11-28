@@ -1,6 +1,6 @@
 //! A Rust port of DuckDB's sqllogictest runner (`duckdb/test/sqlite`).
 //!
-//! It runs the `.test` corpus from a DuckDB checkout against any [`engine::Engine`]: duckrs
+//! It runs the `.test` corpus from a DuckDB checkout against any [`engine::Engine`]: pintail
 //! itself, or (with the `reference` feature) the C++ DuckDB library, which validates the
 //! harness and serves as the oracle for differential testing.
 

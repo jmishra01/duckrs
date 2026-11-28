@@ -32,7 +32,7 @@ jobs:
       - run: cargo test --workspace
 
   miri:
-    # Checks the unsafe code in duckrs-common (string_t, vector buffers) for undefined behavior.
+    # Checks the unsafe code in pintail-common (string_t, vector buffers) for undefined behavior.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -40,7 +40,7 @@ jobs:
         with:
           components: miri
       # `+nightly`: rust-toolchain.toml pins the stable toolchain, which has no Miri
-      - run: cargo +nightly miri test -p duckrs-common
+      - run: cargo +nightly miri test -p pintail-common
         env:
           PROPTEST_CASES: "8"
           MIRIFLAGS: -Zmiri-disable-isolation
@@ -58,13 +58,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release -p sqllogictest
-      - name: Run the corpus against duckrs (fails only on regressions)
+      - name: Run the corpus against pintail (fails only on regressions)
         run: >
           ./target/release/sqllogictest --duckdb-root duckdb --allow-failures --isolate --timeout 60
           --known-passing tools/sqllogictest/known_passing.txt
           --status-out STATUS.md
       - name: Parse and transform the corpus (parse rate >= 99.9%, every transformed SELECT round trips)
-        run: cargo run --release -q -p duckrs-parser --example corpus -- duckdb --min-parse 99.9 --min-transform 99.99 --min-reject 88
+        run: cargo run --release -q -p pintail-parser --example corpus -- duckdb --min-parse 99.9 --min-transform 99.99 --min-reject 88
       - uses: actions/upload-artifact@v4
         with:
           name: sqllogictest-status

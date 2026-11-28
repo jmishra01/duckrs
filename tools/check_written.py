@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Has the real DuckDB read a file that duckrs wrote, and answer as duckrs does.
+"""Has the real DuckDB read a file that pintail wrote, and answer as pintail does.
 
 Needs the reference engine: cargo build --release -p sqllogictest --features reference
 
@@ -16,10 +16,10 @@ root = Path(__file__).resolve().parent.parent
 scratch = Path(tempfile.mkdtemp())
 target = scratch / "written.db"
 subprocess.run(
-    ["cargo", "test", "-q", "-p", "duckrs", "--test", "write_database_file", "a_database_comes_back"],
+    ["cargo", "test", "-q", "-p", "pintail", "--test", "write_database_file", "a_database_comes_back"],
     cwd=root,
     check=True,
-    env={**os.environ, "DUCKRS_KEEP_WRITTEN": str(target)},
+    env={**os.environ, "PINTAIL_KEEP_WRITTEN": str(target)},
 )
 test = [f"statement ok\nATTACH '{target}' AS written (READ_ONLY)\n\nstatement ok\nUSE written\n\n"]
 for block in Path(f"{target}.expected").read_text().split("\n\n"):
@@ -105,10 +105,10 @@ if result.returncode != 0:
 # a file and a log: what the database holds is only there if DuckDB replays the log
 logged = scratch / "logged.db"
 subprocess.run(
-    ["cargo", "test", "-q", "-p", "duckrs", "--test", "write_database_file", "a_log_brings_back"],
+    ["cargo", "test", "-q", "-p", "pintail", "--test", "write_database_file", "a_log_brings_back"],
     cwd=root,
     check=True,
-    env={**os.environ, "DUCKRS_KEEP_LOGGED": str(logged)},
+    env={**os.environ, "PINTAIL_KEEP_LOGGED": str(logged)},
 )
 (scratch / "test/log.test").write_text(f"""statement ok
 ATTACH '{logged}' AS logged
@@ -171,10 +171,10 @@ if result.returncode != 0:
 # ids: DuckDB reads rows with gaps by the ids they have here, and replays a log that names them
 gaps = scratch / "gaps.db"
 subprocess.run(
-    ["cargo", "test", "-q", "-p", "duckrs", "--test", "row_ids", "gaps_for_duckdb"],
+    ["cargo", "test", "-q", "-p", "pintail", "--test", "row_ids", "gaps_for_duckdb"],
     cwd=root,
     check=True,
-    env={**os.environ, "DUCKRS_KEEP_GAPS": str(gaps)},
+    env={**os.environ, "PINTAIL_KEEP_GAPS": str(gaps)},
 )
 replayed = Path(f"{gaps}.expected").read_text().splitlines()[1]
 (scratch / "test/gaps.test").write_text(f"""statement ok
@@ -228,21 +228,21 @@ print(result.stdout[-4000:])
 if result.returncode != 0:
     sys.exit(result.returncode)
 
-# keys and indexes: DuckDB finds every key in the ART that duckrs wrote, and goes on changing them
+# keys and indexes: DuckDB finds every key in the ART that pintail wrote, and goes on changing them
 keyed = scratch / "keyed.db"
 logged_keys = scratch / "keyed_log.db"
 subprocess.run(
-    ["cargo", "test", "-q", "-p", "duckrs", "--test", "write_database_file", "keys_and_indexes"],
+    ["cargo", "test", "-q", "-p", "pintail", "--test", "write_database_file", "keys_and_indexes"],
     cwd=root,
     check=True,
-    env={**os.environ, "DUCKRS_KEEP_KEYS": str(keyed), "DUCKRS_KEEP_KEYS_LOGGED": str(logged_keys)},
+    env={**os.environ, "PINTAIL_KEEP_KEYS": str(keyed), "PINTAIL_KEEP_KEYS_LOGGED": str(logged_keys)},
 )
 altered = scratch / "altered.db"
 subprocess.run(
-    ["cargo", "test", "-q", "-p", "duckrs", "--test", "write_database_file", "a_referenced_table"],
+    ["cargo", "test", "-q", "-p", "pintail", "--test", "write_database_file", "a_referenced_table"],
     cwd=root,
     check=True,
-    env={**os.environ, "DUCKRS_KEEP_KEYS_ALTERED": str(altered)},
+    env={**os.environ, "PINTAIL_KEEP_KEYS_ALTERED": str(altered)},
 )
 
 
@@ -471,10 +471,10 @@ if result.returncode != 0:
 floats = scratch / "floats"
 floats.mkdir()
 subprocess.run(
-    ["cargo", "test", "-q", "-p", "duckrs", "--test", "write_database_file", "--", "floats_keep_their_bits", "strings_can_go_through_fsst"],
+    ["cargo", "test", "-q", "-p", "pintail", "--test", "write_database_file", "--", "floats_keep_their_bits", "strings_can_go_through_fsst"],
     cwd=root,
     check=True,
-    env={**os.environ, "DUCKRS_KEEP_FLOATS": str(floats)},
+    env={**os.environ, "PINTAIL_KEEP_FLOATS": str(floats)},
 )
 test = "".join(
     f"""statement ok
@@ -496,7 +496,7 @@ SELECT count(*) FROM uncompressed.t a JOIN {force}.t b USING (i) WHERE a.d::VARC
 # which has to be there before the first comparison
 test = test.replace(f"ATTACH '{floats}/uncompressed.db' AS uncompressed (READ_ONLY)", "SELECT 1", 1)
 test = f"statement ok\nATTACH '{floats}/uncompressed.db' AS uncompressed (READ_ONLY)\n\n" + test
-# strings through FSST, against the same strings as DuckDB makes them: nothing here comes from duckrs
+# strings through FSST, against the same strings as DuckDB makes them: nothing here comes from pintail
 test += f"""statement ok
 ATTACH '{floats}/strings.db' AS strings (READ_ONLY)
 

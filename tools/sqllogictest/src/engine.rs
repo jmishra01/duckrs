@@ -1,4 +1,4 @@
-//! The database interface the runner drives. One implementation wraps duckrs; the optional
+//! The database interface the runner drives. One implementation wraps pintail; the optional
 //! `reference` feature adds one backed by the C++ DuckDB library.
 
 use std::path::Path;
@@ -85,19 +85,19 @@ pub trait Connection: Send {
 }
 
 /// The engine under development.
-pub struct DuckrsEngine;
+pub struct PintailEngine;
 
-impl Engine for DuckrsEngine {
+impl Engine for PintailEngine {
     fn name(&self) -> &str {
-        "duckrs"
+        "pintail"
     }
 
     fn open(&self, path: Option<&Path>, read_only: bool) -> Result<Box<dyn Database>, String> {
         let db = match path {
-            Some(path) => duckrs::Database::open(path, read_only),
-            None => duckrs::Database::open_in_memory(),
+            Some(path) => pintail::Database::open(path, read_only),
+            None => pintail::Database::open_in_memory(),
         };
-        Ok(Box::new(DuckrsDatabase(db.map_err(|e| e.to_string())?)))
+        Ok(Box::new(PintailDatabase(db.map_err(|e| e.to_string())?)))
     }
 
     fn open_with_version(
@@ -108,25 +108,25 @@ impl Engine for DuckrsEngine {
     ) -> Result<Box<dyn Database>, String> {
         match (path, version) {
             (Some(path), Some(version)) => {
-                let db = duckrs::Database::open_with_storage_version(path, read_only, version);
-                Ok(Box::new(DuckrsDatabase(db.map_err(|e| e.to_string())?)))
+                let db = pintail::Database::open_with_storage_version(path, read_only, version);
+                Ok(Box::new(PintailDatabase(db.map_err(|e| e.to_string())?)))
             }
             _ => self.open(path, read_only),
         }
     }
 }
 
-struct DuckrsDatabase(duckrs::Database);
+struct PintailDatabase(pintail::Database);
 
-impl Database for DuckrsDatabase {
+impl Database for PintailDatabase {
     fn connect(&self) -> Result<Box<dyn Connection>, String> {
-        Ok(Box::new(DuckrsConnection(self.0.connect().map_err(|e| e.to_string())?)))
+        Ok(Box::new(PintailConnection(self.0.connect().map_err(|e| e.to_string())?)))
     }
 }
 
-struct DuckrsConnection(duckrs::Connection);
+struct PintailConnection(pintail::Connection);
 
-impl Connection for DuckrsConnection {
+impl Connection for PintailConnection {
     fn query(&mut self, sql: &str) -> Result<QueryOutput, String> {
         self.query_timed(sql).map(|(output, _)| output)
     }
@@ -160,14 +160,14 @@ impl Connection for DuckrsConnection {
     }
 
     fn load_extension(&mut self, name: &str) -> bool {
-        // what duckrs has compiled in
+        // what pintail has compiled in
         matches!(name, "parquet" | "json" | "tpch" | "tpcds")
     }
 }
 
 /// The comparison category of a result column (as the reference engine maps C API types).
-fn column_type(ty: &duckrs::LogicalType) -> ColumnType {
-    use duckrs::LogicalTypeId::*;
+fn column_type(ty: &pintail::LogicalType) -> ColumnType {
+    use pintail::LogicalTypeId::*;
     match ty.id() {
         Boolean => ColumnType::Boolean,
         TinyInt | SmallInt | Integer | BigInt | HugeInt | UTinyInt | USmallInt | UInteger | UBigInt | UHugeInt => {

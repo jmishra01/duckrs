@@ -1,0 +1,22 @@
+[package]
+name = "pintail-common"
+description = "Core types, vectors and data chunks for pintail (port of duckdb/src/common)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hashbrown.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "executor"
+harness = false
+
+[lints]
+workspace = true

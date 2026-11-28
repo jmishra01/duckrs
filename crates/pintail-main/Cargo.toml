@@ -1,0 +1,18 @@
+[package]
+name = "pintail-main"
+description = "The pintail client: Database, Connection and ClientContext, settings, EXPLAIN, triggers (DuckDB's src/main)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+pintail-common.workspace = true
+pintail-parser.workspace = true
+pintail-tpch.workspace = true
+pintail-tpcds.workspace = true
+pintail-core.workspace = true
+parking_lot.workspace = true
+
+[lints]
+workspace = true

@@ -2,6 +2,6 @@
 /sqllogictest-results
 *.duckdb
 *.wal
-!crates/duckrs/tests/fixtures/*.wal
+!crates/pintail/tests/fixtures/*.wal
 
 .idea

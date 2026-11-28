@@ -1,6 +1,6 @@
 [package]
 name = "benchmark"
-description = "Runs DuckDB's .benchmark files against duckrs or the C++ reference engine"
+description = "Runs DuckDB's .benchmark files against pintail or the C++ reference engine"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

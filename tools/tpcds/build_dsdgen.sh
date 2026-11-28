@@ -1,7 +1,7 @@
 #!/bin/sh
 # Builds a dsdgen that writes the pipe-delimited .tbl files examples/tpcds.rs loads, from the
 # generators in a DuckDB checkout: the TPC code stays there, and driver.cpp replaces the part that
-# appends to DuckDB tables. duckrs has no dsdgen of its own yet.
+# appends to DuckDB tables. pintail has no dsdgen of its own yet.
 #
 #   tools/tpcds/build_dsdgen.sh <duckdb checkout> <output binary>
 #   <output binary> <scale factor> <empty directory>

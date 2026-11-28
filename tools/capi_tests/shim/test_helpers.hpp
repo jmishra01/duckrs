@@ -1,9 +1,9 @@
 //===----------------------------------------------------------------------===//
-// duckrs: test_helpers.hpp for DuckDB's C API tests, without DuckDB's C++ internals.
+// pintail: test_helpers.hpp for DuckDB's C API tests, without DuckDB's C++ internals.
 //
 // DuckDB's own test_helpers.hpp pulls in all of DuckDB. The C API tests use a small part of it: string helpers,
 // the test directory, ApproxEqual, a few value types and REQUIRE_NO_FAIL. This header gives that part, written
-// against the C API and the standard library only, so the tests link with libduckrs_capi alone.
+// against the C API and the standard library only, so the tests link with libpintail_capi alone.
 //===----------------------------------------------------------------------===//
 
 #pragma once

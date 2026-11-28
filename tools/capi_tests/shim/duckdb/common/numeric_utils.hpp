@@ -1,4 +1,4 @@
-// duckrs shim: DuckDB's C++ header duckdb/common/numeric_utils.hpp is not used; the C API tests only need its
+// pintail shim: DuckDB's C++ header duckdb/common/numeric_utils.hpp is not used; the C API tests only need its
 // NumericCast, which here is a plain static_cast (the tests cast values that fit).
 #pragma once
 #include "test_helpers.hpp"

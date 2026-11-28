@@ -1,4 +1,4 @@
-// duckrs shim: DuckDB's C++ header duckdb/common/arrow/arrow_converter.hpp is not used. The C API tests call
+// pintail shim: DuckDB's C++ header duckdb/common/arrow/arrow_converter.hpp is not used. The C API tests call
 // `ArrowConverter::ToArrowSchema`, which here goes through `duckdb_to_arrow_schema` with the arrow options of the
 // shim's ClientProperties (see arrow_appender.hpp).
 #pragma once

@@ -3,7 +3,7 @@
 //! `concurrentloop`, `require`) working unchanged, and the test's own expectations still apply to
 //! the primary engine.
 //!
-//! The plan's two checks are both modes of this: duckrs against the C++ library, and duckrs against
+//! The plan's two checks are both modes of this: pintail against the C++ library, and pintail against
 //! itself with the optimizer off (DuckDB's `enable_verification` compares the same way).
 
 use crate::engine::{ColumnType, Connection, Database, Engine, QueryOutput};

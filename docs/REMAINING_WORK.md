@@ -229,7 +229,7 @@ Each item gives the number of failing files in `test/` that it should fix, where
     key slot per field of an object, in the order the objects are opened (`json_to_variant.hpp`: an object
     reserves its slots, its keys in document order, when it is converted; `{"z":[{"c":..,"b":..}],"a":{"y":..,
     "x":..},"empty":{}}` has `z, a, empty, c, b, y, x`). `variant_to_parquet_variant` writes those slots as the
-    dictionary and sorts only the field ids of each object by name (`parquet_variant_encoding.cpp`). duckrs sorts
+    dictionary and sorts only the field ids of each object by name (`parquet_variant_encoding.cpp`). pintail sorts
     the keys of an object as it builds it (`VariantNode::Object`) and stores them sorted and once each, so the
     order is gone: a format change, where each object keeps the order of its keys, set by the conversions from
     JSON and STRUCT and by the readers of database files and Parquet, and used by their writers
@@ -297,9 +297,9 @@ Each item gives the number of failing files in `test/` that it should fix, where
     back in the order of `CompressionType` (`RLE,Dictionary`)
   - [x] `read_duckdb` and the replacement scan of `.db` files; `enable_view_dependencies` (DROP ... CASCADE,
     refused DROP and ALTER, CREATE OR REPLACE of a view that reads itself)
-  - [ ] `vector_type` (~20 files) reports engine internals duckrs does not model
+  - [ ] `vector_type` (~20 files) reports engine internals pintail does not model
   - [x] `duckdb_memory()`: C++'s columns and a row per `MemoryTag`, volatile so common subplans do not share it;
-    duckrs does not account memory by tag, so every row reports 0 bytes in memory and in temporary storage
+    pintail does not account memory by tag, so every row reports 0 bytes in memory and in temporary storage
   - [ ] memory accounting by `MemoryTag`: until it exists, the tests that check `memory_usage_bytes` stays below a
     bound pass without measuring anything, so they are left out of `known_passing.txt`
     (`bulk_delete_version_info_memory`, `partial_delete_version_info_memory`, `test_art_mem_limit`,
@@ -444,7 +444,7 @@ Each item gives the number of failing files in `test/` that it should fix, where
     its filters, by zones per vector of tables in memory, the segments' statistics of tables in files, the fields
     of STRUCT columns, the row ids, and join filters on the row ids; `query.total_rows_scanned` counts the rows of
     the vectors scans read, before their filters, as C++ does (`test_rowid_vector_pruning`)
-  - [ ] the segments of tables in memory as C++ sizes them: duckrs zones them per vector, finer than C++, so
+  - [ ] the segments of tables in memory as C++ sizes them: pintail zones them per vector, finer than C++, so
     `nested_null_segment_pruning` scans fewer rows than its exact count; the bytes late materialization reads
     (`test_rowid_vector_pruning_prefetch`)
   - [x] INTERVAL bounds of row groups in database files: written from v2.0.0 by the normalized intervals and
@@ -530,7 +530,7 @@ Each item gives the number of failing files in `test/` that it should fix, where
     projections, filters and joins on equal columns
   - [x] projections between the filter and the window that compute something: not ported. C++'s
     `TraverseProjectionBindings` follows each expression to its one column and drops what it computes
-    (1.5.6 gives 256 for `x + 100` of 0 with `filter_pushdown` disabled); duckrs keeps the window there
+    (1.5.6 gives 256 for `x + 100` of 0 with `filter_pushdown` disabled); pintail keeps the window there
   - [x] self-join aggregate (TPC-DS q95's `ws_wh` as `GROUP BY keys HAVING min(x) <> max(x)`); volatile
     uncorrelated IN subqueries are MARK joins too
   - [x] `duckdb_types()` and the other system functions as scans of the function in EXPLAIN (`self_join_aggregate`)
@@ -556,7 +556,7 @@ Each item gives the number of failing files in `test/` that it should fix, where
 - [ ] 19. TPC-H 22/22 and TPC-DS 99/99 correct
   - [x] with `tools/tpch` and `tools/tpcds` building dbgen and dsdgen from the C++ checkout, the examples get
     TPC-H 22/22 at SF 0.01 and 0.1, TPC-DS 99/99 at SF 0.01
-  - [x] `dbgen` / `dsdgen` in duckrs: the crates `duckrs-tpch` and `duckrs-tpcds` port the generators (their
+  - [x] `dbgen` / `dsdgen` in pintail: the crates `pintail-tpch` and `pintail-tpcds` port the generators (their
     output matches C++'s byte for byte: TPC-H at SF 0.01 and 0.1, TPC-DS at SF 0.01), with `CALL dbgen` /
     `CALL dsdgen`, `PRAGMA tpch` / `tpcds`, `tpch_queries` / `tpch_answers` / `tpcds_queries` / `tpcds_answers`;
     C++'s parallel generation is not ported, and `dbgen` / `dsdgen` in a FROM clause are not
@@ -572,7 +572,7 @@ Each item gives the number of failing files in `test/` that it should fix, where
     (DISTINCT, FILTER, ORDER BY, through macros), ONE ROW / ALL ROWS (WITH UNMATCHED ROWS, OMIT EMPTY MATCHES),
     AFTER MATCH SKIP, SUBSET, exclusion, anchors, PERMUTE, DEFINE AUTO; the binder's errors; the memo counts
     against `memory_limit`
-  - [ ] `max_execution_time` (not in duckrs at all; `limits` runs into the timeout), window functions in
+  - [ ] `max_execution_time` (not in pintail at all; `limits` runs into the timeout), window functions in
     `duckdb_functions()` (`clauses`, `scope`), UNNEST in a measure, `->` resolved as a JSON operator in a measure
 - [ ] 22. Triggers (`sql/trigger`: 26 of 28 pass)
   - [x] CREATE / DROP TRIGGER with the checks of `BindCreateTriggerInfo`, `duckdb_triggers()`, BEFORE and
@@ -698,7 +698,7 @@ Each item gives the number of failing files in `test/` that it should fix, where
     integers as C++ does it; `quantile_cont`'s overloads (no INTERVAL or VARCHAR, no single argument);
     list_aggr's "No matching aggregate function"; `list_contains` deducing its template type
   - [ ] the memory limits of quantiles and of window builds (7 files)
-  - [x] `EXPORT_STATE` in C++'s layouts for the aggregates duckrs computes from their rows
+  - [x] `EXPORT_STATE` in C++'s layouts for the aggregates pintail computes from their rows
     (`function/holistic_states.rs`): bool_and/or, product, string_agg, the stddev/variance family, covar, corr,
     skewness, kurtosis, fsum/favg, the regr_* family, arg_min/arg_max, the TIMESTAMP/TIME/TIMETZ/INTERVAL averages
     and the quantiles; constants the arguments were bound to (separator, fraction) kept in the state type and
@@ -729,7 +729,7 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [x] GEOMETRY columns in database files (v1.5.0 and later, as WKB) and the WAL
   - [ ] shredded GEOMETRY columns
   - [x] `GeometryStats`: in `stats()`, in database files (extent, types, flags), and `vertex_extract`'s bounds
-  - [ ] `ST_GeomFromWKB`'s types from BLOB min/max (duckrs keeps no string statistics), GeoParquet, the spatial extension's blob format
+  - [ ] `ST_GeomFromWKB`'s types from BLOB min/max (pintail keeps no string statistics), GeoParquet, the spatial extension's blob format
 - [ ] 34. Remaining type and cast failures (`sql/types`: 39 failing, 92.6%; `sql/cast`: 2 failing)
   - [x] UNNEST with `recursive`, `max_depth` and `keep_parent_names`, of structs at the root of a select list,
     refused nested; a cast to NULL of anything that is NULL
@@ -772,18 +772,18 @@ Each item gives the number of failing files in `test/` that it should fix, where
   - [ ] row groups of local storage, memory metrics, secure views
   - [ ] the `query_tree` text output, `duckdb_available_metrics()`, `enable_profiling()` / `disable_profiling()`
     as table functions, the profiler log entries
-- [ ] 41. **C API** (`duckrs-capi`): implement `duckdb.h`, then pass `test/api/capi/*`
+- [ ] 41. **C API** (`pintail-capi`): implement `duckdb.h`, then pass `test/api/capi/*`
   - [x] v1 core (2026-11-26): 319 of the 548 functions of `duckdb.h` (database, connection, config, query results and
     `duckdb_value_*`, data chunks and vectors, logical types, prepared statements and binding, extracted statements,
     appender, `duckdb_value`, date/time helpers, pending results, error data); `unsafe` only at the FFI boundary
     (`src/ffi.rs`), struct layouts checked against `duckdb.h` (`tests/layout.rs`)
-  - [x] `tools/capi_tests/run.sh` builds DuckDB's Catch2 C API tests against `libduckrs_capi` (missing functions are
+  - [x] `tools/capi_tests/run.sh` builds DuckDB's Catch2 C API tests against `libpintail_capi` (missing functions are
     weak stubs that fail only the cases calling them): 101 of 115 test cases of the 11 core files pass; 6 cases that
     read C++ internals are excluded (`tools/capi_tests/excluded.txt`)
   - [x] parameter types before binding: while preparing, a parameter is a `BoundExprKind::Parameter` that the first
     implicit cast types (`AddCastToType`), a root left UNKNOWN is ParameterNotResolved; `duckdb_param_type` reads them
   - [ ] the engine gaps the prepared
-    tests reach (preparing EXECUTE, EXPLAIN, CHECKPOINT, PIVOT), real streaming and pending results (duckrs
+    tests reach (preparing EXECUTE, EXPLAIN, CHECKPOINT, PIVOT), real streaming and pending results (pintail
     finishes a query first), `duckdb_interrupt`, `duckdb_vector_reference_vector` sharing its buffer
   - [x] user-defined scalar, aggregate and table functions (2026-11-26, phase 92): `duckdb_create_scalar_function`
     and its setters (varargs, special handling, volatile, extra info, bind with argument expressions, init with a
@@ -791,7 +791,7 @@ Each item gives the number of failing files in `test/` that it should fix, where
     combine / finalize / destructor, sets, extra info, errors), `duckdb_*_table_function*` with the bind, init and
     function interfaces (parameters, named parameters cast to their types, result columns, cardinality, bind /
     init / local init data, errors), plus `duckdb_client_context` (connection id) and `duckdb_expression`
-    (return type, foldable, fold). The engine side is `duckrs_core::function::udf`: the traits `ScalarUdf`,
+    (return type, foldable, fold). The engine side is `pintail_core::function::udf`: the traits `ScalarUdf`,
     `AggregateUdf` and `TableUdf` that the C API implements, and the `UserFunctions` registry of a database
     instance, which the binder reads through `SessionValues::user_functions` (not the catalog, as C++'s system
     catalog has them). The capi_scalar/aggregate/table_functions.cpp files: 18 of 18 cases
@@ -872,7 +872,7 @@ Each item gives the number of failing files in `test/` that it should fix, where
     `duckdb_vector_reference_vector` sharing its buffer, and preparing `CREATE TABLE ... AS SELECT ?` in a
     v1.5 database (the tuple storage version gate)
   - [ ] then v2 (`src/main/capi/v2`)
-- [ ] 42. **CLI shell** (`crates/duckrs-cli`, the `duckrs` binary). Against `tools/shell/tests` it passes
+- [ ] 42. **CLI shell** (`crates/pintail-cli`, the `pintail` binary). Against `tools/shell/tests` it passes
   150 of `test_shell_basics` (C++ 1.5.6: 141), all of `test_dump`, `test_errors`, `test_import`,
   `test_table_metadata_rendering` and `test_shell_rendering`
   - [x] batch and interactive input (rustyline, history in `~/.duckdb_history`, highlighting as you type),
@@ -891,7 +891,7 @@ Each item gives the number of failing files in `test/` that it should fix, where
     `pragma_version` / `version()` (the shell prints the crate version)
   - [ ] engine gaps the tests reach: `SET TimeZone` (ICU, item 50), `integer_division`,
     `preserve_identifier_case`, `lock_configuration`, CSV cardinality estimates for pipes
-- [ ] 43. **Rust API** (`crates/duckrs`)
+- [ ] 43. **Rust API** (`crates/pintail`)
   - [x] `Appender` (rows into a table, flushed as an INSERT: constraints, triggers and the WAL as for any INSERT)
   - [x] Arrow `RecordBatch` export with C++'s default types (`Connection::query_arrow`, `record_batches`)
   - [x] `Relation`: table, values, filter, project, aggregate, order, limit, distinct, joins, set operations, as SQL
@@ -904,7 +904,7 @@ Each item gives the number of failing files in `test/` that it should fix, where
 
 - [x] 45. Benchmarks: `tools/benchmark` (`benchmark_runner`) ports DuckDB's runner and reads its
   `.benchmark` files (templates, includes, arguments, caches, `result`/`result_query`/`assert`); the
-  Criterion benches `duckrs-common/benches/executor.rs` (vector kernels) and `duckrs/benches/kernels.rs`
+  Criterion benches `pintail-common/benches/executor.rs` (vector kernels) and `pintail/benches/kernels.rs`
   (scan, filter, aggregates, join, sort, top-N, window, casts on a million rows)
 - [ ] 46. Nightly runs against C++ DuckDB: `.github/workflows/benchmarks.yml` times TPC-H SF1, TPC-DS SF1 and
   micro benchmarks on both engines (`--engine=both`, the `reference` feature); `CALL dbgen` / `CALL dsdgen`
@@ -924,7 +924,7 @@ Each item gives the number of failing files in `test/` that it should fix, where
     key per row, aggregate states not behind an enum per row, selective reads of dictionary strings and of
     DELTA_FOR / RLE / ALP segments, morsels smaller than a row group
 - [ ] 48. v1 gate: TPC-H SF10 geometric mean ≤ 1.5× C++ DuckDB, and no query slower than 3×. The runner
-  prints the gate after `--engine=both`. On TPC-H SF1 (8 threads, all 22 answers correct) duckrs is at
+  prints the gate after `--engine=both`. On TPC-H SF1 (8 threads, all 22 answers correct) pintail is at
   1.53× (none above 3×: Q21 2.7×; Q02 0.5×, Q08 0.95×), from 12.7× at the start of item 47.
   SF10, both engines on the file C++ wrote: 0.58× on 2026-11-22 after part 71, all 22 answers correct (none above
   3×: Q18 1.10×, Q13 0.97×, Q16 0.84×, Q09 0.81×; Q06 0.32×, Q15 0.21×), with the load average 5 at the start and 18
@@ -980,9 +980,9 @@ Each item gives the number of failing files in `test/` that it should fix, where
   whose subquery groups 60M rows into 15M groups, about 14% fewer cycles (5.0s of CPU from 6.0s). Threads handing
   a hash join their build chunks only record them while they hold the build, which copies them into its columns
   when it finishes or spills, a column per thread (in Q09 threads waited for the lock about a third of their time),
-  and a probe asks for the build rows of the probe rows ahead: Q09 0.44s from 0.51s. duckrs
+  and a probe asks for the build rows of the probe rows ahead: Q09 0.44s from 0.51s. pintail
   had no way to load SF10 itself, as an append kept its rows in memory (more than 2 GiB failed); appends now write
-  their full row groups to blocks as they fill (an INSERT of 80M rows takes 90MB). duckrs now loads SF10 into its
+  their full row groups to blocks as they fill (an INSERT of 80M rows takes 90MB). pintail now loads SF10 into its
   own file (COPY of the `.tbl` files: lineitem 24s against C++'s 22s, the rest under 5s each; at most 710MB
   resident, where C++ takes 2.2GB; 2.78GB of file against C++'s 2.79GB), and all 22 queries on that file match
   `answers/sf10`. A CSV file larger than a buffer (32MB) is sniffed on its first buffer, unless a scan of the
@@ -996,13 +996,13 @@ Each item gives the number of failing files in `test/` that it should fix, where
 
 ## Phase 14: Extensions (not started)
 
-- [ ] 49. Extension ABI, so `LOAD` works with `.duckrs_extension` files (`sql/extensions`: 11 failing)
+- [ ] 49. Extension ABI, so `LOAD` works with `.pintail_extension` files (`sql/extensions`: 11 failing)
 - [ ] 50. ICU: time zones and collations. This unlocks the 22 skipped `sql/timezone` files.
 - [ ] 51. httpfs (S3 and HTTP), delta, spatial
 
 ## After v1: the C++ scheduler
 
-- [ ] 55. C++'s event-driven executor, then the streaming CTE exchange on it. duckrs runs its pipelines one after
+- [ ] 55. C++'s event-driven executor, then the streaming CTE exchange on it. pintail runs its pipelines one after
   another (`execution/mod.rs`, `build_pipelines` / `Pipeline::run`); C++ runs them as an event graph of tasks
   (`MetaPipeline`, `Event`, `PipelineExecutor`) whose operators can block and resume. The CTE exchange
   (`parallel/pipeline_broadcast_exchange.cpp`, about 2,300 lines, with `physical_cte.cpp`, the CTE scan's

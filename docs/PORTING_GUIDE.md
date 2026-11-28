@@ -1,6 +1,6 @@
 # Porting guide
 
-How to turn DuckDB C++ into duckrs Rust. The rule: **port behavior, not syntax.** Read the C++
+How to turn DuckDB C++ into pintail Rust. The rule: **port behavior, not syntax.** Read the C++
 for semantics and edge cases, then write idiomatic Rust.
 
 ## File headers
@@ -35,7 +35,7 @@ Every ported file starts with its source and the baseline marker:
 
 ## Error messages
 
-Copy them **verbatim**, including the `<Kind> Error: ` prefix that `duckrs::Error`'s `Display`
+Copy them **verbatim**, including the `<Kind> Error: ` prefix that `pintail::Error`'s `Display`
 adds. sqllogictest `statement error` blocks match message substrings, so a reworded message fails
 tests. Find the C++ text with `grep -rn "message fragment" ../duckdb/src`.
 

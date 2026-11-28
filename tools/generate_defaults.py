@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generates crates/duckrs-core/src/catalog/defaults_table.rs from the DuckDB checkout.
+"""Generates crates/pintail-core/src/catalog/defaults_table.rs from the DuckDB checkout.
 
 The default views, macros and table macros are SQL in the initializer arrays of
 duckdb/src/catalog/default/default_{views,functions,table_functions}.cpp; this reads those
@@ -15,7 +15,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 DUCKDB = Path(sys.argv[1] if len(sys.argv) > 1 else ROOT.parent / "duckdb")
-OUTPUT = ROOT / "crates/duckrs-core/src/catalog/defaults_table.rs"
+OUTPUT = ROOT / "crates/pintail-core/src/catalog/defaults_table.rs"
 
 ESCAPES = {"n": "\n", "t": "\t", '"': '"', "'": "'", "\\": "\\", "r": "\r", "0": "\0"}
 

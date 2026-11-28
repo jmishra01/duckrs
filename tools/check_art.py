@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Can the ART of duckrs read what the real DuckDB wrote.
+"""Can the ART of pintail read what the real DuckDB wrote.
 
 Needs the reference engine: cargo build --release -p sqllogictest --features reference
 
@@ -54,8 +54,8 @@ if result.returncode != 0:
     sys.exit(result.returncode)
 sys.exit(
     subprocess.run(
-        ["cargo", "test", "-q", "-p", "duckrs-core", "an_art_that_duckdb_wrote", "--", "--ignored", "--nocapture"],
+        ["cargo", "test", "-q", "-p", "pintail-core", "an_art_that_duckdb_wrote", "--", "--ignored", "--nocapture"],
         cwd=root,
-        env={**os.environ, "DUCKRS_ART_FILES": ":".join(files)},
+        env={**os.environ, "PINTAIL_ART_FILES": ":".join(files)},
     ).returncode
 )

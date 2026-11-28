@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-/// What duckrs says about SQL it does not run yet (`duckrs_core::unported`).
-const UNPORTED_MARKER: &str = "is not yet ported to duckrs";
+/// What pintail says about SQL it does not run yet (`pintail_core::unported`).
+const UNPORTED_MARKER: &str = "is not yet ported to pintail";
 
 /// Settings shared by every file in a run.
 #[derive(Debug, Clone)]
@@ -230,7 +230,7 @@ impl Shared {
             (ExpectedResult::Error(_), None) => {
                 self.record_failure(Failure::new(location, "Query unexpectedly succeeded!"))
             }
-            // a feature duckrs lacks never stands in for the error a test expects
+            // a feature pintail lacks never stands in for the error a test expects
             (ExpectedResult::Error(_), Some(error)) if error.contains(UNPORTED_MARKER) => self.record_failure(
                 Failure::new(location, format!("Query failed on a missing feature:\n{error}")),
             ),
@@ -851,7 +851,7 @@ impl<'a> FileRunner<'a> {
                 shared.settings.write().unwrap().always_fail_error_messages = m.clone();
                 Flow::Next
             }
-            // `QueryWatchdog` interrupts a statement that runs past the timeout. duckrs can't interrupt a
+            // `QueryWatchdog` interrupts a statement that runs past the timeout. pintail can't interrupt a
             // running query yet, so the file's own `--timeout` is what bounds a hang: the setting is
             // checked and taken, and a hang still fails the file.
             Record::SetQueryTimeout(_) => Flow::Next,

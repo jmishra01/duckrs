@@ -46,7 +46,7 @@ def run(binary):
     failures = []
     for case in cases:
         # each case starts with an empty test directory, as DuckDB's test runner gives it
-        shutil.rmtree(os.environ.get("DUCKRS_CAPI_TEST_DIR", "duckrs_capi_test_dir"), ignore_errors=True)
+        shutil.rmtree(os.environ.get("PINTAIL_CAPI_TEST_DIR", "pintail_capi_test_dir"), ignore_errors=True)
         try:
             proc = subprocess.run([binary, spec(case)], capture_output=True, text=True, timeout=TIMEOUT,
                                   errors="replace")

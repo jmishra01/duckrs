@@ -1,12 +1,12 @@
-# duckrs
+# pintail
 
 An analytical SQL database engine: a port of [DuckDB](https://github.com/duckdb/duckdb) to Rust.
 
-**Status: 5592 files pass, 91.8% of the 6,090 that run (6,367 in all, 277 skipped), against DuckDB's test suite at baseline `d4eea3f208d`.** That meets the overall v1 target of 90%. The phase gates are met (`test/parquet` at 85.6% against 80%; the CTE gate counts as met at 84%). The C API (`crates/duckrs-capi`) has 538 of the 548 functions of `duckdb.h` and passes 161 of 179 test cases of DuckDB's C API tests; config options and `duckdb_appender_create_query` are left (item 41 of REMAINING_WORK). Still open for v1: one more TPC-H SF10 run on a quiet machine (the last gave 0.58× of C++'s time against a 1.5× limit). Extensions (`LOAD`, ICU, httpfs, ...) come after v1. Per-directory numbers are in [`docs/STATUS.md`](docs/STATUS.md), and what is left in [`docs/REMAINING_WORK.md`](docs/REMAINING_WORK.md).
+**Status: 5592 files pass, 91.8% of the 6,090 that run (6,367 in all, 277 skipped), against DuckDB's test suite at baseline `d4eea3f208d`.** That meets the overall v1 target of 90%. The phase gates are met (`test/parquet` at 85.6% against 80%; the CTE gate counts as met at 84%). The C API (`crates/pintail-capi`) has 538 of the 548 functions of `duckdb.h` and passes 161 of 179 test cases of DuckDB's C API tests; config options and `duckdb_appender_create_query` are left (item 41 of REMAINING_WORK). Still open for v1: one more TPC-H SF10 run on a quiet machine (the last gave 0.58× of C++'s time against a 1.5× limit). Extensions (`LOAD`, ICU, httpfs, ...) come after v1. Per-directory numbers are in [`docs/STATUS.md`](docs/STATUS.md), and what is left in [`docs/REMAINING_WORK.md`](docs/REMAINING_WORK.md).
 
 What exists today:
 
-- `crates/duckrs-common`: the core building blocks every other crate uses:
+- `crates/pintail-common`: the core building blocks every other crate uses:
   - the type system (`LogicalType`, `PhysicalType`, with DuckDB's ids and names), `string_t`
     (`StringT`, the 16-byte inline/prefix+pointer string) and its arena, `Interval`;
   - `Vector` (flat, constant, dictionary and sequence representations, nested LIST/STRUCT/
@@ -24,11 +24,11 @@ What exists today:
   - the binary serializer (DuckDB's on-disk/WAL format) with `LogicalType` and `Value`
     serialization, interval parsing, and byte-comparable sort keys (`create_sort_key`) with an
     in-memory sort.
-- `crates/duckrs-parser`: a port of DuckDB's PEG parser engine: the tokenizer, keyword tables,
+- `crates/pintail-parser`: a port of DuckDB's PEG parser engine: the tokenizer, keyword tables,
   grammar loader and a memoizing PEG matcher that runs DuckDB's own grammar (vendored from the
   baseline in `grammar/`, re-synced with `sync_grammar.sh`) and produces parse trees. It accepts
   99.99% of the statements the test corpus expects to parse (all except one extension's
-  grammar); `cargo run --release -p duckrs-parser --example corpus` measures this, and CI fails
+  grammar); `cargo run --release -p pintail-parser --example corpus` measures this, and CI fails
   below 99.9%. The transformer turns parse trees into the AST in `ast.rs`, which renders SQL
   exactly like DuckDB's `ToString`. It covers every statement in DuckDB's grammar (SELECT with
   every expression form, DML, DDL, utility statements, PIVOT, MERGE, MATCH_RECOGNIZE, external
@@ -38,9 +38,9 @@ What exists today:
   later phases. Expression depth is limited like DuckDB (`max_expression_depth`). Parsing a
   corpus statement into the AST takes about 82 µs (`bench` example), with packrat memoization of
   the rules DuckDB memoizes and a pool of reused parser threads. Phase 2 is complete.
-- `crates/duckrs-main`: the client (`ClientContext`, `DatabaseInstance`, settings, EXPLAIN, triggers),
-  split out of `duckrs-core` as the first step of the crate split (see `../CLAUDE.md`).
-- `crates/duckrs-core`: the engine, one module per DuckDB `src/` directory until the boundaries
+- `crates/pintail-main`: the client (`ClientContext`, `DatabaseInstance`, settings, EXPLAIN, triggers),
+  split out of `pintail-core` as the first step of the crate split (see `../CLAUDE.md`).
+- `crates/pintail-core`: the engine, one module per DuckDB `src/` directory until the boundaries
   settle: an in-memory catalog (`catalog`); scalar functions, the implicit cast cost rules, type
   unification (`MaxLogicalType`), overload resolution and vector casts (`function`); the binder,
   bound expressions, logical operators and column binding resolution (`planner`); the expression
@@ -58,15 +58,15 @@ What exists today:
   of DuckDB's settings (generated from its `settings.json` by `tools/generate_settings.py`), with
   DuckDB's types and error messages. The optimizer turns a filter over a cross product
   (`FROM a, b WHERE a.x = b.x`) into a join, and Phase 7 reorders inner joins by estimated cost. BEGIN, COMMIT and ROLLBACK work: a transaction sees a snapshot of its own, and write-write conflicts on rows and catalog entries fail as in DuckDB. UNION, EXCEPT and INTERSECT (with ALL, and BY NAME) and non-recursive CTEs work, the CTEs inlined at each reference. Scalar, EXISTS, IN, ANY and ALL subqueries work, correlated too. Correlated ones in a filter or a projection are flattened into duplicate eliminated joins where possible; the others run as plans of their own, once if uncorrelated and otherwise once per combination of correlated values. Recursive CTEs run round by round, and LATERAL joins run their right side per combination of left values. UPDATE and DELETE work, with RETURNING, and rewrite the table at the end of the statement; until Phase 10 a statement that writes runs alone. SQL it does not
-  run yet fails with an error saying it `is not yet ported to duckrs`; the sqllogictest runner
+  run yet fails with an error saying it `is not yet ported to pintail`; the sqllogictest runner
   never counts that error as the one a test expects.
-- `crates/duckrs`: the public API (`Database`, `Connection`, `QueryResult`) over the engine.
+- `crates/pintail`: the public API (`Database`, `Connection`, `QueryResult`) over the engine.
   Phase 9 has started: `Database::open` reads files written by DuckDB and scans their tables in place: tables of scalar and
   nested types, with deleted rows, in all compression. Such a
   database takes no writes. Views, macros, sequences, types, defaults, generated columns, constraints and indexes come along, what a write-ahead log committed is replayed, and what isn't ported yet is an error. Files can be written too, in a format that DuckDB reads: commits go to a write-ahead log, and `CHECKPOINT` and closing the database write all of it, compressed with RLE, BitPacking, Roaring and dictionaries, apart from keys and indexes, which wait for Phase 10; see "Phase 9" in
   [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 - `tools/sqllogictest`: a port of DuckDB's sqllogictest runner. It runs the DuckDB `.test` corpus
-  against duckrs, or against the C++ DuckDB library as a reference. duckrs passes 3322 files so far
+  against pintail, or against the C++ DuckDB library as a reference. pintail passes 3322 files so far
   (`tools/sqllogictest/known_passing.txt`, a CI gate), among them
   `test/sql/projection/test_simple_projection.test`.
 
@@ -80,25 +80,25 @@ The full roadmap is in [`../RUST_PORT_PLAN.md`](../RUST_PORT_PLAN.md).
 ## Layout
 
 ```
-duckrs/
-├── crates/duckrs/          # public API (facade crate)
-├── crates/duckrs-common/   # types, vectors, executors, values
-├── crates/duckrs-core/     # catalog, functions, binder/planner, optimizer, execution, storage
-├── crates/duckrs-main/     # Database, Connection and ClientContext, settings, EXPLAIN (DuckDB's src/main)
-├── crates/duckrs-parser/   # tokenizer, PEG grammar engine (+ vendored grammar), AST, transformer
-├── crates/duckrs-cli/      # the duckrs shell binary
+pintail/
+├── crates/pintail/          # public API (facade crate)
+├── crates/pintail-common/   # types, vectors, executors, values
+├── crates/pintail-core/     # catalog, functions, binder/planner, optimizer, execution, storage
+├── crates/pintail-main/     # Database, Connection and ClientContext, settings, EXPLAIN (DuckDB's src/main)
+├── crates/pintail-parser/   # tokenizer, PEG grammar engine (+ vendored grammar), AST, transformer
+├── crates/pintail-cli/      # the pintail shell binary
 ├── tools/sqllogictest/     # test runner + known_passing.txt
 └── docs/                   # ARCHITECTURE, PORTING_GUIDE, UPSTREAM_SYNC
 ```
 
 Each crate has a README with its modules, main types, how it works, what is missing and how to
 test it, from the bottom of the stack up:
-[`duckrs-common`](crates/duckrs-common/README.md),
-[`duckrs-parser`](crates/duckrs-parser/README.md),
-[`duckrs-core`](crates/duckrs-core/README.md),
-[`duckrs-main`](crates/duckrs-main/README.md),
-[`duckrs`](crates/duckrs/README.md) and
-[`duckrs-cli`](crates/duckrs-cli/README.md).
+[`pintail-common`](crates/pintail-common/README.md),
+[`pintail-parser`](crates/pintail-parser/README.md),
+[`pintail-core`](crates/pintail-core/README.md),
+[`pintail-main`](crates/pintail-main/README.md),
+[`pintail`](crates/pintail/README.md) and
+[`pintail-cli`](crates/pintail-cli/README.md).
 
 The runner expects the DuckDB checkout at `../duckdb` (override with `--duckdb-root`). The port
 is pinned to the `rust-port-baseline` branch of that checkout.
@@ -107,7 +107,7 @@ is pinned to the `rust-port-baseline` branch of that checkout.
 
 ```bash
 cargo build --release -p sqllogictest
-./target/release/sqllogictest --allow-failures --isolate --timeout 60 --status-out docs/STATUS.md   # duckrs, whole corpus
+./target/release/sqllogictest --allow-failures --isolate --timeout 60 --status-out docs/STATUS.md   # pintail, whole corpus
 ./target/release/sqllogictest test/sql/select -v                            # one directory, verbose
 ```
 

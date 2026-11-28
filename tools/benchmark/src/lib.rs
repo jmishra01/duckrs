@@ -2,7 +2,7 @@
 //
 //! A Rust port of DuckDB's benchmark runner. It reads the `.benchmark` files of a DuckDB checkout
 //! (`benchmark/micro`, `benchmark/tpch`, ...) and times them on any [`Engine`] of the sqllogictest
-//! crate: duckrs, and with the `reference` feature the C++ DuckDB library, so that the two can be
+//! crate: pintail, and with the `reference` feature the C++ DuckDB library, so that the two can be
 //! compared on the same queries.
 
 pub mod datagen;

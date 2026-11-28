@@ -341,7 +341,7 @@ checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "benchmark"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "regex",
  "sqllogictest",
@@ -751,115 +751,6 @@ dependencies = [
  "block-buffer 0.12.1",
  "const-oid",
  "crypto-common 0.2.2",
-]
-
-[[package]]
-name = "duckrs"
-version = "0.0.1"
-dependencies = [
- "arrow",
- "criterion",
- "duckrs-common",
- "duckrs-core",
- "duckrs-main",
- "libc",
-]
-
-[[package]]
-name = "duckrs-capi"
-version = "0.0.1"
-dependencies = [
- "arrow",
- "duckrs",
- "duckrs-common",
- "libc",
-]
-
-[[package]]
-name = "duckrs-cli"
-version = "0.0.1"
-dependencies = [
- "duckrs",
- "duckrs-common",
- "duckrs-core",
- "duckrs-parser",
- "libc",
- "rustyline",
-]
-
-[[package]]
-name = "duckrs-common"
-version = "0.0.1"
-dependencies = [
- "criterion",
- "hashbrown",
- "parking_lot",
- "proptest",
-]
-
-[[package]]
-name = "duckrs-core"
-version = "0.0.1"
-dependencies = [
- "arrow",
- "brotli",
- "duckrs-common",
- "duckrs-parser",
- "duckrs-tpcds",
- "duckrs-tpch",
- "flate2",
- "hashbrown",
- "libc",
- "libm",
- "lz4_flex",
- "memchr",
- "parking_lot",
- "parquet",
- "proptest",
- "regex",
- "ring",
- "sha1",
- "sha2 0.10.9",
- "snap",
- "twox-hash",
- "unicode-normalization",
- "unicode-segmentation",
- "zstd",
-]
-
-[[package]]
-name = "duckrs-main"
-version = "0.0.1"
-dependencies = [
- "duckrs-common",
- "duckrs-core",
- "duckrs-parser",
- "duckrs-tpcds",
- "duckrs-tpch",
- "parking_lot",
-]
-
-[[package]]
-name = "duckrs-parser"
-version = "0.0.1"
-dependencies = [
- "duckrs-common",
- "proptest",
- "sqllogictest",
-]
-
-[[package]]
-name = "duckrs-tpcds"
-version = "0.0.1"
-dependencies = [
- "duckrs-common",
-]
-
-[[package]]
-name = "duckrs-tpch"
-version = "0.0.1"
-dependencies = [
- "duckrs-common",
 ]
 
 [[package]]
@@ -1430,6 +1321,115 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
+name = "pintail"
+version = "1.0.0"
+dependencies = [
+ "arrow",
+ "criterion",
+ "libc",
+ "pintail-common",
+ "pintail-core",
+ "pintail-main",
+]
+
+[[package]]
+name = "pintail-capi"
+version = "1.0.0"
+dependencies = [
+ "arrow",
+ "libc",
+ "pintail",
+ "pintail-common",
+]
+
+[[package]]
+name = "pintail-cli"
+version = "1.0.0"
+dependencies = [
+ "libc",
+ "pintail",
+ "pintail-common",
+ "pintail-core",
+ "pintail-parser",
+ "rustyline",
+]
+
+[[package]]
+name = "pintail-common"
+version = "1.0.0"
+dependencies = [
+ "criterion",
+ "hashbrown",
+ "parking_lot",
+ "proptest",
+]
+
+[[package]]
+name = "pintail-core"
+version = "1.0.0"
+dependencies = [
+ "arrow",
+ "brotli",
+ "flate2",
+ "hashbrown",
+ "libc",
+ "libm",
+ "lz4_flex",
+ "memchr",
+ "parking_lot",
+ "parquet",
+ "pintail-common",
+ "pintail-parser",
+ "pintail-tpcds",
+ "pintail-tpch",
+ "proptest",
+ "regex",
+ "ring",
+ "sha1",
+ "sha2 0.10.9",
+ "snap",
+ "twox-hash",
+ "unicode-normalization",
+ "unicode-segmentation",
+ "zstd",
+]
+
+[[package]]
+name = "pintail-main"
+version = "1.0.0"
+dependencies = [
+ "parking_lot",
+ "pintail-common",
+ "pintail-core",
+ "pintail-parser",
+ "pintail-tpcds",
+ "pintail-tpch",
+]
+
+[[package]]
+name = "pintail-parser"
+version = "1.0.0"
+dependencies = [
+ "pintail-common",
+ "proptest",
+ "sqllogictest",
+]
+
+[[package]]
+name = "pintail-tpcds"
+version = "1.0.0"
+dependencies = [
+ "pintail-common",
+]
+
+[[package]]
+name = "pintail-tpch"
+version = "1.0.0"
+dependencies = [
+ "pintail-common",
+]
+
+[[package]]
 name = "pkg-config"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1865,13 +1865,13 @@ checksum = "199905e6153d6405f9728fe44daace35f8f837bbf830bb6e85fbd5828709a886"
 
 [[package]]
 name = "sqllogictest"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "clap",
- "duckrs",
  "libc",
  "libduckdb-sys",
  "md-5",
+ "pintail",
  "regex",
  "walkdir",
 ]

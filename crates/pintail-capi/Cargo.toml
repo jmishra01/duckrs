@@ -1,0 +1,21 @@
+[package]
+name = "pintail-capi"
+description = "DuckDB's C API (duckdb.h, v1) over pintail"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "pintail_capi"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+# the Arrow C data interface (`arrow::ffi`) of the Arrow functions
+arrow = { workspace = true, features = ["ffi"] }
+pintail.workspace = true
+pintail-common.workspace = true
+libc.workspace = true
+
+[lints]
+workspace = true

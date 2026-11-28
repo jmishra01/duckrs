@@ -62,7 +62,7 @@ impl Connection for MockConnection {
 }
 
 fn run(name: &str, body: &str) -> Outcome {
-    let dir = std::env::temp_dir().join(format!("duckrs-slt-mock-{}-{name}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("pintail-slt-mock-{}-{name}", std::process::id()));
     std::fs::create_dir_all(dir.join("test")).unwrap();
     let file = format!("test/{name}.test");
     std::fs::write(dir.join(&file), body).unwrap();
