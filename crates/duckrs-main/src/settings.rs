@@ -948,6 +948,20 @@ fn on_set(setting: &SettingDefinition, value: Value) -> Result<Value> {
     })
 }
 
+/// The default of the setting at `index`: what the database set as its own (`DBConfig::SetDefaultTempDirectory`),
+/// else [`default_value`].
+fn database_default(index: usize, setting: &SettingDefinition, global: &SettingValues) -> Option<Value> {
+    global.2.get(&index).cloned().or_else(|| default_value(setting))
+}
+
+/// Sets the default of `name` this database has, which RESET goes back to (`DBConfig::SetDefaultTempDirectory`
+/// makes `temp_directory` the database file's with `.tmp`, or `.tmp` in memory).
+pub fn set_database_default(name: &str, value: Value, global: &mut SettingValues) {
+    if let Some((index, _)) = find_setting(name) {
+        global.2.insert(index, value);
+    }
+}
+
 /// The default value of a setting, if it has one (`DBConfig::TryGetDefaultValue`).
 fn default_value(setting: &SettingDefinition) -> Option<Value> {
     // `StandardVectorSizeSetting::GetSetting`
@@ -989,6 +1003,10 @@ fn default_value(setting: &SettingDefinition) -> Option<Value> {
         }
         // `ClientConfig::streaming_buffer_size`
         "max_streaming_buffer_size" => return Some(Value::varchar("10.0 MiB")),
+        // `MaxTempDirectorySizeSetting::GetSetting`: nothing set, and no temporary directory in use
+        "max_temp_directory_size" => {
+            return Some(Value::varchar(duckrs_core::execution::temporary::DEFAULT_TEMP_DIRECTORY_SIZE));
+        }
         _ => {}
     }
     let text = setting.default_value?;
@@ -1000,7 +1018,7 @@ fn default_value(setting: &SettingDefinition) -> Option<Value> {
 /// Setting values of one scope. The database's (global) values also hold the extension options registered at run
 /// time (the extension options of `DBConfig::user_settings`), whose values sit after those of the built-in settings.
 #[derive(Debug, Default, Clone)]
-pub struct SettingValues(HashMap<usize, Value>, Vec<ExtensionOption>);
+pub struct SettingValues(HashMap<usize, Value>, Vec<ExtensionOption>, HashMap<usize, Value>);
 
 /// `ExtensionOption`: an option registered while the database runs (`DBConfig::AddExtensionOption`, as
 /// `duckdb_register_config_option` does), set, reset and read as any other.
@@ -1073,7 +1091,7 @@ pub fn lookup_setting(name: &str, global: &SettingValues, session: &SettingValue
     if let Some(value) = global.0.get(&index) {
         return Some((value.clone(), SettingLookupScope::Global));
     }
-    default_value(setting?).map(|value| (value, SettingLookupScope::Global))
+    database_default(index, setting?, global).map(|value| (value, SettingLookupScope::Global))
 }
 
 /// `PhysicalSet::GetSettingScope`: the scope `SET` without a scope uses, and the checks of an
@@ -1393,9 +1411,10 @@ fn file_access_on_set(name: &str, value: Value, global: &SettingValues, session:
             }
             Ok(value)
         }
+        // `TempDirectorySetting::SetGlobal`: NULL is no directory, as the empty string
         "temp_directory" => {
             check_temp_directory_change(global, session)?;
-            Ok(value)
+            Ok(if value.is_null() { Value::varchar("") } else { value })
         }
         "disabled_filesystems" => {
             let text = if value.is_null() { String::new() } else { value.try_to_string()? };
@@ -1464,7 +1483,7 @@ pub fn current_value(name: &str, global: &SettingValues, session: &SettingValues
         .get(&index)
         .or_else(|| global.0.get(&index))
         .cloned()
-        .or_else(|| default_value(setting))
+        .or_else(|| database_default(index, setting, global))
 }
 
 
@@ -1486,7 +1505,7 @@ pub fn list_settings(global: &SettingValues, session: &SettingValues) -> Vec<Set
             scope = "GLOBAL";
             Some(value.clone())
         } else {
-            default_value(setting)
+            database_default(index, setting, global)
         };
         let row = SettingRow {
             name: Cow::Borrowed(setting.name),

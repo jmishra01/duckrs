@@ -3624,6 +3624,47 @@ impl Binder<'_> {
                 .bind_rows(table_ref, &name, names, types, rows)
                 .map(|op| table_function_rows(op, &name));
         }
+        // `DuckDBTemporaryFilesFunction` (`StandardBufferManager::GetTemporaryFiles`): the files in
+        // `temp_directory` that hold spilled data, those of queries running now (duckrs removes a query's
+        // when it is done) and the `.block` files
+        if name == "duckdb_temporary_files"
+            && call.args.is_empty()
+            && call.name.qualification.iter().all(String::is_empty)
+        {
+            let directory = self
+                .session
+                .as_ref()
+                .and_then(|session| (session.setting)("temp_directory").ok())
+                .filter(|value| !value.is_null())
+                .and_then(|value| value.try_to_string().ok())
+                .unwrap_or_default();
+            let mut files = Vec::new();
+            if !directory.is_empty()
+                && let Ok(entries) = std::fs::read_dir(&directory)
+            {
+                for entry in entries.flatten() {
+                    let file_name = entry.file_name().to_string_lossy().into_owned();
+                    let spilled = file_name.ends_with(".block")
+                        || file_name.starts_with(duckrs_common::SPILL_FILE_PREFIX);
+                    // another query can remove its file before its size is read
+                    let Ok(metadata) = entry.metadata() else { continue };
+                    if spilled && metadata.is_file() {
+                        let path = std::path::Path::new(&directory).join(&file_name);
+                        files.push((path.to_string_lossy().into_owned(), metadata.len()));
+                    }
+                }
+            }
+            files.sort();
+            let rows = files
+                .into_iter()
+                .map(|(path, size)| vec![Value::varchar(path), Value::bigint(size as i64)])
+                .collect();
+            let names = vec!["path".to_string(), "size".to_string()];
+            let types = vec![LogicalType::VARCHAR, LogicalType::BIGINT];
+            return self
+                .bind_rows(table_ref, &name, names, types, rows)
+                .map(|op| table_function_rows(op, &name));
+        }
         let generate_series = name == "generate_series";
         if !(generate_series || name == "range") || !call.name.qualification.is_empty() {
             // the table macros of the system catalog (`DefaultTableFunctionGenerator`)

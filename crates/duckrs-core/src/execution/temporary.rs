@@ -31,7 +31,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 pub struct QueryMemory {
     limit: usize,
     used: AtomicUsize,
-    directory: PathBuf,
+    /// `temp_directory`; `None` when it is empty, and nothing can be spilled
+    directory: Option<PathBuf>,
     /// whether this query made the directory
     made_directory: Mutex<bool>,
     max_temp_size: Option<u64>,
@@ -46,7 +47,7 @@ pub struct QueryMemory {
 }
 
 impl QueryMemory {
-    pub fn new(limit: usize, directory: PathBuf, max_temp_size: Option<u64>) -> Arc<Self> {
+    pub fn new(limit: usize, directory: Option<PathBuf>, max_temp_size: Option<u64>) -> Arc<Self> {
         Arc::new(Self {
             limit,
             used: AtomicUsize::new(0),
@@ -88,7 +89,7 @@ impl QueryMemory {
 
     /// The limit of the settings' defaults: 80% of the machine's memory, and `.tmp`.
     pub fn with_defaults() -> Arc<Self> {
-        Self::new(default_memory_limit(), PathBuf::from(".tmp"), None)
+        Self::new(default_memory_limit(), Some(PathBuf::from(".tmp")), None)
     }
 
     pub fn limit(&self) -> usize {
@@ -113,27 +114,33 @@ impl QueryMemory {
 
     /// A new file to spill to.
     pub fn spill_file(self: &Arc<Self>) -> Result<SpillFile> {
+        // `StandardBufferManager::RequireTemporaryDirectory`
+        let Some(directory) = &self.directory else {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "Out-of-memory: cannot write buffer because no temporary directory is specified!\nTo enable \
+                 temporary buffer eviction set a temporary directory using PRAGMA temp_directory='/path/to/tmp.tmp'",
+            ));
+        };
         {
             let mut made = self.made_directory.lock();
-            if !self.directory.exists() {
-                std::fs::create_dir_all(&self.directory).map_err(|e| {
+            if !directory.exists() {
+                std::fs::create_dir_all(directory).map_err(|e| {
                     Error::new(
                         ErrorKind::Io,
-                        format!(
-                            "Failed to create the temporary directory \"{}\": {e}",
-                            self.directory.display()
-                        ),
+                        format!("Failed to create the temporary directory \"{}\": {e}", directory.display()),
                     )
                 })?;
                 *made = true;
             }
         }
         let name = format!(
-            "duckrs_temp_storage_{}_{}.tmp",
+            "{}{}_{}.tmp",
+            duckrs_common::SPILL_FILE_PREFIX,
             std::process::id(),
             self.next_file.fetch_add(1, Ordering::Relaxed)
         );
-        let path = self.directory.join(name);
+        let path = directory.join(name);
         let file = File::create(&path).map_err(|e| {
             Error::new(
                 ErrorKind::Io,
@@ -177,8 +184,10 @@ impl QueryMemory {
 impl Drop for QueryMemory {
     fn drop(&mut self) {
         // only when it is empty: another query may be using it
-        if *self.made_directory.get_mut() {
-            let _ = std::fs::remove_dir(&self.directory);
+        if *self.made_directory.get_mut()
+            && let Some(directory) = &self.directory
+        {
+            let _ = std::fs::remove_dir(directory);
         }
     }
 }
@@ -583,7 +592,7 @@ mod tests {
     #[test]
     fn encrypted_spill_files_hold_no_plaintext_and_give_back_their_chunks() {
         let directory = std::env::temp_dir().join(format!("duckrs_spill_encrypted_{}", std::process::id()));
-        let memory = QueryMemory::new(1000, directory.clone(), None);
+        let memory = QueryMemory::new(1000, Some(directory.clone()), None);
         memory.set_encrypt_files(true);
         let mut file = memory.spill_file().unwrap();
         let types = [LogicalType::VARCHAR];
@@ -612,7 +621,7 @@ mod tests {
     #[test]
     fn spill_files_give_back_their_chunks_and_go_away() {
         let directory = std::env::temp_dir().join(format!("duckrs_spill_test_{}", std::process::id()));
-        let memory = QueryMemory::new(1000, directory.clone(), None);
+        let memory = QueryMemory::new(1000, Some(directory.clone()), None);
         assert!(memory.try_reserve(600));
         assert!(!memory.try_reserve(600));
         memory.release(600);
@@ -643,7 +652,7 @@ mod tests {
     #[test]
     fn the_temporary_directory_has_a_limit() {
         let directory = std::env::temp_dir().join(format!("duckrs_spill_limit_{}", std::process::id()));
-        let memory = QueryMemory::new(1000, directory, Some(100));
+        let memory = QueryMemory::new(1000, Some(directory), Some(100));
         let mut file = memory.spill_file().unwrap();
         let mut chunk = DataChunk::new(&[LogicalType::BIGINT]);
         for i in 0..100 {

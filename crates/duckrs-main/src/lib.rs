@@ -329,9 +329,12 @@ struct OpenTransactions {
 impl DatabaseInstance {
     fn with_file_access(file_access: Option<FileAccess>) -> Self {
         duckrs_common::types::set_keyword_check(duckrs_parser::keywords::is_keyword);
+        // `DBConfig::SetDefaultTempDirectory`: `.tmp` for a database in memory
+        let mut settings = SettingValues::default();
+        settings::set_database_default("temp_directory", Value::varchar(".tmp"), &mut settings);
         Self {
             catalog: Arc::new(Catalog::new(DEFAULT_CATALOG)),
-            settings: Arc::default(),
+            settings: Arc::new(RwLock::new(settings)),
             transactions: Mutex::new(OpenTransactions::default()),
             connections: AtomicU64::new(0),
             statements: RwLock::new(()),
@@ -497,8 +500,14 @@ impl DatabaseInstance {
         let name = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
         let mut db = Self::with_file_access(None);
         db.name.clone_from(&name);
-        if let Some(settings) = &options.settings {
-            db.settings = settings.clone();
+        match &options.settings {
+            Some(settings) => db.settings = settings.clone(),
+            // `DBConfig::SetDefaultTempDirectory`: the database file's path with `.tmp`
+            None => settings::set_database_default(
+                "temp_directory",
+                Value::varchar(format!("{}.tmp", path.display())),
+                &mut db.settings.write(),
+            ),
         }
         let buffer = storage::load_database(path, &db.catalog, read_only, options.encryption.as_ref())?;
         // `SingleFileStorageManager::LoadDatabase`: a block size given has to be the file's
@@ -1877,13 +1886,10 @@ impl ClientContext {
             Some(limit) => parse_setting_bytes(&limit)?.map_or(usize::MAX, |bytes| bytes as usize),
             None => default_memory_limit(),
         };
-        let directory = match text("temp_directory") {
-            Some(directory) => PathBuf::from(directory),
-            None => match &self.db.file {
-                Some(file) => PathBuf::from(format!("{}.tmp", file.path.display())),
-                None => PathBuf::from(".tmp"),
-            },
-        };
+        // the database's default when nobody set one; empty is none (`use_temporary_directory`)
+        let directory = text("temp_directory")
+            .filter(|directory| !directory.is_empty())
+            .map(PathBuf::from);
         let max_temp_size = match text("max_temp_directory_size") {
             Some(size) => parse_setting_bytes(&size)?,
             None => None,

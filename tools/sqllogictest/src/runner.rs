@@ -638,7 +638,33 @@ impl<'a> FileRunner<'a> {
         });
         self.con = Some(db.connect()?);
         self.db = Some(db);
+        self.default_in_memory_temp_directory();
         Ok(())
+    }
+
+    /// `ConfigureDefaultInMemoryTemporaryDirectory`: a database in memory that would spill to `.tmp`
+    /// spills to a directory of this test's own instead.
+    fn default_in_memory_temp_directory(&mut self) {
+        if self.db_path.is_some() {
+            return;
+        }
+        let Some(con) = self.con.as_mut() else { return };
+        let current = con
+            .query("SELECT current_setting('temp_directory'), current_setting('enable_external_access')::VARCHAR")
+            .ok()
+            .and_then(|output| output.rows.into_iter().next());
+        let Some([Some(directory), Some(access)]) = current.as_deref() else {
+            return;
+        };
+        if directory != ".tmp" || access != "true" {
+            return;
+        }
+        let name = self.shared.file_name.replace('\\', "/").replace(['/', ':'], "_");
+        let path = self.shared.test_dir.join(format!("sqllogic_temp_{name}"));
+        let _ = con.query(&format!(
+            "SET GLOBAL temp_directory='{}'",
+            path.to_string_lossy().replace('\'', "''")
+        ));
     }
 
     /// `RestartCommand`: the database opened again, with the settings and the search path of the connection
