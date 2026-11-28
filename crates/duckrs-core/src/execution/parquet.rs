@@ -4572,8 +4572,34 @@ fn footer_error(path: &str) -> Option<Error> {
             "Failed to read Parquet file \"{path}\": schema has elements that are not part of the schema tree"
         )));
     }
+    let groups = footer.field(4).map(ThriftValue::items).unwrap_or(&[]);
+    // `ParquetStatisticsUtils::TransformColumnStatistics` of GEOMETRY chunks (`GeometryStats::TryAddWKBType`): the
+    // geospatial types (`ColumnMetaData` field 17, its field 2) are WKB codes of 4 vertex types and 7 geometry types
+    for chunk in groups
+        .iter()
+        .flat_map(|group| group.field(1).map(ThriftValue::items).unwrap_or(&[]))
+    {
+        let types = chunk
+            .field(3)
+            .and_then(|meta| meta.field(17))
+            .and_then(|geo| geo.field(2));
+        for code in types
+            .map(ThriftValue::items)
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(ThriftValue::int)
+        {
+            let (vertex, geometry) = (code / 1000, code % 1000);
+            if !(0..4).contains(&vertex) || !(1..8).contains(&geometry) {
+                return Some(Error::new(
+                    ErrorKind::DataCorruption,
+                    "Invalid geometry type in Parquet file",
+                ));
+            }
+        }
+    }
     // a footer of `PAR1` is not encrypted itself, so a chunk's crypto metadata has no file crypto metadata to go with
-    for group in footer.field(4).map(ThriftValue::items).unwrap_or(&[]) {
+    for group in groups {
         for chunk in group.field(1).map(ThriftValue::items).unwrap_or(&[]) {
             if chunk.field(8).is_some() {
                 return Some(invalid("File is encrypted but no file crypto metadata is set"));
