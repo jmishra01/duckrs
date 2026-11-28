@@ -34,6 +34,20 @@ pub struct GroupTable {
     hashes: Vec<u64>,
     entries: Vec<u64>,
     matcher: RowMatcher,
+    /// what [`Self::find_or_create`] works in, kept so that a chunk allocates none of it
+    scratch: Scratch,
+}
+
+/// The buffers of a lookup, by row of the chunk or of the rows still looked for.
+#[derive(Debug, Default)]
+struct Scratch {
+    slots: Vec<usize>,
+    remaining: Vec<u32>,
+    compare: Vec<u32>,
+    compare_ids: Vec<(u32, usize)>,
+    missed: Vec<u32>,
+    candidates: Vec<RowPtr>,
+    candidate_ids: Vec<usize>,
 }
 
 impl GroupTable {
@@ -59,7 +73,16 @@ impl GroupTable {
             hashes: Vec::new(),
             entries: vec![0; INITIAL_CAPACITY],
             matcher,
+            scratch: Scratch::default(),
         })
+    }
+
+    /// Room for `groups` groups in all, so that a table that is to get them grows once rather than doubling its
+    /// way there (`GroupedAggregateHashTable::Resize` to the size of a partition).
+    pub fn reserve(&mut self, groups: usize) {
+        self.resize(groups * 2);
+        self.rows.reserve(groups.saturating_sub(self.rows.len()));
+        self.hashes.reserve(groups.saturating_sub(self.hashes.len()));
     }
 
     /// How many groups it has.
@@ -110,15 +133,27 @@ impl GroupTable {
         // room for every row to be a new group, so that pushing one never moves the hashes
         self.hashes.reserve(count);
         let mut ids = vec![0usize; count];
-        let mut slots: Vec<usize> = hashes.iter().map(|&hash| hash as usize & mask).collect();
-        let mut remaining: Vec<u32> = (0..count as u32).collect();
         let mut new_rows: Vec<u32> = Vec::with_capacity(count);
+        let mut scratch = std::mem::take(&mut self.scratch);
+        let Scratch {
+            slots,
+            remaining,
+            compare,
+            compare_ids,
+            missed,
+            candidates,
+            candidate_ids,
+        } = &mut scratch;
+        slots.clear();
+        slots.extend(hashes.iter().map(|&hash| hash as usize & mask));
+        remaining.clear();
+        remaining.extend(0..count as u32);
         // the row each row is compared with, by the row of `groups`; those not compared are never read
-        let mut candidates: Vec<RowPtr> = Vec::new();
-        let mut candidate_ids = vec![0usize; count];
+        candidates.clear();
+        candidate_ids.resize(count, 0);
         while !remaining.is_empty() {
-            let mut compare: Vec<u32> = Vec::new();
-            let mut compare_ids: Vec<(u32, usize)> = Vec::new();
+            compare.clear();
+            compare_ids.clear();
             let first_new = new_rows.len();
             for (i, &row) in remaining.iter().enumerate() {
                 if let Some(&ahead) = remaining.get(i + PREFETCH_DISTANCE) {
@@ -159,28 +194,28 @@ impl GroupTable {
                 break;
             }
             if candidates.is_empty() {
-                candidates = vec![self.rows[0]; count];
+                candidates.resize(count, self.rows[0]);
             }
-            for &(row, id) in &compare_ids {
+            for &(row, id) in compare_ids.iter() {
                 candidates[row as usize] = self.rows[id];
                 candidate_ids[row as usize] = id;
             }
-            let mut matched = compare;
-            let mut missed = Vec::new();
+            missed.clear();
             // SAFETY: each candidate is a row of `self.data`, which is alive and not reset while `self` is
             unsafe {
                 self.matcher
-                    .match_rows(&self.data, groups, &candidates, &mut matched, Some(&mut missed))
+                    .match_rows(&self.data, groups, candidates, compare, Some(missed))
             };
-            for row in matched {
+            for &row in compare.iter() {
                 ids[row as usize] = candidate_ids[row as usize];
             }
             // those that differ go on from the next entry
-            for &row in &missed {
+            for &row in missed.iter() {
                 slots[row as usize] = (slots[row as usize] + 1) & mask;
             }
-            remaining = missed;
+            std::mem::swap(remaining, missed);
         }
+        self.scratch = scratch;
         Ok((ids, new_rows))
     }
 
