@@ -722,8 +722,16 @@ fn zstd_corrupt(message: &str) -> Error {
 
 /// `ZSTDStorage::StringScan`: per vector of 2048 strings their lengths and one zstd frame of them, on the page
 /// of the segment or a page of its own, and on from there through pages whose last 8 bytes say which is next.
-/// `segment` is the segment to the end of its block, and `packed` says whether others share that block.
-pub fn scan_zstd(segment: &[u8], count: usize, packed: bool, pin: &PinBlock<'_>, out: &mut StringRows) -> Result<()> {
+/// `segment` is the segment to the end of its block, and `packed` says whether others share that block. `memory` is
+/// what the buffer manager holds and may hold: the strings of a vector are allocated within it.
+pub fn scan_zstd(
+    segment: &[u8],
+    count: usize,
+    packed: bool,
+    pin: &PinBlock<'_>,
+    memory: (usize, usize),
+    out: &mut StringRows,
+) -> Result<()> {
     const INVALID_BLOCK: i64 = -1;
     let vectors = count.div_ceil(ZSTD_VECTOR_ROWS);
     let what = "the metadata of a ZSTD segment";
@@ -741,6 +749,12 @@ pub fn scan_zstd(segment: &[u8], count: usize, packed: bool, pin: &PinBlock<'_>,
         let mut visited = std::collections::HashSet::new();
         let first_page;
         let page: &[u8] = if block_id == INVALID_BLOCK {
+            // `ZSTDScanState::LoadVector`: the data on the segment's page comes after the vectors' directory
+            // (`ReadLayout`'s `data_offset`), and its offset is from there
+            let data_offset = compressed_at + 8 * vectors;
+            if offset < data_offset || offset > segment.len() {
+                return Err(corrupted("Corrupted ZSTD segment data: offset is outside the segment"));
+            }
             segment
         } else {
             first_page = pin(block_id as u64)?;
@@ -782,8 +796,27 @@ pub fn scan_zstd(segment: &[u8], count: usize, packed: bool, pin: &PinBlock<'_>,
             current = Some(next_page);
         }
         // `DecompressString`: as many bytes as the strings take, streamed from the frame
-        let wanted: usize = lengths.iter().sum();
+        let wanted = lengths
+            .iter()
+            .fold(0usize, |total, &length| total.saturating_add(length));
         let _ = uncompressed;
+        // `StringVector::AllocateShrinkableBuffer`: the strings' arena, whose blocks double until they hold
+        // them (`ArenaAllocator::AllocateNewBlock`), asks the buffer manager for them within `memory_limit` (the
+        // blocks it holds can be evicted)
+        let (used, limit) = memory;
+        let block = wanted.checked_next_power_of_two().unwrap_or(usize::MAX);
+        if block > limit {
+            use duckrs_common::string_util::bytes_to_human_readable as human;
+            return Err(Error::new(
+                ErrorKind::OutOfMemory,
+                format!(
+                    "failed to allocate data of size {} ({}/{} used)",
+                    human(block as u64),
+                    human(used as u64),
+                    human(limit as u64)
+                ),
+            ));
+        }
         let mut data = vec![0u8; wanted];
         let mut decoder =
             zstd::stream::read::Decoder::with_buffer(frame.as_slice()).map_err(|e| zstd_corrupt(&e.to_string()))?;

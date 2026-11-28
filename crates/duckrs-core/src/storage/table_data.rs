@@ -388,7 +388,10 @@ fn scan_strings(
         COMPRESSION_DICTIONARY => scan_dictionary(data, count, out),
         COMPRESSION_FSST => scan_fsst(data, count, out),
         COMPRESSION_DICT_FSST => scan_dict_fsst(data, count, out, nulls),
-        COMPRESSION_ZSTD => scan_zstd(data, count, pointer.offset != 0, &pin, out),
+        COMPRESSION_ZSTD => {
+            let memory = (buffer.used_memory(), buffer.memory_limit());
+            scan_zstd(data, count, pointer.offset != 0, &pin, memory, out)
+        }
         other => Err(not_ported(other)),
     }
 }

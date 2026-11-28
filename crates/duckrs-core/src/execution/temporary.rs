@@ -553,26 +553,9 @@ pub fn parse_formatted_bytes(text: &str) -> std::result::Result<u64, String> {
     Ok(result as u64)
 }
 
-/// `StringUtil::BytesToHumanReadableString` with 1024: the largest unit with a whole number, and
-/// its first decimal, cut off rather than rounded.
+/// `StringUtil::BytesToHumanReadableString` with 1024.
 pub fn format_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 6] = ["bytes", "KiB", "MiB", "GiB", "TiB", "PiB"];
-    let mut parts = [0u64; 6];
-    parts[0] = bytes;
-    for i in 1..6 {
-        parts[i] = parts[i - 1] / 1024;
-        parts[i - 1] %= 1024;
-    }
-    for i in (1..6).rev() {
-        if parts[i] != 0 {
-            return format!("{}.{} {}", parts[i], parts[i - 1] * 10 / 1024, UNITS[i]);
-        }
-    }
-    if bytes == 1 {
-        "1 byte".into()
-    } else {
-        format!("{bytes} bytes")
-    }
+    duckrs_common::string_util::bytes_to_human_readable(bytes)
 }
 
 #[cfg(test)]

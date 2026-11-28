@@ -66,6 +66,11 @@ impl BufferManager {
         }
     }
 
+    /// `memory_limit`, as a query last set it.
+    pub fn memory_limit(&self) -> usize {
+        self.memory_limit.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// A block an append is filling, which segments in it are read from until it is written.
     pub fn open_provisional(&self, id: u64, bytes: Arc<Mutex<Vec<u8>>>) {
         self.provisional.lock().insert(id, Provisional::Open(bytes));
