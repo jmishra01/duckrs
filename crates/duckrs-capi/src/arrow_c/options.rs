@@ -58,7 +58,9 @@ impl ArrowOptions {
             large_offsets: flag("arrow_large_buffer_size", defaults.large_offsets),
             list_view: flag("arrow_output_list_view", defaults.list_view),
             version,
-            time_zone: text("TimeZone").filter(|tz| !tz.is_empty()).unwrap_or(defaults.time_zone),
+            time_zone: text("TimeZone")
+                .filter(|tz| !tz.is_empty())
+                .unwrap_or(defaults.time_zone),
         }
     }
 

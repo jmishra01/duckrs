@@ -255,7 +255,9 @@ pub unsafe extern "C" fn duckdb_data_chunk_from_arrow(
     // SAFETY: the array was valid as C passed it, and `owned` keeps it alive while the view is in use.
     let view = unsafe { ArrayView::new(&owned.0) };
     let count = view.len();
-    let imported = ffi::guard(None, || Some(import::import_chunk(schema, &view, 0, count, Some(owned.clone()))));
+    let imported = ffi::guard(None, || {
+        Some(import::import_chunk(schema, &view, 0, count, Some(owned.clone())))
+    });
     match imported {
         Some(Ok(chunk)) => {
             // SAFETY: C passes where to write the chunk; it is not null.
@@ -268,7 +270,9 @@ pub unsafe extern "C" fn duckdb_data_chunk_from_arrow(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn duckdb_destroy_arrow_converted_schema(arrow_converted_schema: *mut duckdb_arrow_converted_schema) {
+pub unsafe extern "C" fn duckdb_destroy_arrow_converted_schema(
+    arrow_converted_schema: *mut duckdb_arrow_converted_schema,
+) {
     // SAFETY: C passes a converted schema `duckdb_schema_from_arrow` made.
     drop(unsafe { ffi::take(arrow_converted_schema) });
 }
@@ -322,7 +326,10 @@ mod tests {
         let mut array = ArrowArray::empty();
         // SAFETY: both are written to structs of this test.
         unsafe {
-            write_schema(&mut schema, export::schema(&result.types, &result.names, &options).unwrap());
+            write_schema(
+                &mut schema,
+                export::schema(&result.types, &result.names, &options).unwrap(),
+            );
             write_array(&mut array, export::chunk_to_ffi(&chunk, &options).unwrap());
         }
         // SAFETY: the schema and the array were just made by arrow-rs, and live to the end of the test.

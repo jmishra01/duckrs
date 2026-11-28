@@ -347,7 +347,7 @@ impl Pass<'_> {
         if max < min {
             return None;
         }
-        let range = u64::try_from(max - min).ok()?;
+        let range = u64::try_from(max.checked_sub(min)?).ok()?;
         if range >= i32::MAX as u64 {
             return None;
         }

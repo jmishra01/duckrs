@@ -209,7 +209,9 @@ pub unsafe extern "C" fn duckdb_destroy_file_handle(file: *mut duckdb_file_handl
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn duckdb_file_handle_error_data(file: duckdb_file_handle) -> duckdb_error_data {
     // SAFETY: C passes a live file handle, or none.
-    let error = unsafe { ffi::get(file) }.map(|file| file.error.clone()).unwrap_or_default();
+    let error = unsafe { ffi::get(file) }
+        .map(|file| file.error.clone())
+        .unwrap_or_default();
     ffi::into_handle(error)
 }
 

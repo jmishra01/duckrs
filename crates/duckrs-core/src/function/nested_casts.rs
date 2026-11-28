@@ -490,7 +490,9 @@ pub(super) fn nested_cast(source: &Vector, result: &mut Vector, count: usize, mo
         && let Some((from, to)) = array_size_mismatch(source.logical_type(), &target)
     {
         if mode == CastMode::Strict {
-            return Err(conversion_error(format!("Cannot cast array of size {from} to array of size {to}")));
+            return Err(conversion_error(format!(
+                "Cannot cast array of size {from} to array of size {to}"
+            )));
         }
         // every row fails
         *result = Vector::constant_null(target);

@@ -2,7 +2,7 @@
 //! engine calls on whole chunks.
 
 use duckrs::udf::*;
-use duckrs::{Database, DataChunk, LogicalType, Result, Value};
+use duckrs::{DataChunk, Database, LogicalType, Result, Value};
 use duckrs_common::vector::Vector;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -51,11 +51,18 @@ fn column(result: &duckrs::QueryResult, column: usize) -> Vec<Value> {
 fn volatile_scalar_function_runs_per_row_in_order() {
     let db = Database::open_in_memory().unwrap();
     let mut con = db.connect().unwrap();
-    con.register_scalar_functions(scalar_set("my_counter", Arc::new(Counter), true)).unwrap();
+    con.register_scalar_functions(scalar_set("my_counter", Arc::new(Counter), true))
+        .unwrap();
     let result = con.query("SELECT my_counter(i) FROM range(3) r(i)").unwrap();
-    assert_eq!(column(&result, 0), vec![Value::bigint(5), Value::bigint(6), Value::bigint(7)]);
+    assert_eq!(
+        column(&result, 0),
+        vec![Value::bigint(5), Value::bigint(6), Value::bigint(7)]
+    );
     let result = con.query("SELECT my_counter(0) FROM range(3)").unwrap();
-    assert_eq!(column(&result, 0), vec![Value::bigint(5), Value::bigint(6), Value::bigint(7)]);
+    assert_eq!(
+        column(&result, 0),
+        vec![Value::bigint(5), Value::bigint(6), Value::bigint(7)]
+    );
 }
 
 /// `sum` of BIGINTs as a user-defined aggregate.
@@ -102,14 +109,17 @@ fn aggregate_function_groups_and_windows() {
     let db = Database::open_in_memory().unwrap();
     let mut con = db.connect().unwrap();
     let function = user_aggregate_function("my_sum", vec![LogicalType::BIGINT], LogicalType::BIGINT, Arc::new(Sum));
-    con.register_aggregate_functions(user_aggregate_set("my_sum", vec![function])).unwrap();
+    con.register_aggregate_functions(user_aggregate_set("my_sum", vec![function]))
+        .unwrap();
     let result = con
         .query("SELECT i % 2 AS g, my_sum(i) FROM range(10) t(i) GROUP BY g ORDER BY g")
         .unwrap();
     assert_eq!(column(&result, 1), vec![Value::bigint(20), Value::bigint(25)]);
     let result = con.query("SELECT my_sum(i) FROM range(0) t(i)").unwrap();
     assert_eq!(column(&result, 0), vec![Value::null(LogicalType::BIGINT)]);
-    let result = con.query("SELECT my_sum(i) OVER () FROM range(4) t(i) LIMIT 1").unwrap();
+    let result = con
+        .query("SELECT my_sum(i) OVER () FROM range(4) t(i) LIMIT 1")
+        .unwrap();
     assert_eq!(column(&result, 0), vec![Value::bigint(6)]);
 }
 
@@ -172,5 +182,9 @@ fn table_function_gives_its_chunks() {
     let result = con.query("SELECT count(*), sum(n) FROM count_to(2500)").unwrap();
     assert_eq!(result.value(0, 0), Value::bigint(2500));
     let error = con.query("SELECT * FROM count_to(1, x := 2)").unwrap_err();
-    assert!(error.message.contains("Invalid named parameter \"x\""), "{}", error.message);
+    assert!(
+        error.message.contains("Invalid named parameter \"x\""),
+        "{}",
+        error.message
+    );
 }

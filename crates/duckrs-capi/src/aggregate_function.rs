@@ -53,7 +53,8 @@ struct CAggregateUdf {
     state_size: unsafe extern "C" fn(duckdb_function_info) -> idx_t,
     init: unsafe extern "C" fn(duckdb_function_info, duckdb_aggregate_state),
     update: unsafe extern "C" fn(duckdb_function_info, duckdb_data_chunk, *mut duckdb_aggregate_state),
-    combine: unsafe extern "C" fn(duckdb_function_info, *mut duckdb_aggregate_state, *mut duckdb_aggregate_state, idx_t),
+    combine:
+        unsafe extern "C" fn(duckdb_function_info, *mut duckdb_aggregate_state, *mut duckdb_aggregate_state, idx_t),
     finalize: unsafe extern "C" fn(duckdb_function_info, *mut duckdb_aggregate_state, duckdb_vector, idx_t, idx_t),
     destroy: duckdb_aggregate_destroy_t,
     extra: ExtraInfo,
@@ -100,7 +101,9 @@ impl CAggregateUdf {
             error: None,
         });
         let result = call(ffi::borrowed_handle(&mut info));
-        let FunctionInfo::Aggregate(info) = info else { unreachable!("an aggregate function info") };
+        let FunctionInfo::Aggregate(info) = info else {
+            unreachable!("an aggregate function info")
+        };
         callback_error(ErrorKind::InvalidInput, info.error)?;
         Ok(result)
     }
@@ -141,9 +144,7 @@ impl AggregateUdf for CAggregateUdf {
         let mut row_states: Vec<duckdb_aggregate_state> = rows.iter().map(|&group| groups[group]).collect();
         // SAFETY: the update callback C registered, with an info and a chunk that live for the call, and a state for
         // each row of the chunk.
-        self.with_info(|info| unsafe {
-            (self.update)(info, ffi::borrowed_handle(&mut input), row_states.as_mut_ptr())
-        })
+        self.with_info(|info| unsafe { (self.update)(info, ffi::borrowed_handle(&mut input), row_states.as_mut_ptr()) })
     }
 
     /// `CAPIAggregateCombine`.
@@ -164,7 +165,13 @@ impl AggregateUdf for CAggregateUdf {
         // SAFETY: the finalize callback C registered, with an info and a result vector that live for the call, and
         // `count` states, the result having a row for each.
         self.with_info(|info| unsafe {
-            (self.finalize)(info, source.as_mut_ptr(), ffi::borrowed_handle(result), count as idx_t, 0)
+            (self.finalize)(
+                info,
+                source.as_mut_ptr(),
+                ffi::borrowed_handle(result),
+                count as idx_t,
+                0,
+            )
         })
     }
 }

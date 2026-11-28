@@ -1039,7 +1039,11 @@ impl<'g> Transformer<'g> {
 
     fn like_clause(&mut self, node: &ParseNode) -> Result<Expr> {
         // `RegexMatchOperatorFunctionName`
-        let regex = if self.regex_full_match { "regexp_full_match" } else { REGEX_MATCH_FUNCTION };
+        let regex = if self.regex_full_match {
+            "regexp_full_match"
+        } else {
+            REGEX_MATCH_FUNCTION
+        };
         let mut variation = match self.name(self.alt(self.req(node, "LikeVariations")?)?) {
             "LikeToken" => "~~".to_string(),
             "ILikeToken" => "~~*".to_string(),
@@ -2404,7 +2408,11 @@ impl<'g> Transformer<'g> {
         let mut rows = Vec::new();
         let mut locations = Vec::new();
         for row in self.subs(node, "ValuesExpressions") {
-            locations.push(self.subs(row, "Expression").first().map_or(QueryLocation::default(), |e| self.location(e)));
+            locations.push(
+                self.subs(row, "Expression")
+                    .first()
+                    .map_or(QueryLocation::default(), |e| self.location(e)),
+            );
             rows.push(self.exprs(row, "Expression")?);
         }
         for (row, location) in rows.iter().zip(&locations).skip(1) {
@@ -3385,7 +3393,11 @@ fn regex_any_all(
     if case_insensitive {
         children.push(Expr::constant(Literal::string("i")));
     }
-    let function = if regex_full_match { "regexp_full_match" } else { REGEX_MATCH_FUNCTION };
+    let function = if regex_full_match {
+        "regexp_full_match"
+    } else {
+        REGEX_MATCH_FUNCTION
+    };
     let mut regex_match: Expr = FunctionExpr::new(function, children).into();
     if negated {
         regex_match = Expr::not_op(regex_match);
@@ -3671,7 +3683,11 @@ fn visit_all_table_ref_exprs_mut(table_ref: &mut TableRef, f: &mut impl FnMut(&m
             pivot.aggregates.iter_mut().for_each(|e| visit_expr_mut(e, f));
             for column in &mut pivot.pivots {
                 column.pivot_expressions.iter_mut().for_each(|e| visit_expr_mut(e, f));
-                column.entries.iter_mut().filter_map(|e| e.expr.as_mut()).for_each(|e| visit_expr_mut(e, f));
+                column
+                    .entries
+                    .iter_mut()
+                    .filter_map(|e| e.expr.as_mut())
+                    .for_each(|e| visit_expr_mut(e, f));
                 if let Some(subquery) = &mut column.subquery {
                     visit_all_query_node_exprs_mut(subquery, f);
                 }
@@ -3698,7 +3714,11 @@ fn visit_table_ref_exprs_mut(table_ref: &mut TableRef, f: &mut impl FnMut(&mut E
             pivot.aggregates.iter_mut().for_each(|e| visit_expr_mut(e, f));
             for column in &mut pivot.pivots {
                 column.pivot_expressions.iter_mut().for_each(|e| visit_expr_mut(e, f));
-                column.entries.iter_mut().filter_map(|e| e.expr.as_mut()).for_each(|e| visit_expr_mut(e, f));
+                column
+                    .entries
+                    .iter_mut()
+                    .filter_map(|e| e.expr.as_mut())
+                    .for_each(|e| visit_expr_mut(e, f));
                 if let Some(subquery) = &mut column.subquery {
                     visit_query_node_exprs_mut(subquery, f);
                 }
@@ -3871,9 +3891,10 @@ fn leading_tokens(node: &ParseNode, count: usize, out: &mut Vec<String>) {
     }
     match node {
         ParseNode::Terminal { value, .. } => match value {
-            TerminalValue::Literal(t) | TerminalValue::Identifier(t) | TerminalValue::Number(t) | TerminalValue::Operator(t) => {
-                out.push(t.clone())
-            }
+            TerminalValue::Literal(t)
+            | TerminalValue::Identifier(t)
+            | TerminalValue::Number(t)
+            | TerminalValue::Operator(t) => out.push(t.clone()),
             TerminalValue::String { value, .. } => out.push(value.clone()),
             TerminalValue::EndOfInput => {}
         },

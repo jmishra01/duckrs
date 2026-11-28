@@ -190,7 +190,10 @@ fn prepared_statements() {
         duckdb_free(name.cast_mut().cast());
         let mut index = 0;
         let high = CString::new("HIGH").unwrap();
-        assert_eq!(duckdb_bind_parameter_index(stmt, &mut index, high.as_ptr()), DuckDBSuccess);
+        assert_eq!(
+            duckdb_bind_parameter_index(stmt, &mut index, high.as_ptr()),
+            DuckDBSuccess
+        );
         assert_eq!(index, 2);
         assert_eq!(duckdb_bind_int32(stmt, 1, 3), DuckDBSuccess);
         assert_eq!(duckdb_bind_int64(stmt, 2, 7), DuckDBSuccess);
@@ -219,7 +222,10 @@ fn appenders() {
     let table = CString::new("t").unwrap();
     // SAFETY: the appender `duckdb_appender_create` makes.
     unsafe {
-        assert_eq!(duckdb_appender_create(db.con, null(), table.as_ptr(), &mut appender), DuckDBSuccess);
+        assert_eq!(
+            duckdb_appender_create(db.con, null(), table.as_ptr(), &mut appender),
+            DuckDBSuccess
+        );
         assert_eq!(duckdb_appender_column_count(appender), 3);
         for i in 0..5000 {
             let s = CString::new(format!("v{i}")).unwrap();
@@ -230,7 +236,10 @@ fn appenders() {
         }
         assert_eq!(duckdb_append_int64(appender, 1), DuckDBSuccess);
         assert_eq!(duckdb_appender_end_row(appender), DuckDBError);
-        assert_eq!(text(duckdb_appender_error(appender)), "Call to EndRow before all columns have been appended to!");
+        assert_eq!(
+            text(duckdb_appender_error(appender)),
+            "Call to EndRow before all columns have been appended to!"
+        );
         assert_eq!(duckdb_append_null(appender), DuckDBSuccess);
         assert_eq!(duckdb_append_double(appender, 1.0), DuckDBSuccess);
         assert_eq!(duckdb_append_null(appender), DuckDBError);
@@ -247,7 +256,10 @@ fn appenders() {
         assert_eq!(duckdb_value_int64(&mut result, 3, 0), 5000);
         duckdb_destroy_result(&mut result);
         let missing = CString::new("missing").unwrap();
-        assert_eq!(duckdb_appender_create(db.con, null(), missing.as_ptr(), &mut appender), DuckDBError);
+        assert_eq!(
+            duckdb_appender_create(db.con, null(), missing.as_ptr(), &mut appender),
+            DuckDBError
+        );
         assert!(!duckdb_appender_error(appender).is_null());
         duckdb_appender_destroy(&mut appender);
     }
@@ -279,10 +291,29 @@ fn values_types_and_dates() {
             duckdb_destroy_logical_type(ty);
         }
 
-        let date = duckdb_to_date(duckdb_date_struct { year: 2024, month: 2, day: 29 });
+        let date = duckdb_to_date(duckdb_date_struct {
+            year: 2024,
+            month: 2,
+            day: 29,
+        });
         assert_eq!(date.days, 19782);
-        assert_eq!(duckdb_from_date(date), duckdb_date_struct { year: 2024, month: 2, day: 29 });
-        assert_eq!(duckdb_to_date(duckdb_date_struct { year: 2023, month: 2, day: 29 }).days, 0);
+        assert_eq!(
+            duckdb_from_date(date),
+            duckdb_date_struct {
+                year: 2024,
+                month: 2,
+                day: 29
+            }
+        );
+        assert_eq!(
+            duckdb_to_date(duckdb_date_struct {
+                year: 2023,
+                month: 2,
+                day: 29
+            })
+            .days,
+            0
+        );
         let time = duckdb_from_time(duckdb_time { micros: 3_723_000_004 });
         assert_eq!((time.hour, time.min, time.sec, time.micros), (1, 2, 3, 4));
         assert_eq!(duckdb_hugeint_to_double(duckdb_double_to_hugeint(-1e20)), -1e20);

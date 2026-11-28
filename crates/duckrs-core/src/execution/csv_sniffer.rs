@@ -1349,7 +1349,10 @@ pub fn sniff(
                 format!("{message}\nFile: {path}\n", path = sniffer.path)
             } else {
                 let line = data[..begin.min(data.len())].iter().filter(|&&b| b == b'\n').count() + 1;
-                format!("CSV Error on Line: {line}\n{message}\nFile: {path}\n", path = sniffer.path)
+                format!(
+                    "CSV Error on Line: {line}\n{message}\nFile: {path}\n",
+                    path = sniffer.path
+                )
             };
             return Err(Error::new(ErrorKind::InvalidInput, message));
         }

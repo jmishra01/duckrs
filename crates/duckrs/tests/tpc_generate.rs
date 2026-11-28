@@ -16,7 +16,10 @@ fn dbgen_in_a_from_clause_fills_the_tables() {
     assert_eq!(result.names, vec!["Success"]);
     assert_eq!(result.row_count(), 0);
     // the same rows as CALL dbgen(sf = 0.01)
-    assert_eq!(count(&mut connection, "SELECT count(*) FROM lineitem"), Value::bigint(60175));
+    assert_eq!(
+        count(&mut connection, "SELECT count(*) FROM lineitem"),
+        Value::bigint(60175)
+    );
     assert_eq!(count(&mut connection, "SELECT count(*) FROM region"), Value::bigint(5));
     // committed: another connection sees them
     let mut other = db.connect().unwrap();
@@ -34,11 +37,22 @@ fn dbgen_in_a_from_clause_takes_its_options() {
     connection
         .query("SELECT * FROM dbgen(sf = 0, schema = 'tpch', suffix = '_x')")
         .unwrap();
-    assert_eq!(count(&mut connection, "SELECT count(*) FROM tpch.lineitem_x"), Value::bigint(0));
-    let error = connection.query("SELECT * FROM dbgen(sf = 0.01, children = 2)").unwrap_err();
-    assert!(error.message.contains("Step must be defined when children are defined"), "{error}");
+    assert_eq!(
+        count(&mut connection, "SELECT count(*) FROM tpch.lineitem_x"),
+        Value::bigint(0)
+    );
+    let error = connection
+        .query("SELECT * FROM dbgen(sf = 0.01, children = 2)")
+        .unwrap_err();
+    assert!(
+        error.message.contains("Step must be defined when children are defined"),
+        "{error}"
+    );
     let error = connection.query("SELECT * FROM dbgen(sf = NULL)").unwrap_err();
-    assert!(error.message.contains("Cannot use NULL as function argument"), "{error}");
+    assert!(
+        error.message.contains("Cannot use NULL as function argument"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -46,11 +60,19 @@ fn dsdgen_in_a_from_clause_fills_the_tables() {
     let db = Database::open_in_memory().unwrap();
     let mut connection = db.connect().unwrap();
     connection.query("SELECT * FROM dsdgen(sf = 0.01)").unwrap();
-    assert_eq!(count(&mut connection, "SELECT count(*) FROM store_sales"), Value::bigint(28810));
+    assert_eq!(
+        count(&mut connection, "SELECT count(*) FROM store_sales"),
+        Value::bigint(28810)
+    );
     // an existing table is an error, or replaced with overwrite
     assert!(connection.query("SELECT * FROM dsdgen(sf = 0)").is_err());
-    connection.query("SELECT * FROM dsdgen(sf = 0, overwrite = true)").unwrap();
-    assert_eq!(count(&mut connection, "SELECT count(*) FROM store_sales"), Value::bigint(0));
+    connection
+        .query("SELECT * FROM dsdgen(sf = 0, overwrite = true)")
+        .unwrap();
+    assert_eq!(
+        count(&mut connection, "SELECT count(*) FROM store_sales"),
+        Value::bigint(0)
+    );
 }
 
 #[test]

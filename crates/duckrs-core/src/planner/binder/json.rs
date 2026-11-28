@@ -201,7 +201,9 @@ impl Binder<'_> {
                 }
                 "maximum_sample_files" => {
                     if value.is_null() {
-                        return Err(binder_error("read_json \"maximum_sample_files\" parameter cannot be NULL"));
+                        return Err(binder_error(
+                            "read_json \"maximum_sample_files\" parameter cannot be NULL",
+                        ));
                     }
                     let files = number()?;
                     if files == 0 || files < -1 {

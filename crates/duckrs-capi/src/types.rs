@@ -449,7 +449,8 @@ pub type duckdb_scalar_function_init_t = Option<unsafe extern "C" fn(info: duckd
 pub type duckdb_scalar_function_t =
     Option<unsafe extern "C" fn(info: duckdb_function_info, input: duckdb_data_chunk, output: duckdb_vector)>;
 pub type duckdb_aggregate_state_size = Option<unsafe extern "C" fn(info: duckdb_function_info) -> idx_t>;
-pub type duckdb_aggregate_init_t = Option<unsafe extern "C" fn(info: duckdb_function_info, state: duckdb_aggregate_state)>;
+pub type duckdb_aggregate_init_t =
+    Option<unsafe extern "C" fn(info: duckdb_function_info, state: duckdb_aggregate_state)>;
 pub type duckdb_aggregate_destroy_t = Option<unsafe extern "C" fn(states: *mut duckdb_aggregate_state, count: idx_t)>;
 pub type duckdb_aggregate_update_t = Option<
     unsafe extern "C" fn(info: duckdb_function_info, input: duckdb_data_chunk, states: *mut duckdb_aggregate_state),

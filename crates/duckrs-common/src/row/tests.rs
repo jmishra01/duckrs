@@ -323,7 +323,10 @@ proptest! {
 /// slot would point at.
 #[test]
 fn null_lists_round_trip() {
-    for ty in [LogicalType::list(LogicalType::VARCHAR), LogicalType::array(LogicalType::VARCHAR, 2)] {
+    for ty in [
+        LogicalType::list(LogicalType::VARCHAR),
+        LogicalType::array(LogicalType::VARCHAR, 2),
+    ] {
         let mut vector = Vector::new(ty.clone(), 3);
         vector.prepare_flat(3);
         for row in 0..3 {

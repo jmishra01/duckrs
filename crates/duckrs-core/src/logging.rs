@@ -984,7 +984,8 @@ impl LogManager {
     /// `LogManager::RegisterLogStorage`: false when a storage has the name already.
     pub fn register_storage(&mut self, name: &str, storage: Arc<dyn LogStorageCallback>) -> bool {
         let lower = name.to_lowercase();
-        if [MEMORY_STORAGE, STDOUT_STORAGE, FILE_STORAGE].contains(&lower.as_str()) || self.registered.contains_key(&lower)
+        if [MEMORY_STORAGE, STDOUT_STORAGE, FILE_STORAGE].contains(&lower.as_str())
+            || self.registered.contains_key(&lower)
         {
             return false;
         }
@@ -1398,7 +1399,10 @@ pub fn log_external_resource(
         ("resource_type".to_string(), nullable(resource_type)),
         ("resource_name".to_string(), nullable(resource_name)),
         ("operation".to_string(), Value::varchar(operation)),
-        ("outcome".to_string(), Value::varchar(if error.is_empty() { "ok" } else { "error" })),
+        (
+            "outcome".to_string(),
+            Value::varchar(if error.is_empty() { "ok" } else { "error" }),
+        ),
         ("error".to_string(), nullable(error)),
         ("extra_info".to_string(), extra),
     ]);

@@ -768,9 +768,7 @@ fn is_complete_type(ty: &LogicalType) -> bool {
     use LogicalTypeId as T;
     match ty.id() {
         T::Any | T::Template | T::Invalid | T::Unknown => false,
-        T::Struct | T::Tuple | T::Union | T::List | T::Map | T::Array | T::Decimal if !ty.has_params() => {
-            false
-        }
+        T::Struct | T::Tuple | T::Union | T::List | T::Map | T::Array | T::Decimal if !ty.has_params() => false,
         T::Struct | T::Tuple | T::Union => ty.struct_children().iter().all(|(_, c)| is_complete_type(c)),
         T::List | T::Map | T::Array => ty.child_type().is_some_and(is_complete_type),
         _ => true,
@@ -780,7 +778,11 @@ fn is_complete_type(ty: &LogicalType) -> bool {
 /// What a parameter of a statement being prepared ([`BoundExprKind::Parameter`]) of type `ty` evaluates to: a NULL
 /// of that type, or an untyped one while it has none.
 pub fn parameter_null(ty: &LogicalType) -> Value {
-    if is_valid_type(ty) { Value::null(ty.clone()) } else { Value::sql_null() }
+    if is_valid_type(ty) {
+        Value::null(ty.clone())
+    } else {
+        Value::sql_null()
+    }
 }
 
 /// `x IN (a, b, ...)` as `x = a OR x = b ...`, and `x NOT IN (...)` as the NOT of that, of the

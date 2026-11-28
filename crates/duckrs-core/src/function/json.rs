@@ -2230,7 +2230,9 @@ fn path_argument(child: &BoundExpr) -> Result<Option<(bool, bool)>> {
             let path = parse_path(&path_text(item)?).map_err(|e| binder_error(e.message))?;
             // `JSONReadManyFunctionData::Bind`
             if path.is_wildcard() {
-                return Err(binder_error("Cannot have wildcards in JSON path when supplying multiple paths"));
+                return Err(binder_error(
+                    "Cannot have wildcards in JSON path when supplying multiple paths",
+                ));
             }
         }
         return Ok(Some((true, false)));

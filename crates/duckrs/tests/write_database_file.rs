@@ -408,7 +408,10 @@ fn a_commit_that_fails_loses_nothing_else() {
     run(&mut connection, "BEGIN");
     run(&mut connection, "INSERT INTO kept VALUES (1)");
     // a view that duckrs can't write to the log yet (SHOW and DESCRIBE in a stored query)
-    run(&mut connection, "CREATE VIEW unstorable AS SELECT * FROM (DESCRIBE kept)");
+    run(
+        &mut connection,
+        "CREATE VIEW unstorable AS SELECT * FROM (DESCRIBE kept)",
+    );
     assert!(connection.query("COMMIT").is_err());
     run(&mut connection, "DROP VIEW IF EXISTS unstorable");
     run(&mut connection, "INSERT INTO kept VALUES (2)");
@@ -1607,7 +1610,13 @@ fn strings_of_some_rows_read_as_all_rows_do() {
     run(&mut c, "CHECKPOINT f");
     // a copy in memory, of a scan of all the rows
     run(&mut c, "CREATE TABLE m AS SELECT * FROM f.t");
-    for filter in ["i % 97 = 3", "i BETWEEN 1000 AND 1200", "i % 3 = 0", "i % 5 < 2", "low = 'R'"] {
+    for filter in [
+        "i % 97 = 3",
+        "i BETWEEN 1000 AND 1200",
+        "i % 3 = 0",
+        "i % 5 < 2",
+        "low = 'R'",
+    ] {
         let sql = |table: &str| {
             format!(
                 "SELECT count(*), count(low), count(high), sum(hash(i, low, high)), max(high) FROM {table} WHERE \

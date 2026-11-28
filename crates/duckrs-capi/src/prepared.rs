@@ -80,14 +80,22 @@ fn parameter_order(names: &[String]) -> BTreeMap<idx_t, String> {
     let numbers: Option<Vec<idx_t>> = names.iter().map(|name| name.parse().ok()).collect();
     match numbers {
         Some(numbers) => numbers.into_iter().zip(names.iter().cloned()).collect(),
-        None => names.iter().cloned().enumerate().map(|(i, name)| (i as idx_t + 1, name)).collect(),
+        None => names
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(i, name)| (i as idx_t + 1, name))
+            .collect(),
     }
 }
 
 /// Prepares `query` on `connection`, as `duckdb_prepare` and `duckdb_prepare_extracted_statement` do.
 fn prepare(connection: &SharedConnection, query: &str) -> PreparedWrapper {
     let statement = ffi::guard(
-        Err(duckrs::Error::new(duckrs::ErrorKind::Internal, "preparing the statement panicked")),
+        Err(duckrs::Error::new(
+            duckrs::ErrorKind::Internal,
+            "preparing the statement panicked",
+        )),
         || connection.lock().prepare(query),
     );
     PreparedWrapper::new(connection.clone(), statement)
@@ -99,7 +107,11 @@ fn prepare(connection: &SharedConnection, query: &str) -> PreparedWrapper {
 ///
 /// `out` is valid for a write of a handle.
 unsafe fn write_prepared(wrapper: PreparedWrapper, out: *mut duckdb_prepared_statement) -> duckdb_state {
-    let state = if wrapper.statement.is_ok() { DuckDBSuccess } else { DuckDBError };
+    let state = if wrapper.statement.is_ok() {
+        DuckDBSuccess
+    } else {
+        DuckDBError
+    };
     // SAFETY: by the contract of this function.
     unsafe { ffi::write(out, ffi::into_handle(wrapper)) };
     state
@@ -161,7 +173,10 @@ pub unsafe extern "C" fn duckdb_nparams(prepared_statement: duckdb_prepared_stat
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn duckdb_parameter_name(prepared_statement: duckdb_prepared_statement, index: idx_t) -> *const c_char {
+pub unsafe extern "C" fn duckdb_parameter_name(
+    prepared_statement: duckdb_prepared_statement,
+    index: idx_t,
+) -> *const c_char {
     // SAFETY: C passes a live prepared statement.
     match unsafe { prepared(prepared_statement) }.and_then(|wrapper| wrapper.name(index)) {
         Some(name) => ffi::strdup(name),
@@ -200,7 +215,10 @@ pub unsafe extern "C" fn duckdb_param_logical_type(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn duckdb_param_type(prepared_statement: duckdb_prepared_statement, param_idx: idx_t) -> duckdb_type {
+pub unsafe extern "C" fn duckdb_param_type(
+    prepared_statement: duckdb_prepared_statement,
+    param_idx: idx_t,
+) -> duckdb_type {
     // SAFETY: C passes a live prepared statement.
     unsafe { param_type(prepared_statement, param_idx) }
         .map_or(DUCKDB_TYPE_INVALID, |ty| crate::helper::type_id_to_c(ty.id()))
@@ -223,7 +241,9 @@ pub unsafe extern "C" fn duckdb_clear_bindings(prepared_statement: duckdb_prepar
 /// # Safety
 ///
 /// As for [`prepared`].
-unsafe fn result_columns<'a>(prepared_statement: duckdb_prepared_statement) -> Option<(&'a [String], &'a [LogicalType])> {
+unsafe fn result_columns<'a>(
+    prepared_statement: duckdb_prepared_statement,
+) -> Option<(&'a [String], &'a [LogicalType])> {
     // SAFETY: by the contract of this function.
     let statement = unsafe { prepared(prepared_statement) }?.statement.as_ref().ok()?;
     // a statement whose parameters' types could not be resolved has one column `unknown` of type UNKNOWN
@@ -231,7 +251,9 @@ unsafe fn result_columns<'a>(prepared_statement: duckdb_prepared_statement) -> O
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn duckdb_prepared_statement_column_count(prepared_statement: duckdb_prepared_statement) -> idx_t {
+pub unsafe extern "C" fn duckdb_prepared_statement_column_count(
+    prepared_statement: duckdb_prepared_statement,
+) -> idx_t {
     // SAFETY: C passes a live prepared statement.
     unsafe { result_columns(prepared_statement) }.map_or(0, |(names, _)| names.len() as idx_t)
 }
@@ -331,13 +353,21 @@ pub unsafe extern "C" fn duckdb_bind_parameter_index(
         return DuckDBError;
     };
     // SAFETY: C passes where to write the index.
-    if unsafe { ffi::write(param_idx_out, index) } { DuckDBSuccess } else { DuckDBError }
+    if unsafe { ffi::write(param_idx_out, index) } {
+        DuckDBSuccess
+    } else {
+        DuckDBError
+    }
 }
 
 macro_rules! bind_scalar {
     ($name:ident, $t:ty, $make:expr) => {
         #[unsafe(no_mangle)]
-        pub unsafe extern "C" fn $name(prepared_statement: duckdb_prepared_statement, param_idx: idx_t, val: $t) -> duckdb_state {
+        pub unsafe extern "C" fn $name(
+            prepared_statement: duckdb_prepared_statement,
+            param_idx: idx_t,
+            val: $t,
+        ) -> duckdb_state {
             // SAFETY: C passes a live prepared statement.
             unsafe { bind(prepared_statement, param_idx, $make(val)) }
         }
@@ -355,19 +385,31 @@ bind_scalar!(duckdb_bind_uint32, u32, Value::uinteger);
 bind_scalar!(duckdb_bind_uint64, u64, Value::ubigint);
 bind_scalar!(duckdb_bind_float, f32, Value::float);
 bind_scalar!(duckdb_bind_double, f64, Value::double);
-bind_scalar!(duckdb_bind_hugeint, duckdb_hugeint, |v: duckdb_hugeint| Value::hugeint(v.to_i128()));
-bind_scalar!(duckdb_bind_uhugeint, duckdb_uhugeint, |v: duckdb_uhugeint| Value::uhugeint(v.to_u128()));
-bind_scalar!(duckdb_bind_date, duckdb_date, |v: duckdb_date| Value::date(Date(v.days)));
-bind_scalar!(duckdb_bind_time, duckdb_time, |v: duckdb_time| Value::time(Time(v.micros)));
-bind_scalar!(duckdb_bind_timestamp, duckdb_timestamp, |v: duckdb_timestamp| Value::timestamp(Timestamp(v.micros)));
-bind_scalar!(duckdb_bind_timestamp_tz, duckdb_timestamp, |v: duckdb_timestamp| Value::timestamp_tz(Timestamp(
+bind_scalar!(duckdb_bind_hugeint, duckdb_hugeint, |v: duckdb_hugeint| Value::hugeint(
+    v.to_i128()
+));
+bind_scalar!(duckdb_bind_uhugeint, duckdb_uhugeint, |v: duckdb_uhugeint| {
+    Value::uhugeint(v.to_u128())
+});
+bind_scalar!(duckdb_bind_date, duckdb_date, |v: duckdb_date| Value::date(Date(
+    v.days
+)));
+bind_scalar!(duckdb_bind_time, duckdb_time, |v: duckdb_time| Value::time(Time(
     v.micros
 )));
-bind_scalar!(duckdb_bind_interval, duckdb_interval, |v: duckdb_interval| Value::interval(Interval {
-    months: v.months,
-    days: v.days,
-    micros: v.micros,
-}));
+bind_scalar!(duckdb_bind_timestamp, duckdb_timestamp, |v: duckdb_timestamp| {
+    Value::timestamp(Timestamp(v.micros))
+});
+bind_scalar!(duckdb_bind_timestamp_tz, duckdb_timestamp, |v: duckdb_timestamp| {
+    Value::timestamp_tz(Timestamp(v.micros))
+});
+bind_scalar!(duckdb_bind_interval, duckdb_interval, |v: duckdb_interval| {
+    Value::interval(Interval {
+        months: v.months,
+        days: v.days,
+        micros: v.micros,
+    })
+});
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn duckdb_bind_timestamp_tz_ns(
@@ -390,7 +432,11 @@ pub unsafe extern "C" fn duckdb_bind_timestamp_tz_ns(
 /// # Safety
 ///
 /// As for [`prepared`].
-unsafe fn bind_text(prepared_statement: duckdb_prepared_statement, param_idx: idx_t, bytes: Option<&[u8]>) -> duckdb_state {
+unsafe fn bind_text(
+    prepared_statement: duckdb_prepared_statement,
+    param_idx: idx_t,
+    bytes: Option<&[u8]>,
+) -> duckdb_state {
     match bytes.map(std::str::from_utf8) {
         // SAFETY: by the contract of this function.
         Some(Ok(text)) => unsafe { bind(prepared_statement, param_idx, Value::varchar(text)) },
@@ -454,7 +500,10 @@ pub unsafe extern "C" fn duckdb_bind_blob(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn duckdb_bind_null(prepared_statement: duckdb_prepared_statement, param_idx: idx_t) -> duckdb_state {
+pub unsafe extern "C" fn duckdb_bind_null(
+    prepared_statement: duckdb_prepared_statement,
+    param_idx: idx_t,
+) -> duckdb_state {
     // SAFETY: C passes a live prepared statement.
     unsafe { bind(prepared_statement, param_idx, Value::sql_null()) }
 }
@@ -493,7 +542,9 @@ pub unsafe extern "C" fn duckdb_execute_prepared_streaming(
 /// # Safety
 ///
 /// As for [`prepared`].
-pub(crate) unsafe fn prepared_wrapper<'a>(prepared_statement: duckdb_prepared_statement) -> Option<&'a PreparedWrapper> {
+pub(crate) unsafe fn prepared_wrapper<'a>(
+    prepared_statement: duckdb_prepared_statement,
+) -> Option<&'a PreparedWrapper> {
     // SAFETY: by the contract of this function.
     unsafe { prepared(prepared_statement) }.map(|w| &*w)
 }
@@ -514,7 +565,10 @@ impl PreparedWrapper {
     pub(crate) fn run(&self) -> Option<(duckrs::Result<duckrs::QueryResult>, duckrs::StatementProperties)> {
         let statement = self.prepared()?;
         let result = ffi::guard(
-            Err(duckrs::Error::new(duckrs::ErrorKind::Internal, "executing the statement panicked")),
+            Err(duckrs::Error::new(
+                duckrs::ErrorKind::Internal,
+                "executing the statement panicked",
+            )),
             || self.connection.lock().execute_named(statement, self.values.clone()),
         );
         Some((result, statement.properties()))
@@ -536,7 +590,10 @@ pub unsafe extern "C" fn duckdb_extract_statements(
     }
     let query = String::from_utf8_lossy(query);
     let extracted = ffi::guard(
-        Err(duckrs::Error::new(duckrs::ErrorKind::Internal, "extracting the statements panicked")),
+        Err(duckrs::Error::new(
+            duckrs::ErrorKind::Internal,
+            "extracting the statements panicked",
+        )),
         || connection.connection.lock().extract_statements(&query),
     );
     let wrapper = match extracted {
@@ -563,8 +620,9 @@ pub unsafe extern "C" fn duckdb_prepare_extracted_statement(
     out_prepared_statement: *mut duckdb_prepared_statement,
 ) -> duckdb_state {
     // SAFETY: C passes a live connection and extracted statements.
-    let (Some(connection), Some(extracted)) = (unsafe { ffi::get(connection) }, unsafe { ffi::get(extracted_statements) })
-    else {
+    let (Some(connection), Some(extracted)) = (unsafe { ffi::get(connection) }, unsafe {
+        ffi::get(extracted_statements)
+    }) else {
         return DuckDBError;
     };
     let Some(statement) = extracted.statements.get(index as usize) else {
@@ -579,7 +637,9 @@ pub unsafe extern "C" fn duckdb_prepare_extracted_statement(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn duckdb_extract_statements_error(extracted_statements: duckdb_extracted_statements) -> *const c_char {
+pub unsafe extern "C" fn duckdb_extract_statements_error(
+    extracted_statements: duckdb_extracted_statements,
+) -> *const c_char {
     // SAFETY: C passes live extracted statements.
     match unsafe { ffi::get(extracted_statements) }.and_then(|e| e.error.as_ref()) {
         Some(error) => error.as_ptr(),

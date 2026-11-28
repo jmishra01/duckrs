@@ -52,7 +52,10 @@ pub unsafe extern "C" fn duckdb_execute_tasks_state(state: duckdb_task_state) {
     // `ExecuteForever`: until the execution is finished
     let mut finished = state.finished.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     while !*finished {
-        finished = state.wake.wait(finished).unwrap_or_else(|poisoned| poisoned.into_inner());
+        finished = state
+            .wake
+            .wait(finished)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
     }
 }
 

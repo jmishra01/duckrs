@@ -106,7 +106,9 @@ impl ScalarUdf for CScalarUdf {
             });
             // SAFETY: the bind callback C registered, with an info that lives for the call.
             unsafe { bind(ffi::borrowed_handle(&mut info)) };
-            let BindInfo::Scalar(info) = info else { unreachable!("a scalar bind info") };
+            let BindInfo::Scalar(info) = info else {
+                unreachable!("a scalar bind info")
+            };
             callback_error(ErrorKind::Binder, info.error)?;
             bind_data = info.bind_data;
         }
@@ -139,7 +141,9 @@ impl ScalarUdfExecutor for CScalarExecutor {
             });
             // SAFETY: the init callback C registered, with an info that lives for the call.
             unsafe { init(ffi::borrowed_handle(&mut info)) };
-            let InitInfo::Scalar(info) = info else { unreachable!("a scalar init info") };
+            let InitInfo::Scalar(info) = info else {
+                unreachable!("a scalar init info")
+            };
             callback_error(ErrorKind::InvalidInput, info.error)?;
             *local = info.state;
         }
@@ -161,7 +165,9 @@ impl ScalarUdfExecutor for CScalarExecutor {
                 ffi::borrowed_handle(result),
             )
         };
-        let FunctionInfo::Scalar(info) = info else { unreachable!("a scalar function info") };
+        let FunctionInfo::Scalar(info) = info else {
+            unreachable!("a scalar function info")
+        };
         callback_error(ErrorKind::InvalidInput, info.error)
     }
 }
@@ -232,7 +238,10 @@ pub unsafe extern "C" fn duckdb_scalar_function_set_volatile(function: duckdb_sc
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn duckdb_scalar_function_add_parameter(function: duckdb_scalar_function, ty: duckdb_logical_type) {
+pub unsafe extern "C" fn duckdb_scalar_function_add_parameter(
+    function: duckdb_scalar_function,
+    ty: duckdb_logical_type,
+) {
     // SAFETY: C passes a live function and a live logical type.
     let (Some(function), Some(ty)) = (unsafe { function_mut(function) }, unsafe { logical_type(ty) }) else {
         return;
@@ -270,7 +279,10 @@ pub unsafe extern "C" fn duckdb_scalar_function_set_extra_info(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn duckdb_scalar_function_set_bind(function: duckdb_scalar_function, bind: duckdb_scalar_function_bind_t) {
+pub unsafe extern "C" fn duckdb_scalar_function_set_bind(
+    function: duckdb_scalar_function,
+    bind: duckdb_scalar_function_bind_t,
+) {
     // SAFETY: C passes a live function.
     if let (Some(function), Some(_)) = (unsafe { function_mut(function) }, bind) {
         function.bind = bind;
@@ -278,7 +290,10 @@ pub unsafe extern "C" fn duckdb_scalar_function_set_bind(function: duckdb_scalar
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn duckdb_scalar_function_set_init(function: duckdb_scalar_function, init: duckdb_scalar_function_init_t) {
+pub unsafe extern "C" fn duckdb_scalar_function_set_init(
+    function: duckdb_scalar_function,
+    init: duckdb_scalar_function_init_t,
+) {
     // SAFETY: C passes a live function.
     if let (Some(function), Some(_)) = (unsafe { function_mut(function) }, init) {
         function.init = init;
@@ -391,7 +406,10 @@ pub unsafe extern "C" fn duckdb_scalar_function_bind_get_argument_count(info: du
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn duckdb_scalar_function_bind_get_argument(info: duckdb_bind_info, index: idx_t) -> duckdb_expression {
+pub unsafe extern "C" fn duckdb_scalar_function_bind_get_argument(
+    info: duckdb_bind_info,
+    index: idx_t,
+) -> duckdb_expression {
     // SAFETY: C passes the info of the bind that runs.
     let Some(info) = (unsafe { bind_info(info) }) else {
         return std::ptr::null_mut();
@@ -417,7 +435,10 @@ pub unsafe extern "C" fn duckdb_scalar_function_set_bind_data(
 /// duckrs shares the bind data of a call among its copies rather than copying it, so the copy callback is kept but
 /// does not run.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn duckdb_scalar_function_set_bind_data_copy(info: duckdb_bind_info, copy: duckdb_copy_callback_t) {
+pub unsafe extern "C" fn duckdb_scalar_function_set_bind_data_copy(
+    info: duckdb_bind_info,
+    copy: duckdb_copy_callback_t,
+) {
     // SAFETY: C passes the info of the bind that runs.
     if let Some(info) = unsafe { bind_info(info) } {
         info.copy = copy;

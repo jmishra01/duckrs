@@ -1207,7 +1207,11 @@ impl TableCatalogEntry {
 
     /// Whether a PRIMARY KEY or UNIQUE of the table is DEFERRED, which a commit checks.
     pub fn has_deferred_keys(&self) -> bool {
-        if self.local_keys_from.lock().is_some_and(|from| from < self.constraints.len()) {
+        if self
+            .local_keys_from
+            .lock()
+            .is_some_and(|from| from < self.constraints.len())
+        {
             return true;
         }
         self.constraints.iter().any(|constraint| {

@@ -11,16 +11,15 @@ pub mod csv;
 pub mod csv_sniffer;
 pub mod csv_state_machine;
 pub mod expression_executor;
-pub mod tpc_generate;
 pub mod external_sort;
 pub mod file_system;
-pub mod interrupt;
 pub mod group_table;
+pub mod interrupt;
 pub mod join;
 pub mod join_filter;
-pub mod metric_catalog;
 pub mod json_scan;
 pub mod match_recognize;
+pub mod metric_catalog;
 pub mod multi_file;
 pub mod parquet;
 pub mod parquet_schema;
@@ -29,6 +28,7 @@ pub mod parquet_writer;
 pub mod physical;
 pub mod profiler;
 pub mod temporary;
+pub mod tpc_generate;
 pub mod user_copy;
 pub mod zone_map;
 
@@ -888,9 +888,8 @@ impl Pipeline<'_> {
         std::thread::scope(|scope| {
             for _ in 0..threads.min(morsels) {
                 scope.spawn(|| {
-                    let run = || {
-                        interrupt::with_deadline(deadline, || temporary::with_memory(Arc::clone(&memory), worker))
-                    };
+                    let run =
+                        || interrupt::with_deadline(deadline, || temporary::with_memory(Arc::clone(&memory), worker));
                     if let Err(failure) = profiler::with_profiler(query_profiler.clone(), run) {
                         failed.store(true, Ordering::Relaxed);
                         error.lock().get_or_insert(failure);

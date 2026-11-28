@@ -8,13 +8,15 @@
 //! connection of the database has: its one parameter names the stream in a registry of the streams views were made
 //! of. Its bind reads the stream's schema; its scan reads the stream's arrays, `STANDARD_VECTOR_SIZE` rows to a chunk.
 
+use super::duckdb_arrow_schema;
 use super::import::{self, ConvertedSchema, OwnedArray};
 use super::raw::{ArrayView, ArrowArray, ArrowArrayStream, ArrowSchema, SchemaView};
-use super::duckdb_arrow_schema;
 use super::{duckdb_arrow_array, duckdb_arrow_stream};
 use crate::ffi::{self, CPointer};
 use crate::types::*;
-use duckrs::udf::{TableUdf, TableUdfBindInput, TableUdfBinding, TableUdfOverload, TableUdfRun, TableUdfScan, TableUdfSet};
+use duckrs::udf::{
+    TableUdf, TableUdfBindInput, TableUdfBinding, TableUdfOverload, TableUdfRun, TableUdfScan, TableUdfSet,
+};
 use duckrs::{DataChunk, Error, ErrorKind, LogicalType, Result};
 use duckrs_common::STANDARD_VECTOR_SIZE;
 use duckrs_common::value::ValueData;
@@ -212,7 +214,10 @@ fn ingest(connection: &crate::database::ConnectionWrapper, table_name: &str, str
         "CREATE OR REPLACE TEMPORARY VIEW \"{name}\" AS SELECT * FROM {SCAN_FUNCTION}({id}::UBIGINT)"
     ));
     if let Err(error) = created {
-        STREAMS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&id);
+        STREAMS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&id);
         return Err(error);
     }
     Ok(())
@@ -226,7 +231,8 @@ pub unsafe extern "C" fn duckdb_arrow_scan(
 ) -> duckdb_state {
     let stream = arrow.cast::<ArrowArrayStream>();
     // SAFETY: C passes a live connection and a NUL-terminated name.
-    let (Some(connection), Some(table_name)) = (unsafe { ffi::get(connection) }, unsafe { ffi::c_str(table_name) }) else {
+    let (Some(connection), Some(table_name)) = (unsafe { ffi::get(connection) }, unsafe { ffi::c_str(table_name) })
+    else {
         return DuckDBError;
     };
     // SAFETY: C passes a live stream, or none.

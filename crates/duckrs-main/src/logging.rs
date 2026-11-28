@@ -7,14 +7,14 @@
 
 use super::ClientContext;
 use super::settings::{self, SettingValues};
+use duckrs_common::types::LogicalType;
+use duckrs_common::value::{Value, ValueData};
+use duckrs_common::{Error, ErrorKind, Result};
 use duckrs_core::execution::expression_executor::evaluate_scalar;
 use duckrs_core::logging::{
     FILE_STORAGE, LogConfig, LogLevel, LogManager, LogMode, LogScope, LogTarget, LoggingContext, lookup_log_type,
 };
 use duckrs_core::planner::binder::bind_constant_expression;
-use duckrs_common::types::LogicalType;
-use duckrs_common::value::{Value, ValueData};
-use duckrs_common::{Error, ErrorKind, Result};
 use duckrs_parser::ast::{Expr, ExprKind};
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -247,7 +247,11 @@ impl ClientContext {
             ExprKind::ColumnRef(names) if names.len() == 1 => Ok(Value::varchar(names[0].clone())),
             _ => evaluate_scalar(&bind_constant_expression(&catalog, expr)?),
         };
-        let arguments: Vec<_> = call.args.iter().map(duckrs_core::planner::binder::named_argument).collect();
+        let arguments: Vec<_> = call
+            .args
+            .iter()
+            .map(duckrs_core::planner::binder::named_argument)
+            .collect();
         let positional: Vec<&Expr> = arguments
             .iter()
             .filter(|a| a.name.is_empty())
