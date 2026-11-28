@@ -7,8 +7,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # The DuckDB commit the port is pinned to (`rust-port-baseline` in the fork).
-  DUCKDB_BASELINE: 4d77d9c103baca29a62af61cba9ebdc40e5d2023
+  # The DuckDB commit the port follows, which `known_passing.txt` and docs/STATUS.md are measured against
+  # (`Baseline:` in docs/STATUS.md). Move it with them.
+  DUCKDB_BASELINE: d4eea3f208d42ca4ee522aca23f5ea76f902b0ca
 
 jobs:
   lint:
@@ -38,7 +39,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
-      - run: cargo miri test -p duckrs-common
+      # `+nightly`: rust-toolchain.toml pins the stable toolchain, which has no Miri
+      - run: cargo +nightly miri test -p duckrs-common
         env:
           PROPTEST_CASES: "8"
           MIRIFLAGS: -Zmiri-disable-isolation

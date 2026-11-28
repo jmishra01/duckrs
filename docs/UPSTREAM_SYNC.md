@@ -17,3 +17,4 @@ Also update `DUCKDB_BASELINE` in `.github/workflows/ci.yml`, so CI runs the matc
 | Date | From | To | Modules re-synced | Notes |
 |---|---|---|---|---|
 | 2026-11-03 | (none) | `4d77d9c103b` | n/a | Initial baseline. Storage version 69, vector size 2048. |
+| 2026-11-28 | `4d77d9c103b` | `d4eea3f208d` | (recorded late) | The port and `known_passing.txt` had followed `d4eea3f208d` (the `duckdb/` checkout) for a while; CI and the benchmarks still checked out `4d77d9c103b`, which gave 30 false regressions. `rust-port-baseline` in `duckdb/` still points at `4d77d9c103b`. |
