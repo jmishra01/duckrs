@@ -27,7 +27,7 @@ use super::common_subplan::{max_table_index, visit_bindings};
 use super::statistics::StatisticsMap;
 use crate::catalog::ColumnStatistics;
 use crate::planner::expression::{BoundExpr, BoundExprKind, ColumnBinding};
-use crate::planner::logical::{LogicalOperator, LogicalOperatorKind as K};
+use crate::planner::logical::{LogicalOperator, LogicalOperatorKind as K, PerfectHashGroup};
 use duckrs_common::Result;
 use duckrs_common::executor;
 use duckrs_common::types::{LogicalType, LogicalTypeId, NativeType, StringT};
@@ -307,22 +307,27 @@ impl Pass<'_> {
         else {
             return;
         };
-        if *perfect_hash || groups.is_empty() || aggregates.iter().any(|a| a.distinct) {
+        // groups the statistics found a range for have their compressed one now: the ranges are what the aggregate
+        // sees, and the operator stays perfect hash when the compressed groups have none
+        if groups.is_empty() || aggregates.iter().any(|a| a.distinct) {
             return;
         }
-        let mut total = 0;
+        let mut ranges = Vec::with_capacity(groups.len());
         for group in groups.iter() {
-            let Some(bits) = self.perfect_hash_bits(group) else {
+            let Some(range) = self.perfect_hash_group(group) else {
                 return;
             };
-            total += bits;
+            ranges.push(range);
         }
-        *perfect_hash = total <= self.perfect_ht_threshold;
+        let total: u64 = ranges.iter().map(|g| u64::from(g.bits)).sum();
+        if total <= self.perfect_ht_threshold {
+            *perfect_hash = Some(ranges);
+        }
     }
 
-    /// The bits a group takes in a perfect hash table (`RequiredBitsForValue` of its range, plus one for NULL and
+    /// The range of a group in a perfect hash table (`RequiredBitsForValue` of its range, plus one for NULL and
     /// one to count from one), as the statistics propagation works them out.
-    fn perfect_hash_bits(&mut self, group: &BoundExpr) -> Option<u64> {
+    fn perfect_hash_group(&mut self, group: &BoundExpr) -> Option<PerfectHashGroup> {
         use duckrs_common::types::PhysicalType::*;
         let BoundExprKind::ColumnRef { binding, depth: 0 } = group.kind else {
             return None;
@@ -351,7 +356,10 @@ impl Pass<'_> {
         if range >= i32::MAX as u64 {
             return None;
         }
-        Some(u64::from(64 - (range + 2).leading_zeros()))
+        Some(PerfectHashGroup {
+            min,
+            bits: 64 - (range + 2).leading_zeros(),
+        })
     }
 
     /// `CreateProjections`: a compressing projection below each child of `op` that has a column to

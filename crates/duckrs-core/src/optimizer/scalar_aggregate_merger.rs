@@ -664,7 +664,7 @@ impl Merger {
                 aggregates,
                 grouping_sets: first.grouping_sets.clone(),
                 grouping_functions: Vec::new(),
-                perfect_hash: false,
+                perfect_hash: None,
                 domain_cap: None,
             },
             vec![relation],

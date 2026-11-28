@@ -183,7 +183,7 @@ impl Pass {
                 aggregates: vec![combined],
                 grouping_sets: grouping_sets.clone(),
                 grouping_functions: Vec::new(),
-                perfect_hash: false,
+                perfect_hash: None,
                 domain_cap: None,
             },
             vec![promoted],

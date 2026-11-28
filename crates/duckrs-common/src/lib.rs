@@ -30,6 +30,10 @@ pub use error::{Error, ErrorKind, Result};
 /// The number of rows in a vector (`STANDARD_VECTOR_SIZE`).
 pub const STANDARD_VECTOR_SIZE: usize = 2048;
 
+/// How the names of the temporary files that spilled data goes to start (`duckdb_temp_storage` in C++):
+/// what `duckdb_temporary_files()` lists.
+pub const SPILL_FILE_PREFIX: &str = "duckrs_temp_storage_";
+
 /// Asks for the memory of `value` to be brought into the cache, without waiting for it (a prefetch never faults).
 #[inline(always)]
 pub fn prefetch<T: ?Sized>(value: &T) {

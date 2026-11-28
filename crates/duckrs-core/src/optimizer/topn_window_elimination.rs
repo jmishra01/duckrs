@@ -366,7 +366,7 @@ fn rewrite(op: &mut LogicalOperator, limit: i64, next: &mut usize, replacements:
             aggregates: vec![aggregate],
             grouping_sets: Vec::new(),
             grouping_functions: Vec::new(),
-            perfect_hash: false,
+            perfect_hash: None,
             domain_cap: None,
         },
         vec![input],

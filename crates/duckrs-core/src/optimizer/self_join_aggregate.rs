@@ -458,7 +458,7 @@ fn rewrite(projection: &mut LogicalOperator, read: &[bool], next: &mut usize) ->
             aggregates: bounds,
             grouping_sets: Vec::new(),
             grouping_functions: Vec::new(),
-            perfect_hash: false,
+            perfect_hash: None,
             domain_cap: None,
         },
         vec![filter],
