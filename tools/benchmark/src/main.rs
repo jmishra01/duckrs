@@ -1,6 +1,6 @@
 // Ported from duckdb/benchmark/benchmark_runner.cpp @ rust-port-baseline
 //
-//! `benchmark_runner`: times the `.benchmark` files of a DuckDB checkout on duckrs, and with the
+//! `benchmark_runner`: times the `.benchmark` files of a DuckDB checkout on pintail, and with the
 //! `reference` feature on the C++ library too, as C++'s `benchmark_runner` does.
 //!
 //! ```text
@@ -9,14 +9,14 @@
 //! ```
 
 use benchmark::{Config, Outcome, discover, geometric_mean, run_benchmark};
-use sqllogictest::engine::{DuckrsEngine, Engine};
+use sqllogictest::engine::{Engine, PintailEngine};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// The v1 gate (`docs/REMAINING_WORK.md`, item 48): the geometric mean of the duckrs / C++ ratios,
+/// The v1 gate (`docs/REMAINING_WORK.md`, item 48): the geometric mean of the pintail / C++ ratios,
 /// and the largest ratio of any one benchmark.
 const GATE_GEOMETRIC_MEAN: f64 = 1.5;
 const GATE_WORST: f64 = 3.0;
@@ -32,7 +32,7 @@ fn print_help() {
     eprintln!("              --out=[file]           Write the timings to file");
     eprintln!("              --root-dir DIR         The DuckDB checkout to run in (default: ../duckdb)");
     eprintln!("              --disable-timeout      Never stop a benchmark for taking long (30 seconds by default)");
-    eprintln!("              --engine=E             duckrs (default), reference or both (needs --features reference)");
+    eprintln!("              --engine=E             pintail (default), reference or both (needs --features reference)");
     eprintln!("              --no-summary           Do not print the summary at the end");
     eprintln!("              --NAME VALUE           Sets the benchmark argument NAME (e.g. --sf 10)");
     eprintln!(
@@ -52,10 +52,10 @@ fn engines(which: &str) -> Result<Vec<Box<dyn Engine>>, String> {
         }
     };
     Ok(match which {
-        "duckrs" => vec![Box::new(DuckrsEngine)],
+        "pintail" => vec![Box::new(PintailEngine)],
         "reference" => vec![reference()?],
-        "both" => vec![Box::new(DuckrsEngine), reference()?],
-        other => return Err(format!("unknown engine {other}: duckrs, reference or both")),
+        "both" => vec![Box::new(PintailEngine), reference()?],
+        other => return Err(format!("unknown engine {other}: pintail, reference or both")),
     })
 }
 
@@ -72,7 +72,7 @@ fn run() -> i32 {
     let mut print_query = false;
     let mut summary = true;
     let mut out: Option<File> = None;
-    let mut engine_name = "duckrs".to_string();
+    let mut engine_name = "pintail".to_string();
     let mut root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../duckdb");
     let mut i = 0;
     while i < args.len() {
@@ -254,7 +254,7 @@ fn print_comparison(results: &[(String, Vec<Outcome>)]) {
     let seconds = |d: Option<Duration>| d.map_or_else(|| "-".to_string(), |d| format!("{:.4}", d.as_secs_f64()));
     println!(
         "\n{:<40} {:>12} {:>12} {:>8}",
-        "benchmark", "duckrs (s)", "C++ (s)", "ratio"
+        "benchmark", "pintail (s)", "C++ (s)", "ratio"
     );
     let mut ratios = Vec::new();
     let mut by_name: HashMap<&str, f64> = HashMap::new();

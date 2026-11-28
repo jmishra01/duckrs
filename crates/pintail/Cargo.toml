@@ -1,0 +1,24 @@
+[package]
+name = "pintail"
+description = "An analytical SQL database engine, ported from DuckDB to Rust"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+pintail-common.workspace = true
+pintail-core.workspace = true
+pintail-main.workspace = true
+arrow.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+libc.workspace = true
+
+[[bench]]
+name = "kernels"
+harness = false

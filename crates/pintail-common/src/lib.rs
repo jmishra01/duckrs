@@ -1,0 +1,54 @@
+//! Core building blocks shared by every pintail crate (port of `duckdb/src/common`):
+//! the type system, `string_t`, validity masks, selection vectors, vectors, data chunks, the
+//! vectorized executors, and scalar values.
+
+pub mod column_data;
+pub mod comparison;
+mod error;
+pub mod executor;
+mod fmt_float;
+pub mod geojson;
+pub mod geometry;
+pub mod geometry_crs;
+pub mod hash;
+pub mod json;
+pub mod path;
+pub mod render_width;
+pub mod row;
+pub mod serializer;
+pub mod sort_key;
+pub mod storage_version;
+pub mod string_cast;
+pub mod string_util;
+pub mod types;
+pub mod value;
+pub mod variant;
+pub mod vector;
+
+pub use error::{Error, ErrorKind, Result};
+
+/// The number of rows in a vector (`STANDARD_VECTOR_SIZE`).
+pub const STANDARD_VECTOR_SIZE: usize = 2048;
+
+/// How the names of the temporary files that spilled data goes to start (`duckdb_temp_storage` in C++):
+/// what `duckdb_temporary_files()` lists.
+pub const SPILL_FILE_PREFIX: &str = "pintail_temp_storage_";
+
+/// Asks for the memory of `value` to be brought into the cache, without waiting for it (a prefetch never faults).
+#[inline(always)]
+pub fn prefetch<T: ?Sized>(value: &T) {
+    let address = std::ptr::from_ref(value).cast::<u8>();
+    // (Miri runs no inline assembly or prefetch intrinsics, and a prefetch changes nothing it checks)
+    #[cfg(all(target_arch = "aarch64", not(miri)))]
+    // SAFETY: `prfm` only hints at a read of a valid address; it reads no register and writes no memory
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) address, options(nostack, readonly, preserves_flags));
+    }
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    // SAFETY: a prefetch only hints at a read; it never faults
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(address.cast::<i8>(), std::arch::x86_64::_MM_HINT_T0);
+    }
+    #[cfg(any(miri, not(any(target_arch = "aarch64", target_arch = "x86_64"))))]
+    let _ = address;
+}

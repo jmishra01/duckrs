@@ -19,8 +19,8 @@ were kept twice and keys made for the merge.
 
 ## Why
 
-On TPC-H SF10, warm Q10 takes 0.49s in duckrs against 0.23s in C++, with 2.5s of CPU against
-1.1s. The GROUP BY is the largest single part of duckrs's CPU, about a third of it (profile of
+On TPC-H SF10, warm Q10 takes 0.49s in pintail against 0.23s in C++, with 2.5s of CPU against
+1.1s. The GROUP BY is the largest single part of pintail's CPU, about a third of it (profile of
 part 44/46):
 
 | Where | Samples | What it does |
@@ -45,7 +45,7 @@ Two cheaper attempts were measured and reverted:
 
 ## What already exists
 
-`duckrs-common/src/row` (Phase 1, parts 3 and 5) is a port of the row format that nothing uses
+`pintail-common/src/row` (Phase 1, parts 3 and 5) is a port of the row format that nothing uses
 yet:
 - `TupleDataLayout`: validity bits, columns, and 8-byte-aligned aggregate slots.
 - `TupleDataCollection`: in-memory blocks that never move, `append(chunk) -> Vec<RowPtr>`,
@@ -53,7 +53,7 @@ yet:
 - `RowMatcher`: compares column `i` of a chunk with column `i` of candidate rows, per
   `ComparisonType`.
 
-`duckrs-common/src/hash.rs` has `hash_vector` and `combine_hash` (C++'s `VectorOperations::Hash`
+`pintail-common/src/hash.rs` has `hash_vector` and `combine_hash` (C++'s `VectorOperations::Hash`
 and `CombineHash`).
 
 ## What must keep working
@@ -84,7 +84,7 @@ exactly the same values together:
 
 ## Design
 
-1. **`GroupTable`** (new, in `duckrs-core/src/execution/group_table.rs`):
+1. **`GroupTable`** (new, in `pintail-core/src/execution/group_table.rs`):
    - Group columns live in a `TupleDataCollection` with no aggregate slots at first.
    - Entries are `u64` values: the hash's top 16 bits as salt, and the group id + 1 in the low
      48 bits (0 means empty). Probing is linear, and the table resizes at 50% load

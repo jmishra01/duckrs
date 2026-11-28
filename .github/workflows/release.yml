@@ -1,0 +1,77 @@
+name: Release
+
+# A tag like v1.0.0 builds the shell and the C library for Linux and macOS and attaches them to a
+# GitHub release of that tag, with the release notes of its section of CHANGELOG.md.
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+  # The DuckDB commit whose duckdb.h the C library implements (as in ci.yml).
+  DUCKDB_BASELINE: d4eea3f208d42ca4ee522aca23f5ea76f902b0ca
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            lib: libpintail_capi.so
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            lib: libpintail_capi.dylib
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out duckdb.h at the baseline
+        uses: actions/checkout@v4
+        with:
+          repository: jmishra01/duckdb
+          ref: ${{ env.DUCKDB_BASELINE }}
+          path: duckdb
+          sparse-checkout: src/include/duckdb.h
+          sparse-checkout-cone-mode: false
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p pintail-cli -p pintail-capi
+      - name: Package
+        run: |
+          name="pintail-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "$name/bin" "$name/lib" "$name/include"
+          cp target/release/pintail "$name/bin/"
+          cp "target/release/${{ matrix.lib }}" target/release/libpintail_capi.a "$name/lib/"
+          cp duckdb/src/include/duckdb.h "$name/include/"
+          cp README.md CHANGELOG.md LICENSE "$name/"
+          mkdir -p "$name/licenses"
+          cp crates/pintail-tpch/LICENSE "$name/licenses/TPC-H-EULA"
+          cp crates/pintail-tpcds/LICENSE-TPC "$name/licenses/TPC-DS-EULA"
+          tar czf "$name.tar.gz" "$name"
+          echo "ARCHIVE=$name.tar.gz" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ env.ARCHIVE }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Release notes from CHANGELOG.md
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v heading="## ${version}" '$0 == heading {on = 1; next} /^## / && on {exit} on' CHANGELOG.md > notes.md
+          test -s notes.md || { echo "CHANGELOG.md has no section ## ${version}"; exit 1; }
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/*.tar.gz --title "PintailDB $GITHUB_REF_NAME" --notes-file notes.md --verify-tag

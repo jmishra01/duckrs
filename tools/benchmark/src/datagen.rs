@@ -82,7 +82,7 @@ pub fn find_generator_calls(load: &str) -> (Vec<(Generator, String)>, String) {
 /// Builds the generator if it is not there yet, and makes the `.tbl` files of scale factor `sf`
 /// (in `data/<tpch|tpcds>_sf<sf>/`), unless they are there already.
 fn generate(generator: Generator, sf: &str, data: &Path) -> Result<PathBuf, String> {
-    let repo = std::env::var("DUCKRS_DIR").map_or_else(
+    let repo = std::env::var("PINTAIL_DIR").map_or_else(
         |_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."),
         PathBuf::from,
     );

@@ -1,9 +1,9 @@
 [workspace]
 resolver = "3"
-members = ["crates/duckrs", "crates/duckrs-capi","crates/duckrs-cli", "crates/duckrs-common", "crates/duckrs-core", "crates/duckrs-main", "crates/duckrs-parser", "crates/duckrs-tpch", "crates/duckrs-tpcds", "tools/benchmark", "tools/sqllogictest"]
+members = ["crates/pintail", "crates/pintail-capi","crates/pintail-cli", "crates/pintail-common", "crates/pintail-core", "crates/pintail-main", "crates/pintail-parser", "crates/pintail-tpch", "crates/pintail-tpcds", "tools/benchmark", "tools/sqllogictest"]
 
 [workspace.package]
-version = "0.0.1"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -17,13 +17,13 @@ sha2 = "0.10"
 ring = "0.17"
 arrow = { version = "60", default-features = false }
 parquet = { version = "60", features = ["arrow_canonical_extension_types"] }
-duckrs = { path = "crates/duckrs" }
-duckrs-common = { path = "crates/duckrs-common" }
-duckrs-core = { path = "crates/duckrs-core" }
-duckrs-main = { path = "crates/duckrs-main" }
-duckrs-parser = { path = "crates/duckrs-parser" }
-duckrs-tpch = { path = "crates/duckrs-tpch" }
-duckrs-tpcds = { path = "crates/duckrs-tpcds" }
+pintail = { path = "crates/pintail" }
+pintail-common = { path = "crates/pintail-common" }
+pintail-core = { path = "crates/pintail-core" }
+pintail-main = { path = "crates/pintail-main" }
+pintail-parser = { path = "crates/pintail-parser" }
+pintail-tpch = { path = "crates/pintail-tpch" }
+pintail-tpcds = { path = "crates/pintail-tpcds" }
 parking_lot = "0.13"
 proptest = "1.12"
 criterion = "0.8"

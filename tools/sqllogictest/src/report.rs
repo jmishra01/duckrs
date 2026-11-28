@@ -102,7 +102,7 @@ pub fn passing_list(reports: &[FileReport]) -> String {
         .collect();
     paths.sort_unstable();
     let mut out = String::from(
-        "# Test files (relative to the DuckDB checkout) that duckrs passes. CI fails if any of these\n\
+        "# Test files (relative to the DuckDB checkout) that pintail passes. CI fails if any of these\n\
          # stop passing. Regenerate with:\n\
          #   ./target/release/sqllogictest --allow-failures --passing-out tools/sqllogictest/known_passing.txt\n",
     );
@@ -152,7 +152,7 @@ mod tests {
             report("test/sql/select/b.test", Outcome::Skip("require x".into())),
             report("test/sql/join/c.test", Outcome::Error("boom".into())),
         ];
-        let md = status_markdown("duckrs", "abc", &reports);
+        let md = status_markdown("pintail", "abc", &reports);
         assert!(md.contains("| `test/sql/select` | 2 | 1 | 0 | 1 | 0 | 100.0 |"));
         let known = "test/sql/select/a.test\ntest/sql/join/c.test\ntest/sql/other.test\n";
         assert_eq!(regressions(known, &reports), ["test/sql/join/c.test"]);

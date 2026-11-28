@@ -1,8 +1,8 @@
-# How the duckrs optimizer makes queries faster
+# How the pintail optimizer makes queries faster
 
-The binder turns SQL into a logical plan: scans, filters, joins, aggregates. The optimizer rewrites that plan into one that returns exactly the same rows with less work. Stage 3 ported DuckDB's optimizer passes to Rust so that duckrs picks the same plans DuckDB does.
+The binder turns SQL into a logical plan: scans, filters, joins, aggregates. The optimizer rewrites that plan into one that returns exactly the same rows with less work. Stage 3 ported DuckDB's optimizer passes to Rust so that pintail picks the same plans DuckDB does.
 
-*Branch phase-52-stage3-optimizer · crates/duckrs-core/src/optimizer/ · 48 files, about 22,500 lines added*
+*Branch phase-52-stage3-optimizer · crates/pintail-core/src/optimizer/ · 48 files, about 22,500 lines added*
 
 ## Five ways a pass saves work
 
@@ -134,13 +134,13 @@ Projection __internal_decompress_string(l_returnflag), __internal_decompress_str
 2. **unused_columns** cut lineitem from 16 columns to 7: the six the aggregate reads, plus `l_shipdate`, which the scan reads for its filter and doesn't output.
 3. **aggregate_function_rewriter** turned the three `avg(x)`s into `sum(x) / count(x)`, computed in a projection above the GROUP BY. All the columns are NOT NULL, so each `count(x)` became `count_star()`. The aggregate list still has duplicates, though. `sum(l_quantity)` and `sum(l_extendedprice)` appear twice and `count_star()` four times, so 11 aggregates compute only 7 different values: one more state per group than the 8 aggregates written in the query. DuckDB 1.5.6 doesn't rewrite Q1's averages at all.
 4. **compressed_materialization** packs the one-letter `l_returnflag` and `l_linestatus` strings into one-byte integers (`utinyint`), below the GROUP BY and again below the ORDER BY. The top projection unpacks them. Grouping and sorting then compare bytes instead of strings.
-5. **Perfect hash group-by doesn't kick in.** DuckDB's plan for Q1 uses `PERFECT_HASH_GROUP_BY`, which looks the two packed bytes up directly in a small array instead of hashing them. In duckrs, statistics propagation decides on the perfect hash before compression runs (`statistics.rs`, `perfect_hash_bits`), and at that point the groups are still VARCHAR, which it only accepts as integers. The compression pass doesn't revisit the decision, so duckrs uses an ordinary hash group-by. In C++, compression happens inside statistics propagation, so the aggregate already sees integer groups.
+5. **Perfect hash group-by doesn't kick in.** DuckDB's plan for Q1 uses `PERFECT_HASH_GROUP_BY`, which looks the two packed bytes up directly in a small array instead of hashing them. In pintail, statistics propagation decides on the perfect hash before compression runs (`statistics.rs`, `perfect_hash_bits`), and at that point the groups are still VARCHAR, which it only accepts as integers. The compression pass doesn't revisit the decision, so pintail uses an ordinary hash group-by. In C++, compression happens inside statistics propagation, so the aggregate already sees integer groups.
 
 - **4 rows**: The result: one row per return flag and line status (A F, N F, N O, R F).
 - **98.5%**: Rows that pass the filter (591,856 of 600,572), against an estimate of 20%. With no joins, the wrong estimate doesn't change the plan here.
 - **11 for 7**: Aggregates in the GROUP BY against the different values they compute. I couldn't measure their cost: the machine's load average was above 70 during these runs, so Q1's timings (about 0.01–0.02 s) were too noisy to compare.
 
-> **Fixed, merged into phase-55-optimizer-rewriters (a74af3f, merge 0426536):** a port of `CommonAggregateOptimizer` (`COMMON_AGGREGATE`) now runs where C++ runs it, after the statistics, and merges identical aggregates. Q1's GROUP BY drops from 11 aggregates to 6. Compressed GROUP BY columns now carry the value range of their compressed form, as C++'s `UpdateAggregateStats` does, and the perfect hash decision is made again from those ranges. Q1's plan now shows **Perfect Hash Group By**, as DuckDB's does. In duckrs that operator is only a name over the same hash table, so this second fix makes the plans match but doesn't make Q1 faster. The plans above are from before the fix.
+> **Fixed, merged into phase-55-optimizer-rewriters (a74af3f, merge 0426536):** a port of `CommonAggregateOptimizer` (`COMMON_AGGREGATE`) now runs where C++ runs it, after the statistics, and merges identical aggregates. Q1's GROUP BY drops from 11 aggregates to 6. Compressed GROUP BY columns now carry the value range of their compressed form, as C++'s `UpdateAggregateStats` does, and the perfect hash decision is made again from those ranges. Q1's plan now shows **Perfect Hash Group By**, as DuckDB's does. In pintail that operator is only a name over the same hash table, so this second fix makes the plans match but doesn't make Q1 faster. The plans above are from before the fix.
 
 ## TPC-H Q2, with the optimizer off and on
 
@@ -211,7 +211,7 @@ Top N 100 BY s_acctbal DESC, n_name, s_name, p_partkey     ~32
                 └ CTE Scan __common_subplan_1                ~5
 ```
 
-> The first child of each hash join probes and the second child is the build side. duckrs's EXPLAIN labels the Delim Scan as a CTE Scan without an index.
+> The first child of each hash join probes and the second child is the build side. pintail's EXPLAIN labels the Delim Scan as a CTE Scan without an index.
 
 ### What each pass changed
 
@@ -221,11 +221,11 @@ Top N 100 BY s_acctbal DESC, n_name, s_name, p_partkey     ~32
 4. **deliminator** can't remove this Delim Join, since the subquery has an aggregate the outer rows depend on. But it removes one join inside: without it, the subquery's grouped result is joined to the outer part keys once more, which adds another join and another scan of the keys.
 5. **unused_columns** cut partsupp to 3 of its 5 columns and part to 2 of 9 in both halves. The subquery's supplier scan reads 2 columns; the outer one reads the 7 the query returns.
 
-### Where duckrs differs from DuckDB 1.5.6
+### Where pintail differs from DuckDB 1.5.6
 
-1. **DuckDB shares a larger piece.** Its common subplan is the European suppliers (supplier ⋈ nation ⋈ region, ~192 rows), where duckrs shares only the European nations (~5) and joins supplier again in each half.
-2. **DuckDB packs the subquery's group key.** It narrows `p_partkey` to a 2-byte integer for the subquery's GROUP BY. duckrs groups on the full BIGINT.
-3. **The estimates differ.** duckrs estimates ~161 outer rows and ~32 results; DuckDB ~274 and ~276. In fact 63 rows reach the price filter and 44 pass it. Both engines estimate ~445 brass parts where there are 73.
+1. **DuckDB shares a larger piece.** Its common subplan is the European suppliers (supplier ⋈ nation ⋈ region, ~192 rows), where pintail shares only the European nations (~5) and joins supplier again in each half.
+2. **DuckDB packs the subquery's group key.** It narrows `p_partkey` to a 2-byte integer for the subquery's GROUP BY. pintail groups on the full BIGINT.
+3. **The estimates differ.** pintail estimates ~161 outer rows and ~32 results; DuckDB ~274 and ~276. In fact 63 rows reach the price filter and 44 pass it. Both engines estimate ~445 brass parts where there are 73.
 
 - **0.006 s**: Q2 with the optimizer on, median of 11 warm runs, with a load average of about 4. It returns 44 rows, one per brass part that has a European supplier.
 - **0.036 s**: Q2 with `SET disabled_optimizers = 'join_order'`, 6 times slower in all 11 runs (0.035–0.037 s). The joins then follow the FROM clause, which starts with a cross product of the brass parts and all 1,000 suppliers (~445,000 rows estimated), probed by partsupp on two keys.
@@ -353,9 +353,9 @@ Projection ...                                              ~5
 3. **build_side_probe_side** builds the hash table on the filtered orders (~30,000 estimated, 5,552 in fact) and lets the late line items (379,809 of 600,572) probe it, which makes it a RIGHT_SEMI join.
 4. **unused_columns** cut orders to 2 of its 9 columns and the lineitem scan to 3 of 16.
 
-### Where duckrs differs from DuckDB 1.5.6
+### Where pintail differs from DuckDB 1.5.6
 
-1. **DuckDB 1.5.6 keeps the Delim Join.** Its plan still collects the distinct order keys (~27,171), joins the late line items to them, and then does a RIGHT_SEMI join with orders on `IS NOT DISTINCT FROM`. duckrs's plan has one join where 1.5.6 has three operators.
+1. **DuckDB 1.5.6 keeps the Delim Join.** Its plan still collects the distinct order keys (~27,171), joins the late line items to them, and then does a RIGHT_SEMI join with orders on `IS NOT DISTINCT FROM`. pintail's plan has one join where 1.5.6 has three operators.
 2. **The lineitem side still carries 16 NULL columns.** `SELECT *` in the subquery asked for all 16 lineitem columns. unused_columns stops the scan from reading them, but a projection still puts out a constant NULL for each of them, next to the key it joins on. DuckDB's projection there has only the key. Constant vectors cost almost nothing to make, so this is untidy rather than slow.
 
 - **0.007 s**: Q4 with the optimizer on, median of 11 warm runs, with a load average of about 12. It returns 5 rows, from 989 orders for 4-NOT SPECIFIED to 1,077 for 5-LOW: 5,093 of the quarter's 5,552 orders had a late line item.
@@ -364,7 +364,7 @@ Projection ...                                              ~5
 
 ## TPC-H Q5, with the optimizer off and on
 
-Q5 joins six tables to find the revenue of each Asian nation in 1994. These are real `EXPLAIN` plans from a duckrs release build of the Stage 3 branch, run on TPC-H scale factor 0.1 data (lineitem has 600,572 rows). The plans are redrawn as text trees from the CLI's boxes. Row counts with `~` are the optimizer's estimates, not counted rows.
+Q5 joins six tables to find the revenue of each Asian nation in 1994. These are real `EXPLAIN` plans from a pintail release build of the Stage 3 branch, run on TPC-H scale factor 0.1 data (lineitem has 600,572 rows). The plans are redrawn as text trees from the CLI's boxes. Row counts with `~` are the optimizer's estimates, not counted rows.
 
 ```
 SELECT n_name, sum(l_extendedprice * (1 - l_discount)) AS revenue
@@ -489,7 +489,7 @@ Ungrouped Aggregate sum(l_extendedprice * l_discount)       ~1
 4. **statistics_propagation** changed nothing here. Each condition cuts inside its column's range (ship dates 1992-01-03 to 1998-12-01, discounts 0.00 to 0.10, quantities 1 to 50), so none of them is always true or always false. lineitem is stored in order key order, so each of its 5 row groups holds ship dates from early 1992 to late 1998 and zone maps can't skip any.
 
 - **0.002 s**: Q6 with the optimizer on, median of 7 warm runs. It returns 11,803,420.2534. With it off, the time is 0.006 s, about 3.5 times the CPU time (0.043 s of user time against 0.012 s).
-- **1.9%**: Rows that pass all four conditions: 11,618 of 600,572. The estimate stays at ~120,114 (20%), the default guess for one comparison: duckrs doesn't combine the selectivity of several filters on one table.
+- **1.9%**: Rows that pass all four conditions: 11,618 of 600,572. The estimate stays at ~120,114 (20%), the default guess for one comparison: pintail doesn't combine the selectivity of several filters on one table.
 - **Either one**: Of filter_pushdown and expression_rewriter is enough for the faster time. With only one of them switched off, Q6 still takes 0.002–0.003 s. Only with both off does it slow to 0.006 s, the same as with the whole optimizer off: then the Filter operator evaluates the five casts again for every chunk. Switching off unused_columns, with or without filter_pushdown, makes no measurable difference at this size.
 
 > The first run after the load took 0.088 s every time, as in Q5: it includes working out the table statistics the first time a plan reads them. The timings above leave it out.
@@ -555,7 +555,7 @@ Projection __internal_decompress_string(supp_nation), (cust_nation), l_year, rev
               └ Seq Scan nation n2  Filters: optional: n_name IN ('GERMANY', 'FRANCE')
 ```
 
-> The first child of each hash join probes and the second child is the build side. The repeated n1 filters, the extra IN conditions in the last join and its ~15 row estimate are where duckrs differs from DuckDB 1.5.6, described below.
+> The first child of each hash join probes and the second child is the build side. The repeated n1 filters, the extra IN conditions in the last join and its ~15 row estimate are where pintail differs from DuckDB 1.5.6, described below.
 
 ### What each pass changed
 
@@ -566,12 +566,12 @@ Projection __internal_decompress_string(supp_nation), (cust_nation), l_year, rev
 5. **compressed_materialization** packs the two nation names into 16-byte integers for the GROUP BY and the ORDER BY.
 6. **unused_columns** cut every table down to the columns the joins and the sum need: lineitem to 5 of 16, orders, customer and supplier to 2 each.
 
-### Where duckrs differs from DuckDB 1.5.6
+### Where pintail differs from DuckDB 1.5.6
 
-1. **The n1 filter is there three times.** The supplier side of nation has one Filter on another, with the same OR three times, and the optional IN filter twice in its scan. DuckDB has each once. With `SET disabled_optimizers = 'expression_rewriter'` duckrs has it once too, so the copies come from how the rewriter and the pushdown work together. On 25 rows of nation it costs nothing measurable, but the copies also feed the estimates.
-2. **The last join keeps the derived conditions.** duckrs checks the two IN conditions again in the last join, next to the full OR. DuckDB checks only the full OR, in a Filter above the join.
-3. **The estimates are much too low.** duckrs estimates the last join at ~15 rows and the GROUP BY at ~1. In fact 643 rows reach the GROUP BY, and they make 4 groups. DuckDB estimates ~4,187. The French and German line items are 15,631 rows, where duckrs estimates ~3,749 and DuckDB ~18,749. The repeated nation filters are a likely cause, since each copy that is counted as a separate condition lowers the estimate again. I haven't confirmed that. Here the low estimate doesn't change the plan, since both engines pick the same join order.
-4. **l_year isn't packed.** DuckDB packs `year(l_shipdate)` into one byte, as `__internal_compress_integral_utinyint(l_year, 1992)`. duckrs groups on the full integer.
+1. **The n1 filter is there three times.** The supplier side of nation has one Filter on another, with the same OR three times, and the optional IN filter twice in its scan. DuckDB has each once. With `SET disabled_optimizers = 'expression_rewriter'` pintail has it once too, so the copies come from how the rewriter and the pushdown work together. On 25 rows of nation it costs nothing measurable, but the copies also feed the estimates.
+2. **The last join keeps the derived conditions.** pintail checks the two IN conditions again in the last join, next to the full OR. DuckDB checks only the full OR, in a Filter above the join.
+3. **The estimates are much too low.** pintail estimates the last join at ~15 rows and the GROUP BY at ~1. In fact 643 rows reach the GROUP BY, and they make 4 groups. DuckDB estimates ~4,187. The French and German line items are 15,631 rows, where pintail estimates ~3,749 and DuckDB ~18,749. The repeated nation filters are a likely cause, since each copy that is counted as a separate condition lowers the estimate again. I haven't confirmed that. Here the low estimate doesn't change the plan, since both engines pick the same join order.
+4. **l_year isn't packed.** DuckDB packs `year(l_shipdate)` into one byte, as `__internal_compress_integral_utinyint(l_year, 1992)`. pintail groups on the full integer.
 
 - **4 rows**: The result: France to Germany and Germany to France, for 1995 and 1996. Germany's sales to France in 1995 are the largest, 6,232,818.70.
 - **643**: Rows that reach the GROUP BY, out of 1,270 line items whose supplier and customer are both French or German. The full OR drops the half where both are from the same nation.
@@ -656,7 +656,7 @@ Order By o_year                                             ~2
 
 ## TPC-H Q9, with the optimizer off and on
 
-Q9 works out the profit on "green" parts per nation and year. It also joins six tables, but its filter is a `LIKE` on part names, and partsupp joins lineitem on two keys at once. The setup is the same as for Q5: the duckrs Stage 3 release build and TPC-H SF0.1 data.
+Q9 works out the profit on "green" parts per nation and year. It also joins six tables, but its filter is a `LIKE` on part names, and partsupp joins lineitem on two keys at once. The setup is the same as for Q5: the pintail Stage 3 release build and TPC-H SF0.1 data.
 
 ```
 SELECT nation, o_year, sum(amount) AS sum_profit
@@ -729,7 +729,7 @@ Projection __internal_decompress_string(nation), o_year, sum_profit
 2. **filter_pushdown** sent the `contains` filter into the part scan and turned the five cross products into hash joins. With the optimizer off, the cross product reaches about 3.6 × 10^27 rows before the filter runs. As in Q5, the estimate stops at the 64-bit limit.
 3. **filter_combiner** put `s_suppkey`, `l_suppkey` and `ps_suppkey` into one set of equal columns, and did the same for `p_partkey`, `l_partkey` and `ps_partkey`. The query only ever compares lineitem with the other tables. Thanks to these sets, the plan can join partsupp with part (`ps_partkey = p_partkey`) and with supplier (`ps_suppkey = s_suppkey`) before lineitem is touched.
 4. **join_order** used that freedom. It joins the small tables first: green parts (~4,000) with partsupp (~9,365), then with supplier and nation (~7,267). The result is a hash table keyed on both `(suppkey, partkey)`. lineitem probes it on both keys at once, so the lineitem rows for parts that aren't green are dropped in that one join (~54,561 left).
-5. **build_side** left orders (~150,000 rows) as the probe side of the last join and built on the smaller join result (~54,561). C++ compares rows times row width, and by that measure it would build on all of orders here. duckrs only lets width decide when the widths differ several times over, and `build_side.rs` names Q9 as the reason.
+5. **build_side** left orders (~150,000 rows) as the probe side of the last join and built on the smaller join result (~54,561). C++ compares rows times row width, and by that measure it would build on all of orders here. pintail only lets width decide when the widths differ several times over, and `build_side.rs` names Q9 as the reason.
 6. **unused_columns** cut each scan down to the columns the query reads: 6 of lineitem's 16, 3 of partsupp's 5, 2 of orders' 9 and 2 of supplier's 7. The part scan outputs only `p_partkey`. Its `p_name` is read inside the scan for the filter and goes no further.
 7. **compressed_materialization** packs the nation names into a `uhugeint` for the GROUP BY and the ORDER BY, as in Q5.
 
@@ -880,11 +880,11 @@ Projection CAST(ps_partkey AS BIGINT), value              ~1,241
 5. **compressed_materialization** narrows `ps_partkey` to a SMALLINT for the GROUP BY and the ORDER BY. It is at most 20,000, which fits.
 6. **unused_columns** cut partsupp to 4 of its 5 columns in the outer half and to 3 in the subquery, which doesn't need the part key.
 
-### Where duckrs differs from DuckDB 1.5.6
+### Where pintail differs from DuckDB 1.5.6
 
-1. **DuckDB shares a larger piece and reads partsupp once.** Its common subplan is the whole join of partsupp with the German suppliers (~2,483 rows), which both the GROUP BY and the threshold read. duckrs shares only the German suppliers and scans and joins partsupp in each half. This is the same difference as in Q2.
-2. **DuckDB checks the subquery's row count.** It wraps the threshold in a check that raises an error if the subquery returns more than one row. An ungrouped aggregate always returns one row, so this can't happen here; duckrs leaves the check out.
-3. **The estimates differ widely.** duckrs estimates ~1,241 result rows and DuckDB ~17. In fact there are 2,541 of the 3,716 groups.
+1. **DuckDB shares a larger piece and reads partsupp once.** Its common subplan is the whole join of partsupp with the German suppliers (~2,483 rows), which both the GROUP BY and the threshold read. pintail shares only the German suppliers and scans and joins partsupp in each half. This is the same difference as in Q2.
+2. **DuckDB checks the subquery's row count.** It wraps the threshold in a check that raises an error if the subquery returns more than one row. An ungrouped aggregate always returns one row, so this can't happen here; pintail leaves the check out.
+3. **The estimates differ widely.** pintail estimates ~1,241 result rows and DuckDB ~17. In fact there are 2,541 of the 3,716 groups.
 
 - **0.008 s**: Q11 with the optimizer on, median of 11 warm runs, with a load average of about 4. It returns 2,541 parts, led by part 12098 with a stock value of 16,227,681.21.
 - **About the same**: With `common_subplan`, `compressed_materialization` or `join_order` switched off, the medians were all 0.007 s. Sharing a join of 1,000 suppliers with one nation saves too little to show. Without join_order, all 80,000 partsupp rows are joined to supplier first and Germany is filtered after (and no CTE is shared), but with only three small tables that still costs nothing measurable here.
@@ -960,7 +960,7 @@ Projection __internal_decompress_string(l_shipmode), high_line_count, low_line_c
 
 ## TPC-H Q13, with the optimizer off and on
 
-Q13 counts how many customers have 0, 1, 2, … orders, leaving out orders whose comment mentions special requests. It is the only walkthrough with an outer join, and its filter sits in the `ON` clause, not in WHERE. It shows which filters may move below an outer join, and how the build side of one is chosen. The optimized plan is from `phase-55-build-side-flip` at `0b13e01`, the change merged into phase-55 as `1ff6f10` that lets duckrs swap the sides of a LEFT join, and is the same at the phase-55 tip `34ed290`; the unoptimized plan is the same in every build. Same SF0.1 data.
+Q13 counts how many customers have 0, 1, 2, … orders, leaving out orders whose comment mentions special requests. It is the only walkthrough with an outer join, and its filter sits in the `ON` clause, not in WHERE. It shows which filters may move below an outer join, and how the build side of one is chosen. The optimized plan is from `phase-55-build-side-flip` at `0b13e01`, the change merged into phase-55 as `1ff6f10` that lets pintail swap the sides of a LEFT join, and is the same at the phase-55 tip `34ed290`; the unoptimized plan is the same in every build. Same SF0.1 data.
 
 ```
 SELECT c_count, count(*) AS custdist
@@ -1014,9 +1014,9 @@ Order By custdist DESC, c_count DESC                        ~14,035
 
 ### Compared with DuckDB 1.5.6
 
-1. **The plan now matches DuckDB's.** Both build on the 15,000 customers and let the filtered orders probe, with the comment filter in the orders scan. Before `1ff6f10`, duckrs's build side pass only swapped SEMI and ANTI joins, so it built a hash table of all 148,467 filtered orders, about ten times larger. C++ `BuildProbeSideOptimizer` swaps every join type that has an inverse (`HasInverseJoinType`), LEFT and RIGHT among them, and duckrs now does the same.
+1. **The plan now matches DuckDB's.** Both build on the 15,000 customers and let the filtered orders probe, with the comment filter in the orders scan. Before `1ff6f10`, pintail's build side pass only swapped SEMI and ANTI joins, so it built a hash table of all 148,467 filtered orders, about ten times larger. C++ `BuildProbeSideOptimizer` swaps every join type that has an inverse (`HasInverseJoinType`), LEFT and RIGHT among them, and pintail now does the same.
 2. **The swapped plan was slower at first, and isn't any more.** Right after the swap was merged, Q13 took 0.056 s with it and 0.042 s with `build_side_probe_side` switched off. The cause was in execution, not in the plan: according to the session that fixed it, the GROUP BY above the join merged the groups of its serial pipeline with those of the threads one at a time. `f40d03c` merges them by partition instead. On a build of the phase-55 tip with that fix (`34ed290`), Q13 takes 0.035 s with the swap and 0.036 s without it, medians of 15 interleaved runs; CPU time is 0.031 s against 0.028 s. The load average was about 70, so the two are best read as even at this size. The session that made the fix measured the swapped plan at SF1 as faster: 0.133 s against 0.142 s for the LEFT join.
-3. **The estimates are rough in both.** The comment filter is estimated at 20% of orders (~30,000) where 99% pass (148,467). duckrs estimates ~14,035 customer groups and DuckDB ~11,711; there are 15,000, one per customer.
+3. **The estimates are rough in both.** The comment filter is estimated at 20% of orders (~30,000) where 99% pass (148,467). pintail estimates ~14,035 customer groups and DuckDB ~11,711; there are 15,000, one per customer.
 
 - **5,000**: Customers with no qualifying orders: the largest group of the result, c_count 0. The next ones are 9 orders (659 customers), 10 (658) and 11 (643).
 - **148,467**: Orders out of 150,000 that pass the comment filter. Since nearly all pass, the 15,000 customers are the right side to build on.
@@ -1077,7 +1077,7 @@ Projection CAST(100.00 * sum AS DOUBLE) / CAST(sum AS DOUBLE)   ~1
 - **7,630**: Line items shipped in September 1995, against an estimate of ~120,114. All 7,630 find their part, and 3,309 of the 20,000 parts are PROMO types.
 - **0.007 s**: Q14 with `SET disabled_optimizers = 'join_filter_pushdown'`, faster in all 9 runs. Since the filter drops nothing here, checking it is pure cost. Switching off `expression_rewriter` (0.010 s) or `build_side_probe_side` (0.009 s) makes no clear difference: the `LIKE` only runs on the 7,630 joined rows.
 
-> DuckDB 1.5.6 makes the same plan: a hash join that builds on part, the same three lineitem columns and `prefix(p_type, 'PROMO')`. It estimates the join at ~120,114 rows where duckrs says ~128,746, and puts the CASE in a projection under the aggregate where duckrs evaluates it inside the aggregate.
+> DuckDB 1.5.6 makes the same plan: a hash join that builds on part, the same three lineitem columns and `prefix(p_type, 'PROMO')`. It estimates the join at ~120,114 rows where pintail says ~128,746, and puts the CASE in a projection under the aggregate where pintail evaluates it inside the aggregate.
 
 ## TPC-H Q15, with the optimizer off and on
 
@@ -1147,7 +1147,7 @@ CTE revenue                                                 ~1,000
 5. **The build sides** follow the row counts: the first hash table holds the one-row maximum, which the 1,000 CTE rows probe, and the one revenue row that matches is the build side for the supplier join.
 6. **unused_columns** cut lineitem to 3 of its 16 columns and supplier to 4 of its 7.
 
-> DuckDB 1.5.6 makes the same plan: the materialized CTE, the perfect hash group-by, the equality join with the maximum, and the same compression, with a 2-byte unsigned integer and an offset where duckrs uses a SMALLINT. Like Q11, it adds a check that the subquery returns one row, and it uses `sum_no_overflow` where duckrs uses `sum`.
+> DuckDB 1.5.6 makes the same plan: the materialized CTE, the perfect hash group-by, the equality join with the maximum, and the same compression, with a 2-byte unsigned integer and an offset where pintail uses a SMALLINT. Like Q11, it adds a check that the subquery returns one row, and it uses `sum_no_overflow` where pintail uses `sum`.
 
 - **1 row**: Supplier 677, with 1,614,410.29 of revenue from January to March 1996, the same answer DuckDB gives.
 - **22,830**: Line items shipped in that quarter, from all 1,000 suppliers. The estimate was ~120,114, the default guess of 20% for a range.
@@ -1155,7 +1155,7 @@ CTE revenue                                                 ~1,000
 
 ## TPC-H Q16, with the optimizer off and on
 
-Q16 counts, for each brand, type and size of part, how many suppliers sell it, leaving out suppliers with customer complaints. It has three kinds of condition the other walkthroughs don't combine: a negated `LIKE`, an `IN` list of eight sizes, and a `NOT IN` subquery. It also shows a gap: in duckrs the IN list keeps the part filters out of the part scan. The plans are from the same build as Q15 (`1ed6cc1`) and the same SF0.1 data.
+Q16 counts, for each brand, type and size of part, how many suppliers sell it, leaving out suppliers with customer complaints. It has three kinds of condition the other walkthroughs don't combine: a negated `LIKE`, an `IN` list of eight sizes, and a `NOT IN` subquery. It also shows a gap: in pintail the IN list keeps the part filters out of the part scan. The plans are from the same build as Q15 (`1ed6cc1`) and the same SF0.1 data.
 
 ```
 SELECT p_brand, p_type, p_size, count(DISTINCT ps_suppkey) AS supplier_cnt
@@ -1215,11 +1215,11 @@ Projection __internal_decompress_string(p_brand), p_type, CAST(p_size AS INTEGER
 4. **The NOT IN** stays a MARK join, now a hash join on `ps_suppkey = s_suppkey`. The supplier list is the build side: one supplier at this scale has a complaint.
 5. **compressed_materialization** packs `p_brand` into a 16-byte integer and `p_size` into a TINYINT for the GROUP BY and the ORDER BY. `p_type` is too long to pack.
 
-### Where duckrs differs from DuckDB 1.5.6
+### Where pintail differs from DuckDB 1.5.6
 
-1. **The part filters stay above the IN join.** In DuckDB, `p_brand != 'Brand#45'` and the `prefix` test are scan filters on part, and only the IN result is checked above its MARK join. In duckrs all three sit in one Filter above that join. The cause is the order of the passes: C++ moves filters into scans inside FILTER_PUSHDOWN, which runs before IN_CLAUSE (`optimizer.cpp`), while duckrs does it later, in `scan_filters::push_into_scans` (`optimizer/mod.rs`, after `in_clause`). By then the MARK join sits between the Filter and the scan. With `SET disabled_optimizers = 'in_clause'`, both filters do go into the part scan.
-2. **The part scan reads all 9 columns.** DuckDB reads 4. In duckrs the scan under the IN join still outputs `p_name`, `p_container`, `p_comment` and the rest. With in_clause switched off it reads 4 columns, as DuckDB does, and in a smaller query with the same IN list it reads only what it needs, so it has to do with how unused_columns handles the MARK join under the other joins. I haven't pinned it down further.
-3. **The estimates differ.** duckrs estimates ~4,000 parts after the filters and ~1,862 groups; DuckDB ~800 and ~639. In fact 2,911 parts pass, 11,644 partsupp rows join them, and there are 2,762 groups.
+1. **The part filters stay above the IN join.** In DuckDB, `p_brand != 'Brand#45'` and the `prefix` test are scan filters on part, and only the IN result is checked above its MARK join. In pintail all three sit in one Filter above that join. The cause is the order of the passes: C++ moves filters into scans inside FILTER_PUSHDOWN, which runs before IN_CLAUSE (`optimizer.cpp`), while pintail does it later, in `scan_filters::push_into_scans` (`optimizer/mod.rs`, after `in_clause`). By then the MARK join sits between the Filter and the scan. With `SET disabled_optimizers = 'in_clause'`, both filters do go into the part scan.
+2. **The part scan reads all 9 columns.** DuckDB reads 4. In pintail the scan under the IN join still outputs `p_name`, `p_container`, `p_comment` and the rest. With in_clause switched off it reads 4 columns, as DuckDB does, and in a smaller query with the same IN list it reads only what it needs, so it has to do with how unused_columns handles the MARK join under the other joins. I haven't pinned it down further.
+3. **The estimates differ.** pintail estimates ~4,000 parts after the filters and ~1,862 groups; DuckDB ~800 and ~639. In fact 2,911 parts pass, 11,644 partsupp rows join them, and there are 2,762 groups.
 
 - **2,762**: Rows returned, the same as DuckDB. The top ones are sold by 12 suppliers each, starting with Brand#14 SMALL ANODIZED NICKEL, size 45.
 - **1**: Supplier with a customer complaint at SF0.1, against an estimate of ~200. The NOT IN removes its partsupp rows.
@@ -1276,7 +1276,7 @@ Projection CAST(sum AS DOUBLE) / 7.0                        ~1
             └ Delim Scan  (the outer p_partkey values)      ~539
 ```
 
-> The first child of each hash join probes and the second child is the build side. duckrs's EXPLAIN labels the Delim Scan as a CTE Scan without an index.
+> The first child of each hash join probes and the second child is the build side. pintail's EXPLAIN labels the Delim Scan as a CTE Scan without an index.
 
 ### What each pass changed
 
@@ -1286,11 +1286,11 @@ Projection CAST(sum AS DOUBLE) / 7.0                        ~1
 4. **join_filter_pushdown** doesn't show in EXPLAIN. At run time each hash join hands its lineitem scan the range and a Bloom filter of the part keys it built, so line items of other parts can be dropped in the scan.
 5. **unused_columns** cut the outer lineitem scan to 3 of its 16 columns, the subquery's to 2, and part to 1 of 9.
 
-### Where duckrs differs from DuckDB 1.5.6
+### Where pintail differs from DuckDB 1.5.6
 
-1. **DuckDB's plan has more operators.** It uses a RIGHT Delim Join and keeps a RIGHT hash join on `IS NOT DISTINCT FROM` above the subquery's GROUP BY, with a dummy scan. duckrs has one Delim Join and no join above the GROUP BY.
-2. **DuckDB packs the subquery's group key.** It narrows `p_partkey` to a 2-byte integer for the subquery's GROUP BY. duckrs groups on the full BIGINT, as in Q2.
-3. **The subquery estimates differ widely.** DuckDB estimates ~349,097 rows into the subquery's GROUP BY and ~174,548 groups; duckrs ~17,348 and ~1. In fact 555 line items make 18 groups.
+1. **DuckDB's plan has more operators.** It uses a RIGHT Delim Join and keeps a RIGHT hash join on `IS NOT DISTINCT FROM` above the subquery's GROUP BY, with a dummy scan. pintail has one Delim Join and no join above the GROUP BY.
+2. **DuckDB packs the subquery's group key.** It narrows `p_partkey` to a 2-byte integer for the subquery's GROUP BY. pintail groups on the full BIGINT, as in Q2.
+3. **The subquery estimates differ widely.** DuckDB estimates ~349,097 rows into the subquery's GROUP BY and ~174,548 groups; pintail ~17,348 and ~1. In fact 555 line items make 18 groups.
 
 - **23,512.75**: The result, the same as DuckDB's: 43 of the 555 line items of those 18 parts are under 20% of their part's average.
 - **0.012 s**: Q17 with the optimizer on, median of 11 warm runs (0.007–0.019 s). With deliminator switched off it was 0.013 s.
@@ -1298,7 +1298,7 @@ Projection CAST(sum AS DOUBLE) / 7.0                        ~1
 
 ## TPC-H Q18, with the optimizer off and on
 
-Q18 finds the 100 largest orders whose line items add up to a quantity over 300. Unlike Q5 and Q9, it has an `IN` subquery, and both the subquery and the outer query compute `sum(l_quantity)` per order. The setup is the same: the duckrs Stage 3 release build and TPC-H SF0.1 data.
+Q18 finds the 100 largest orders whose line items add up to a quantity over 300. Unlike Q5 and Q9, it has an `IN` subquery, and both the subquery and the outer query compute `sum(l_quantity)` per order. The setup is the same: the pintail Stage 3 release build and TPC-H SF0.1 data.
 
 ```
 SELECT c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice, sum(l_quantity)
@@ -1371,15 +1371,15 @@ Top N 100 BY o_totalprice DESC, o_orderdate ASC             ~100
 - **0.022 s**: Q18 with `SET disabled_optimizers = 'aggregate_reuse'`, median of 5 runs alternated with the ones before. With the reuse off, the plan has a SEMI join and two scans of lineitem.
 - **Not run**: The plan with the optimizer off. Its cross product of customer, orders and lineitem is estimated at 1.35 × 10^15 rows.
 
-> **Open finding:** in duckrs today, aggregate reuse saves a scan of lineitem but makes Q18 about 4× slower at this scale. DuckDB 1.5.6 doesn't apply this rewrite to Q18; its plan keeps the SEMI join and both lineitem scans. The pass comes from the newer DuckDB source that duckrs is ported from.
+> **Open finding:** in pintail today, aggregate reuse saves a scan of lineitem but makes Q18 about 4× slower at this scale. DuckDB 1.5.6 doesn't apply this rewrite to Q18; its plan keeps the SEMI join and both lineitem scans. The pass comes from the newer DuckDB source that pintail is ported from.
 
-> **Cause:** the plan is right; the cost is in how duckrs writes out exported aggregate states. Grouping lineitem by order takes 0.024 s as a plain `sum`, 0.056 s when it exports its states, and 0.085 s when `finalize` then reads them back. In a profile, 81% of the busy CPU time is in the hash aggregate's output loop (`PhysicalAggregate::set_output`), which handles the 150,000 groups one row at a time. For each row, `write_state` calls `LogicalType::state_layout()`, which copies the whole state type and then frees it. `Vector::set_value` then compares the value's type with the column's type, and that comparison formats the state's constants into strings twice (`StateInfo::constants_key`). Any plan with exported states pays this cost, which also includes partial aggregate pushdown and grouping sets.
+> **Cause:** the plan is right; the cost is in how pintail writes out exported aggregate states. Grouping lineitem by order takes 0.024 s as a plain `sum`, 0.056 s when it exports its states, and 0.085 s when `finalize` then reads them back. In a profile, 81% of the busy CPU time is in the hash aggregate's output loop (`PhysicalAggregate::set_output`), which handles the 150,000 groups one row at a time. For each row, `write_state` calls `LogicalType::state_layout()`, which copies the whole state type and then frees it. `Vector::set_value` then compares the value's type with the column's type, and that comparison formats the state's constants into strings twice (`StateInfo::constants_key`). Any plan with exported states pays this cost, which also includes partial aggregate pushdown and grouping sets.
 
 > **Fixed, merged into phase-55-optimizer-rewriters (081d0b9):** the output loop now works out the state layout once per column, comparing two types that share their info returns at once, constants are only formatted when there are some, and `finalize()` looks up its aggregate once per vector. Measured against a clean build of the same commit: Q18 with reuse goes from 0.089 s to 0.048 s, and the GROUP BY that exports states from 0.054 s to 0.029 s, about the cost of a plain one. Q18 without reuse stays at 0.020 s, so the reuse plan is still slower. What's left is the row-at-a-time `finalize` of 150,000 states in the HAVING filter.
 
 ## TPC-H Q19, with the optimizer off and on
 
-Q19 sums the discounted revenue of three kinds of part shipped by air and delivered in person. Its whole WHERE clause is one OR of three branches, and every branch repeats the join condition. So none of its conditions can be pushed as they are written, and the work is to get filters for each table out of the OR. duckrs gets more out of it than DuckDB 1.5.6, but runs slower for it. The plans are from the same build as Q17 (`1ed6cc1`) and the same SF0.1 data.
+Q19 sums the discounted revenue of three kinds of part shipped by air and delivered in person. Its whole WHERE clause is one OR of three branches, and every branch repeats the join condition. So none of its conditions can be pushed as they are written, and the work is to get filters for each table out of the OR. pintail gets more out of it than DuckDB 1.5.6, but runs slower for it. The plans are from the same build as Q17 (`1ed6cc1`) and the same SF0.1 data.
 
 ```
 SELECT sum(l_extendedprice * (1 - l_discount)) AS revenue
@@ -1436,9 +1436,9 @@ Ungrouped Aggregate sum(l_extendedprice * (1.00 - l_discount))   ~1
 3. **statistics_propagation** dropped the lower bounds: `p_size >= 1` and `l_quantity >= 1` always hold, since 1 is the smallest size and quantity in the data. Only `p_size <= 15` and `l_quantity <= 30.00` are left.
 4. **unused_columns** cut lineitem to 5 of its 16 columns (plus `l_shipinstruct`, read inside the scan for its filter) and part to 4 of 9.
 
-### Where duckrs differs from DuckDB 1.5.6
+### Where pintail differs from DuckDB 1.5.6
 
-1. **duckrs derives more filters.** DuckDB 1.5.6 takes out only the conditions common to all three branches. Its part scan has no filter and sends all 20,000 parts to the join, and its lineitem scan has no quantity filter. duckrs is ported from the baseline C++ source, which is newer than 1.5.6; I haven't checked whether that source derives the same filters.
+1. **pintail derives more filters.** DuckDB 1.5.6 takes out only the conditions common to all three branches. Its part scan has no filter and sends all 20,000 parts to the join, and its lineitem scan has no quantity filter. pintail is ported from the baseline C++ source, which is newer than 1.5.6; I haven't checked whether that source derives the same filters.
 2. **The part scan has each derived filter twice**, and the Filter above it repeats them once more inside its first condition. This looks like the same kind of repetition as the nation filter in Q7.
 3. **A useless condition on quantity.** The plan checks `l_quantity <= 20.00 OR l_quantity >= 20.00` in a Filter over lineitem and again in the join. It holds for every quantity that isn't NULL, and quantity is NOT NULL, so it removes nothing. It looks like a leftover of combining the quantity bounds of the three branches; I haven't traced where it is made.
 4. **And it's slower for it.** With `SET disabled_optimizers = 'filter_pushdown'`, Q19 took 0.006 s against 0.010 s with the default settings, in all 11 runs (0.006–0.007 s against 0.010 s). The same derived conditions still exist then, but once each, in one Filter above each scan instead of as scan filters with copies. So the scan filters and the repeated conditions cost more here than they save. I haven't measured which of them costs the most.
@@ -1513,7 +1513,7 @@ Order By s_name                                             ~7
       └ Seq Scan nation  [n_nationkey]  Filters: n_name = 'CANADA'
 ```
 
-> The first child of each hash join probes and the second child is the build side. duckrs's EXPLAIN labels the Delim Scan as a CTE Scan without an index.
+> The first child of each hash join probes and the second child is the build side. pintail's EXPLAIN labels the Delim Scan as a CTE Scan without an index.
 
 ### What each pass changed
 
@@ -1523,7 +1523,7 @@ Order By s_name                                             ~7
 4. **build_side_probe_side** made the top join a RIGHT_SEMI join: the 37 Canadian suppliers (~38 estimated) build, and the partsupp rows that pass probe, so each supplier is kept once however many of its parts qualify.
 5. **unused_columns** cut partsupp to 3 of its 5 columns, part to 1 of 9, lineitem to 3 of 16 and supplier to 4 of 7.
 
-> DuckDB 1.5.6 makes the same plan, with the same LIKE range, semi joins and RIGHT_SEMI top join. As in Q17, it keeps an extra RIGHT join above the subquery's GROUP BY and packs the two group keys into 2-byte integers, which duckrs doesn't.
+> DuckDB 1.5.6 makes the same plan, with the same LIKE range, semi joins and RIGHT_SEMI top join. As in Q17, it keeps an extra RIGHT join above the subquery's GROUP BY and packs the two group keys into 2-byte integers, which pintail doesn't.
 
 - **9 rows**: Canadian suppliers with a surplus of a forest part, the same as DuckDB. The first are Supplier#000000157 and Supplier#000000197.
 - **190 → 760 → 521**: Forest parts, their partsupp rows, and the rows with more in stock than half of 1994's shipments. The estimates were ~4,000, ~16,000 and ~3,200.
@@ -1596,7 +1596,7 @@ Top N 100 BY numwait DESC, s_name                           ~25
           └ Delim Scan  (the outer key pairs)               ~188
 ```
 
-> The first child of each hash join probes and the second child is the build side. duckrs's EXPLAIN labels the Delim Scan as a CTE Scan without an index.
+> The first child of each hash join probes and the second child is the build side. pintail's EXPLAIN labels the Delim Scan as a CTE Scan without an index.
 
 ### What each pass changed
 
@@ -1606,12 +1606,12 @@ Top N 100 BY numwait DESC, s_name                           ~25
 4. **The NOT EXISTS keeps its Delim Join.** Its subquery has its own filter on l3, so it still runs once over the distinct outer key pairs (Delim Scan), joined with the late line items of l3 on the order key, with `!=` on the supplier as a second condition. A MARK on the Delim Join and a `NOT #mark` filter keep the outer rows without a match.
 5. **unused_columns** cut each lineitem scan to 2 or 4 of its 16 columns, orders to 1 of 9 and supplier to 3 of 7.
 
-### Where duckrs differs from DuckDB 1.5.6
+### Where pintail differs from DuckDB 1.5.6
 
-1. **duckrs removes one Delim Join that DuckDB keeps.** DuckDB 1.5.6 keeps both: a RIGHT Delim Join for the EXISTS, which joins l2 to the distinct key pairs and groups them, and a LEFT Delim Join for the NOT EXISTS. duckrs turns the EXISTS into one hash join with the inequality as a join condition.
-2. **DuckDB's NOT EXISTS is an ANTI join; duckrs's is a MARK and a filter.** Same rows, but duckrs builds a marker column and then filters on it. For a NOT EXISTS correlated only by equality, as in `orders WHERE NOT EXISTS (… l_orderkey = o_orderkey …)`, duckrs does make an ANTI join, so it is the Delim Join with the inequality that stays a MARK.
+1. **pintail removes one Delim Join that DuckDB keeps.** DuckDB 1.5.6 keeps both: a RIGHT Delim Join for the EXISTS, which joins l2 to the distinct key pairs and groups them, and a LEFT Delim Join for the NOT EXISTS. pintail turns the EXISTS into one hash join with the inequality as a join condition.
+2. **DuckDB's NOT EXISTS is an ANTI join; pintail's is a MARK and a filter.** Same rows, but pintail builds a marker column and then filters on it. For a NOT EXISTS correlated only by equality, as in `orders WHERE NOT EXISTS (… l_orderkey = o_orderkey …)`, pintail does make an ANTI join, so it is the Delim Join with the inequality that stays a MARK.
 3. **The NOT EXISTS side carries 16 NULL columns,** from its `SELECT *`, as in Q4.
-4. **The estimates differ.** duckrs estimates ~188 outer rows and ~25 groups; DuckDB ~377 and ~71. In fact 8,590 late line items of Saudi suppliers are in finished orders, and the result has 47 suppliers.
+4. **The estimates differ.** pintail estimates ~188 outer rows and ~25 groups; DuckDB ~377 and ~71. In fact 8,590 late line items of Saudi suppliers are in finished orders, and the result has 47 suppliers.
 
 - **47 rows**: Saudi suppliers with at least one order they alone delivered late, 465 such line items in all, the same as DuckDB. Suppliers 445 and 825 lead with 16 each.
 - **0.051 s**: Q21 with the optimizer on, median of 11 warm runs, with a load average of about 13. With `deliminator` off it was 0.065 s, and with `join_filter_pushdown` off 0.061 s. The runs overlap (0.036–0.103 s in all), so these are rough.
@@ -1679,11 +1679,11 @@ Order By cntrycode                                          ~150
 3. **in_clause** turned each `substring(c_phone, 1, 2) IN (7 codes)` into a MARK join with the 7 codes as a small table, as in Q16.
 4. **unused_columns** cut orders to 1 of its 9 columns and the subquery's customer scan to 2 of 8. The outer customer scan keeps all 8 (see below).
 
-### Where duckrs differs from DuckDB 1.5.6
+### Where pintail differs from DuckDB 1.5.6
 
-1. **The same IN list gap as in Q16.** DuckDB keeps `substring(c_phone, 1, 2) IN (…)` as a filter inside both customer scans, together with `c_acctbal > 0.00`, and the outer scan reads 3 columns. In duckrs the IN becomes a MARK join first, so the filters stay above it and the outer scan reads all 8 columns. With `SET disabled_optimizers = 'in_clause'` duckrs makes DuckDB's plan: both conditions in the scans and 3 columns.
-2. **duckrs removes the Delim Join that DuckDB keeps.** DuckDB 1.5.6 keeps a RIGHT Delim Join for the NOT EXISTS, which joins orders to the distinct customer keys first and groups them. duckrs has a single RIGHT_ANTI hash join.
-3. **DuckDB checks the scalar subquery's row count,** as in Q11 and Q15; duckrs doesn't.
+1. **The same IN list gap as in Q16.** DuckDB keeps `substring(c_phone, 1, 2) IN (…)` as a filter inside both customer scans, together with `c_acctbal > 0.00`, and the outer scan reads 3 columns. In pintail the IN becomes a MARK join first, so the filters stay above it and the outer scan reads all 8 columns. With `SET disabled_optimizers = 'in_clause'` pintail makes DuckDB's plan: both conditions in the scans and 3 columns.
+2. **pintail removes the Delim Join that DuckDB keeps.** DuckDB 1.5.6 keeps a RIGHT Delim Join for the NOT EXISTS, which joins orders to the distinct customer keys first and groups them. pintail has a single RIGHT_ANTI hash join.
+3. **DuckDB checks the scalar subquery's row count,** as in Q11 and Q15; pintail doesn't.
 
 - **7 rows**: One per country code, the same as DuckDB: from 85 customers (code 29) to 99 (code 18), 641 in all.
 - **4,115 → 5,000**: Customers with one of the seven codes, and customers who have never ordered, out of 15,000. The average is taken over the 3,741 coded customers with a positive balance.
@@ -1927,4 +1927,4 @@ EXPLAIN SELECT ...;                                   -- without those two
 PRAGMA disable_optimizer;                             -- every pass off
 ```
 
-Each pass is a port of the DuckDB C++ optimizer file named in its header comment. Where duckrs differs from C++, the header says so.
+Each pass is a port of the DuckDB C++ optimizer file named in its header comment. Where pintail differs from C++, the header says so.

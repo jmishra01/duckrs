@@ -1,6 +1,6 @@
 name: Benchmarks
 
-# Times duckrs against the C++ DuckDB library on the same .benchmark files every night (item 46 of
+# Times pintail against the C++ DuckDB library on the same .benchmark files every night (item 46 of
 # docs/REMAINING_WORK.md). The comparison ends with the v1 gate of item 48.
 on:
   schedule:

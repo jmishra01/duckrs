@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Runs DuckDB's C API tests (test/api/capi/v1/test_capi*.cpp and the capi_*_functions.cpp of user-defined functions,
-# of the C++ checkout) against libduckrs_capi.
+# of the C++ checkout) against libpintail_capi.
 #
 # usage: tools/capi_tests/run.sh [--release] [test_capi.cpp ...]
 #
 # Each test file is compiled with Catch2 and duckdb.h from the checkout and the shim of shim/ (in place of DuckDB's
-# C++ test helpers), and linked with libduckrs_capi plus generated weak stubs for the duckdb.h functions the library
+# C++ test helpers), and linked with libpintail_capi plus generated weak stubs for the duckdb.h functions the library
 # does not export yet (a stub throws, so only the test cases that call it fail). Every test case then runs in a
 # process of its own, so that one that crashes does not take the others with it.
 #
@@ -52,16 +52,16 @@ fi
 BUILD=${CAPI_TEST_BUILD:-$ROOT/target/capi_tests}
 mkdir -p "$BUILD/src" "$BUILD/obj" "$BUILD/bin"
 
-echo "== building libduckrs_capi ($PROFILE)"
-(cd "$ROOT" && cargo build -p duckrs-capi "${CARGO_FLAGS[@]}")
+echo "== building libpintail_capi ($PROFILE)"
+(cd "$ROOT" && cargo build -p pintail-capi "${CARGO_FLAGS[@]}")
 LIBDIR="$ROOT/target/$PROFILE"
 case "$(uname)" in
 Darwin)
-	LIB="$LIBDIR/libduckrs_capi.dylib"
+	LIB="$LIBDIR/libpintail_capi.dylib"
 	nm -gU "$LIB" | awk '{print $3}' | sed 's/^_//' >"$BUILD/exported.txt"
 	;;
 *)
-	LIB="$LIBDIR/libduckrs_capi.so"
+	LIB="$LIBDIR/libpintail_capi.so"
 	nm -D --defined-only "$LIB" | awk '{print $3}' >"$BUILD/exported.txt"
 	;;
 esac
@@ -94,7 +94,7 @@ for test in "${TESTS[@]}"; do
 		continue
 	fi
 	"$CXX" -o "$BUILD/bin/$name" "$BUILD/obj/$name.o" "$BUILD/obj/catch_main.o" "$BUILD/obj/capi_tester.o" \
-		"$BUILD/obj/stubs.o" -L "$LIBDIR" -lduckrs_capi -Wl,-rpath,"$LIBDIR"
+		"$BUILD/obj/stubs.o" -L "$LIBDIR" -lpintail_capi -Wl,-rpath,"$LIBDIR"
 	BINARIES+=("$BUILD/bin/$name")
 done
 

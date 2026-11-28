@@ -1,0 +1,13 @@
+[package]
+name = "pintail-tpch"
+description = "TPC-H data generator, queries and answers for pintail (port of duckdb/extension/tpch)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file = "LICENSE"
+
+[dependencies]
+pintail-common.workspace = true
+
+[lints]
+workspace = true

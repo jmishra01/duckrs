@@ -1,7 +1,7 @@
 #!/bin/sh
 # Builds a dbgen that writes the pipe-delimited .tbl files examples/tpch.rs loads, from the
 # generators in a DuckDB checkout: the TPC code stays there, and the row functions of its
-# dbgen.cpp get text output instead of DuckDB's appender. duckrs has no dbgen of its own yet.
+# dbgen.cpp get text output instead of DuckDB's appender. pintail has no dbgen of its own yet.
 #
 #   tools/tpch/build_dbgen.sh <duckdb checkout> <output binary>
 #   <output binary> <scale factor> <empty directory>

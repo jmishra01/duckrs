@@ -1,6 +1,6 @@
 use clap::{Parser, ValueEnum};
 use sqllogictest::diff::{DiffEngine, DiffOptions};
-use sqllogictest::engine::{DuckrsEngine, Engine};
+use sqllogictest::engine::{Engine, PintailEngine};
 use sqllogictest::report;
 use sqllogictest::runner::{self, FileReport, Outcome, RunConfig};
 use std::io::Read;
@@ -14,20 +14,20 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum EngineKind {
     /// The Rust engine under development.
-    Duckrs,
+    Pintail,
     /// The C++ DuckDB library (requires the `reference` cargo feature).
     Reference,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum DiffKind {
-    /// duckrs with the optimizer off, like `PRAGMA enable_verification`.
+    /// pintail with the optimizer off, like `PRAGMA enable_verification`.
     Unoptimized,
     /// The C++ DuckDB library (requires the `reference` cargo feature).
     Reference,
 }
 
-/// Runs DuckDB's sqllogictest corpus against duckrs or the C++ reference engine.
+/// Runs DuckDB's sqllogictest corpus against pintail or the C++ reference engine.
 #[derive(Debug, Parser)]
 #[command(version)]
 struct Args {
@@ -35,7 +35,7 @@ struct Args {
     /// Defaults to every `.test` file under `test/`.
     patterns: Vec<String>,
 
-    #[arg(long, value_enum, default_value = "duckrs")]
+    #[arg(long, value_enum, default_value = "pintail")]
     engine: EngineKind,
 
     /// Path to the DuckDB checkout that holds the test corpus and its data files.
@@ -97,7 +97,10 @@ struct Args {
 
 fn engine(kind: EngineKind) -> Result<(Box<dyn Engine>, String), String> {
     match kind {
-        EngineKind::Duckrs => Ok((Box::new(DuckrsEngine), format!("duckrs {}", env!("CARGO_PKG_VERSION")))),
+        EngineKind::Pintail => Ok((
+            Box::new(PintailEngine),
+            format!("pintail {}", env!("CARGO_PKG_VERSION")),
+        )),
         #[cfg(feature = "reference")]
         EngineKind::Reference => {
             use sqllogictest::engine::ReferenceEngine;
@@ -125,7 +128,7 @@ fn with_diff(
         return Ok(primary);
     };
     let (secondary, setup, allow_secondary_errors): (Box<dyn Engine>, _, _) = match kind {
-        DiffKind::Unoptimized => (Box::new(DuckrsEngine), Some("PRAGMA disable_optimizer"), true),
+        DiffKind::Unoptimized => (Box::new(PintailEngine), Some("PRAGMA disable_optimizer"), true),
         DiffKind::Reference => (engine(EngineKind::Reference)?.0, None, false),
     };
     let options = DiffOptions {
@@ -178,7 +181,7 @@ fn main() -> ExitCode {
 
     if let Some(worker) = &args.worker {
         std::env::set_current_dir(&root).expect("enter DuckDB checkout");
-        let scratch = std::env::temp_dir().join(format!("duckrs-sqllogictest-{}", std::process::id()));
+        let scratch = std::env::temp_dir().join(format!("pintail-sqllogictest-{}", std::process::id()));
         let config = RunConfig {
             root: root.clone(),
             scratch: scratch.clone(),
@@ -216,7 +219,7 @@ fn main() -> ExitCode {
 
     let config = RunConfig {
         root: root.clone(),
-        scratch: std::env::temp_dir().join(format!("duckrs-sqllogictest-{}", std::process::id())),
+        scratch: std::env::temp_dir().join(format!("pintail-sqllogictest-{}", std::process::id())),
         continue_on_failure: args.continue_on_failure,
         vector_size: 2048,
     };
@@ -477,7 +480,7 @@ fn run_isolated(args: &Args, root: &std::path::Path, file: &str, index: usize) -
     }
 }
 
-/// Removes the `duckrs-sqllogictest-{pid}` directories whose process is gone.
+/// Removes the `pintail-sqllogictest-{pid}` directories whose process is gone.
 fn sweep_scratch() {
     let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
         return;
@@ -486,7 +489,7 @@ fn sweep_scratch() {
         let name = entry.file_name();
         let pid = name
             .to_str()
-            .and_then(|name| name.strip_prefix("duckrs-sqllogictest-"))
+            .and_then(|name| name.strip_prefix("pintail-sqllogictest-"))
             .and_then(|pid| pid.parse::<libc::pid_t>().ok());
         let gone = pid.is_some_and(|pid| {
             // SAFETY: signal 0 only asks whether the process exists.

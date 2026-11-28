@@ -1,5 +1,5 @@
 //===----------------------------------------------------------------------===//
-// duckrs: DuckDB's test/include/capi_tester.hpp, with its C++ includes replaced by the shim's test_helpers.hpp,
+// pintail: DuckDB's test/include/capi_tester.hpp, with its C++ includes replaced by the shim's test_helpers.hpp,
 // and a `DuckDB` and `Connection` over the C API for the tests that set up a database with DuckDB's C++ API.
 // The classes are those of DuckDB's header, unchanged.
 //===----------------------------------------------------------------------===//
@@ -346,7 +346,7 @@ class DuckDB {
 public:
 	explicit DuckDB(const char *path = nullptr) {
 		if (duckdb_open(path, &database) != DuckDBSuccess) {
-			throw std::runtime_error("duckrs shim: could not open the database");
+			throw std::runtime_error("pintail shim: could not open the database");
 		}
 	}
 	explicit DuckDB(const string &path) : DuckDB(path.c_str()) {
@@ -369,7 +369,7 @@ public:
 
 	explicit Connection(DuckDB &db) {
 		if (duckdb_connect(db.database, &connection) != DuckDBSuccess) {
-			throw std::runtime_error("duckrs shim: could not connect");
+			throw std::runtime_error("pintail shim: could not connect");
 		}
 	}
 	~Connection() {

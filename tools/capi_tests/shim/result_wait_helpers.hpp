@@ -1,4 +1,4 @@
-// duckrs shim: the part of DuckDB's test/include/result_wait_helpers.hpp the C API tests use.
+// pintail shim: the part of DuckDB's test/include/result_wait_helpers.hpp the C API tests use.
 #pragma once
 #include "test_helpers.hpp"
 

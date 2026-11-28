@@ -1,5 +1,5 @@
 //===----------------------------------------------------------------------===//
-// duckrs: DuckDB's test/helpers/capi_tester.cpp (NO_FAIL and CAPIResult::Fetch, unchanged), and the helpers of
+// pintail: DuckDB's test/helpers/capi_tester.cpp (NO_FAIL and CAPIResult::Fetch, unchanged), and the helpers of
 // test_helpers.hpp the C API tests use, written against the C API and the standard library.
 //===----------------------------------------------------------------------===//
 
@@ -212,10 +212,10 @@ bool ApproxEqual(double ldecimal, double rdecimal) {
 	return std::fabs(ldecimal - rdecimal) <= epsilon;
 }
 
-//! The directory the tests write their files in: $DUCKRS_CAPI_TEST_DIR, or duckrs_capi_test_dir.
+//! The directory the tests write their files in: $PINTAIL_CAPI_TEST_DIR, or pintail_capi_test_dir.
 string TestDirectoryPath() {
-	const char *dir = getenv("DUCKRS_CAPI_TEST_DIR");
-	string path = dir ? dir : "duckrs_capi_test_dir";
+	const char *dir = getenv("PINTAIL_CAPI_TEST_DIR");
+	string path = dir ? dir : "pintail_capi_test_dir";
 	mkdir(path.c_str(), 0755);
 	return path;
 }

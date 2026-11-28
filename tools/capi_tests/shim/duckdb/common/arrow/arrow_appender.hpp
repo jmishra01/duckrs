@@ -1,4 +1,4 @@
-// duckrs shim: DuckDB's C++ header duckdb/common/arrow/arrow_appender.hpp is not used. The C API tests build an Arrow
+// pintail shim: DuckDB's C++ header duckdb/common/arrow/arrow_appender.hpp is not used. The C API tests build an Arrow
 // array of a few chunks of fixed-width values with `ArrowAppender`; here that is a small builder over a shim
 // `DataChunk` (values appended as `Value`s), giving a struct array whose release callback frees its buffers.
 // `ClientProperties` holds the arrow options of a connection (`duckdb_connection_get_arrow_options`).

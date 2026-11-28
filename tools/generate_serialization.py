@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Generates crates/duckrs-core/src/storage/serialization/generated.rs.
+"""Generates crates/pintail-core/src/storage/serialization/generated.rs.
 
 The counterpart of DuckDB's scripts/generate_serialization.py: it reads the same JSON specs, and the
 enums in the C++ headers, and writes readers that follow them field by field, so that the file
 format stays in step with upstream mechanically.
 
-C++ deserializes into the classes of its parser. The AST of duckrs has a shape of its own, so this
+C++ deserializes into the classes of its parser. The AST of pintail has a shape of its own, so this
 writes structs that mirror the specs, and `serialization/convert.rs` and `to_stored.rs` turn those
 into the AST and back by hand. Objects are read as any version wrote them and written as v2.0.0.
 
@@ -501,7 +501,7 @@ class Generator:
                 for text in ENUM_STRINGS.get(name, {}).get(member, [member])
             )
             enums += "        pub struct Names;\n"
-            enums += "        impl duckrs_common::serializer::EnumNames for Names {\n"
+            enums += "        impl pintail_common::serializer::EnumNames for Names {\n"
             enums += f'            const NAME: &\'static str = "{name}";\n'
             enums += f"            const NAMES: &'static [(&'static str, u64)] = &[{names}];\n"
             enums += "        }\n"
@@ -518,10 +518,10 @@ HEADER = """\
 
 use super::custom::{CastExpression, FunctionExpression, LambdaExpression, QualifiedName, WindowExpression};
 use super::{not_ported, unknown};
-use duckrs_common::Result;
-use duckrs_common::serializer::{BinaryDeserializer, BinarySerializer, Deserialize, Enum, Map, MapRef, Serialize, StorageVersion};
-use duckrs_common::types::LogicalType;
-use duckrs_common::value::Value;
+use pintail_common::Result;
+use pintail_common::serializer::{BinaryDeserializer, BinarySerializer, Deserialize, Enum, Map, MapRef, Serialize, StorageVersion};
+use pintail_common::types::LogicalType;
+use pintail_common::value::Value;
 
 """
 
@@ -536,7 +536,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--duckdb-root", type=Path, default=tools.parent.parent / "duckdb")
     args = parser.parse_args()
-    target = tools.parent / "crates/duckrs-core/src/storage/serialization/generated.rs"
+    target = tools.parent / "crates/pintail-core/src/storage/serialization/generated.rs"
     target.write_text(Generator(args.duckdb_root).generate())
     subprocess.run(["rustfmt", "--edition", "2024", str(target)], check=True)
     print(f"wrote {target}")
