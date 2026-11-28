@@ -830,8 +830,11 @@ Each item gives the number of failing files in `test/` that it should fix, where
     `duckdb_register_logical_type`. The engine keeps registered casts (`udf::UserCast`, looked up as
     `MapCastInfo::GetEntry` with `RelaxedTypeMatch`) and types in `UserFunctions`; an explicit CAST / TRY_CAST
     binds to a registered cast first (`Binder::bind_user_cast`), type names fall back to the registered types,
-    which `duckdb_types()` lists under `system.main`. Not ported: registered casts as implicit casts (their
-    `implicit_cast_cost` is kept but the function binder's cost rules don't read it), `duckdb_create_type_info`.
+    which `duckdb_types()` lists under `system.main`. Registered casts are implicit casts too (phase 101):
+    `cast_rules::implicit_cast` (`CastFunctionSet::ImplicitCastCost`) gives a registered cast's
+    `implicit_cast_cost` before the rules, and an implicit cast to its pair of types runs it
+    (`BoundExpr::add_cast`); the casts are those of the database whose statement binds on the thread
+    (`RegisteredCastsGuard`). Not ported: `duckdb_create_type_info`.
     capi_custom_type.cpp: 2 of 2
   - [x] copy functions and the file system (phase 98): `duckdb_create_copy_function` with bind / global init / sink
     / finalize and their infos, `duckdb_copy_function_set_copy_from_function`, `duckdb_register_copy_function`;
@@ -844,8 +847,7 @@ Each item gives the number of failing files in `test/` that it should fix, where
     `QueryProfileResult` tree (`QueryProfile::to_result_tree`) the connection keeps of its last profiled statement
     (prepared statements are profiled too); `duckdb_create_log_storage`, its setters and
     `duckdb_register_log_storage` (`logging::LogStorageCallback`, selectable with `SET logging_storage`).
-    test_capi_profiling.cpp 7 of 9 (both appender cases: `duckdb_appender_create_query`, and the SQL the
-    appender runs differs from C++'s), test_capi_logging.cpp 2 of 3 (a failed checkpoint at shutdown is not
+    test_capi_profiling.cpp 9 of 9, test_capi_logging.cpp 2 of 3 (a failed checkpoint at shutdown is not
     logged), test_capi_streaming.cpp 3 of 5 (query progress, a partly read streaming result in a transaction)
   - [x] the instance cache (phase 98): `duckdb_create_instance_cache`, `duckdb_get_or_create_from_cache` (the
     `GetCacheKey` of the path, lower case on macOS/Windows; unnamed in-memory databases are not kept; a different
@@ -855,10 +857,20 @@ Each item gives the number of failing files in `test/` that it should fix, where
     a query runs on the context's connection, as C++ requires a transaction), `duckdb_catalog_get_entry` and the
     entry getters; the threading functions (no task queue for client threads: `duckdb_execute_tasks_state` waits
     for `duckdb_finish_execution`). capi_catalog.cpp 1 of 1, test_capi_geometry.cpp 3 of 3
-  - [ ] the rest of v1: `duckdb_create_config_option` and its setters, `duckdb_register_config_option` and
-    `duckdb_client_context_get_config_option` (needs extension options in the settings of a database instance;
-    capi_config_options.cpp 1 of 2), `duckdb_appender_create_query`. The default harness set (27 files): 161 of
-    179 cases, 538 of 548 functions
+  - [x] the rest of v1 (2026-11-28, phase 101): all 548 functions of `duckdb.h`.
+    `duckdb_create_config_option`, its setters, `duckdb_register_config_option` and
+    `duckdb_client_context_get_config_option`: a database's global `SettingValues` hold the extension options
+    registered at run time (`settings::ExtensionOption`, `DBConfig::AddExtensionOption`), which SET / RESET (their
+    type, default and default scope), `current_setting`, `duckdb_settings()` and `settings::lookup_setting`
+    (`TryGetCurrentSetting`, with the scope) know. `duckdb_appender_create_query` (`QueryAppender`): the rows are a
+    NOT MATERIALIZED CTE of the query's one INSERT / DELETE / UPDATE (`BaseAppender::ParseStatement`,
+    `ClientContext::append_query`), and the table appender runs C++'s `INSERT INTO catalog.schema.table[(columns)]
+    FROM __duckdb_internal_appended_data` the same way. Preparing an unknown PRAGMA fails as running it does;
+    `duckdb_api` (`capi`) and `custom_user_agent` are set when a database opens; `PRAGMA user_agent`.
+    The default harness set (27 files): 167 of 179 cases. Still failing: the 7 prepared cases above (EXPLAIN /
+    EXECUTE / PIVOT / ALTER that expands, real streaming), the 2 streaming cases and the logging case above,
+    `duckdb_vector_reference_vector` sharing its buffer, and preparing `CREATE TABLE ... AS SELECT ?` in a
+    v1.5 database (the tuple storage version gate)
   - [ ] then v2 (`src/main/capi/v2`)
 - [ ] 42. **CLI shell** (`crates/duckrs-cli`, the `duckrs` binary). Against `tools/shell/tests` it passes
   150 of `test_shell_basics` (C++ 1.5.6: 141), all of `test_dump`, `test_errors`, `test_import`,

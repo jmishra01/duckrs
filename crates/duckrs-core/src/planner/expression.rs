@@ -567,10 +567,14 @@ impl BoundExpr {
         self.add_cast(target, try_cast)
     }
 
-    /// `AddCastExpressionInternal`: a cast of the expression to `target`.
+    /// `AddCastExpressionInternal`: a cast of the expression to `target`, by a registered cast when there is one
+    /// (`CastFunctionSet::GetCastFunction` consults `map_info` first).
     fn add_cast(self, target: &LogicalType, try_cast: bool) -> BoundExpr {
         if &self.return_type == target {
             return self;
+        }
+        if let Some(cast) = crate::function::cast_rules::registered_cast(&self.return_type, target) {
+            return super::binder::user_cast_expression(self, cast, target, try_cast);
         }
         let alias = self.alias.clone();
         let mut cast = BoundExpr::new(

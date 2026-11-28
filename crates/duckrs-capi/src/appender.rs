@@ -1,7 +1,8 @@
 // Ported from duckdb/src/main/capi/v1/appender-c.cpp and duckdb/src/main/appender.cpp @ rust-port-baseline
 
-//! `duckdb_appender` (`AppenderWrapper` around a table `Appender`): rows go into a chunk of the table's types a
-//! value at a time, full chunks into a collection, and the collection into the table on a flush.
+//! `duckdb_appender` (`AppenderWrapper` around a table `Appender`, or a `QueryAppender`): rows go into a chunk of
+//! the table's types a value at a time, full chunks into a collection, and the collection into the table on a flush,
+//! or, for a query appender, to the query, which reads them as a table.
 
 use crate::database::SharedConnection;
 use crate::error::ErrorData;
@@ -14,9 +15,18 @@ use std::ffi::c_char;
 /// `BaseAppender::flush_count`: the rows it collects before it flushes them.
 const FLUSH_COUNT: usize = 204_800;
 
-/// A table `Appender`.
+/// What a `QueryAppender` runs on a flush: the query, and the name and the column names it reads the rows under.
+struct AppendQuery {
+    query: String,
+    table_name: String,
+    names: Vec<String>,
+}
+
+/// A table `Appender`, or a `QueryAppender`.
 struct Appender {
     connection: SharedConnection,
+    /// `QueryAppender`: the query that takes the rows in place of the table
+    query: Option<AppendQuery>,
     catalog: Option<String>,
     schema: Option<String>,
     table: String,
@@ -66,6 +76,7 @@ impl Appender {
         let types: Vec<LogicalType> = columns.iter().map(|(_, ty)| ty.clone()).collect();
         Ok(Self {
             connection,
+            query: None,
             catalog,
             schema,
             table,
@@ -77,6 +88,36 @@ impl Appender {
             collection: Vec::new(),
             collected_rows: 0,
         })
+    }
+
+    /// `QueryAppender::QueryAppender`: rows of `types` for `query`.
+    fn new_query(connection: SharedConnection, query: AppendQuery, types: Vec<LogicalType>) -> Self {
+        let columns: Vec<(String, LogicalType)> = types.iter().map(|ty| (String::new(), ty.clone())).collect();
+        Self {
+            connection,
+            query: Some(query),
+            catalog: None,
+            schema: None,
+            table: String::new(),
+            defaults: vec![None; columns.len()],
+            columns,
+            active: Vec::new(),
+            chunk: DataChunk::new(&types),
+            column: 0,
+            collection: Vec::new(),
+            collected_rows: 0,
+        }
+    }
+
+    /// The `BaseAppender` methods only a table `Appender` has.
+    fn table_only(&self, what: &str) -> duckrs::Result<()> {
+        if self.query.is_some() {
+            return Err(Error::new(
+                ErrorKind::NotImplemented,
+                format!("{what} is only supported when directly appending to a table"),
+            ));
+        }
+        Ok(())
     }
 
     /// `GetActiveTypes`.
@@ -148,6 +189,7 @@ impl Appender {
 
     /// `GetDefaultValue`.
     fn default_value(&self, column: usize) -> duckrs::Result<Value> {
+        self.table_only("AppendDefault")?;
         let index = if self.active.is_empty() {
             column
         } else {
@@ -243,7 +285,13 @@ impl Appender {
         let columns: Vec<(String, LogicalType)> =
             self.active_columns().into_iter().map(|i| self.columns[i].clone()).collect();
         let mut connection = self.connection.lock();
-        connection.append_chunks(self.catalog.as_deref(), self.schema.as_deref(), &self.table, columns, chunks)
+        match &self.query {
+            Some(query) => {
+                let types = columns.into_iter().map(|(_, ty)| ty).collect();
+                connection.append_query(&query.query, &query.table_name, query.names.clone(), types, chunks)
+            }
+            None => connection.append_chunks(self.catalog.as_deref(), self.schema.as_deref(), &self.table, columns, chunks),
+        }
     }
 
     fn close(&mut self) -> duckrs::Result<()> {
@@ -304,6 +352,7 @@ impl Appender {
 
     /// `Appender::AddColumn`.
     fn add_column(&mut self, name: &str) -> duckrs::Result<()> {
+        self.table_only("AddColumn")?;
         self.flush()?;
         let Some(index) = self.columns.iter().position(|(n, _)| n.eq_ignore_ascii_case(name)) else {
             return Err(invalid_input("the column must exist in the table"));
@@ -317,6 +366,7 @@ impl Appender {
     }
 
     fn clear_columns(&mut self) -> duckrs::Result<()> {
+        self.table_only("ClearColumns")?;
         self.flush()?;
         self.active.clear();
         self.initialize_chunk();
@@ -380,6 +430,65 @@ pub unsafe extern "C" fn duckdb_appender_create_ext(
     // SAFETY: C passes where to write the appender; it is not null.
     unsafe { ffi::write(out_appender, ffi::into_handle(wrapper)) };
     state
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn duckdb_appender_create_query(
+    connection: duckdb_connection,
+    query: *const c_char,
+    column_count: idx_t,
+    types: *mut duckdb_logical_type,
+    table_name: *const c_char,
+    column_names: *mut *const c_char,
+    out_appender: *mut duckdb_appender,
+) -> duckdb_state {
+    // SAFETY: C passes a live connection and a NUL-terminated query.
+    let (Some(connection), Some(query)) = (unsafe { ffi::get::<_duckdb_connection>(connection) }, unsafe {
+        ffi::c_str(query)
+    }) else {
+        return DuckDBError;
+    };
+    if column_count == 0 || out_appender.is_null() {
+        return DuckDBError;
+    }
+    // SAFETY: C passes `column_count` types.
+    let Some(type_handles) = (unsafe { ffi::slice(types.cast_const(), column_count) }) else {
+        return DuckDBError;
+    };
+    let mut column_types = Vec::with_capacity(type_handles.len());
+    for &handle in type_handles {
+        // SAFETY: C passes live logical types.
+        let Some(ty) = (unsafe { crate::scalar_function::logical_type(handle) }) else {
+            return DuckDBError;
+        };
+        column_types.push(ty.clone());
+    }
+    // SAFETY: C passes a NUL-terminated table name, or none.
+    let table_name = unsafe { ffi::c_str(table_name) }.map_or_else(String::new, |n| String::from_utf8_lossy(n).into_owned());
+    let mut names = Vec::new();
+    // SAFETY: C passes `column_count` column names, or none.
+    if let Some(name_ptrs) = unsafe { ffi::slice(column_names.cast_const(), column_count) } {
+        for &name in name_ptrs {
+            // SAFETY: C passes NUL-terminated names.
+            let Some(name) = (unsafe { ffi::c_str(name) }) else {
+                return DuckDBError;
+            };
+            names.push(String::from_utf8_lossy(name).into_owned());
+        }
+    }
+    let query = AppendQuery {
+        query: String::from_utf8_lossy(query).into_owned(),
+        table_name,
+        names,
+    };
+    let wrapper = AppenderWrapper {
+        appender: Some(Appender::new_query(connection.connection.clone(), query, column_types)),
+        error: ErrorData::default(),
+        flush_failed: false,
+    };
+    // SAFETY: C passes where to write the appender; it is not null.
+    unsafe { ffi::write(out_appender, ffi::into_handle(wrapper)) };
+    DuckDBSuccess
 }
 
 /// `duckdb_appender_run_function`: `function` on the appender, its error kept for `duckdb_appender_error`.

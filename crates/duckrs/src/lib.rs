@@ -20,7 +20,8 @@ pub use duckrs_core::planner::binder::Replacement;
 
 /// The configuration options (`DBConfig::GetOptionByIndex` / `GetOptionByName`).
 pub mod settings {
-    pub use duckrs_main::settings::{SettingDefinition, all_settings, find_setting};
+    pub use duckrs_main::settings::{ExtensionOption, SettingDefinition, SettingLookupScope, all_settings, find_setting};
+    pub use duckrs_main::settings::SetScope;
 }
 
 /// `Value::DefaultCastAs`: `value` cast to `ty`, as a SQL `CAST` would.
@@ -179,6 +180,18 @@ impl Database {
         }
     }
 
+    /// The value of a setting that can't change while the database runs (`duckdb_api`, `custom_user_agent`), as the
+    /// configuration it opens with gives it.
+    pub fn set_startup_setting(&self, name: &str, value: &str) {
+        self.instance.set_startup_setting(name, Value::varchar(value));
+    }
+
+    /// `DBConfig::TryGetCurrentSetting`: the database's value of setting `name` (not that of a connection), or its
+    /// default.
+    pub fn lookup_setting(&self, name: &str) -> Option<(Value, settings::SettingLookupScope)> {
+        self.instance.lookup_setting(name)
+    }
+
     /// Registers a log storage (`duckdb_register_log_storage`) under `name`, which `SET logging_storage` can then
     /// select: each log entry goes to it. False when a storage has the name already.
     pub fn register_log_storage(&self, name: &str, storage: Arc<dyn logging::LogStorageCallback>) -> bool {
@@ -271,6 +284,18 @@ impl Connection {
     /// The current value of setting `name` for this connection (`current_setting`), or `None` for no such setting.
     pub fn setting(&self, name: &str) -> Option<Value> {
         self.context.setting(name)
+    }
+
+    /// `ClientContext::TryGetCurrentSetting`: the current value of setting `name` for this connection and whether it
+    /// is the connection's own (`Local`) or the database's or the default (`Global`).
+    pub fn lookup_setting(&self, name: &str) -> Option<(Value, settings::SettingLookupScope)> {
+        self.context.lookup_setting(name)
+    }
+
+    /// Registers a configuration option on the database (`DBConfig::AddExtensionOption`,
+    /// `duckdb_register_config_option`); one of that name registered before is an error.
+    pub fn register_config_option(&self, option: settings::ExtensionOption) -> Result<()> {
+        self.context.add_extension_option(option)
     }
 
     /// `ClientContext::GetConnectionId`: what tells this connection apart from the others of the process.
@@ -397,6 +422,20 @@ impl Connection {
         chunks: Vec<DataChunk>,
     ) -> Result<()> {
         self.context.append_in(catalog, schema, table, columns, chunks)
+    }
+
+    /// `QueryAppender::FlushInternal`: runs `query`, a single INSERT, DELETE or UPDATE, which reads `chunks` (of
+    /// `types`) as the table `table_name` (`appended_data` when empty), with the columns `names` (`col1`, `col2`, ...
+    /// for those not named).
+    pub fn append_query(
+        &mut self,
+        query: &str,
+        table_name: &str,
+        names: Vec<String>,
+        types: Vec<LogicalType>,
+        chunks: Vec<DataChunk>,
+    ) -> Result<()> {
+        self.context.append_query(query, table_name, names, types, chunks)
     }
 }
 
@@ -601,6 +640,99 @@ impl PreparedStatement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registered_casts_cast_implicitly() {
+        /// BOOLEAN to VARCHAR as `yes` / `no`.
+        struct YesNo;
+        impl udf::CastUdf for YesNo {
+            fn cast(
+                &self,
+                source: &duckrs_common::vector::Vector,
+                result: &mut duckrs_common::vector::Vector,
+                count: usize,
+                _try_cast: bool,
+            ) -> Result<()> {
+                for row in 0..count {
+                    let value = match source.get_value(row).data() {
+                        duckrs_common::value::ValueData::Bool(true) => Value::varchar("yes"),
+                        duckrs_common::value::ValueData::Bool(false) => Value::varchar("no"),
+                        _ => Value::null(LogicalType::VARCHAR),
+                    };
+                    result.set_value(row, &value)?;
+                }
+                Ok(())
+            }
+        }
+        let db = Database::open_in_memory().unwrap();
+        let mut con = db.connect().unwrap();
+        // BOOLEAN does not cast to VARCHAR implicitly by the rules
+        assert!(con.query("SELECT strlen(true)").is_err());
+        con.register_cast(udf::UserCast {
+            source: LogicalType::BOOLEAN,
+            target: LogicalType::VARCHAR,
+            implicit_cast_cost: 1,
+            function: Arc::new(YesNo),
+        });
+        // the registered cast's cost lets strlen(VARCHAR) and upper(VARCHAR) take a BOOLEAN, and the cast is the registered one
+        let result = con.query("SELECT strlen(true), upper(false), true::VARCHAR").unwrap();
+        assert_eq!(result.value(0, 0), Value::bigint(3));
+        assert_eq!(result.value(1, 0), Value::varchar("NO"));
+        assert_eq!(result.value(2, 0), Value::varchar("yes"));
+        let prepared = con.prepare("SELECT strlen(true)").unwrap();
+        assert_eq!(con.execute(&prepared, &[]).unwrap().value(0, 0), Value::bigint(3));
+    }
+
+    #[test]
+    fn append_chunks_and_query_appender() {
+        let db = Database::open_in_memory().unwrap();
+        let mut con = db.connect().unwrap();
+        let dir = std::env::temp_dir().join(format!("duckrs_append_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("other.db");
+        let _ = std::fs::remove_file(&path);
+        con.query(&format!("ATTACH '{}' AS other", path.display())).unwrap();
+        con.query("CREATE TABLE other.tbl (i INTEGER, j VARCHAR DEFAULT 'x'); CREATE TABLE t (i INTEGER PRIMARY KEY, v VARCHAR)")
+            .unwrap();
+        let chunk = |values: &[i32]| {
+            let mut chunk = DataChunk::new(&[LogicalType::INTEGER]);
+            for (row, value) in values.iter().enumerate() {
+                chunk.column_mut(0).data_mut::<i32>()[row] = *value;
+            }
+            chunk.set_len(values.len());
+            chunk
+        };
+        let columns = vec![("i".to_string(), LogicalType::INTEGER)];
+        con.append_chunks(Some("other"), Some("main"), "tbl", columns, vec![chunk(&[1, 2])])
+            .unwrap();
+        let result = con.query("SELECT sum(i)::BIGINT, min(j) FROM other.tbl").unwrap();
+        assert_eq!(result.value(0, 0), Value::bigint(3));
+        assert_eq!(result.value(1, 0), Value::varchar("x"));
+        // a query appender: the rows as the named table of the one statement, unnamed columns as col1, ...
+        con.append_query(
+            "INSERT INTO t SELECT col1, 'v' || col1 FROM rows",
+            "rows",
+            Vec::new(),
+            vec![LogicalType::INTEGER],
+            vec![chunk(&[5, 6])],
+        )
+        .unwrap();
+        con.append_query(
+            "INSERT OR REPLACE INTO t SELECT k, 'w' FROM appended_data",
+            "",
+            vec!["k".to_string()],
+            vec![LogicalType::INTEGER],
+            vec![chunk(&[6])],
+        )
+        .unwrap();
+        let result = con.query("SELECT string_agg(v, ',' ORDER BY i) FROM t").unwrap();
+        assert_eq!(result.value(0, 0), Value::varchar("v5,w"));
+        let err = con
+            .append_query("SELECT 1", "", Vec::new(), vec![LogicalType::INTEGER], vec![chunk(&[1])])
+            .unwrap_err();
+        assert!(err.message.contains("Unsupported statement type for appender"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn queries_run() {

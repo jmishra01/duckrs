@@ -45,28 +45,128 @@ impl RowMatcher {
         lhs: &DataChunk,
         rows: &[RowPtr],
         sel: &mut Vec<u32>,
-        mut no_match: Option<&mut Vec<u32>>,
+        no_match: Option<&mut Vec<u32>>,
     ) {
         let layout = rows_from.layout();
         let nested = rows_from.nested();
-        let columns: Vec<Prepared> = lhs.columns()[..self.predicates.len()]
-            .iter()
-            .map(|c| Prepared::new(c, lhs.len()))
-            .collect();
-        let mut matched = Vec::with_capacity(sel.len());
-        for &idx in sel.iter() {
-            let i = idx as usize;
+        let input = no_match.is_some().then(|| sel.clone());
+        // a column at a time, as C++'s match functions go: each keeps the rows that match it so far
+        for (col, &predicate) in self.predicates.iter().enumerate() {
+            if sel.is_empty() {
+                break;
+            }
+            let column = Prepared::new(&lhs.columns()[col], lhs.len());
             // SAFETY: forwarded to the caller.
-            let ok = self.predicates.iter().enumerate().all(|(col, &predicate)| unsafe {
-                match_value(layout, nested, col, predicate, &columns[col], i, rows[i])
-            });
-            if ok {
-                matched.push(idx);
-            } else if let Some(no_match) = no_match.as_deref_mut() {
-                no_match.push(idx);
+            unsafe { match_column(layout, nested, col, predicate, &column, rows, sel) };
+        }
+        // the rows that missed, in the order they came in, whichever column they missed on
+        if let (Some(no_match), Some(input)) = (no_match, input) {
+            let mut kept = sel.iter().peekable();
+            for idx in input {
+                if kept.peek() == Some(&&idx) {
+                    kept.next();
+                } else {
+                    no_match.push(idx);
+                }
             }
         }
-        *sel = matched;
+    }
+}
+
+/// Keeps in `sel` the rows `i` whose value of an LHS column matches column `col` of `rows[i]`: a loop over the
+/// rows for the type of the column, which is looked at once, and equality without an order for `=` and
+/// `IS NOT DISTINCT FROM`, the predicates of hash tables.
+///
+/// # Safety
+///
+/// `rows[i]` must be a live row laid out with `layout` for every `i` in `sel`.
+unsafe fn match_column(
+    layout: &TupleDataLayout,
+    nested: &NestedStores,
+    col: usize,
+    predicate: ComparisonType,
+    lhs: &Prepared,
+    rows: &[RowPtr],
+    sel: &mut Vec<u32>,
+) {
+    let Prepared::Value(u) = lhs else {
+        // SAFETY: forwarded to the caller.
+        sel.retain(|&idx| unsafe {
+            match_value(layout, nested, col, predicate, lhs, idx as usize, rows[idx as usize])
+        });
+        return;
+    };
+    let can_have_null = layout.can_have_null();
+    let equality = matches!(predicate, ComparisonType::Equal | ComparisonType::NotDistinctFrom);
+    // whether a pair with a NULL matches: for `IS NOT DISTINCT FROM`, when both are
+    let null_match =
+        |lhs_null: bool, rhs_null: bool| predicate == ComparisonType::NotDistinctFrom && lhs_null == rhs_null;
+    macro_rules! typed {
+        ($t:ty) => {{
+            let data = u.data::<$t>();
+            sel.retain(|&idx| {
+                let i = idx as usize;
+                let lhs_idx = u.sel.get(i);
+                let lhs_null = !u.validity.is_valid(lhs_idx);
+                // SAFETY: the caller guarantees the row is alive and laid out with `layout`.
+                let rhs_null = can_have_null && !unsafe { row_is_valid(rows[i].as_ptr(), col) };
+                if equality {
+                    if lhs_null || rhs_null {
+                        return null_match(lhs_null, rhs_null);
+                    }
+                    // SAFETY: the column stores $t values, and the row is alive.
+                    let rhs: $t = unsafe { load(layout, rows[i], col) };
+                    return data[lhs_idx].duck_eq(&rhs);
+                }
+                predicate.evaluate(lhs_null, rhs_null, || {
+                    // SAFETY: as above.
+                    let rhs: $t = unsafe { load(layout, rows[i], col) };
+                    data[lhs_idx].duck_cmp(&rhs)
+                })
+            });
+        }};
+    }
+    match layout.types()[col].physical_type() {
+        PhysicalType::Bool => typed!(bool),
+        PhysicalType::Int8 => typed!(i8),
+        PhysicalType::Int16 => typed!(i16),
+        PhysicalType::Int32 => typed!(i32),
+        PhysicalType::Int64 => typed!(i64),
+        PhysicalType::Int128 => typed!(i128),
+        PhysicalType::UInt8 => typed!(u8),
+        PhysicalType::UInt16 => typed!(u16),
+        PhysicalType::UInt32 => typed!(u32),
+        PhysicalType::UInt64 => typed!(u64),
+        PhysicalType::UInt128 => typed!(u128),
+        PhysicalType::Float => typed!(f32),
+        PhysicalType::Double => typed!(f64),
+        PhysicalType::Interval => typed!(Interval),
+        PhysicalType::Varchar => {
+            let data = u.data::<StringT>();
+            sel.retain(|&idx| {
+                let i = idx as usize;
+                let lhs_idx = u.sel.get(i);
+                let lhs_null = !u.validity.is_valid(lhs_idx);
+                // SAFETY: the caller guarantees the row is alive and laid out with `layout`.
+                let rhs_null = can_have_null && !unsafe { row_is_valid(rows[i].as_ptr(), col) };
+                if lhs_null || rhs_null {
+                    return predicate.evaluate(lhs_null, rhs_null, || unreachable!("a NULL decides"));
+                }
+                // SAFETY: the column stores strings, and the row is alive.
+                let rhs: StringT = unsafe { load(layout, rows[i], col) };
+                if equality {
+                    // SAFETY: the LHS string's bytes live in the format's buffer, and the row's long strings in its
+                    // collection's buffer, alive with the row.
+                    return unsafe { data[lhs_idx].equals(&rhs) };
+                }
+                predicate.evaluate(false, false, || {
+                    // SAFETY: as above.
+                    let (left, right) = unsafe { (data[lhs_idx].as_bytes(), rhs.as_bytes()) };
+                    left.cmp(right)
+                })
+            });
+        }
+        other => unreachable!("{other} vectors hold no values"),
     }
 }
 

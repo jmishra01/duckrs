@@ -18,6 +18,7 @@ pub mod appender;
 pub mod arrow_c;
 pub mod cast_function;
 pub mod catalog;
+pub mod config_option;
 pub mod copy_function;
 pub mod database;
 pub mod datetime;

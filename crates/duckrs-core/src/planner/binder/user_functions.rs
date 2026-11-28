@@ -8,8 +8,8 @@ use super::{Binder, BoundStatement, StatementReturnType};
 use crate::function::aggregates::AggregateFunctionSet;
 use crate::function::binder::{expression_return_type, select_function};
 use crate::function::udf::{
-    CopyToBindInput, ScalarUdfBindInput, ScalarUdfSet, TableUdfBindInput, TableUdfSet, UserCopyFunction, UserCopyTo,
-    UserFunctions,
+    CopyToBindInput, ScalarUdfBindInput, ScalarUdfSet, TableUdfBindInput, TableUdfSet, UserCast, UserCopyFunction,
+    UserCopyTo, UserFunctions,
 };
 use crate::function::{ScalarFunction, ScalarFunctionSet};
 use crate::planner::expression::{BoundExpr, BoundExprKind};
@@ -20,6 +20,29 @@ use duckrs_common::vector::{DataChunk, Vector};
 use duckrs_common::{Error, ErrorKind, Result};
 use duckrs_parser::ast::{CopyInfo, FunctionExpr, InsertStatement, InsertValues, TableRef};
 use std::sync::Arc;
+
+/// `MapCastFunction`: `child` cast to `target` by the registered `cast`, which runs on the vectors of the rows.
+pub(crate) fn user_cast_expression(child: BoundExpr, cast: UserCast, target: &LogicalType, try_cast: bool) -> BoundExpr {
+    fn unbound(_: &DataChunk, _: &mut Vector) -> Result<()> {
+        Err(Error::new(
+            ErrorKind::Internal,
+            "a user-defined cast runs once it is bound",
+        ))
+    }
+    let mut scalar = ScalarFunction::new("CAST", vec![child.return_type.clone()], target.clone(), unbound);
+    let function = cast.function;
+    scalar.bound = Some(Arc::new(move |arguments, result| {
+        function.cast(arguments.column(0), result, arguments.len(), try_cast)
+    }));
+    BoundExpr::new(
+        BoundExprKind::Function {
+            function: Arc::new(scalar),
+            children: vec![child],
+            is_operator: false,
+        },
+        target.clone(),
+    )
+}
 
 fn binder_error(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::Binder, message)
@@ -73,25 +96,7 @@ impl Binder<'_> {
         let Some(cast) = self.user_functions().and_then(|f| f.cast(&child.return_type, target)) else {
             return Err(child);
         };
-        fn unbound(_: &DataChunk, _: &mut Vector) -> Result<()> {
-            Err(Error::new(
-                ErrorKind::Internal,
-                "a user-defined cast runs once it is bound",
-            ))
-        }
-        let mut scalar = ScalarFunction::new("CAST", vec![child.return_type.clone()], target.clone(), unbound);
-        let function = cast.function;
-        scalar.bound = Some(Arc::new(move |arguments, result| {
-            function.cast(arguments.column(0), result, arguments.len(), try_cast)
-        }));
-        Ok(BoundExpr::new(
-            BoundExprKind::Function {
-                function: Arc::new(scalar),
-                children: vec![child],
-                is_operator: false,
-            },
-            target.clone(),
-        ))
+        Ok(user_cast_expression(child, cast, target, try_cast))
     }
 
     /// `FunctionBinder::BindScalarFunction` of a call of a user-defined scalar function: the overload the

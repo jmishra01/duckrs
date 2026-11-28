@@ -209,9 +209,16 @@ fn open(path: Option<&str>, config: Option<&Config>) -> duckrs::Result<Database>
         (Some(path), None) => Database::open(path, read_only)?,
         (None, _) => unreachable!("no path is in memory"),
     };
+    // `duckdb_create_config` (or `duckdb_open_internal` without a config) sets `duckdb_api` to `capi`; it and
+    // `custom_user_agent` are set when the database starts, not after
+    let api = config.and_then(|c| c.option("duckdb_api")).unwrap_or("capi");
+    database.set_startup_setting("duckdb_api", api);
+    if let Some(agent) = config.and_then(|c| c.option("custom_user_agent")) {
+        database.set_startup_setting("custom_user_agent", agent);
+    }
     let mut connection = database.connect()?;
     for (name, value) in options {
-        if ["access_mode", "storage_compatibility_version", "duckdb_api"]
+        if ["access_mode", "storage_compatibility_version", "duckdb_api", "custom_user_agent"]
             .iter()
             .any(|n| n.eq_ignore_ascii_case(name))
         {
