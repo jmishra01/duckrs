@@ -242,7 +242,7 @@ fn visit(op: &mut LogicalOperator, next: &mut usize, replacements: &mut HashMap<
             aggregates,
             grouping_sets: Vec::new(),
             grouping_functions: Vec::new(),
-            perfect_hash: false,
+            perfect_hash: None,
             domain_cap: None,
         },
         vec![copy],
