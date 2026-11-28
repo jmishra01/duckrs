@@ -4454,10 +4454,14 @@ test/sql/storage/storage_version_65.test
 test/sql/storage/storage_versions.test
 test/sql/storage/store_group_order_all.test
 test/sql/storage/temp_directory/max_swap_space_explicit.test
+test/sql/storage/temp_directory/max_swap_space_inmemory.test
+test/sql/storage/temp_directory/max_swap_space_persistent.test
 test/sql/storage/temp_directory/max_swap_space_unlimited.test
 test/sql/storage/temp_directory/offload_small_transient_segments.test
 test/sql/storage/temp_directory/offload_small_transient_segments_no_optimistic_write.test
+test/sql/storage/temp_directory/temp_directory_null.test
 test/sql/storage/temp_directory/test_default_temp_directory.test
+test/sql/storage/temp_directory/test_runner_temp_directory.test
 test/sql/storage/test_empty_shutdown.test
 test/sql/storage/test_empty_table.test
 test/sql/storage/test_ignore_duplicate_deletes_unique_index.test
