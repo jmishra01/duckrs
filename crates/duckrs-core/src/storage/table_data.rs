@@ -1046,7 +1046,7 @@ impl DiskTable {
         };
         let count = column_count(&read, &self.table.columns[column].ty);
         let group_count = self.table.row_groups[group].tuple_count;
-        if count != group_count as u64 {
+        if count != group_count {
             return Err(corrupted(&format!(
                 "Corrupted database - loaded column with index {column}, count {count} did not match count of row \
                  group {group_count}"
