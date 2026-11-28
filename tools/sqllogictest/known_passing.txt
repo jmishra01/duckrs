@@ -770,8 +770,10 @@ test/parquet/corrupt/bss_level_slicing_overread.test
 test/parquet/corrupt/decimal_stats_signed_overflow.test
 test/parquet/corrupt/f1_scratch_buffer_stale_ptr.test
 test/parquet/corrupt/footer_len_overflow.test
+test/parquet/corrupt/geometry_add_wkb_type_oob.test
 test/parquet/corrupt/gzip_short_output.test
 test/parquet/corrupt/list_short_output.test
+test/parquet/corrupt/page_index_row_count_overflow.test
 test/parquet/corrupt/rle_truncated_literal_run.test
 test/parquet/corrupted_bitwidth.test
 test/parquet/dbp_small_decimal.test
@@ -1946,6 +1948,7 @@ test/sql/copy/parquet/decimal_filter.test
 test/sql/copy/parquet/delta_byte_array.test
 test/sql/copy/parquet/describe_parquet.test
 test/sql/copy/parquet/dictionary_compression_ratio_threshold.test
+test/sql/copy/parquet/encryption/plaintext_footer_encryption.test
 test/sql/copy/parquet/enum_converted_type.test
 test/sql/copy/parquet/file_metadata.test
 test/sql/copy/parquet/fixed.test
@@ -2007,6 +2010,7 @@ test/sql/copy/parquet/parquet_column_metadata_corruption.test
 test/sql/copy/parquet/parquet_column_statistics_option.test
 test/sql/copy/parquet/parquet_copy_failure_cleans_up.test
 test/sql/copy/parquet/parquet_copy_type_mismatch.test
+test/sql/copy/parquet/parquet_corrupt_metadata.test
 test/sql/copy/parquet/parquet_corrupt_stats.test
 test/sql/copy/parquet/parquet_count_star.test
 test/sql/copy/parquet/parquet_deep_schema.test
@@ -2071,6 +2075,7 @@ test/sql/copy/parquet/parquet_silly.test
 test/sql/copy/parquet/parquet_sqlnull_write.test
 test/sql/copy/parquet/parquet_string_stats.test
 test/sql/copy/parquet/parquet_union_by_name.test
+test/sql/copy/parquet/parquet_variant_leaf_types.test
 test/sql/copy/parquet/parquet_virtual_columns.test
 test/sql/copy/parquet/parquet_virtual_file_row_group_number.test
 test/sql/copy/parquet/parquet_virtual_file_row_number.test
