@@ -114,12 +114,18 @@ impl QueryMemory {
 
     /// A new file to spill to.
     pub fn spill_file(self: &Arc<Self>) -> Result<SpillFile> {
-        // `StandardBufferManager::RequireTemporaryDirectory`
+        // without a temporary directory nothing is offloaded, and the memory asked for is refused
+        // (`BlockHandle::CanUnload`, then `EvictBlocksOrThrow` with `InMemoryWarning`)
         let Some(directory) = &self.directory else {
             return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "Out-of-memory: cannot write buffer because no temporary directory is specified!\nTo enable \
-                 temporary buffer eviction set a temporary directory using PRAGMA temp_directory='/path/to/tmp.tmp'",
+                ErrorKind::OutOfMemory,
+                format!(
+                    "could not spill data to disk ({}/{} used)\nDatabase is launched in in-memory mode and no \
+                     temporary directory is specified.\nUnused blocks cannot be offloaded to disk.\n\nLaunch the \
+                     database with a persistent storage back-end\nOr set SET temp_directory='/path/to/tmp.tmp'",
+                    format_bytes(self.used.load(Ordering::Relaxed) as u64),
+                    format_bytes(self.limit as u64)
+                ),
             ));
         };
         {
