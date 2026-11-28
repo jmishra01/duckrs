@@ -262,7 +262,10 @@ pub unsafe extern "C" fn duckdb_copy_function_set_extra_info(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn duckdb_copy_function_set_bind(function: duckdb_copy_function, bind: duckdb_copy_function_bind_t) {
+pub unsafe extern "C" fn duckdb_copy_function_set_bind(
+    function: duckdb_copy_function,
+    bind: duckdb_copy_function_bind_t,
+) {
     // SAFETY: C passes a live copy function.
     if let (Some(function), Some(_)) = (unsafe { function_mut(function) }, bind) {
         function.callbacks.bind = bind;
@@ -281,7 +284,10 @@ pub unsafe extern "C" fn duckdb_copy_function_set_global_init(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn duckdb_copy_function_set_sink(function: duckdb_copy_function, sink: duckdb_copy_function_sink_t) {
+pub unsafe extern "C" fn duckdb_copy_function_set_sink(
+    function: duckdb_copy_function,
+    sink: duckdb_copy_function_sink_t,
+) {
     // SAFETY: C passes a live copy function.
     if let (Some(function), Some(_)) = (unsafe { function_mut(function) }, sink) {
         function.callbacks.sink = sink;
@@ -361,7 +367,10 @@ pub unsafe extern "C" fn duckdb_register_copy_function(
 // --------------------------------------------------------------------------------------------------------------
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn duckdb_copy_function_bind_set_error(info: duckdb_copy_function_bind_info, error: *const c_char) {
+pub unsafe extern "C" fn duckdb_copy_function_bind_set_error(
+    info: duckdb_copy_function_bind_info,
+    error: *const c_char,
+) {
     // SAFETY: C passes the info of the bind that runs, and a NUL-terminated error.
     if let Some(info) = unsafe { ffi::get_mut(info) } {
         // SAFETY: as above.
@@ -500,7 +509,10 @@ pub unsafe extern "C" fn duckdb_copy_function_global_init_get_file_path(
 // --------------------------------------------------------------------------------------------------------------
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn duckdb_copy_function_sink_set_error(info: duckdb_copy_function_sink_info, error: *const c_char) {
+pub unsafe extern "C" fn duckdb_copy_function_sink_set_error(
+    info: duckdb_copy_function_sink_info,
+    error: *const c_char,
+) {
     // SAFETY: C passes the info of the sink that runs, and a NUL-terminated error.
     if let Some(info) = unsafe { ffi::get_mut(info) } {
         // SAFETY: as above.

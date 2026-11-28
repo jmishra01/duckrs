@@ -182,7 +182,11 @@ fn wkb_header_types(stats: &Stats) -> Option<[u8; 4]> {
     let has_m = flag_id & 2 != 0 || meta & 0x4000_0000 != 0;
     let dimensions = 2 + u64::from(has_z) + u64::from(has_m);
     // a POINT has its ordinates inline, the others an element count
-    let shortest = if type_id == 1 { HEADER as u64 + dimensions * 8 } else { HEADER as u64 + 4 };
+    let shortest = if type_id == 1 {
+        HEADER as u64 + dimensions * 8
+    } else {
+        HEADER as u64 + 4
+    };
     if strings.min_length.is_none_or(|length| length < shortest) {
         return None;
     }
@@ -2818,7 +2822,9 @@ impl StatisticsPropagator {
                 continue;
             }
             // a range wider than `i128` (HUGEINT statistics at both ends) is never covered by the excluded values
-            let narrow = max.checked_sub(min).is_some_and(|width| width >= 0 && width < values.len() as i128 + 1);
+            let narrow = max
+                .checked_sub(min)
+                .is_some_and(|width| width >= 0 && width < values.len() as i128 + 1);
             if narrow && (min..=max).all(|v| values.contains(&v)) {
                 *op = empty_result(op);
                 return;
@@ -3230,7 +3236,10 @@ impl StatisticsPropagator {
         }
         // `PropagateStatistics(LogicalProjection)`: a projection of nothing is nothing
         if matches!(op.kind, K::Projection { .. })
-            && op.children.first().is_some_and(|child| matches!(child.kind, K::EmptyResult { .. }))
+            && op
+                .children
+                .first()
+                .is_some_and(|child| matches!(child.kind, K::EmptyResult { .. }))
         {
             *op = empty_result(op);
             return;
@@ -4210,7 +4219,11 @@ fn monotone_bounds(
     stats: &[Stats],
     return_type: &LogicalType,
 ) -> Option<Stats> {
-    if children.is_empty() || function.random.is_some() || function.volatile || expr_is_volatile_function(&function.name) {
+    if children.is_empty()
+        || function.random.is_some()
+        || function.volatile
+        || expr_is_volatile_function(&function.name)
+    {
         return None;
     }
     let numeric_stats = return_type.is_numeric()

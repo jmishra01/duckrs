@@ -63,24 +63,34 @@ pub enum Layout {
     /// TIME of `unit`, in 32 bits for seconds and milliseconds
     Time(Unit),
     /// TIMESTAMP of `unit`; `to_micros` for a time zone, which DuckDB keeps in microseconds
-    Timestamp { unit: Unit, to_micros: bool },
+    Timestamp {
+        unit: Unit,
+        to_micros: bool,
+    },
     Duration(Unit),
     IntervalMonths,
     IntervalDayTime,
     IntervalMonthDayNano,
     /// strings or blobs with offsets of 32 bits, or 64 when `large`
-    Bytes { large: bool },
+    Bytes {
+        large: bool,
+    },
     /// string or binary views
     View,
     FixedBinary(usize),
     /// `arrow.uuid`: 16 bytes, big-endian
     Uuid,
-    List { large: bool, view: bool },
+    List {
+        large: bool,
+        view: bool,
+    },
     FixedList(usize),
     Struct,
     Map,
     /// dictionary-encoded: indices of `index` (an integer layout) into the dictionary (the one child)
-    Dictionary { index: Box<ArrowType> },
+    Dictionary {
+        index: Box<ArrowType>,
+    },
 }
 
 /// A column's DuckDB type and the layout of its Arrow array (`ArrowType`); `children` are those of a nested type.
@@ -138,10 +148,42 @@ fn type_from_format(format: &str) -> Result<Option<ArrowType>> {
         "z" => return leaf(T::BLOB, Layout::Bytes { large: false }),
         "Z" => return leaf(T::BLOB, Layout::Bytes { large: true }),
         "vz" => return leaf(T::BLOB, Layout::View),
-        "tsn:" => return leaf(id(LogicalTypeId::TimestampNs), Layout::Timestamp { unit: Unit::Nano, to_micros: false }),
-        "tsu:" => return leaf(T::TIMESTAMP, Layout::Timestamp { unit: Unit::Micro, to_micros: false }),
-        "tsm:" => return leaf(id(LogicalTypeId::TimestampMs), Layout::Timestamp { unit: Unit::Milli, to_micros: false }),
-        "tss:" => return leaf(id(LogicalTypeId::TimestampSec), Layout::Timestamp { unit: Unit::Second, to_micros: false }),
+        "tsn:" => {
+            return leaf(
+                id(LogicalTypeId::TimestampNs),
+                Layout::Timestamp {
+                    unit: Unit::Nano,
+                    to_micros: false,
+                },
+            );
+        }
+        "tsu:" => {
+            return leaf(
+                T::TIMESTAMP,
+                Layout::Timestamp {
+                    unit: Unit::Micro,
+                    to_micros: false,
+                },
+            );
+        }
+        "tsm:" => {
+            return leaf(
+                id(LogicalTypeId::TimestampMs),
+                Layout::Timestamp {
+                    unit: Unit::Milli,
+                    to_micros: false,
+                },
+            );
+        }
+        "tss:" => {
+            return leaf(
+                id(LogicalTypeId::TimestampSec),
+                Layout::Timestamp {
+                    unit: Unit::Second,
+                    to_micros: false,
+                },
+            );
+        }
         "tdD" => return leaf(T::DATE, Layout::Date32),
         "tdm" => return leaf(T::DATE, Layout::Date64),
         "tts" => return leaf(T::TIME, Layout::Time(Unit::Second)),
@@ -179,7 +221,9 @@ fn type_from_format(format: &str) -> Result<Option<ArrowType>> {
         let scale = number(parts[1])?;
         let bits = if parts.len() == 3 { number(parts[2])? } else { 128 };
         if width > 38 || bits > 128 {
-            return Err(not_implemented(format!("Unsupported Internal Arrow Type for Decimal {format}")));
+            return Err(not_implemented(format!(
+                "Unsupported Internal Arrow Type for Decimal {format}"
+            )));
         }
         if !matches!(bits, 32 | 64 | 128) {
             return Err(not_implemented(format!(
@@ -198,7 +242,9 @@ fn type_from_format(format: &str) -> Result<Option<ArrowType>> {
         return leaf(T::BLOB, Layout::FixedBinary(size));
     }
     if format.starts_with('w') {
-        return Err(invalid(format!("Invalid Arrow fixed-size binary format string: \"{format}\"")));
+        return Err(invalid(format!(
+            "Invalid Arrow fixed-size binary format string: \"{format}\""
+        )));
     }
     if let Some(rest) = format.strip_prefix("ts") {
         // a timestamp with a time zone: DuckDB keeps the instant
@@ -206,7 +252,10 @@ fn type_from_format(format: &str) -> Result<Option<ArrowType>> {
             Some(b'n') => {
                 return leaf(
                     id(LogicalTypeId::TimestampTzNs),
-                    Layout::Timestamp { unit: Unit::Nano, to_micros: false },
+                    Layout::Timestamp {
+                        unit: Unit::Nano,
+                        to_micros: false,
+                    },
                 );
             }
             Some(b'u') => Unit::Micro,
@@ -214,7 +263,10 @@ fn type_from_format(format: &str) -> Result<Option<ArrowType>> {
             Some(b's') => Unit::Second,
             _ => return Err(not_implemented(" Timestamptz precision of not accepted")),
         };
-        return leaf(id(LogicalTypeId::TimestampTz), Layout::Timestamp { unit, to_micros: true });
+        return leaf(
+            id(LogicalTypeId::TimestampTz),
+            Layout::Timestamp { unit, to_micros: true },
+        );
     }
     Ok(None)
 }
@@ -257,7 +309,11 @@ fn extension(schema: &SchemaView<'_>) -> Option<(String, Option<String>)> {
         .and_then(|(_, v)| {
             let vendor_is_duckdb = v.contains("\"vendor_name\"") && v.contains("\"DuckDB\"");
             let start = v.find("\"type_name\"")? + "\"type_name\"".len();
-            let rest = v[start..].trim_start().strip_prefix(':')?.trim_start().strip_prefix('"')?;
+            let rest = v[start..]
+                .trim_start()
+                .strip_prefix(':')?
+                .trim_start()
+                .strip_prefix('"')?;
             let end = rest.find('"')?;
             vendor_is_duckdb.then(|| rest[..end].to_string())
         });
@@ -291,9 +347,10 @@ fn arrow_type_without_dictionary(schema: SchemaView<'_>, format: &str) -> Result
             ("arrow.opaque", Some("uhugeint"), "w:16") => {
                 Some(ArrowType::leaf(LogicalType::UHUGEINT, Layout::Fixed(16)))
             }
-            ("arrow.opaque", Some("time_tz"), "w:8") => {
-                Some(ArrowType::leaf(LogicalType::new(LogicalTypeId::TimeTz), Layout::Fixed(8)))
-            }
+            ("arrow.opaque", Some("time_tz"), "w:8") => Some(ArrowType::leaf(
+                LogicalType::new(LogicalTypeId::TimeTz),
+                Layout::Fixed(8),
+            )),
             ("arrow.json", _, "u" | "U" | "vu") => {
                 let mut storage = type_from_format(format)?.expect("a string format");
                 storage.ty = LogicalType::VARCHAR.with_alias("JSON");
@@ -346,7 +403,10 @@ fn arrow_type_without_dictionary(schema: SchemaView<'_>, format: &str) -> Result
             let value = arrow_type(entries.child(1)?)?;
             let ty = LogicalType::map(key.ty.clone(), value.ty.clone());
             let entry = ArrowType {
-                ty: LogicalType::struct_type(vec![("key".to_string(), key.ty.clone()), ("value".to_string(), value.ty.clone())]),
+                ty: LogicalType::struct_type(vec![
+                    ("key".to_string(), key.ty.clone()),
+                    ("value".to_string(), value.ty.clone()),
+                ]),
                 layout: Layout::Struct,
                 children: vec![key, value],
             };
@@ -360,7 +420,9 @@ fn arrow_type_without_dictionary(schema: SchemaView<'_>, format: &str) -> Result
     }
     if let Some(size) = format.strip_prefix("+w") {
         let Some(size) = size.strip_prefix(':').and_then(|s| s.parse::<u32>().ok()) else {
-            return Err(invalid(format!("Invalid Arrow fixed-size list format string: \"{format}\"")));
+            return Err(invalid(format!(
+                "Invalid Arrow fixed-size list format string: \"{format}\""
+            )));
         };
         let child = child(0)?;
         return Ok(ArrowType {
@@ -387,7 +449,11 @@ pub fn convert_schema(schema: SchemaView<'_>) -> Result<ConvertedSchema> {
             return Err(invalid("arrow_scan: released schema passed"));
         }
         let name = child.name();
-        names.push(if name.is_empty() { format!("v{i}") } else { name.to_string() });
+        names.push(if name.is_empty() {
+            format!("v{i}")
+        } else {
+            name.to_string()
+        });
     }
     deduplicate(&mut names);
     let mut columns = Vec::with_capacity(names.len());
@@ -445,7 +511,11 @@ fn validity_bits(array: &ArrayView<'_>, base: usize, count: usize) -> Result<Opt
     let Some(bits) = array.buffer(0, (base + count).div_ceil(8))? else {
         return Ok(None);
     };
-    Ok(Some((base..base + count).map(|bit| bits[bit / 8] >> (bit % 8) & 1 == 1).collect()))
+    Ok(Some(
+        (base..base + count)
+            .map(|bit| bits[bit / 8] >> (bit % 8) & 1 == 1)
+            .collect(),
+    ))
 }
 
 /// `ArrowToDuckDBConversion::SetValidityMask`: the NULLs of rows `base..base + count` of `array`.
@@ -538,7 +608,10 @@ pub fn import_column(ty: &ArrowType, array: &ArrayView<'_>, start: usize, count:
         Layout::Null => out.validity_mut().set_all_invalid(count),
         Layout::Bool => {
             let bits = array.data(1, (base + count).div_ceil(8))?;
-            write::<bool>(&mut out, (base..base + count).map(|bit| bits[bit / 8] >> (bit % 8) & 1 == 1));
+            write::<bool>(
+                &mut out,
+                (base..base + count).map(|bit| bits[bit / 8] >> (bit % 8) & 1 == 1),
+            );
         }
         Layout::Bool8 => {
             let bytes = value_buffer(array, 1, base, count, 1)?;
@@ -565,8 +638,12 @@ pub fn import_column(ty: &ArrowType, array: &ArrayView<'_>, start: usize, count:
         }
         Layout::Decimal(bits) => {
             let wide: Vec<i128> = match bits {
-                32 => values::<i32>(value_buffer(array, 1, base, count, 4)?, base, count).map(i128::from).collect(),
-                64 => values::<i64>(value_buffer(array, 1, base, count, 8)?, base, count).map(i128::from).collect(),
+                32 => values::<i32>(value_buffer(array, 1, base, count, 4)?, base, count)
+                    .map(i128::from)
+                    .collect(),
+                64 => values::<i64>(value_buffer(array, 1, base, count, 8)?, base, count)
+                    .map(i128::from)
+                    .collect(),
                 _ => values::<i128>(value_buffer(array, 1, base, count, 16)?, base, count).collect(),
             };
             match out.physical_type() {
@@ -576,7 +653,10 @@ pub fn import_column(ty: &ArrowType, array: &ArrayView<'_>, start: usize, count:
                 _ => write::<i128>(&mut out, wide.into_iter()),
             }
         }
-        Layout::Date32 => write::<i32>(&mut out, values::<i32>(value_buffer(array, 1, base, count, 4)?, base, count)),
+        Layout::Date32 => write::<i32>(
+            &mut out,
+            values::<i32>(value_buffer(array, 1, base, count, 4)?, base, count),
+        ),
         Layout::Date64 => write::<i32>(
             &mut out,
             values::<i64>(value_buffer(array, 1, base, count, 8)?, base, count)
@@ -586,7 +666,10 @@ pub fn import_column(ty: &ArrowType, array: &ArrayView<'_>, start: usize, count:
             &mut out,
             values::<i32>(value_buffer(array, 1, base, count, 4)?, base, count).map(|v| unit.to_micros(i64::from(v))),
         ),
-        Layout::Time(_) => write::<i64>(&mut out, values::<i64>(value_buffer(array, 1, base, count, 8)?, base, count)),
+        Layout::Time(_) => write::<i64>(
+            &mut out,
+            values::<i64>(value_buffer(array, 1, base, count, 8)?, base, count),
+        ),
         Layout::Timestamp { unit, to_micros } => {
             let source = values::<i64>(value_buffer(array, 1, base, count, 8)?, base, count);
             if *to_micros {
@@ -626,11 +709,13 @@ pub fn import_column(ty: &ArrowType, array: &ArrayView<'_>, start: usize, count:
             let bytes = value_buffer(array, 1, base, count, 16)?;
             write::<Interval>(
                 &mut out,
-                bytes[base * 16..(base + count) * 16].chunks_exact(16).map(|v| Interval {
-                    months: i32::read(&v[0..4]),
-                    days: i32::read(&v[4..8]),
-                    micros: i64::read(&v[8..16]) / 1000,
-                }),
+                bytes[base * 16..(base + count) * 16]
+                    .chunks_exact(16)
+                    .map(|v| Interval {
+                        months: i32::read(&v[0..4]),
+                        days: i32::read(&v[4..8]),
+                        micros: i64::read(&v[8..16]) / 1000,
+                    }),
             );
         }
         Layout::Bytes { large } => {
@@ -655,7 +740,9 @@ pub fn import_column(ty: &ArrowType, array: &ArrayView<'_>, start: usize, count:
             let strings = if *width == 0 {
                 vec![&[][..]; count]
             } else {
-                bytes[base * width..(base + count) * width].chunks_exact(*width).collect()
+                bytes[base * width..(base + count) * width]
+                    .chunks_exact(*width)
+                    .collect()
             };
             write_strings(&mut out, strings);
         }
@@ -687,7 +774,10 @@ pub fn import_column(ty: &ArrowType, array: &ArrayView<'_>, start: usize, count:
                 let entries: Vec<ListEntry> = starts
                     .iter()
                     .zip(&sizes)
-                    .map(|(&s, &n)| ListEntry { offset: s as u64, length: n as u64 })
+                    .map(|(&s, &n)| ListEntry {
+                        offset: s as u64,
+                        length: n as u64,
+                    })
                     .collect();
                 (entries, 0, end as usize)
             } else {
@@ -713,7 +803,9 @@ pub fn import_column(ty: &ArrowType, array: &ArrayView<'_>, start: usize, count:
         }
         Layout::Struct => {
             if array.n_children() != ty.children.len() {
-                return Err(invalid("Arrow struct array has a different number of children than its schema"));
+                return Err(invalid(
+                    "Arrow struct array has a different number of children than its schema",
+                ));
             }
             for (i, child_type) in ty.children.iter().enumerate() {
                 let child = import_column(child_type, &array.child(i)?, base, count)?;
@@ -742,7 +834,13 @@ pub fn import_column(ty: &ArrowType, array: &ArrayView<'_>, start: usize, count:
 }
 
 /// `ColumnArrowToDuckDBDictionary`: the dictionary's values, selected by the indices of rows `base..base + count`.
-fn import_dictionary(ty: &ArrowType, index: &ArrowType, array: &ArrayView<'_>, base: usize, count: usize) -> Result<Vector> {
+fn import_dictionary(
+    ty: &ArrowType,
+    index: &ArrowType,
+    array: &ArrayView<'_>,
+    base: usize,
+    count: usize,
+) -> Result<Vector> {
     let dictionary = array.dictionary()?;
     let dictionary_len = dictionary.len();
     let Layout::Fixed(width) = index.layout else {
@@ -798,7 +896,9 @@ pub fn validate_shape(schema: &ConvertedSchema, array: &ArrayView<'_>) -> Result
     array.check()?;
     let column_count = schema.columns.len();
     if array.n_children() != column_count {
-        return Err(invalid("Arrow array child count does not match the schema's column count"));
+        return Err(invalid(
+            "Arrow array child count does not match the schema's column count",
+        ));
     }
     if column_count > 0 && !array.has_children_pointer() {
         return Err(invalid("Arrow array has null children"));

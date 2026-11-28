@@ -575,7 +575,11 @@ impl Binder<'_> {
                 && schema.is_none_or(|schema| {
                     // a nested schema goes by its whole path
                     let nested = listed.schema.path.len() > 1;
-                    let name = if nested { listed.schema.key() } else { listed.schema.name.clone() };
+                    let name = if nested {
+                        listed.schema.key()
+                    } else {
+                        listed.schema.name.clone()
+                    };
                     name.eq_ignore_ascii_case(schema)
                 })
         })
@@ -1545,11 +1549,16 @@ impl Binder<'_> {
     ) -> Result<LogicalOperator> {
         const METADATA_BLOCK_COUNT: u64 = 64;
         let name = match call.args.as_slice() {
-            [] => self.session.as_ref().map_or_else(String::new, |session| session.database.clone()),
+            [] => self
+                .session
+                .as_ref()
+                .map_or_else(String::new, |session| session.database.clone()),
             [argument] if argument.name.is_empty() => {
                 let value = evaluate_scalar(&self.bind_expression(&argument.expr)?)?;
                 if value.is_null() {
-                    return Err(binder_error("Database argument for pragma_metadata_info cannot be NULL"));
+                    return Err(binder_error(
+                        "Database argument for pragma_metadata_info cannot be NULL",
+                    ));
                 }
                 value.try_to_string()?
             }
@@ -1558,7 +1567,11 @@ impl Binder<'_> {
         if name.eq_ignore_ascii_case("system") || name.eq_ignore_ascii_case(TEMP_SCHEMA) {
             return Err(binder_error(format!("Database \"{name}\" does not have storage")));
         }
-        let listing = self.catalog.databases().into_iter().find(|db| db.name.eq_ignore_ascii_case(&name));
+        let listing = self
+            .catalog
+            .databases()
+            .into_iter()
+            .find(|db| db.name.eq_ignore_ascii_case(&name));
         let Some(listing) = listing else {
             return Err(duckrs_common::Error::new(
                 duckrs_common::ErrorKind::Catalog,
@@ -1581,7 +1594,9 @@ impl Binder<'_> {
                 ])
             })
             .collect::<Result<Vec<_>>>()?;
-        let names = ["block_id", "total_blocks", "free_blocks", "free_list"].map(String::from).to_vec();
+        let names = ["block_id", "total_blocks", "free_blocks", "free_list"]
+            .map(String::from)
+            .to_vec();
         let types = vec![
             LogicalType::BIGINT,
             LogicalType::BIGINT,
@@ -2438,7 +2453,9 @@ impl Binder<'_> {
                     .databases()
                     .iter()
                     .filter_map(|database| database.cached_blocks)
-                    .fold((0u64, 0u64), |(size, total), (cached, inserted)| (size + cached, total + inserted));
+                    .fold((0u64, 0u64), |(size, total), (cached, inserted)| {
+                        (size + cached, total + inserted)
+                    });
                 (
                     vec![
                         ("queue_index", bigint.clone()),
@@ -2459,12 +2476,16 @@ impl Binder<'_> {
             // `DuckDBConnectionCountFunction`
             "duckdb_connection_count" => (
                 vec![("count", LogicalType::UBIGINT)],
-                vec![vec![Value::ubigint(self.session.as_ref().map_or(1, |s| s.connection_count))]],
+                vec![vec![Value::ubigint(
+                    self.session.as_ref().map_or(1, |s| s.connection_count),
+                )]],
             ),
             // `DuckDBApproxDatabaseCountFunction`
             "duckdb_approx_database_count" => (
                 vec![("approx_count", LogicalType::UBIGINT)],
-                vec![vec![Value::ubigint(self.session.as_ref().map_or(3, |s| s.approx_database_count))]],
+                vec![vec![Value::ubigint(
+                    self.session.as_ref().map_or(3, |s| s.approx_database_count),
+                )]],
             ),
             // `DuckDBVariablesFunction`: the user variables of the connection
             "duckdb_variables" => {
@@ -2484,7 +2505,11 @@ impl Binder<'_> {
                     rows.push(vec![text(&name), shown, text(&value.logical_type().to_string())]);
                 }
                 (
-                    vec![("name", varchar.clone()), ("value", varchar.clone()), ("type", varchar.clone())],
+                    vec![
+                        ("name", varchar.clone()),
+                        ("value", varchar.clone()),
+                        ("type", varchar.clone()),
+                    ],
                     rows,
                 )
             }
@@ -2522,14 +2547,21 @@ impl Binder<'_> {
             ),
             // `DuckDBGrammarExtensionsFunction`: duckrs has no grammar extensions
             "duckdb_grammar_extensions" => (
-                vec![("name", varchar.clone()), ("description", varchar.clone()), ("active", boolean.clone())],
+                vec![
+                    ("name", varchar.clone()),
+                    ("description", varchar.clone()),
+                    ("active", boolean.clone()),
+                ],
                 Vec::new(),
             ),
             // `DuckDBPreparedStatementsFunction`
             "duckdb_prepared_statements" => {
                 let list = LogicalType::list(varchar.clone());
                 let types = |types: &[String]| {
-                    Value::list(varchar.clone(), types.iter().map(|t| Value::varchar(t.clone())).collect())
+                    Value::list(
+                        varchar.clone(),
+                        types.iter().map(|t| Value::varchar(t.clone())).collect(),
+                    )
                 };
                 let rows = self
                     .session
@@ -2562,7 +2594,9 @@ impl Binder<'_> {
             // `PragmaCollateFunction`: the collations of the catalog
             "pragma_collations" => (
                 vec![("collname", varchar.clone())],
-                crate::planner::collation::collation_names().map(|name| vec![text(name)]).collect(),
+                crate::planner::collation::collation_names()
+                    .map(|name| vec![text(name)])
+                    .collect(),
             ),
             // `PragmaPlatformFunction`
             "pragma_platform" => (vec![("platform", varchar.clone())], vec![vec![text(&platform())]]),
@@ -2794,7 +2828,10 @@ impl Binder<'_> {
                 let database = self.session.as_ref().map(|session| session.database.clone());
                 let mut rows = Vec::new();
                 for listed in self.listed_entries() {
-                    if database.as_ref().is_some_and(|name| !listed.database.eq_ignore_ascii_case(name)) {
+                    if database
+                        .as_ref()
+                        .is_some_and(|name| !listed.database.eq_ignore_ascii_case(name))
+                    {
                         continue;
                     }
                     let TableOrView::Table(table) = &listed.entry else {

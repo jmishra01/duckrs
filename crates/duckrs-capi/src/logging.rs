@@ -27,7 +27,8 @@ impl Handle for _duckdb_log_storage {
 
 /// `CallbackLogStorage`.
 struct CLogStorage {
-    write_log_entry: unsafe extern "C" fn(*mut std::ffi::c_void, *mut duckdb_timestamp, *const c_char, *const c_char, *const c_char),
+    write_log_entry:
+        unsafe extern "C" fn(*mut std::ffi::c_void, *mut duckdb_timestamp, *const c_char, *const c_char, *const c_char),
     /// freed when the database lets go of the storage (`~CallbackLogStorage`)
     extra_data: Option<OwnedData>,
 }

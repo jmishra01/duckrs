@@ -24,7 +24,10 @@ fn table_names_look_through_views_and_skip_ctes() {
     connection.query("CREATE TABLE base(i INTEGER)").unwrap();
     connection.query("CREATE VIEW v AS SELECT i FROM base").unwrap();
     let names = connection
-        .get_table_names("WITH c AS (SELECT 1) SELECT * FROM v, c, (SELECT count(*) FROM other)", false)
+        .get_table_names(
+            "WITH c AS (SELECT 1) SELECT * FROM v, c, (SELECT count(*) FROM other)",
+            false,
+        )
         .unwrap();
     assert_eq!(names, ["base", "other"]);
     assert!(connection.get_table_names("SELECT 1; SELECT 2", false).is_err());

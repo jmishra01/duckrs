@@ -634,7 +634,12 @@ impl<'a> FileRunner<'a> {
                 .open_with_version(self.db_path.as_deref(), self.read_only, self.storage_version.as_deref())?;
         let db: Box<dyn Database> = Box::new(TestDatabase {
             inner: db,
-            secret_directory: self.shared.test_dir.join("test_secret_dir").to_string_lossy().into_owned(),
+            secret_directory: self
+                .shared
+                .test_dir
+                .join("test_secret_dir")
+                .to_string_lossy()
+                .into_owned(),
         });
         self.con = Some(db.connect()?);
         self.db = Some(db);

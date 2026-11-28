@@ -181,7 +181,13 @@ fn write_values<S: NativeType, D: Copy>(
 }
 
 /// [`write_values`] of a VARCHAR or BLOB column.
-fn write_strings<D: Copy>(result: &QueryResult, column: usize, target: &mut [D], null: D, convert: impl Fn(&[u8]) -> D) {
+fn write_strings<D: Copy>(
+    result: &QueryResult,
+    column: usize,
+    target: &mut [D],
+    null: D,
+    convert: impl Fn(&[u8]) -> D,
+) {
     let mut row = 0;
     for chunk in result.collection.chunks() {
         let unified = chunk.column(column).to_unified(chunk.len());
@@ -354,7 +360,8 @@ fn destroy_column(column: &duckdb_column, rows: usize) {
     if !column.deprecated_data.is_null() {
         if column.deprecated_type == DUCKDB_TYPE_VARCHAR {
             // SAFETY: a VARCHAR column's data is the array of `rows` strings `translate_column` allocated.
-            let strings = unsafe { ffi::slice(column.deprecated_data.cast::<*mut c_char>().cast_const(), rows as idx_t) };
+            let strings =
+                unsafe { ffi::slice(column.deprecated_data.cast::<*mut c_char>().cast_const(), rows as idx_t) };
             strings.unwrap_or_default().iter().for_each(|s| ffi::free(*s));
         } else if column.deprecated_type == DUCKDB_TYPE_BLOB {
             // SAFETY: a BLOB column's data is the array of `rows` blobs `translate_column` allocated.
@@ -409,9 +416,7 @@ pub unsafe extern "C" fn duckdb_column_type(result: *mut duckdb_result, col: idx
 pub unsafe extern "C" fn duckdb_column_logical_type(result: *mut duckdb_result, col: idx_t) -> duckdb_logical_type {
     // SAFETY: C passes a result a query wrote.
     match unsafe { result_and_data(result) } {
-        Some((_, data)) if (col as usize) < data.column_count() => {
-            ffi::into_handle(data.types()[col as usize].clone())
-        }
+        Some((_, data)) if (col as usize) < data.column_count() => ffi::into_handle(data.types()[col as usize].clone()),
         _ => std::ptr::null_mut(),
     }
 }
@@ -491,7 +496,13 @@ pub unsafe extern "C" fn duckdb_nullmask_data(result: *mut duckdb_result, col: i
 pub unsafe extern "C" fn duckdb_result_error(result: *mut duckdb_result) -> *const c_char {
     // SAFETY: C passes a result a query wrote.
     match unsafe { result_and_data(result) } {
-        Some((_, ResultData { error: Some((message, _)), .. })) => message.as_ptr(),
+        Some((
+            _,
+            ResultData {
+                error: Some((message, _)),
+                ..
+            },
+        )) => message.as_ptr(),
         _ => std::ptr::null(),
     }
 }
@@ -500,7 +511,12 @@ pub unsafe extern "C" fn duckdb_result_error(result: *mut duckdb_result) -> *con
 pub unsafe extern "C" fn duckdb_result_error_type(result: *mut duckdb_result) -> duckdb_error_type {
     // SAFETY: C passes a result a query wrote.
     match unsafe { result_and_data(result) } {
-        Some((_, ResultData { error: Some((_, kind)), .. })) => error_type_to_c(*kind),
+        Some((
+            _,
+            ResultData {
+                error: Some((_, kind)), ..
+            },
+        )) => error_type_to_c(*kind),
         _ => DUCKDB_ERROR_INVALID,
     }
 }
@@ -759,7 +775,11 @@ pub unsafe extern "C" fn duckdb_value_time(result: *mut duckdb_result, col: idx_
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn duckdb_value_timestamp(result: *mut duckdb_result, col: idx_t, row: idx_t) -> duckdb_timestamp {
+pub unsafe extern "C" fn duckdb_value_timestamp(
+    result: *mut duckdb_result,
+    col: idx_t,
+    row: idx_t,
+) -> duckdb_timestamp {
     // SAFETY: C passes a result a query wrote.
     match unsafe { fetch_cast(result, col, row, &LogicalType::TIMESTAMP) } {
         Some(ValueData::Int64(micros)) => duckdb_timestamp { micros },
@@ -817,7 +837,11 @@ pub unsafe extern "C" fn duckdb_value_varchar(result: *mut duckdb_result, col: i
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn duckdb_value_string_internal(result: *mut duckdb_result, col: idx_t, row: idx_t) -> duckdb_string {
+pub unsafe extern "C" fn duckdb_value_string_internal(
+    result: *mut duckdb_result,
+    col: idx_t,
+    row: idx_t,
+) -> duckdb_string {
     // SAFETY: C passes a result a query wrote.
     let Some((column, data)) = (unsafe { deprecated_fetch(result, col, row) }) else {
         return no_string();
@@ -826,7 +850,12 @@ pub unsafe extern "C" fn duckdb_value_string_internal(result: *mut duckdb_result
         return no_string();
     }
     // SAFETY: a VARCHAR column's data is the array of the strings `translate_column` allocated, one per row.
-    let strings = unsafe { ffi::slice(column.deprecated_data.cast::<*mut c_char>().cast_const(), data.row_count() as idx_t) };
+    let strings = unsafe {
+        ffi::slice(
+            column.deprecated_data.cast::<*mut c_char>().cast_const(),
+            data.row_count() as idx_t,
+        )
+    };
     let Some(&text) = strings.and_then(|s| s.get(row as usize)) else {
         return no_string();
     };
@@ -839,7 +868,11 @@ pub unsafe extern "C" fn duckdb_value_string_internal(result: *mut duckdb_result
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn duckdb_value_varchar_internal(result: *mut duckdb_result, col: idx_t, row: idx_t) -> *mut c_char {
+pub unsafe extern "C" fn duckdb_value_varchar_internal(
+    result: *mut duckdb_result,
+    col: idx_t,
+    row: idx_t,
+) -> *mut c_char {
     // SAFETY: C passes a result a query wrote.
     unsafe { duckdb_value_string_internal(result, col, row) }.data
 }

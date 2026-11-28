@@ -107,7 +107,9 @@ pub unsafe extern "C" fn duckdb_pending_execute_task(pending_result: duckdb_pend
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn duckdb_pending_execute_check_state(pending_result: duckdb_pending_result) -> duckdb_pending_state {
+pub unsafe extern "C" fn duckdb_pending_execute_check_state(
+    pending_result: duckdb_pending_result,
+) -> duckdb_pending_state {
     // SAFETY: C passes a live pending result.
     unsafe { state(pending_result) }
 }
@@ -127,8 +129,9 @@ pub unsafe extern "C" fn duckdb_execute_pending(
     out_result: *mut duckdb_result,
 ) -> duckdb_state {
     // SAFETY: C passes a live pending result and where to write the result.
-    let (Some(pending), Some(out)) = (unsafe { ffi::get_mut(pending_result) }, unsafe { ffi::reference_mut(out_result) })
-    else {
+    let (Some(pending), Some(out)) = (unsafe { ffi::get_mut(pending_result) }, unsafe {
+        ffi::reference_mut(out_result)
+    }) else {
         return DuckDBError;
     };
     *out = duckdb_result::zeroed();

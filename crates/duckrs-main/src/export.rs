@@ -6,8 +6,10 @@
 //! again and `load.sql` to read the tables back; and `IMPORT DATABASE`, which runs the two.
 
 use super::{ClientContext, MaterializedQueryResult};
-use duckrs_core::catalog::{Catalog, DEFAULT_SCHEMA, SchemaCatalogEntry, TEMP_SCHEMA, TableCatalogEntry, TableConstraint};
 use duckrs_common::{Error, ErrorKind, Result};
+use duckrs_core::catalog::{
+    Catalog, DEFAULT_SCHEMA, SchemaCatalogEntry, TEMP_SCHEMA, TableCatalogEntry, TableConstraint,
+};
 use duckrs_parser::ast::{
     self, CopyInfo, CreateInfo, CreateKind, Literal, OnCreateConflict, QualifiedName, Statement, sql_identifier,
     sql_string,
@@ -291,9 +293,9 @@ fn schema_statements(
             && table_sql.iter().any(|sql| {
                 let sql = sql.to_lowercase();
                 sql.contains(&quoted)
-                    || sql.match_indices(&bare).any(|(at, _)| {
-                        at == 0 || !sql[..at].ends_with(|c: char| c.is_alphanumeric() || c == '_')
-                    })
+                    || sql
+                        .match_indices(&bare)
+                        .any(|(at, _)| at == 0 || !sql[..at].ends_with(|c: char| c.is_alphanumeric() || c == '_'))
             })
     };
     let (early, late): (Vec<_>, Vec<_>) = macros.into_iter().partition(|(_, entry, _)| called_by_tables(entry));
@@ -727,7 +729,9 @@ fn order_macros(mut pending: Vec<(String, Arc<duckrs_core::catalog::MacroCatalog
             })
         };
         // a cycle can't be ordered: what is left goes in the order it was found
-        let at = (0..pending.len()).find(|&i| !waits(&pending[i].1, &pending)).unwrap_or(0);
+        let at = (0..pending.len())
+            .find(|&i| !waits(&pending[i].1, &pending))
+            .unwrap_or(0);
         ordered.push(pending.remove(at).2);
     }
     ordered

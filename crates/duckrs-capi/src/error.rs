@@ -35,7 +35,9 @@ impl ErrorData {
 
     /// `RawMessage`, as C reads it, or null without an error.
     pub fn raw_message(&self) -> *const c_char {
-        self.error.as_ref().map_or(std::ptr::null(), |(_, message)| message.as_ptr())
+        self.error
+            .as_ref()
+            .map_or(std::ptr::null(), |(_, message)| message.as_ptr())
     }
 }
 
@@ -81,7 +83,11 @@ pub unsafe extern "C" fn duckdb_error_data_message(error_data: duckdb_error_data
     let Some(error) = (unsafe { ffi::get(error_data) }) else {
         return std::ptr::null();
     };
-    if error.has_error() { error.raw_message() } else { c"".as_ptr() }
+    if error.has_error() {
+        error.raw_message()
+    } else {
+        c"".as_ptr()
+    }
 }
 
 #[unsafe(no_mangle)]

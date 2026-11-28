@@ -11,12 +11,12 @@
 //! of the statement as transition tables the bodies bind to.
 
 use super::*;
+use duckrs_common::types::sql_identifier;
 use duckrs_core::catalog::{
     DEFAULT_SCHEMA, TableCatalogEntry, TriggerCatalogEntry, TriggerEvent, TriggerForEach, TriggerTiming,
 };
 use duckrs_core::planner::statement_names::{body_statement, referenced_names};
 use duckrs_core::planner::trigger_scope::{self, RowScope, TransitionTable, TriggerScope};
-use duckrs_common::types::sql_identifier;
 use duckrs_parser::ast::{QueryNode, QueryNodeKind, TableRef, TableRefKind};
 use std::sync::atomic::Ordering as AtomicOrdering2;
 
@@ -912,9 +912,7 @@ impl ClientContext {
                 )));
             }
             // a first part that is a schema of this database starts a path of nested schemas
-            if !temp_reference
-                && !name.qualification.is_empty()
-                && catalog.get_schema(&name.qualification[0]).is_none()
+            if !temp_reference && !name.qualification.is_empty() && catalog.get_schema(&name.qualification[0]).is_none()
             {
                 let database = &name.qualification[0];
                 if !database.eq_ignore_ascii_case(&self.db.name) && !database.eq_ignore_ascii_case(DEFAULT_CATALOG) {

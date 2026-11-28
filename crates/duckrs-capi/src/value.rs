@@ -86,17 +86,105 @@ macro_rules! scalar {
     };
 }
 
-scalar!(duckdb_create_bool, duckdb_get_bool, bool, Value::boolean, LogicalType::BOOLEAN, Bool, false);
-scalar!(duckdb_create_int8, duckdb_get_int8, i8, Value::tinyint, LogicalType::TINYINT, Int8, i8::MIN);
-scalar!(duckdb_create_uint8, duckdb_get_uint8, u8, Value::utinyint, LogicalType::UTINYINT, UInt8, 0);
-scalar!(duckdb_create_int16, duckdb_get_int16, i16, Value::smallint, LogicalType::SMALLINT, Int16, i16::MIN);
-scalar!(duckdb_create_uint16, duckdb_get_uint16, u16, Value::usmallint, LogicalType::USMALLINT, UInt16, 0);
-scalar!(duckdb_create_int32, duckdb_get_int32, i32, Value::integer, LogicalType::INTEGER, Int32, i32::MIN);
-scalar!(duckdb_create_uint32, duckdb_get_uint32, u32, Value::uinteger, LogicalType::UINTEGER, UInt32, 0);
-scalar!(duckdb_create_int64, duckdb_get_int64, i64, Value::bigint, LogicalType::BIGINT, Int64, i64::MIN);
-scalar!(duckdb_create_uint64, duckdb_get_uint64, u64, Value::ubigint, LogicalType::UBIGINT, UInt64, 0);
-scalar!(duckdb_create_float, duckdb_get_float, f32, Value::float, LogicalType::FLOAT, Float, f32::NAN);
-scalar!(duckdb_create_double, duckdb_get_double, f64, Value::double, LogicalType::DOUBLE, Double, f64::NAN);
+scalar!(
+    duckdb_create_bool,
+    duckdb_get_bool,
+    bool,
+    Value::boolean,
+    LogicalType::BOOLEAN,
+    Bool,
+    false
+);
+scalar!(
+    duckdb_create_int8,
+    duckdb_get_int8,
+    i8,
+    Value::tinyint,
+    LogicalType::TINYINT,
+    Int8,
+    i8::MIN
+);
+scalar!(
+    duckdb_create_uint8,
+    duckdb_get_uint8,
+    u8,
+    Value::utinyint,
+    LogicalType::UTINYINT,
+    UInt8,
+    0
+);
+scalar!(
+    duckdb_create_int16,
+    duckdb_get_int16,
+    i16,
+    Value::smallint,
+    LogicalType::SMALLINT,
+    Int16,
+    i16::MIN
+);
+scalar!(
+    duckdb_create_uint16,
+    duckdb_get_uint16,
+    u16,
+    Value::usmallint,
+    LogicalType::USMALLINT,
+    UInt16,
+    0
+);
+scalar!(
+    duckdb_create_int32,
+    duckdb_get_int32,
+    i32,
+    Value::integer,
+    LogicalType::INTEGER,
+    Int32,
+    i32::MIN
+);
+scalar!(
+    duckdb_create_uint32,
+    duckdb_get_uint32,
+    u32,
+    Value::uinteger,
+    LogicalType::UINTEGER,
+    UInt32,
+    0
+);
+scalar!(
+    duckdb_create_int64,
+    duckdb_get_int64,
+    i64,
+    Value::bigint,
+    LogicalType::BIGINT,
+    Int64,
+    i64::MIN
+);
+scalar!(
+    duckdb_create_uint64,
+    duckdb_get_uint64,
+    u64,
+    Value::ubigint,
+    LogicalType::UBIGINT,
+    UInt64,
+    0
+);
+scalar!(
+    duckdb_create_float,
+    duckdb_get_float,
+    f32,
+    Value::float,
+    LogicalType::FLOAT,
+    Float,
+    f32::NAN
+);
+scalar!(
+    duckdb_create_double,
+    duckdb_get_double,
+    f64,
+    Value::double,
+    LogicalType::DOUBLE,
+    Double,
+    f64::NAN
+);
 
 #[unsafe(no_mangle)]
 pub extern "C" fn duckdb_create_hugeint(input: duckdb_hugeint) -> duckdb_value {
@@ -132,7 +220,10 @@ pub unsafe extern "C" fn duckdb_create_bignum(input: duckdb_bignum) -> duckdb_va
     let Some(magnitude) = (unsafe { ffi::bytes(input.data.cast_const().cast(), input.size) }) else {
         return std::ptr::null_mut();
     };
-    typed(LogicalTypeId::Bignum, ValueData::Bytes(bignum::from_magnitude(magnitude, input.is_negative)))
+    typed(
+        LogicalTypeId::Bignum,
+        ValueData::Bytes(bignum::from_magnitude(magnitude, input.is_negative)),
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -435,7 +526,11 @@ pub unsafe extern "C" fn duckdb_get_varchar(value: duckdb_value) -> *mut c_char 
 /// # Safety
 ///
 /// `values` is null or an array of `count` live values.
-unsafe fn values_of(values: *mut duckdb_value, count: idx_t, types: impl Fn(usize) -> LogicalType) -> Option<Vec<Value>> {
+unsafe fn values_of(
+    values: *mut duckdb_value,
+    count: idx_t,
+    types: impl Fn(usize) -> LogicalType,
+) -> Option<Vec<Value>> {
     // SAFETY: by the contract of this function.
     let handles = unsafe { ffi::slice(values.cast_const(), count) }?;
     let mut result = Vec::with_capacity(handles.len());
@@ -456,7 +551,10 @@ unsafe fn values_of(values: *mut duckdb_value, count: idx_t, types: impl Fn(usiz
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn duckdb_create_struct_value(ty: duckdb_logical_type, values: *mut duckdb_value) -> duckdb_value {
+pub unsafe extern "C" fn duckdb_create_struct_value(
+    ty: duckdb_logical_type,
+    values: *mut duckdb_value,
+) -> duckdb_value {
     // SAFETY: C passes a live logical type.
     let Some(ty) = (unsafe { ffi::get(ty) }) else {
         return std::ptr::null_mut();
@@ -509,8 +607,11 @@ pub unsafe extern "C" fn duckdb_create_array_value(
     let Some(items) = (unsafe { values_of(values, value_count, |_| ty.clone()) }) else {
         return std::ptr::null_mut();
     };
-    Value::new(LogicalType::array(ty.clone(), value_count as u32), ValueData::List(items))
-        .map_or(std::ptr::null_mut(), new_value)
+    Value::new(
+        LogicalType::array(ty.clone(), value_count as u32),
+        ValueData::List(items),
+    )
+    .map_or(std::ptr::null_mut(), new_value)
 }
 
 #[unsafe(no_mangle)]
@@ -530,7 +631,10 @@ pub unsafe extern "C" fn duckdb_create_map_value(
     let Some(entry) = ty.child_type() else {
         return std::ptr::null_mut();
     };
-    let (key_type, value_type) = (entry.struct_children()[0].1.clone(), entry.struct_children()[1].1.clone());
+    let (key_type, value_type) = (
+        entry.struct_children()[0].1.clone(),
+        entry.struct_children()[1].1.clone(),
+    );
     // SAFETY: C passes `entry_count` keys and values.
     let (Some(keys), Some(values)) = (unsafe { values_of(keys, entry_count, |_| key_type.clone()) }, unsafe {
         values_of(values, entry_count, |_| value_type.clone())
@@ -567,7 +671,11 @@ pub unsafe extern "C" fn duckdb_create_union_value(
     }
     let mut fields = vec![Value::utinyint(tag as u8)];
     fields.extend(children[1..].iter().enumerate().map(|(i, (_, member))| {
-        if i == tag { value.clone() } else { Value::null(member.clone()) }
+        if i == tag {
+            value.clone()
+        } else {
+            Value::null(member.clone())
+        }
     }));
     Value::new(ty.clone(), ValueData::Struct(fields)).map_or(std::ptr::null_mut(), new_value)
 }
@@ -676,8 +784,12 @@ pub unsafe extern "C" fn duckdb_get_struct_child(value: duckdb_value, index: idx
         return std::ptr::null_mut();
     };
     match value.data() {
-        ValueData::Struct(fields) if matches!(value.logical_type().id(), LogicalTypeId::Struct | LogicalTypeId::Tuple) => {
-            fields.get(index as usize).map_or(std::ptr::null_mut(), |f| new_value(f.clone()))
+        ValueData::Struct(fields)
+            if matches!(value.logical_type().id(), LogicalTypeId::Struct | LogicalTypeId::Tuple) =>
+        {
+            fields
+                .get(index as usize)
+                .map_or(std::ptr::null_mut(), |f| new_value(f.clone()))
         }
         _ => std::ptr::null_mut(),
     }

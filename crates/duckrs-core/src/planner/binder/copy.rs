@@ -1491,7 +1491,10 @@ impl Binder<'_> {
         /// the connection and query of the last scan, its scan id, and the next file number
         type LastScan = Option<((u64, u64), u64, usize)>;
         static LAST: std::sync::Mutex<LastScan> = std::sync::Mutex::new(None);
-        let query = self.session.as_ref().map(|session| (session.connection_id, session.query_id));
+        let query = self
+            .session
+            .as_ref()
+            .map(|session| (session.connection_id, session.query_id));
         let (scan_id, file_offset) = {
             let mut last = LAST.lock().expect("not poisoned");
             let (scan_id, file_offset) = match (*last, query) {
@@ -2368,7 +2371,12 @@ impl Binder<'_> {
                 let known = SUPPORTED_BASE_OPTIONS.contains(&name.as_str())
                     || matches!(
                         name.as_str(),
-                        "format" | "order_by" | "dateformat" | "date_format" | "timestampformat" | "timestamp_format"
+                        "format"
+                            | "order_by"
+                            | "dateformat"
+                            | "date_format"
+                            | "timestampformat"
+                            | "timestamp_format"
                             | "array"
                     )
                     || (geojson.is_some() && matches!(name.as_str(), "geometry_column" | "id_column" | "bbox"));
@@ -2530,8 +2538,7 @@ impl Binder<'_> {
                 })
                 .map(|(_, (name, ty))| (name.clone(), ty.clone()))
                 .collect();
-            let mut layout =
-                crate::function::geojson_copy::layout(&written, &geometry_column, &id_column, write_bbox)?;
+            let mut layout = crate::function::geojson_copy::layout(&written, &geometry_column, &id_column, write_bbox)?;
             layout.date_format = options.date_format.clone();
             layout.timestamp_format = options.timestamp_format.clone();
             options.geojson = Some(layout);
@@ -3485,8 +3492,7 @@ fn is_bytes_option(name: &str) -> bool {
 }
 /// `CSVReaderOptions::SetDateFormat`: a format to read with must parse (`StrTimeFormat::ParseFormatSpecifier`).
 fn check_read_format(format: &str) -> Result<()> {
-    crate::function::strptime::StrpFormat::new(format).map(|_| ()).map_err(|error| {
-        Error::new(ErrorKind::InvalidInput, format!("Could not parse DATEFORMAT: {error}"))
-    })
+    crate::function::strptime::StrpFormat::new(format)
+        .map(|_| ())
+        .map_err(|error| Error::new(ErrorKind::InvalidInput, format!("Could not parse DATEFORMAT: {error}")))
 }
-

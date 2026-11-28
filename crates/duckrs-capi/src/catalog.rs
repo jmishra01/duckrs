@@ -69,7 +69,9 @@ pub unsafe extern "C" fn duckdb_client_context_get_catalog(
 ) -> duckdb_catalog {
     // SAFETY: C passes a live client context and a NUL-terminated name.
     let (Some(ClientContextWrapper { connection_id }), Some(name)) =
-        (unsafe { ffi::get::<_duckdb_client_context>(context) }, unsafe { ffi::c_str(name) })
+        (unsafe { ffi::get::<_duckdb_client_context>(context) }, unsafe {
+            ffi::c_str(name)
+        })
     else {
         return std::ptr::null_mut();
     };

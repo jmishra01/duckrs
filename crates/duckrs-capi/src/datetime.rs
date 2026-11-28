@@ -68,7 +68,11 @@ pub extern "C" fn duckdb_to_time(time: duckdb_time_struct) -> duckdb_time {
 pub extern "C" fn duckdb_from_timestamp(ts: duckdb_timestamp) -> duckdb_timestamp_struct {
     let timestamp = Timestamp(ts.micros);
     // an infinite timestamp has no time of day: it gets the parts of the infinite date
-    let time = if timestamp.is_finite() { timestamp.time() } else { Time(0) };
+    let time = if timestamp.is_finite() {
+        timestamp.time()
+    } else {
+        Time(0)
+    };
     duckdb_timestamp_struct {
         date: duckdb_from_date(duckdb_date {
             days: timestamp.date().0,
@@ -146,7 +150,9 @@ pub extern "C" fn duckdb_double_to_decimal(value: f64, width: u8, scale: u8) -> 
     if scale > width || width > 38 || width == 0 {
         return duckdb_decimal::default();
     }
-    let cast = crate::ffi::guard(None, || duckrs::cast_value(&Value::double(value), &LogicalType::decimal(width, scale)).ok());
+    let cast = crate::ffi::guard(None, || {
+        duckrs::cast_value(&Value::double(value), &LogicalType::decimal(width, scale)).ok()
+    });
     match cast.as_ref().map(Value::data) {
         Some(ValueData::Null) | None => duckdb_decimal::default(),
         Some(_) => duckdb_decimal {

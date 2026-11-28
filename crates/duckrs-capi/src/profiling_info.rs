@@ -45,7 +45,10 @@ pub unsafe extern "C" fn duckdb_get_profiling_info(connection: duckdb_connection
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn duckdb_profiling_info_get_value(info: duckdb_profiling_info, key: *const c_char) -> duckdb_value {
+pub unsafe extern "C" fn duckdb_profiling_info_get_value(
+    info: duckdb_profiling_info,
+    key: *const c_char,
+) -> duckdb_value {
     // SAFETY: C passes a live profiling info and a NUL-terminated key.
     let (Some(node), Some(key)) = (unsafe { ffi::get(info) }, unsafe { ffi::c_str(key) }) else {
         return std::ptr::null_mut();
@@ -104,7 +107,10 @@ pub unsafe extern "C" fn duckdb_profiling_info_get_child_count(info: duckdb_prof
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn duckdb_profiling_info_get_child(info: duckdb_profiling_info, index: idx_t) -> duckdb_profiling_info {
+pub unsafe extern "C" fn duckdb_profiling_info_get_child(
+    info: duckdb_profiling_info,
+    index: idx_t,
+) -> duckdb_profiling_info {
     // SAFETY: C passes a live profiling info.
     let Some(node) = (unsafe { ffi::get(info) }) else {
         return std::ptr::null_mut();

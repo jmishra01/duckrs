@@ -10,9 +10,9 @@ use super::statements::not_implemented;
 use super::{BindContext, Binder, Binding, UsingColumnSet, binder_error};
 use crate::planner::expression::{BoundExpr, BoundExprKind, ColumnBinding};
 use crate::planner::logical::{JoinCondition, LogicalOperator, LogicalOperatorKind};
-use duckrs_common::{ErrorKind, Result};
 use duckrs_common::types::{LogicalType, LogicalTypeId};
 use duckrs_common::value::Value;
+use duckrs_common::{ErrorKind, Result};
 use duckrs_parser::ast::{
     ComparisonOp, Expr, ExprKind, JoinRef, JoinRefType, JoinType, Literal, NullOrder, OperatorType, OrderByNode,
     OrderType, QueryNode, ResultModifier, SelectNode, SelectStatement, TableRef, TableRefKind, sql_quoted_identifier,

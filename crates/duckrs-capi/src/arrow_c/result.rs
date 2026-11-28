@@ -10,7 +10,9 @@
 use super::export;
 use super::options::ArrowOptions;
 use super::raw::ArrowSchema;
-use super::{_duckdb_arrow, ArrowArray, duckdb_arrow, duckdb_arrow_array, duckdb_arrow_schema, write_array, write_schema};
+use super::{
+    _duckdb_arrow, ArrowArray, duckdb_arrow, duckdb_arrow_array, duckdb_arrow_schema, write_array, write_schema,
+};
 use crate::error::c_string;
 use crate::ffi::{self, Handle};
 use crate::types::*;
@@ -162,7 +164,10 @@ pub unsafe extern "C" fn duckdb_query_arrow(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn duckdb_query_arrow_schema(result: duckdb_arrow, out_schema: *mut duckdb_arrow_schema) -> duckdb_state {
+pub unsafe extern "C" fn duckdb_query_arrow_schema(
+    result: duckdb_arrow,
+    out_schema: *mut duckdb_arrow_schema,
+) -> duckdb_state {
     if out_schema.is_null() {
         return DuckDBSuccess;
     }
@@ -187,7 +192,10 @@ pub unsafe extern "C" fn duckdb_query_arrow_schema(result: duckdb_arrow, out_sch
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn duckdb_query_arrow_array(result: duckdb_arrow, out_array: *mut duckdb_arrow_array) -> duckdb_state {
+pub unsafe extern "C" fn duckdb_query_arrow_array(
+    result: duckdb_arrow,
+    out_array: *mut duckdb_arrow_array,
+) -> duckdb_state {
     if out_array.is_null() {
         return DuckDBSuccess;
     }
@@ -195,10 +203,9 @@ pub unsafe extern "C" fn duckdb_query_arrow_array(result: duckdb_arrow, out_arra
     let Some(result) = (unsafe { ffi::get_mut(result) }) else {
         return DuckDBError;
     };
-    let next = ffi::guard(
-        Err(Error::new(ErrorKind::Internal, "Unknown error in Fetch")),
-        || result.next_array(),
-    );
+    let next = ffi::guard(Err(Error::new(ErrorKind::Internal, "Unknown error in Fetch")), || {
+        result.next_array()
+    });
     let array = match next {
         Ok(Some(array)) => array,
         Ok(None) => return DuckDBSuccess,
@@ -270,7 +277,9 @@ pub unsafe extern "C" fn duckdb_execute_prepared_arrow(
     if out_result.is_null() {
         return DuckDBError;
     }
-    let options = ffi::guard(ArrowOptions::default(), || ArrowOptions::of(&wrapper.connection().lock()));
+    let options = ffi::guard(ArrowOptions::default(), || {
+        ArrowOptions::of(&wrapper.connection().lock())
+    });
     let Some((result, properties)) = wrapper.run() else {
         return DuckDBError;
     };
@@ -290,7 +299,9 @@ pub unsafe extern "C" fn duckdb_prepared_arrow_schema(
     let Some(wrapper) = (unsafe { crate::prepared::prepared_wrapper(prepared) }) else {
         return DuckDBError;
     };
-    let options = ffi::guard(ArrowOptions::default(), || ArrowOptions::of(&wrapper.connection().lock()));
+    let options = ffi::guard(ArrowOptions::default(), || {
+        ArrowOptions::of(&wrapper.connection().lock())
+    });
     // Every parameter is of type UNKNOWN, which is NULL in Arrow ('AdbcStatementGetParameterSchema')
     let count = wrapper.parameter_count();
     let types = vec![LogicalType::SQLNULL; count];

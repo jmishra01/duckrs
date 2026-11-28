@@ -209,7 +209,10 @@ impl Select {
             && self.sample.is_none()
             && self.from.sample.is_none()
             && !matches!(self.from.kind, TableRefKind::Empty)
-            && self.columns.iter().all(|c| matches!(c.expr.kind, ExprKind::ColumnRef(_)))
+            && self
+                .columns
+                .iter()
+                .all(|c| matches!(c.expr.kind, ExprKind::ColumnRef(_)))
     }
 
     /// `PlainScope`: columns of the FROM clause, filtered.
@@ -315,7 +318,8 @@ fn constant_key(bound: &BoundExpr, exported: &Expr) -> bool {
 /// The arguments of an aggregate as it was called: a holistic one with several keeps them packed in
 /// one STRUCT of fields `a0`, `a1`, ... (`bind_aggregate`), which SQL spells as the arguments again.
 fn holistic_arguments(a: &BoundAggregate) -> &[BoundExpr] {
-    if let (crate::function::aggregates::AggregateKind::Holistic(_), [packed]) = (&a.function.kind, a.children.as_slice())
+    if let (crate::function::aggregates::AggregateKind::Holistic(_), [packed]) =
+        (&a.function.kind, a.children.as_slice())
         && let BoundExprKind::Function { function, children, .. } = &packed.kind
         && function.name == "struct_pack"
         && children.len() > 1
@@ -1855,10 +1859,10 @@ impl Exporter<'_> {
         // `ComposeProjection`: a computed column nothing reads stays, as what computes it can fail (an aggregate
         // too, whatever its arguments)
         let drops_computed = select
-                .columns
-                .iter()
-                .enumerate()
-                .any(|(p, c)| !is_leaf(c) && !positions.contains(&p));
+            .columns
+            .iter()
+            .enumerate()
+            .any(|(p, c)| !is_leaf(c) && !positions.contains(&p));
         let ok = (fromless || !matches!(select.from.kind, TableRefKind::Empty) || select.columns.is_empty())
             && select.composable()
             && !(ungrouped && positions.is_empty())
@@ -1971,12 +1975,16 @@ impl Exporter<'_> {
             .filter_map(|b| fields.iter().position(|f| f.binding == *b))
             .collect();
         // `ComposeInput`: a computed input that can fail, or that a CASE, TRY or COALESCE reads, keeps its SELECT
-        let failing = positions.iter().any(|&p| select.columns.get(p).is_some_and(|c| c.throws));
+        let failing = positions
+            .iter()
+            .any(|&p| select.columns.get(p).is_some_and(|c| c.throws));
         let barrier = groups
             .iter()
             .chain(aggregates.iter().flat_map(|a| a.children.iter().chain(a.filter.iter())))
             .any(has_composition_barrier)
-            && positions.iter().any(|&p| select.columns.get(p).is_some_and(|c| c.kind != Kind::Column));
+            && positions
+                .iter()
+                .any(|&p| select.columns.get(p).is_some_and(|c| c.kind != Kind::Column));
         if !Self::substitutable(&select, &positions, Kind::Computed)
             || !select.composable()
             || matches!(select.from.kind, TableRefKind::Empty)
@@ -3141,9 +3149,9 @@ fn unsupported_variant_keys(node: &duckrs_common::variant::VariantNode) -> bool 
     match node {
         N::Object(children) => {
             let mut names = BTreeSet::new();
-            children
-                .iter()
-                .any(|(key, child)| key.is_empty() || !names.insert(key.to_lowercase()) || unsupported_variant_keys(child))
+            children.iter().any(|(key, child)| {
+                key.is_empty() || !names.insert(key.to_lowercase()) || unsupported_variant_keys(child)
+            })
         }
         N::Array(items) => items.iter().any(unsupported_variant_keys),
         _ => false,

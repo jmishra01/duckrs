@@ -564,7 +564,13 @@ impl Catalog {
         let versions = self.versions.lock();
         let held = versions.owners.get(&entry).is_some_and(|owner| *owner != transaction);
         let committed = versions.changed.get(&entry).is_some_and(|at| *at > start);
-        (held || committed).then(|| if versions.dropped.contains(&entry) { "dropped" } else { "altered" })
+        (held || committed).then(|| {
+            if versions.dropped.contains(&entry) {
+                "dropped"
+            } else {
+                "altered"
+            }
+        })
     }
 
     /// Whether a transaction other than `transaction` holds an index of the table `schema.name` that it created or
@@ -880,7 +886,11 @@ impl Fork {
                 // which the append finds (`AppendLock`); a COMMENT or RENAME shares it, which the commit finds
                 Some(TableOrView::Table(current)) if current.lineage == origin.table.lineage => {
                     let rewritten = current.columns.len() != origin.table.columns.len()
-                        || current.columns.iter().zip(&origin.table.columns).any(|(a, b)| a.ty != b.ty);
+                        || current
+                            .columns
+                            .iter()
+                            .zip(&origin.table.columns)
+                            .any(|(a, b)| a.ty != b.ty);
                     return Err(if rewritten {
                         conflict("altered")
                     } else {

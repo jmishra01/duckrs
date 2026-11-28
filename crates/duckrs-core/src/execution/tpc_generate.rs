@@ -60,19 +60,20 @@ fn generate(generation: &TpcGeneration) -> Result<()> {
     let mut tables: HashMap<&'static str, Arc<TableCatalogEntry>> = HashMap::new();
     match generation.benchmark {
         TpcBenchmark::Tpch => {
-            let mut generator =
-                duckrs_tpch::DBGenGenerator::new(generation.sf, generation.children, generation.step)?;
+            let mut generator = duckrs_tpch::DBGenGenerator::new(generation.sf, generation.children, generation.step)?;
             // `DBGenWrapper::CreateTPCHSchema`: the tables, if they are not there, with NOT NULL columns
             for table in duckrs_tpch::TpchTable::ALL {
                 let spec = table.schema();
                 let name = format!("{}{suffix}", spec.name);
-                let columns: Vec<(String, LogicalType)> =
-                    spec.columns.iter().map(|c| (c.name.to_string(), c.ty.clone())).collect();
+                let columns: Vec<(String, LogicalType)> = spec
+                    .columns
+                    .iter()
+                    .map(|c| (c.name.to_string(), c.ty.clone()))
+                    .collect();
                 create_table(schema, &name, &columns, true, None, OnCreateConflict::Ignore)?;
                 let entry = table_named(schema, &name)?;
                 // `ValidateTPCHTableSchema`: a table that was there must have the columns dbgen fills
-                let found: Vec<(&str, &LogicalType)> =
-                    entry.columns.iter().map(|c| (c.name.as_str(), &c.ty)).collect();
+                let found: Vec<(&str, &LogicalType)> = entry.columns.iter().map(|c| (c.name.as_str(), &c.ty)).collect();
                 duckrs_tpch::validate_tpch_table_schema(table, &name, &found)?;
                 tables.insert(spec.name, entry);
             }

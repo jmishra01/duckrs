@@ -73,8 +73,9 @@ pub unsafe extern "C" fn duckdb_config_option_set_type(option: duckdb_config_opt
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn duckdb_config_option_set_default_value(option: duckdb_config_option, value: duckdb_value) {
     // SAFETY: C passes a live option and a live value.
-    let (Some(option), Some(value)) = (unsafe { option_mut(option) }, unsafe { ffi::get::<_duckdb_value>(value) })
-    else {
+    let (Some(option), Some(value)) = (unsafe { option_mut(option) }, unsafe {
+        ffi::get::<_duckdb_value>(value)
+    }) else {
         return;
     };
     // without a type, the option takes the value's; else the value is cast to it (`DefaultCastAs`, which throws)
@@ -166,7 +167,9 @@ pub unsafe extern "C" fn duckdb_client_context_get_config_option(
 ) -> duckdb_value {
     // SAFETY: C passes a live client context and a NUL-terminated name.
     let (Some(ClientContextWrapper { connection_id }), Some(name)) =
-        (unsafe { ffi::get::<_duckdb_client_context>(context) }, unsafe { ffi::c_str(name) })
+        (unsafe { ffi::get::<_duckdb_client_context>(context) }, unsafe {
+            ffi::c_str(name)
+        })
     else {
         return std::ptr::null_mut();
     };

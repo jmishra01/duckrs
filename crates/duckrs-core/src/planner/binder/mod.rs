@@ -620,7 +620,10 @@ impl BindContext {
             [catalog, schema, table, column, rest @ ..]
                 if !rest.is_empty()
                     && self
-                        .bindings_of(Some(&format!("{catalog}{}{schema}", crate::catalog::SCHEMA_PATH_SEPARATOR)), table)
+                        .bindings_of(
+                            Some(&format!("{catalog}{}{schema}", crate::catalog::SCHEMA_PATH_SEPARATOR)),
+                            table,
+                        )
                         .is_ok_and(|found| found.iter().all(|b| b.column(column).is_none())) =>
             {
                 let qualification = format!("{catalog}{}{schema}", crate::catalog::SCHEMA_PATH_SEPARATOR);

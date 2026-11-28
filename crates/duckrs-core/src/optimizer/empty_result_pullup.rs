@@ -17,12 +17,7 @@ pub fn pull_up(mut op: LogicalOperator) -> LogicalOperator {
     match &op.kind {
         // not ORDER BY or LIMIT: C++ leaves those over an empty input, so a CTE inlined into a join
         // keeps the join of two empty results (`cte_inlining_empty_result`)
-        K::Filter { .. }
-        | K::Projection { .. }
-        | K::Distinct { .. }
-        | K::Window { .. }
-            if any_empty =>
-        {
+        K::Filter { .. } | K::Projection { .. } | K::Distinct { .. } | K::Window { .. } if any_empty => {
             empty_result(&op)
         }
         // an aggregate without groups gives a row for no rows

@@ -561,7 +561,10 @@ fn sniff_next_file(scan: &CsvScanData, file: &CsvFile, data: &[u8]) -> Result<Cs
     } else if same_shape && (!sniffed.header || !first.header) {
         (0..scan.names.len()).map(Some).collect()
     } else if (scan.filename || !scan.hive.is_empty())
-        && !by_name.iter().enumerate().any(|(column, found)| found.is_none() && reads_column(scan, column))
+        && !by_name
+            .iter()
+            .enumerate()
+            .any(|(column, found)| found.is_none() && reads_column(scan, column))
     {
         // `MultiFileColumnMapper` maps the columns that are read: one that nothing reads is not missing
         by_name
@@ -970,7 +973,10 @@ fn scan_file_chunk(scan: &CsvScanData, state: &mut CsvScanState) -> Result<Optio
             if file.header {
                 let header_start = skip_rows(&data, &machine.dialect, &machine.transitions(), bom, rows - 1);
                 let header = &data[header_start..begin.max(header_start)];
-                let end = header.iter().rposition(|&c| c != b'\n' && c != b'\r').map_or(0, |at| at + 1);
+                let end = header
+                    .iter()
+                    .rposition(|&c| c != b'\n' && c != b'\r')
+                    .map_or(0, |at| at + 1);
                 // (the comment lines skipped before it are not part of its line)
                 let line_start = header[..end].iter().rposition(|&c| c == b'\n').map_or(0, |at| at + 1);
                 let size = end - line_start;
@@ -1403,7 +1409,10 @@ fn read_rows(
             };
             let mut row_fields = row.fields;
             // (the comment lines skipped before the row are not part of its line)
-            let first_value = row_fields.first().map_or(span.start, |f| f.offset).clamp(span.start, data.len());
+            let first_value = row_fields
+                .first()
+                .map_or(span.start, |f| f.offset)
+                .clamp(span.start, data.len());
             let line_start = data[span.start..first_value]
                 .iter()
                 .rposition(|&b| b == b'\n')
@@ -1780,7 +1789,9 @@ fn typed_chunk(
                     line: spans[row].line,
                     row_position: spans[row].start + 1,
                     // (a value read as text and cast after has no position of its own)
-                    position: fields[row].filter(|_| parsed_directly(ty)).map(|field| field.offset + 1),
+                    position: fields[row]
+                        .filter(|_| parsed_directly(ty))
+                        .map(|field| field.offset + 1),
                     column: Some(index + 1),
                     column_name: Some(scan.names[index].clone()),
                     kind: "CAST",
@@ -2139,9 +2150,12 @@ impl CsvWriteOptions {
                     .map(|((name, _), field)| Ok((name.clone(), self.formatted_json(field)?)))
                     .collect::<Result<_>>()?,
             ),
-            (LogicalTypeId::List | LogicalTypeId::Array, ValueData::List(items)) => {
-                Json::Array(items.iter().map(|item| self.formatted_json(item)).collect::<Result<_>>()?)
-            }
+            (LogicalTypeId::List | LogicalTypeId::Array, ValueData::List(items)) => Json::Array(
+                items
+                    .iter()
+                    .map(|item| self.formatted_json(item))
+                    .collect::<Result<_>>()?,
+            ),
             _ => value_to_json(value)?,
         })
     }
