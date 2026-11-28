@@ -33,6 +33,7 @@ mod table_constraints;
 mod table_functions;
 pub mod tpc;
 mod user_functions;
+pub(crate) use user_functions::user_cast_expression;
 mod extract_names;
 pub use extract_names::ExtractNames;
 pub use table_functions::named_argument;
@@ -814,10 +815,10 @@ pub type SettingLookup = Box<dyn Fn(&str) -> Result<Value> + Send + Sync>;
 /// A row of `duckdb_settings()`.
 #[derive(Debug, Clone)]
 pub struct SettingRow {
-    pub name: &'static str,
+    pub name: std::borrow::Cow<'static, str>,
     pub value: Option<Value>,
-    pub description: &'static str,
-    pub input_type: &'static str,
+    pub description: std::borrow::Cow<'static, str>,
+    pub input_type: std::borrow::Cow<'static, str>,
     /// `GLOBAL` or `LOCAL`
     pub scope: &'static str,
     pub aliases: &'static [&'static str],

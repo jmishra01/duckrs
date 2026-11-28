@@ -637,6 +637,11 @@ impl UserFunctions {
         }
     }
 
+    /// Whether a cast has been registered.
+    pub fn has_casts(&self) -> bool {
+        !self.casts.read().is_empty()
+    }
+
     /// `MapCastInfo::GetEntry`: the registered cast from `source` to `target`, if there is one.
     pub fn cast(&self, source: &LogicalType, target: &LogicalType) -> Option<UserCast> {
         if self.casts.read().is_empty() {

@@ -1407,10 +1407,10 @@ impl Binder<'_> {
                 _ => (null_text(), Value::null(variant.clone())),
             };
             rows.push(vec![
-                text(setting.name),
+                text(&setting.name),
                 value,
-                text(setting.description),
-                text(setting.input_type),
+                text(&setting.description),
+                text(&setting.input_type),
                 text(setting.scope),
                 Value::list(
                     LogicalType::VARCHAR,

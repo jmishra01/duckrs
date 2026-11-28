@@ -372,6 +372,17 @@ impl DatabaseInstance {
             .map(|database| database.catalog.clone())
     }
 
+    /// The value a setting that can't change while the database runs (`duckdb_api`, `custom_user_agent`) starts with,
+    /// as the configuration a database opens with sets it.
+    pub fn set_startup_setting(&self, name: &str, value: Value) {
+        settings::store_global(name, value, &mut self.settings.write());
+    }
+
+    /// `DBConfig::TryGetCurrentSetting`: the database's value of a setting, or its default.
+    pub fn lookup_setting(&self, name: &str) -> Option<(Value, settings::SettingLookupScope)> {
+        settings::lookup_setting(name, &self.settings.read(), &SettingValues::default())
+    }
+
     /// `LogManager::RegisterLogStorage`: a log storage `SET logging_storage` can name; false when one has the name.
     pub fn register_log_storage(&self, name: &str, storage: Arc<dyn duckrs_core::logging::LogStorageCallback>) -> bool {
         self.log_manager
@@ -1083,6 +1094,29 @@ const DEPRECATED_PRAGMAS: &[&str] = &[
     "disable_object_cache",
 ];
 
+/// `Binder::BindPragma`: the error of a PRAGMA no pragma function has (the logging functions are table functions).
+fn unknown_pragma(name: &str) -> Option<Error> {
+    if ["enable_logging", "disable_logging", "truncate_duckdb_logs"]
+        .iter()
+        .any(|f| f.eq_ignore_ascii_case(name))
+    {
+        return Some(Error::new(
+            ErrorKind::Catalog,
+            format!(
+                "Pragma Function with name \"{name}\" does not exist, but a table function with the same \
+                 name exists, try `CALL \"{name}\"(...)`"
+            ),
+        ));
+    }
+    if PRAGMA_FUNCTIONS.iter().chain(NO_OP_PRAGMAS).any(|f| f.eq_ignore_ascii_case(name)) {
+        return None;
+    }
+    Some(Error::new(
+        ErrorKind::Catalog,
+        format!("Pragma Function with name {name} does not exist!"),
+    ))
+}
+
 const NO_OP_PRAGMAS: &[&str] = &[
     "force_checkpoint",
     "enable_verification",
@@ -1482,6 +1516,8 @@ pub struct ClientContext {
     current_query: String,
     /// the rows of an `Appender` that is flushing
     appended: Option<duckrs_core::planner::binder::AppendedRows>,
+    /// the name the statement an appender flushes with reads its rows under (`BaseAppender::ParseStatement`'s CTE)
+    appended_name: Option<String>,
     /// `DBConfig::replacement_scans` of this connection
     replacement_scans: duckrs_core::planner::binder::ReplacementScans,
     /// `ConnectionSecretStorage`: the secrets `CREATE SECRET ... IN connection` made, which only
@@ -1791,6 +1827,7 @@ impl ClientContext {
             search_path: Vec::new(),
             current_query: String::new(),
             appended: None,
+            appended_name: None,
             replacement_scans: Default::default(),
             connection_secrets: Arc::default(),
             nested: false,
@@ -1814,6 +1851,17 @@ impl ClientContext {
     /// The current value of a setting (`Settings::Get` / `current_setting`).
     pub fn setting(&self, name: &str) -> Option<Value> {
         settings::current_value(name, &self.home.settings.read(), &self.settings)
+    }
+
+    /// `ClientContext::TryGetCurrentSetting`: the current value of a setting and where it comes from.
+    pub fn lookup_setting(&self, name: &str) -> Option<(Value, settings::SettingLookupScope)> {
+        settings::lookup_setting(name, &self.home.settings.read(), &self.settings)
+    }
+
+    /// `DBConfig::AddExtensionOption` of the database: an option SET, RESET, `current_setting` and
+    /// `duckdb_settings()` know from now on, on every connection.
+    pub fn add_extension_option(&self, option: settings::ExtensionOption) -> Result<()> {
+        settings::add_extension_option(option, &mut self.home.settings.write())
     }
 
     /// What spilling operators may hold, from `memory_limit`, and where they spill to, from
@@ -2262,29 +2310,102 @@ impl ClientContext {
         columns: Vec<(String, LogicalType)>,
         chunks: Vec<duckrs_common::vector::DataChunk>,
     ) -> Result<()> {
-        let quote = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
-        let mut target = match schema {
-            Some(schema) => format!("{}.{}", quote(schema), quote(table)),
-            None => quote(table),
+        use duckrs_parser::ast::sql_identifier;
+        // `Appender::ConstructQuery`: the table by catalog, schema and name (`TableDescription::qualified_name`),
+        // with the columns only when the appender chose some (`GetExpectedNames`)
+        let description = self.table_info(catalog, schema, table)?;
+        let target = match &description {
+            Some(found) => format!(
+                "{}.{}.{}",
+                sql_identifier(catalog.filter(|c| !c.is_empty()).unwrap_or(&found.catalog)),
+                sql_identifier(&found.schema),
+                sql_identifier(&found.table)
+            ),
+            None => [catalog, schema, Some(table)]
+                .into_iter()
+                .flatten()
+                .filter(|part| !part.is_empty())
+                .map(sql_identifier)
+                .collect::<Vec<_>>()
+                .join("."),
         };
-        if let Some(catalog) = catalog.filter(|c| !c.is_empty()) {
-            if schema.is_none() {
-                target = format!("{}.{}", quote("main"), target);
-            }
-            target = format!("{}.{target}", quote(catalog));
+        let all_columns = self.table_columns_in(catalog, schema, table).ok();
+        let every_column = all_columns.is_some_and(|all| {
+            all.len() == columns.len() && all.iter().zip(&columns).all(|((a, _), (b, _))| a == b)
+        });
+        let mut query = format!("INSERT INTO {target}");
+        if !every_column {
+            let list: Vec<String> = columns.iter().map(|(name, _)| sql_identifier(name)).collect();
+            query += &format!("({})", list.join(", "));
         }
-        let column_list = columns
-            .iter()
-            .map(|(name, _)| quote(name))
-            .collect::<Vec<_>>()
-            .join(", ");
+        const APPENDED: &str = "__duckdb_internal_appended_data";
+        query += &format!(" FROM {APPENDED}");
         let (names, types): (Vec<String>, Vec<LogicalType>) = columns.into_iter().unzip();
+        let names = if every_column { Vec::new() } else { names };
+        self.append_query(&query, APPENDED, names, types, chunks)
+    }
+
+    /// `QueryAppender::FlushInternal` (`BaseAppender::ParseStatement` and `ClientContext::Append`): runs the single
+    /// INSERT, DELETE or UPDATE statement of `query`, which reads the rows (of `types`) as the table `table_name`
+    /// (`appended_data` without one), a CTE of the statement. The columns are `names`, then `col1`, `col2`, ...
+    pub fn append_query(
+        &mut self,
+        query: &str,
+        table_name: &str,
+        mut names: Vec<String>,
+        types: Vec<LogicalType>,
+        chunks: Vec<duckrs_common::vector::DataChunk>,
+    ) -> Result<()> {
+        let alias = if table_name.is_empty() { "appended_data" } else { table_name };
+        // `Binder::Bind(ColumnDataRef &)`
+        for i in names.len()..types.len() {
+            names.push(format!("col{}", i + 1));
+        }
+        names.truncate(types.len());
         self.appended = Some((names, types, Arc::new(chunks)));
-        let result = self.query(&format!(
-            "INSERT INTO {target} ({column_list}) SELECT * FROM __internal_appender_chunks()"
-        ));
+        self.appended_name = Some(alias.to_string());
+        let result = self.query(query);
         self.appended = None;
+        self.appended_name = None;
         result.map(drop)
+    }
+
+    /// `BaseAppender::ParseStatement`: the appender's rows as a CTE `alias` of the one statement, not materialized.
+    fn add_appended_cte(statements: &mut [(Statement, String)], alias: &str) -> Result<()> {
+        use duckrs_parser::ast::{CteInfo, CteMaterialize};
+        let [(statement, _)] = statements else {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "Expected exactly one query for appending data.",
+            ));
+        };
+        let cte_map = match statement {
+            Statement::Insert(insert) => &mut insert.cte_map,
+            Statement::Delete(delete) => &mut delete.cte_map,
+            Statement::Update(update) => &mut update.cte_map,
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "Unsupported statement type for appender: expected INSERT, DELETE, UPDATE or MERGE INTO",
+                ));
+            }
+        };
+        let Some(Statement::Select(select)) = duckrs_parser::parse_ast("SELECT * FROM __internal_appender_chunks()")?
+            .into_iter()
+            .next()
+        else {
+            return Err(Error::new(ErrorKind::Internal, "the appender's CTE does not parse"));
+        };
+        let info = CteInfo {
+            aliases: Vec::new(),
+            query: Box::new(select.node),
+            key_targets: Vec::new(),
+            materialized: CteMaterialize::Never,
+        };
+        // first, so that the statement's own CTEs can read it too
+        cte_map.0.retain(|(name, _)| !name.eq_ignore_ascii_case(alias));
+        cte_map.0.insert(0, (alias.to_string(), info));
+        Ok(())
     }
 
     pub fn query(&mut self, sql: &str) -> Result<MaterializedQueryResult> {
@@ -2302,7 +2423,7 @@ impl ClientContext {
 
     fn query_text(&mut self, sql: &str) -> Result<MaterializedQueryResult> {
         let _temp = SessionTemp::enter(&self.temp);
-        let statements = match duckrs_parser::parse_ast_with_text(sql, &self.parser_options()) {
+        let mut statements = match duckrs_parser::parse_ast_with_text(sql, &self.parser_options()) {
             Ok(statements) => statements,
             Err(error) => {
                 if let Some(transaction) = &mut self.transaction {
@@ -2311,6 +2432,9 @@ impl ClientContext {
                 return Err(error);
             }
         };
+        if let Some(alias) = self.appended_name.take() {
+            Self::add_appended_cte(&mut statements, &alias)?;
+        }
         let mut result = MaterializedQueryResult {
             names: Vec::new(),
             types: Vec::new(),
@@ -2330,11 +2454,13 @@ impl ClientContext {
                     let old_casting = duckrs_core::function::cast_rules::set_old_implicit_casting(
                         self.setting_text("old_implicit_casting") == "true",
                     );
+                    let casts = duckrs_core::function::cast_rules::RegisteredCastsGuard::set(&self.home.user_functions);
                     let result = match self.verify_no_parameters(statement).and_then(|()| self.verification_statement(statement)) {
                         Ok(Some(replacement)) => self.run_statement(&replacement),
                         Ok(None) => self.run_statement(statement),
                         Err(error) => Err(error),
                     };
+                    drop(casts);
                     duckrs_core::function::cast_rules::set_old_implicit_casting(old_casting);
                     result
                 })
@@ -2527,10 +2653,17 @@ impl ClientContext {
                 "Cannot prepare multiple statements at once!",
             ));
         }
+        let _casts = duckrs_core::function::cast_rules::RegisteredCastsGuard::set(&self.home.user_functions);
         self.prepare_statement(statements.remove(0))
     }
 
     fn prepare_statement(&mut self, statement: Statement) -> Result<Arc<PreparedStatementData>> {
+        // `PragmaHandler::HandlePragmaStatements`: a PRAGMA is expanded, its function looked up, while preparing
+        if let Statement::Pragma(PragmaInfo { name, .. }) = &statement
+            && let Some(error) = unknown_pragma(name)
+        {
+            return Err(error);
+        }
         let declared = parameter_names(&statement.to_string());
         // `BindingMode::PREPARE`: parameters bind as `BoundParameterExpression`s, which take the types their uses
         // give them
@@ -2731,6 +2864,7 @@ impl ClientContext {
         values: HashMap<String, Value>,
         typed: HashSet<String>,
     ) -> Result<MaterializedQueryResult> {
+        let _casts = duckrs_core::function::cast_rules::RegisteredCastsGuard::set(&self.home.user_functions);
         let mut excess: Vec<&str> = values
             .keys()
             .filter(|k| !prepared.parameters.contains(*k))
@@ -5415,7 +5549,7 @@ impl ClientContext {
                     ("table_info" | "show" | "storage_info", [table]) => {
                         Some(format!("SELECT * FROM pragma_{lower}({})", pragma_argument(table)))
                     }
-                    ("version" | "platform" | "database_size" | "metadata_info", []) => {
+                    ("version" | "platform" | "database_size" | "metadata_info" | "user_agent", []) => {
                         Some(format!("SELECT * FROM pragma_{lower}()"))
                     }
                     // `PragmaFunctionsQuery`
@@ -5448,24 +5582,9 @@ impl ClientContext {
                     }
                     return self.execute_statement(&query);
                 }
-                if ["enable_logging", "disable_logging", "truncate_duckdb_logs"]
-                    .iter()
-                    .any(|f| f.eq_ignore_ascii_case(name))
-                {
-                    return Err(Error::new(
-                        ErrorKind::Catalog,
-                        format!(
-                            "Pragma Function with name \"{name}\" does not exist, but a table function with the same \
-                             name exists, try `CALL \"{name}\"(...)`"
-                        ),
-                    ));
-                }
                 // `Binder::BindPragma`: a name no pragma function has
-                if !PRAGMA_FUNCTIONS.iter().any(|f| f.eq_ignore_ascii_case(name)) {
-                    return Err(Error::new(
-                        ErrorKind::Catalog,
-                        format!("Pragma Function with name {name} does not exist!"),
-                    ));
+                if let Some(error) = unknown_pragma(name) {
+                    return Err(error);
                 }
                 // `FunctionBinder::BindPragmaFunction`: a pragma called with the wrong arguments
                 let arity = match lower.as_str() {

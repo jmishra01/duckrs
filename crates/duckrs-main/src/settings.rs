@@ -21,7 +21,8 @@ use duckrs_common::string_util::{candidates_error_message, candidates_message, s
 use duckrs_common::types::LogicalType;
 use duckrs_common::value::Value;
 use duckrs_common::{Error, ErrorKind, Result};
-use duckrs_parser::ast::SetScope;
+pub use duckrs_parser::ast::SetScope;
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 /// Where a setting may be set (`SettingScopeTarget`).
@@ -996,9 +997,84 @@ fn default_value(setting: &SettingDefinition) -> Option<Value> {
     on_set(setting, value.clone()).ok().or(Some(value))
 }
 
-/// Setting values of one scope.
+/// Setting values of one scope. The database's (global) values also hold the extension options registered at run
+/// time (the extension options of `DBConfig::user_settings`), whose values sit after those of the built-in settings.
 #[derive(Debug, Default, Clone)]
-pub struct SettingValues(HashMap<usize, Value>);
+pub struct SettingValues(HashMap<usize, Value>, Vec<ExtensionOption>);
+
+/// `ExtensionOption`: an option registered while the database runs (`DBConfig::AddExtensionOption`, as
+/// `duckdb_register_config_option` does), set, reset and read as any other.
+#[derive(Debug, Clone)]
+pub struct ExtensionOption {
+    pub name: String,
+    pub description: String,
+    pub ty: LogicalType,
+    pub default_value: Value,
+    /// The scope a SET without one uses (`default_scope`): anything but `Global` means the session
+    pub default_scope: SetScope,
+}
+
+/// Where a current value comes from (`SettingLookupResult::GetScope`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingLookupScope {
+    Local,
+    Global,
+}
+
+/// The index of the values of the extension option `at` of the registered ones.
+fn extension_index(at: usize) -> usize {
+    SETTINGS.len() + EXTENSION_SETTINGS.len() + at
+}
+
+/// `DBConfig::TryGetExtensionOption`: a registered extension option by name, case-insensitively, with the index of
+/// its values.
+fn find_extension_option<'a>(name: &str, global: &'a SettingValues) -> Option<(usize, &'a ExtensionOption)> {
+    global
+        .1
+        .iter()
+        .enumerate()
+        .find(|(_, option)| option.name.eq_ignore_ascii_case(name))
+        .map(|(at, option)| (extension_index(at), option))
+}
+
+/// `DBConfig::AddExtensionOption` (`HasExtensionOption` first, as `duckdb_register_config_option` checks): adds
+/// `option`, whose default, unless NULL, becomes its global value. An extension option of that name is an error.
+pub fn add_extension_option(option: ExtensionOption, global: &mut SettingValues) -> Result<()> {
+    if find_extension_option(&option.name, global).is_some() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("extension option \"{}\" already exists", option.name),
+        ));
+    }
+    let index = extension_index(global.1.len());
+    if !option.default_value.is_null() {
+        global.0.insert(index, option.default_value.clone());
+    }
+    global.1.push(option);
+    Ok(())
+}
+
+/// `ExtensionOption::ResolveScope`: `true` means global. Extension options support both scopes.
+fn extension_scope(option: &ExtensionOption, scope: SetScope) -> bool {
+    let scope = if scope == SetScope::Automatic { option.default_scope } else { scope };
+    scope == SetScope::Global
+}
+
+/// `TryGetCurrentSetting`: the current value of `name` and where it comes from: the session's, else the database's,
+/// else the default (global); `None` for no such setting, or one without a value.
+pub fn lookup_setting(name: &str, global: &SettingValues, session: &SettingValues) -> Option<(Value, SettingLookupScope)> {
+    let (index, setting) = match find_setting(name) {
+        Some((index, setting)) => (index, Some(setting)),
+        None => (find_extension_option(name, global)?.0, None),
+    };
+    if let Some(value) = session.0.get(&index) {
+        return Some((value.clone(), SettingLookupScope::Local));
+    }
+    if let Some(value) = global.0.get(&index) {
+        return Some((value.clone(), SettingLookupScope::Global));
+    }
+    default_value(setting?).map(|value| (value, SettingLookupScope::Global))
+}
 
 /// `PhysicalSet::GetSettingScope`: the scope `SET` without a scope uses, and the checks of an
 /// explicit one. `true` means global.
@@ -1057,7 +1133,21 @@ pub fn set_variable(
         return Err(duckrs_core::unported("SET VARIABLE"));
     }
     check_lock(name, global, session)?;
-    let (index, setting) = find_setting(name).ok_or_else(|| unrecognized(name))?;
+    let Some((index, setting)) = find_setting(name) else {
+        // `PhysicalSet::SetExtensionVariable`: the value cast to the option's type, in the resolved scope
+        let (index, option) = find_extension_option(name, global).ok_or_else(|| unrecognized(name))?;
+        let is_global = extension_scope(option, scope);
+        let value = cast_value(value, &option.ty).map_err(|error| match error.kind {
+            ErrorKind::Conversion => Error::new(
+                ErrorKind::InvalidInput,
+                format!("Failed to cast value: {}", error.message),
+            ),
+            _ => error,
+        })?;
+        let target = if is_global { global } else { session };
+        target.0.insert(index, value);
+        return Ok(());
+    };
     read_only(setting.name)?;
     let is_global = resolve_scope(setting, scope)?;
     if value.is_null() {
@@ -1150,7 +1240,22 @@ pub fn reset_variable(
         return Err(duckrs_core::unported("RESET VARIABLE"));
     }
     check_lock(name, global, session)?;
-    let (index, setting) = find_setting(name).ok_or_else(|| unrecognized(name))?;
+    let Some((index, setting)) = find_setting(name) else {
+        // `PhysicalReset::ResetExtensionVariable`: the default, globally unless NULL (`DBConfig::ResetOption`), or
+        // as the session's value
+        let (index, option) = find_extension_option(name, global).ok_or_else(|| unrecognized(name))?;
+        let default = option.default_value.clone();
+        if extension_scope(option, scope) {
+            if default.is_null() {
+                global.0.remove(&index);
+            } else {
+                global.0.insert(index, default);
+            }
+        } else {
+            session.0.insert(index, default);
+        }
+        return Ok(());
+    };
     read_only(setting.name)?;
     running_only(setting.name)?;
     if matches!(setting.name, "allowed_directories" | "allowed_paths") {
@@ -1332,6 +1437,10 @@ pub fn store_global(name: &str, value: Value, global: &mut SettingValues) {
 /// `current_setting`.
 pub fn get_setting(name: &str, global: &SettingValues, session: &SettingValues) -> Result<Value> {
     if find_setting(name).is_none() {
+        if let Some((_, option)) = find_extension_option(name, global) {
+            let value = lookup_setting(name, global, session).map(|(value, _)| value);
+            return Ok(value.unwrap_or_else(|| Value::null(option.ty.clone())));
+        }
         return Err(unrecognized(name));
     }
     let value = current_value(name, global, session).unwrap_or_else(Value::sql_null);
@@ -1347,7 +1456,9 @@ pub fn get_setting(name: &str, global: &SettingValues, session: &SettingValues) 
 }
 
 pub fn current_value(name: &str, global: &SettingValues, session: &SettingValues) -> Option<Value> {
-    let (index, setting) = find_setting(name)?;
+    let Some((index, setting)) = find_setting(name) else {
+        return lookup_setting(name, global, session).map(|(value, _)| value);
+    };
     session
         .0
         .get(&index)
@@ -1378,10 +1489,10 @@ pub fn list_settings(global: &SettingValues, session: &SettingValues) -> Vec<Set
             default_value(setting)
         };
         let row = SettingRow {
-            name: setting.name,
+            name: Cow::Borrowed(setting.name),
             value,
-            description: setting.description,
-            input_type: setting.input_type,
+            description: Cow::Borrowed(setting.description),
+            input_type: Cow::Borrowed(setting.input_type),
             scope,
             aliases: setting.aliases,
             is_debug: setting.is_debug,
@@ -1389,14 +1500,32 @@ pub fn list_settings(global: &SettingValues, session: &SettingValues) -> Vec<Set
         };
         for alias in setting.aliases {
             rows.push(SettingRow {
-                name: alias,
+                name: Cow::Borrowed(alias),
                 aliases: &[],
                 ..row.clone()
             });
         }
         rows.push(row);
     }
-    rows.sort_by(|a, b| a.name.cmp(b.name));
+    // `config.GetExtensionSettings()`: the options registered at run time, global unless the session set one
+    for option in &global.1 {
+        let (value, scope) = match lookup_setting(&option.name, global, session) {
+            Some((value, SettingLookupScope::Local)) => (Some(value), "LOCAL"),
+            Some((value, SettingLookupScope::Global)) => (Some(value), "GLOBAL"),
+            None => (None, "GLOBAL"),
+        };
+        rows.push(SettingRow {
+            name: Cow::Owned(option.name.clone()),
+            value,
+            description: Cow::Owned(option.description.clone()),
+            input_type: Cow::Owned(option.ty.to_string()),
+            scope,
+            aliases: &[],
+            is_debug: false,
+            is_deprecated: false,
+        });
+    }
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
     rows
 }
 
@@ -1484,6 +1613,44 @@ mod tests {
         assert!(err.to_string().contains("Cannot enable external access"), "{err}");
         let err = reset_variable("allowed_directories", SetScope::Automatic, &mut global, &mut session).unwrap_err();
         assert!(err.to_string().contains("enable_external_access is disabled"), "{err}");
+    }
+
+    #[test]
+    fn extension_options() {
+        let (mut global, mut session) = (SettingValues::default(), SettingValues::default());
+        let option = |name: &str, default_scope| ExtensionOption {
+            name: name.into(),
+            description: "an option".into(),
+            ty: LogicalType::INTEGER,
+            default_value: Value::integer(42),
+            default_scope,
+        };
+        add_extension_option(option("my_option", SetScope::Session), &mut global).unwrap();
+        assert!(add_extension_option(option("MY_OPTION", SetScope::Global), &mut global).is_err());
+        add_extension_option(option("my_global", SetScope::Global), &mut global).unwrap();
+        // the default is the global value
+        assert_eq!(
+            lookup_setting("my_option", &global, &session),
+            Some((Value::integer(42), SettingLookupScope::Global))
+        );
+        // SET without a scope uses the option's default scope; the value is cast to its type
+        set_variable("my_option", SetScope::Automatic, &Value::varchar("7"), &mut global, &mut session).unwrap();
+        set_variable("my_global", SetScope::Automatic, &Value::bigint(8), &mut global, &mut session).unwrap();
+        assert_eq!(
+            lookup_setting("my_option", &global, &session),
+            Some((Value::integer(7), SettingLookupScope::Local))
+        );
+        assert_eq!(get_setting("my_global", &global, &session).unwrap(), Value::integer(8));
+        let rows = list_settings(&global, &session);
+        let row = rows.iter().find(|r| r.name == "my_option").unwrap();
+        assert_eq!((row.scope, &*row.input_type), ("LOCAL", "INTEGER"));
+        let err = set_variable("my_option", SetScope::Automatic, &Value::varchar("x"), &mut global, &mut session);
+        assert!(err.is_err());
+        // RESET puts the default back, in the session or globally
+        reset_variable("my_option", SetScope::Automatic, &mut global, &mut session).unwrap();
+        reset_variable("my_global", SetScope::Automatic, &mut global, &mut session).unwrap();
+        assert_eq!(current_value("my_option", &global, &session), Some(Value::integer(42)));
+        assert_eq!(current_value("my_global", &global, &session), Some(Value::integer(42)));
     }
 
     #[test]
