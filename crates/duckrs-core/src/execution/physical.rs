@@ -25,6 +25,7 @@ use crate::function::aggregates::{AggregateState, combine_states, value_keys};
 use crate::planner::expression::{BoundAggregate, BoundExpr, BoundExprKind, ColumnBinding};
 use crate::planner::logical::{
     BoundOrderByNode, COLUMN_IDENTIFIER_ROW_ID, COLUMN_IDENTIFIER_ROW_NUMBER, CteKey, LogicalOperator, OnConflict,
+    PerfectHashGroup,
 };
 use crate::storage::log_writer::can_serialize;
 use duckrs_common::column_data::ColumnDataCollection;
@@ -3456,13 +3457,25 @@ pub struct PhysicalAggregate {
     output: Mutex<Vec<DataChunk>>,
     /// where rows go past the memory limit, for an aggregate that can spill
     spill: Option<AggregateSpill>,
-    /// `PhysicalPerfectHashAggregate`, which C++ plans for groups of small integer ranges; here
-    /// only its name, as the hash table does the same work
-    pub perfect_hash: bool,
+    /// `PhysicalPerfectHashAggregate`, which C++ plans for groups of small integer ranges: their ranges, by which
+    /// the tables of groups find most rows' groups at once ([`GroupTable::enable_direct`])
+    pub perfect_hash: Option<Vec<PerfectHashGroup>>,
 }
 
 /// From how many groups the states of threads are put together by partition, on threads.
 const PARTITIONED_MERGE_GROUPS: usize = 10_000;
+
+/// How many groups the table of a thread's state holds before they go to their partitions and the table starts
+/// again, so that the table rows look up stays in the caches (`RadixHTConfig::SinkCapacity`); the merge puts
+/// together what partitions got.
+const SINK_GROUPS: usize = 1 << 16;
+
+/// How many partitions the groups of threads are merged in: some for each thread, so that threads that finish
+/// theirs take others, a power of two.
+fn merge_partitions() -> usize {
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    (threads * 2).next_power_of_two()
+}
 
 /// How many partitions the rows of an aggregate past the memory limit go into.
 const AGGREGATE_PARTITIONS: usize = 64;
@@ -3589,6 +3602,13 @@ struct AggregateSinkState {
     table: Option<GroupTable>,
     /// what the table took when `bytes` last counted it
     table_bytes: usize,
+    /// for a thread's state, whether its table goes into `parts` when it has [`SINK_GROUPS`] groups
+    may_flush: bool,
+    /// by partition of their hash, the groups of tables that went out, with their states
+    /// (`PartitionedTupleData` of `RadixPartitionedHashTable`): empty, or one per merge partition
+    parts: Vec<PartData>,
+    /// how many groups `parts` has, some of them the same group
+    part_groups: usize,
 }
 
 impl AggregateSinkState {
@@ -3611,8 +3631,25 @@ impl AggregateSinkState {
             full: false,
             table: None,
             table_bytes: 0,
+            may_flush: false,
+            parts: Vec::new(),
+            part_groups: 0,
         }
     }
+
+    /// How many groups it has, in its table or by key and in its parts.
+    fn groups(&self) -> usize {
+        self.group_count + self.part_groups
+    }
+}
+
+/// The groups of one merge partition that a table of a thread had: their values, hashes and states.
+#[derive(Debug)]
+struct PartData {
+    values: Vec<DataChunk>,
+    hashes: Vec<u64>,
+    /// per aggregate, the states of the groups, in the order of the values
+    states: Vec<Vec<AggregateState>>,
 }
 
 /// A row an aggregate with ORDER BY has yet to see.
@@ -3664,7 +3701,7 @@ impl PhysicalAggregate {
             aggregates,
             children,
             spill: None,
-            perfect_hash: false,
+            perfect_hash: None,
             grouping_sets: sets,
             state: Mutex::new(state),
             locals: Mutex::default(),
@@ -4025,14 +4062,25 @@ impl PhysicalAggregate {
                 state.table = Some(GroupTable::new(types)?);
             }
         }
+        if state.may_flush && !state.full && state.table.as_ref().is_some_and(|table| table.len() >= SINK_GROUPS) {
+            self.flush_table(state)?;
+        }
         let columns: Vec<&Vector> = set.groups.iter().map(|&g| &vectors[g]).collect();
         if let Some(ids) = self.find_dictionary_groups(set, vectors, &columns, count, state)? {
             return Ok(ids);
         }
         if let Some(table) = &mut state.table {
             let groups = DataChunk::from_columns(columns.iter().map(|&column| column.clone()).collect(), count);
-            let hashes = GroupTable::hash(&groups)?;
-            let (ids, new_rows) = table.find_or_create(&groups, &hashes)?;
+            if let Some(ranges) = &self.perfect_hash {
+                table.enable_direct(ranges);
+            }
+            let (ids, new_rows) = match table.find_or_create_direct(&groups)? {
+                Some(found) => found,
+                None => {
+                    let hashes = GroupTable::hash(&groups)?;
+                    table.find_or_create(&groups, &hashes)?
+                }
+            };
             state.group_count = table.len();
             self.add_groups(set, vectors, count, new_rows, state)?;
             return Ok(ids);
@@ -4057,6 +4105,53 @@ impl PhysicalAggregate {
         }
         self.add_groups(set, vectors, count, new_rows, state)?;
         Ok(ids)
+    }
+
+    /// Moves the groups of the table of `state` to their partitions in `parts` with their states, and starts
+    /// the table again (`AbandonInternal`): their values are read out while the table is still in the caches.
+    fn flush_table(&self, state: &mut AggregateSinkState) -> Result<()> {
+        let Some(table) = state.table.as_mut().filter(|table| !table.is_empty()) else {
+            return Ok(());
+        };
+        let partitions = merge_partitions();
+        if state.parts.is_empty() {
+            state.parts = (0..partitions)
+                .map(|_| PartData {
+                    values: Vec::new(),
+                    hashes: Vec::new(),
+                    states: self.aggregates.iter().map(|_| Vec::new()).collect(),
+                })
+                .collect();
+        }
+        let partition_of: Vec<usize> = table
+            .hashes()
+            .iter()
+            .map(|&hash| (hash >> 32) as usize & (partitions - 1))
+            .collect();
+        let mut ids: Vec<Vec<usize>> = vec![Vec::new(); partitions];
+        for (id, &partition) in partition_of.iter().enumerate() {
+            ids[partition].push(id);
+        }
+        for (part, ids) in state.parts.iter_mut().zip(&ids) {
+            for batch in ids.chunks(STANDARD_VECTOR_SIZE) {
+                part.values.push(table.gather(batch));
+                part.hashes.extend(batch.iter().map(|&id| table.hashes()[id]));
+            }
+        }
+        let states = std::mem::replace(&mut state.states, self.aggregates.iter().map(|_| Vec::new()).collect());
+        for (i, states) in states.into_iter().enumerate() {
+            for (s, &partition) in states.into_iter().zip(&partition_of) {
+                state.parts[partition].states[i].push(s);
+            }
+        }
+        state.part_groups += table.len();
+        state.group_count = 0;
+        // a new table as large as the old got, whose growth counts from there; what the groups take stays counted
+        let mut fresh = GroupTable::new(state.group_values.types().to_vec())?;
+        fresh.reserve(table.len());
+        *table = fresh;
+        state.table_bytes = table.size_in_bytes();
+        Ok(())
     }
 
     /// Whether the groups of a state can be found in a [`GroupTable`] while rows come in: one grouping set, and
@@ -4296,19 +4391,11 @@ impl PhysicalAggregate {
     }
 }
 
-/// The groups of one thread in one partition, for [`PhysicalAggregate::merge_tables`]: their ids in the thread's
-/// table, and per aggregate their states, in that order.
-struct PartGroups {
-    thread: usize,
-    ids: Vec<usize>,
-    states: Vec<Vec<AggregateState>>,
-}
-
 impl PhysicalOperator for PhysicalAggregate {
     fn name(&self) -> &'static str {
         if self.groups.is_empty() && self.grouping_sets.len() == 1 {
             "UNGROUPED_AGGREGATE"
-        } else if self.perfect_hash {
+        } else if self.perfect_hash.is_some() {
             "PERFECT_HASH_GROUP_BY"
         } else {
             "HASH_GROUP_BY"
@@ -4349,7 +4436,9 @@ impl PhysicalOperator for PhysicalAggregate {
             .iter()
             .map(|set| {
                 let types = set.groups.iter().map(|&g| self.groups[g].return_type.clone()).collect();
-                AggregateSinkState::new(types, &self.aggregates)
+                let mut state = AggregateSinkState::new(types, &self.aggregates);
+                state.may_flush = true;
+                state
             })
             .collect();
         if let Some(spill) = &self.spill {
@@ -4367,6 +4456,8 @@ impl PhysicalOperator for PhysicalAggregate {
             .expect("aggregate local state");
         // a state that never spilled waits for the others, to be put together by partition
         if self.partitioned_merge() && local.len() == 1 && !local[0].full {
+            // its groups go to their partitions here, on its thread
+            self.flush_table(&mut local[0])?;
             self.locals.lock().push(local.remove(0));
             return Ok(());
         }
@@ -4386,12 +4477,13 @@ impl PhysicalOperator for PhysicalAggregate {
             let serial = !states[0].full && !self.merged_locals.load(Ordering::Relaxed);
             if serial && states[0].group_count > 0 {
                 let types = states[0].group_values.types().to_vec();
-                locals.push(std::mem::replace(
-                    &mut states[0],
-                    AggregateSinkState::new(types, &self.aggregates),
-                ));
+                let mut state = std::mem::replace(&mut states[0], AggregateSinkState::new(types, &self.aggregates));
+                if state.table.is_some() {
+                    self.flush_table(&mut state)?;
+                }
+                locals.push(state);
             }
-            let groups: usize = locals.iter().map(|l| l.group_count).sum();
+            let groups: usize = locals.iter().map(AggregateSinkState::groups).sum();
             if serial && locals.len() > 1 && groups >= PARTITIONED_MERGE_GROUPS {
                 let output = self.merge_partitioned(locals)?;
                 if let Some(spill) = &self.spill {
@@ -4493,18 +4585,9 @@ impl PhysicalAggregate {
     fn merge_partitioned(&self, locals: Vec<AggregateSinkState>) -> Result<Vec<DataChunk>> {
         let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
         let partitions = (threads * 2).next_power_of_two();
-        if locals
-            .iter()
-            .all(|local| local.table.is_some() || local.group_count == 0)
-        {
-            let locals = locals
-                .into_iter()
-                .filter(|local| local.table.is_some())
-                .collect::<Vec<_>>();
-            if locals.is_empty() {
-                return Ok(Vec::new());
-            }
-            return self.merge_tables(locals, partitions);
+        if locals.iter().all(|local| local.group_count == 0) {
+            // the groups of every thread are in their partitions
+            return self.merge_parts(locals);
         }
         // split each thread's state, on threads
         let split: Vec<Vec<AggregateSinkState>> = std::thread::scope(|scope| {
@@ -4574,6 +4657,22 @@ impl PhysicalAggregate {
         ids: &[usize],
         states: Vec<Vec<AggregateState>>,
     ) -> Result<()> {
+        let values: Vec<DataChunk> = ids
+            .chunks(STANDARD_VECTOR_SIZE)
+            .map(|part| source.gather(part))
+            .collect();
+        let hashes: Vec<u64> = ids.iter().map(|&id| source.hashes()[id]).collect();
+        self.absorb_values(into, &values, &hashes, states)
+    }
+
+    /// [`Self::absorb`] of groups whose values are the rows of `values`, with `hashes` and `states` in that order.
+    fn absorb_values(
+        &self,
+        into: &mut AggregateSinkState,
+        values: &[DataChunk],
+        hashes: &[u64],
+        states: Vec<Vec<AggregateState>>,
+    ) -> Result<()> {
         if into.table.is_none() {
             if into.group_count > 0 {
                 return Err(Error::new(
@@ -4584,23 +4683,26 @@ impl PhysicalAggregate {
             into.table = Some(GroupTable::new(into.group_values.types().to_vec())?);
         }
         let table = into.table.as_mut().expect("made above");
-        let mut targets = Vec::with_capacity(ids.len());
-        for part in ids.chunks(STANDARD_VECTOR_SIZE) {
-            let values = source.gather(part);
-            let hashes: Vec<u64> = part.iter().map(|&id| source.hashes()[id]).collect();
-            let (found, _) = table.find_or_create(&values, &hashes)?;
+        let mut targets = Vec::with_capacity(hashes.len());
+        let mut offset = 0;
+        for chunk in values {
+            let (found, _) = table.find_or_create(chunk, &hashes[offset..offset + chunk.len()])?;
             targets.extend(found);
+            offset += chunk.len();
         }
         let before = into.group_count;
         into.group_count = table.len();
+        // the groups new here that have a state yet: groups from several tables of one thread can be the same
+        let mut placed = vec![false; into.group_count - before];
         for (i, (aggregate, sourced)) in self.aggregates.iter().zip(states).enumerate() {
             let kind = aggregate.function.kind;
             let merged = &mut into.states[i];
             merged.resize(into.group_count, kind.initial_state());
+            placed.fill(false);
             for (&target, source) in targets.iter().zip(sourced) {
                 let slot = &mut merged[target];
-                if target >= before {
-                    // a group new here has no state yet, and no other group of `source` is it
+                if target >= before && !std::mem::replace(&mut placed[target - before], true) {
+                    // a group new here has no state yet
                     *slot = source;
                     continue;
                 }
@@ -4611,65 +4713,64 @@ impl PhysicalAggregate {
         Ok(())
     }
 
-    /// [`Self::merge_partitioned`] of states whose groups are in tables (`RadixPartitionedHashTable::Finalize`):
-    /// the groups of each thread go to their partition by the hash they have, and each partition puts those of
-    /// every thread in a table of its own, the values of each group copied once, on a thread of its own.
-    fn merge_tables(&self, locals: Vec<AggregateSinkState>, partitions: usize) -> Result<Vec<DataChunk>> {
+    /// [`Self::merge_partitioned`] of states whose groups are in partitions (`RadixPartitionedHashTable::Finalize`):
+    /// each partition puts what every thread has of it in a table of its own, and gives its output, on threads that
+    /// take partitions until there are none.
+    fn merge_parts(&self, locals: Vec<AggregateSinkState>) -> Result<Vec<DataChunk>> {
         let set = &self.grouping_sets[0];
         let types = locals[0].group_values.types().to_vec();
-        // per thread, its table, and per partition its groups with their states
-        let mut tables = Vec::with_capacity(locals.len());
-        let mut parts: Vec<Vec<PartGroups>> = (0..partitions).map(|_| Vec::new()).collect();
-        for (thread, local) in locals.into_iter().enumerate() {
-            let table = local.table.expect("every state has a table");
-            let mut by_partition: Vec<PartGroups> = (0..partitions)
-                .map(|_| PartGroups {
-                    thread,
-                    ids: Vec::new(),
-                    states: self.aggregates.iter().map(|_| Vec::new()).collect(),
-                })
-                .collect();
-            for (id, &hash) in table.hashes().iter().enumerate() {
-                by_partition[(hash >> 32) as usize & (partitions - 1)].ids.push(id);
-            }
-            for (i, states) in local.states.into_iter().enumerate() {
-                let mut states = states.into_iter();
-                for (id, state) in states.by_ref().enumerate().take(table.len()) {
-                    let partition = (table.hashes()[id] >> 32) as usize & (partitions - 1);
-                    by_partition[partition].states[i].push(state);
+        let partitions = locals.iter().map(|local| local.parts.len()).max().unwrap_or(0);
+        let mut by_partition: Vec<Vec<PartData>> = (0..partitions).map(|_| Vec::new()).collect();
+        for local in locals {
+            for (p, part) in local.parts.into_iter().enumerate() {
+                if !part.hashes.is_empty() {
+                    by_partition[p].push(part);
                 }
             }
-            for (p, part) in by_partition.into_iter().enumerate() {
-                if !part.ids.is_empty() {
-                    parts[p].push(part);
-                }
-            }
-            tables.push(table);
         }
-        let tables = &tables;
-        let outputs: Vec<Vec<DataChunk>> = std::thread::scope(|scope| {
-            let handles: Vec<_> = parts
-                .into_iter()
-                .filter(|parts| !parts.is_empty())
-                .map(|parts| {
-                    let types = types.clone();
-                    scope.spawn(move || -> Result<Vec<DataChunk>> {
-                        let mut merged = AggregateSinkState::new(types, &self.aggregates);
-                        for part in parts {
-                            self.absorb(&mut merged, &tables[part.thread], &part.ids, part.states)?;
+        let work: Vec<Mutex<Vec<PartData>>> = by_partition.into_iter().map(Mutex::new).collect();
+        let outputs: Vec<Mutex<Vec<DataChunk>>> = (0..partitions).map(|_| Mutex::default()).collect();
+        let next = AtomicUsize::new(0);
+        let merge = |parts: Vec<PartData>| -> Result<Vec<DataChunk>> {
+            let mut merged = AggregateSinkState::new(types.clone(), &self.aggregates);
+            // room for the most groups the partition can have, up to a few times its largest part
+            let total: usize = parts.iter().map(|part| part.hashes.len()).sum();
+            let largest = parts.iter().map(|part| part.hashes.len()).max().unwrap_or(0);
+            let mut table = GroupTable::new(types.clone())?;
+            table.reserve(total.min(largest * 4));
+            merged.table = Some(table);
+            for part in parts {
+                self.absorb_values(&mut merged, &part.values, &part.hashes, part.states)?;
+            }
+            let mut output = Vec::new();
+            self.set_output(set, &merged, &mut output)?;
+            Ok(output)
+        };
+        let threads = std::thread::available_parallelism()
+            .map_or(4, |n| n.get())
+            .min(partitions);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..threads)
+                .map(|_| {
+                    scope.spawn(|| -> Result<()> {
+                        loop {
+                            let p = next.fetch_add(1, Ordering::Relaxed);
+                            if p >= partitions {
+                                return Ok(());
+                            }
+                            let parts = std::mem::take(&mut *work[p].lock());
+                            if !parts.is_empty() {
+                                *outputs[p].lock() = merge(parts)?;
+                            }
                         }
-                        let mut output = Vec::new();
-                        self.set_output(set, &merged, &mut output)?;
-                        Ok(output)
                     })
                 })
                 .collect();
             handles
                 .into_iter()
-                .map(|h| h.join().expect("an aggregate merge thread"))
-                .collect::<Result<Vec<_>>>()
+                .try_for_each(|h| h.join().expect("an aggregate merge thread"))
         })?;
-        Ok(outputs.into_iter().flatten().collect())
+        Ok(outputs.into_iter().flat_map(Mutex::into_inner).collect())
     }
 
     /// The groups of `state` in `partitions` states, by the hash of their key.
@@ -4735,6 +4836,11 @@ impl PhysicalAggregate {
 
     /// `CombineStates`: the groups of a thread go into `state`.
     fn merge_groups(&self, state: &mut AggregateSinkState, mut local: AggregateSinkState) -> Result<()> {
+        for part in std::mem::take(&mut local.parts) {
+            if !part.hashes.is_empty() {
+                self.absorb_values(state, &part.values, &part.hashes, part.states)?;
+            }
+        }
         // a thread that found no group of a set with groups adds nothing (a set without them has its one group)
         if local.table.is_none() && local.group_count == 0 && !local.group_values.types().is_empty() {
             return Ok(());

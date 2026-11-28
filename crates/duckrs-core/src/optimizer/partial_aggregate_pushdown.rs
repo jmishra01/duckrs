@@ -728,7 +728,7 @@ fn aggregate_operator(
             aggregates,
             grouping_sets,
             grouping_functions: Vec::new(),
-            perfect_hash: false,
+            perfect_hash: None,
             domain_cap: None,
         },
         vec![child],

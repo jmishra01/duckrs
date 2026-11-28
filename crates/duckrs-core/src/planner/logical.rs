@@ -35,6 +35,15 @@ pub struct PushedExtract {
     pub variant_path: Option<(Vec<String>, crate::planner::expression::BoundExpr)>,
 }
 
+/// The range of a group of a perfect hash aggregate (`group_minima` and `required_bits` of
+/// `PhysicalPerfectHashAggregate`): its smallest value, and the bits of a value's offset from it,
+/// where 0 is NULL and the smallest value is 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PerfectHashGroup {
+    pub min: i128,
+    pub bits: u32,
+}
+
 #[derive(Debug, Clone)]
 pub enum LogicalOperatorKind {
     /// `LogicalGet` of a table: scans `column_ids` (indexes into the table's columns).
@@ -165,8 +174,9 @@ pub enum LogicalOperatorKind {
         grouping_sets: Vec<BTreeSet<usize>>,
         grouping_functions: Vec<Vec<usize>>,
         /// `CanUsePerfectHashAggregate`, which the statistics tell: the groups are integers of so
-        /// small a range that a value's offset from the minimum can index the groups' table
-        perfect_hash: bool,
+        /// small a range that a value's offset from the minimum can index the groups' table; the
+        /// range of each group (`group_stats`)
+        perfect_hash: Option<Vec<PerfectHashGroup>>,
         /// `CapGroupedAggregateCardinalityByKeyDomain`, which the statistics tell: at most how many
         /// combinations of groups there are, from the ranges and types of the groups
         domain_cap: Option<u64>,
