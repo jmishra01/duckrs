@@ -11,8 +11,8 @@
 
 use super::dict_fsst_analyze::{bit_width, packed_size};
 use super::fsst::SymbolTable;
-use pintail_common::STANDARD_VECTOR_SIZE;
 use hashbrown::HashSet;
+use pintail_common::STANDARD_VECTOR_SIZE;
 
 /// `DictionaryCompression::MINIMUM_COMPRESSION_RATIO`, a `float`.
 const DICTIONARY_COMPRESSION_RATIO: f32 = 1.2;

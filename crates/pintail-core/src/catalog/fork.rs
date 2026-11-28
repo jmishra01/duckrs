@@ -17,12 +17,12 @@ use super::{
     TableCatalogEntry, TableConstraint, TableOrView, key,
 };
 use crate::execution::constraints;
+use parking_lot::{Mutex, RwLock};
 use pintail_common::column_data::ColumnDataCollection;
 use pintail_common::types::LogicalType;
 use pintail_common::value::Value;
 use pintail_common::vector::DataChunk;
 use pintail_common::{Error, ErrorKind, Result, STANDARD_VECTOR_SIZE};
-use parking_lot::{Mutex, RwLock};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

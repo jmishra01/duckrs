@@ -13,9 +13,9 @@
 use super::aggregate_reuse::{Origin, has_complete_grouping, reference_index, unary_aggregate_path};
 use crate::planner::expression::{BoundAggregate, BoundExpr, BoundExprKind, ColumnBinding};
 use crate::planner::logical::{LogicalOperator, LogicalOperatorKind as K};
+use parking_lot::Mutex;
 use pintail_common::column_data::ColumnDataCollection;
 use pintail_parser::ast::{ComparisonOp, JoinType};
-use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 

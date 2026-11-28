@@ -17,13 +17,13 @@ use super::printf::format_callback;
 use super::{ScalarCallback, ScalarFunction, ScalarFunctionSet};
 use crate::planner::binder::range_parameters;
 use crate::planner::expression::{BoundExpr, BoundExprKind};
+use parking_lot::Mutex;
 use pintail_common::hash::{combine_hash, hash_vector};
 use pintail_common::sort_key::{NullOrder, OrderModifiers, OrderType, create_sort_keys};
 use pintail_common::types::{Interval, LogicalType, LogicalTypeId};
 use pintail_common::value::{Value, ValueData};
 use pintail_common::vector::{DataChunk, Vector};
 use pintail_common::{Error, ErrorKind, Result};
-use parking_lot::Mutex;
 
 fn binder_error(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::Binder, message)

@@ -10,6 +10,7 @@ use super::expression_executor::{evaluate_scalar, execute};
 use super::physical::{PhysicalOperator, SourceState, scan_collection};
 use crate::function::aggregates::{AggregateKind, value_keys};
 use crate::planner::expression::{BoundExpr, BoundWindow, WindowFunction};
+use parking_lot::Mutex;
 use pintail_common::column_data::ColumnDataCollection;
 use pintail_common::sort_key::{OrderModifiers, create_sort_keys};
 use pintail_common::types::{LogicalType, LogicalTypeId};
@@ -17,7 +18,6 @@ use pintail_common::value::{Value, ValueData};
 use pintail_common::vector::{DataChunk, Vector};
 use pintail_common::{Error, ErrorKind, Result, STANDARD_VECTOR_SIZE};
 use pintail_parser::ast::{WindowBoundary, WindowExclude};
-use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 

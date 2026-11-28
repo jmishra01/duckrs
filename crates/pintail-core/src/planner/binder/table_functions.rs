@@ -124,7 +124,9 @@ impl Binder<'_> {
         pintail_parser::transformer::visit_expr_mut(&mut expr.clone(), &mut |e: &mut Expr| {
             // in a scalar macro's body it is a column under the mark
             macro_parameter |= match &e.kind {
-                pintail_parser::ast::ExprKind::Constant(literal) => literal.text == super::macros::CREATE_PARAMETER_MARK,
+                pintail_parser::ast::ExprKind::Constant(literal) => {
+                    literal.text == super::macros::CREATE_PARAMETER_MARK
+                }
                 pintail_parser::ast::ExprKind::ColumnRef(names) => {
                     names.len() == 2 && names[0] == super::macros::CREATE_PARAMETER_MARK
                 }

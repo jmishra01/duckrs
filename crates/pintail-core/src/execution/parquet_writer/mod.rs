@@ -20,13 +20,13 @@ use geoparquet::{GeoParquetFileMetadata, geometry_crs_annotation};
 use written_stats::StatsAccumulator;
 pub use written_stats::WrittenFileStats;
 
+use encoding::{
+    BssEncoder, DbpEncoder, DlbaEncoder, RleBpEncoder, Thrift, bit_width_of_count, bit_width_of_max, ttype, xxhash64,
+};
 use pintail_common::geometry::GeometryStats;
 use pintail_common::types::{LogicalType, LogicalTypeId, TimeTz};
 use pintail_common::value::{Value, ValueData};
 use pintail_common::{Error, ErrorKind, Result, STANDARD_VECTOR_SIZE};
-use encoding::{
-    BssEncoder, DbpEncoder, DlbaEncoder, RleBpEncoder, Thrift, bit_width_of_count, bit_width_of_max, ttype, xxhash64,
-};
 use std::collections::HashMap;
 use std::io::Write;
 

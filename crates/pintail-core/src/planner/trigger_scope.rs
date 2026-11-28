@@ -4,10 +4,10 @@
 //! and OLD TABLE (which C++ makes CTEs of the body), and for FOR EACH ROW the row as `new` or `old`
 //! (`SetupRowScope`). The statements of a body bind while it is set.
 
+use parking_lot::Mutex;
 use pintail_common::column_data::ColumnDataCollection;
 use pintail_common::types::LogicalType;
 use pintail_common::value::Value;
-use parking_lot::Mutex;
 use std::cell::RefCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

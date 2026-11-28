@@ -15,10 +15,10 @@ use super::join_order::{PlanEstimate, estimate_plan};
 use super::rewriter::{aggregate_can_throw, can_throw, contains_barrier};
 use crate::planner::expression::{BoundAggregate, BoundExpr, BoundExprKind, ColumnBinding};
 use crate::planner::logical::{COLUMN_IDENTIFIER_ROW_ID, LogicalOperator, LogicalOperatorKind as K};
+use parking_lot::Mutex;
 use pintail_common::column_data::ColumnDataCollection;
 use pintail_common::types::LogicalType;
 use pintail_parser::ast::JoinType;
-use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 

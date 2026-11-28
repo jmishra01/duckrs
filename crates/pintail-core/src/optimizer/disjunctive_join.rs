@@ -10,11 +10,11 @@ use super::common_subplan::{max_table_index, visit_bindings};
 use super::rewriter::can_throw;
 use crate::planner::expression::{BoundExpr, BoundExprKind, BoundOperator, ColumnBinding};
 use crate::planner::logical::{JoinAlgorithm, JoinCondition, LogicalOperator, LogicalOperatorKind as K};
+use parking_lot::Mutex;
 use pintail_common::column_data::ColumnDataCollection;
 use pintail_common::types::LogicalType;
 use pintail_common::value::Value;
 use pintail_parser::ast::{ComparisonOp, JoinType};
-use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 

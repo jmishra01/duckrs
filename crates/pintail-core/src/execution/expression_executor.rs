@@ -411,7 +411,8 @@ fn slice_rows(input: &DataChunk, rows: &[u32]) -> DataChunk {
 
 /// Writes `source[i]` to `result[rows[i]]`.
 fn scatter(source: &Vector, rows: &[u32], result: &mut Vector) -> Result<()> {
-    if source.logical_type() == result.logical_type() && result.vector_type() == pintail_common::vector::VectorType::Flat
+    if source.logical_type() == result.logical_type()
+        && result.vector_type() == pintail_common::vector::VectorType::Flat
     {
         let u = source.to_unified(rows.len());
         macro_rules! typed {

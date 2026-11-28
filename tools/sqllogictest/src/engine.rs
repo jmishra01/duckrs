@@ -120,7 +120,9 @@ struct PintailDatabase(pintail::Database);
 
 impl Database for PintailDatabase {
     fn connect(&self) -> Result<Box<dyn Connection>, String> {
-        Ok(Box::new(PintailConnection(self.0.connect().map_err(|e| e.to_string())?)))
+        Ok(Box::new(PintailConnection(
+            self.0.connect().map_err(|e| e.to_string())?,
+        )))
     }
 }
 

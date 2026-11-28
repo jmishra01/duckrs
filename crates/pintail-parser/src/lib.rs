@@ -17,8 +17,8 @@ pub mod unicode;
 pub use grammar::Grammar;
 pub use matcher::{ParseNode, TerminalValue};
 
-use pintail_common::{Error, ErrorKind, Result};
 use matcher::Matcher;
+use pintail_common::{Error, ErrorKind, Result};
 use std::sync::Arc;
 use tokenizer::{Token, TokenType};
 

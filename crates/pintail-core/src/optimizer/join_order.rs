@@ -2483,7 +2483,9 @@ fn filter_fraction(cardinality: f64, fraction: f64) -> f64 {
 /// `EstimateFilterRows` for one conjunct: the rows it keeps, and whether it is modeled.
 fn conjunct_rows(cardinality: f64, conjunct: &BoundExpr, child: &RelationStats) -> (f64, bool) {
     match &conjunct.kind {
-        BoundExprKind::Constant(value) if conjunct.return_type.id() == pintail_common::types::LogicalTypeId::Boolean => {
+        BoundExprKind::Constant(value)
+            if conjunct.return_type.id() == pintail_common::types::LogicalTypeId::Boolean =>
+        {
             let keeps = *value == Value::boolean(true);
             (if keeps { cardinality } else { 0.0 }, true)
         }

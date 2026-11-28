@@ -13,11 +13,11 @@
 pub use super::aggregates::{AggregateFunction, AggregateFunctionSet};
 use super::aggregates::{AggregateKind, AggregateState};
 use crate::planner::expression::BoundExpr;
+use parking_lot::{Mutex, RwLock};
 use pintail_common::types::LogicalType;
 use pintail_common::value::Value;
 use pintail_common::vector::{DataChunk, SelectionVector, Vector};
 use pintail_common::{Error, ErrorKind, Result};
-use parking_lot::{Mutex, RwLock};
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;

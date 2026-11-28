@@ -28,6 +28,7 @@ use crate::planner::expression::{BoundExpr, BoundExprKind, ColumnBinding};
 use crate::planner::logical::{
     BoundOrderByNode, COLUMN_IDENTIFIER_ROW_ID, CteKey, LogicalOperator, LogicalOperatorKind,
 };
+use parking_lot::Mutex;
 use pintail_common::column_data::ColumnDataCollection;
 use pintail_common::sort_key::OrderModifiers;
 use pintail_common::string_util::{candidates_message, similarity_rating, top_n_strings};
@@ -43,7 +44,6 @@ use pintail_parser::ast::{
 };
 use pintail_parser::transformer::visit_expr_mut;
 use pintail_parser::{ast, parse_ast};
-use parking_lot::Mutex;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 

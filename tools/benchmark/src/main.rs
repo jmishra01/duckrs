@@ -9,7 +9,7 @@
 //! ```
 
 use benchmark::{Config, Outcome, discover, geometric_mean, run_benchmark};
-use sqllogictest::engine::{PintailEngine, Engine};
+use sqllogictest::engine::{Engine, PintailEngine};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;

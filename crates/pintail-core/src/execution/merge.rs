@@ -10,13 +10,13 @@ use super::physical::{PhysicalOperator, SourceState, check_buffered, scan_collec
 use crate::catalog::{TableCatalogEntry, TableConstraint};
 use crate::planner::expression::BoundExpr;
 use crate::planner::logical::BoundMergeAction;
+use parking_lot::Mutex;
 use pintail_common::column_data::ColumnDataCollection;
 use pintail_common::types::LogicalType;
 use pintail_common::value::{Value, ValueData};
 use pintail_common::vector::{DataChunk, SelectionVector};
 use pintail_common::{Error, ErrorKind, Result, STANDARD_VECTOR_SIZE};
 use pintail_parser::ast::{MergeActionType, MergeCondition};
-use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 

@@ -827,7 +827,9 @@ fn expression_depth_is_limited_like_duckdb() {
         ..Default::default()
     };
     let casts = format!("SELECT 1{}", "::INTEGER".repeat(150));
-    let err = pintail_parser::parse_ast_with(&casts, &options).unwrap_err().to_string();
+    let err = pintail_parser::parse_ast_with(&casts, &options)
+        .unwrap_err()
+        .to_string();
     assert!(
         err.starts_with("Parser Error: Max expression depth limit of 100 exceeded"),
         "{err}"

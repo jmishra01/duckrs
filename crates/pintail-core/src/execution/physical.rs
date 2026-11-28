@@ -28,6 +28,7 @@ use crate::planner::logical::{
     PerfectHashGroup,
 };
 use crate::storage::log_writer::can_serialize;
+use parking_lot::Mutex;
 use pintail_common::column_data::ColumnDataCollection;
 use pintail_common::sort_key::{
     NullOrder, OrderModifiers, OrderType, RowKey, RowKeyMap, RowKeySet, create_row_key_buffer, create_row_keys,
@@ -38,7 +39,6 @@ use pintail_common::value::{Value, ValueData};
 use pintail_common::vector::{DataChunk, SelectionVector, StringCopy, Vector};
 use pintail_common::{Error, ErrorKind, Result, STANDARD_VECTOR_SIZE};
 use pintail_parser::ast::{JoinType, SampleMethod, SampleOptions, sql_identifier};
-use parking_lot::Mutex;
 use std::any::Any;
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -348,7 +348,9 @@ impl PhysicalTableScan {
             match *self.column_ids.get(index)? {
                 COLUMN_IDENTIFIER_ROW_ID => Some(crate::catalog::ColumnZone {
                     min: Some(pintail_common::value::Value::bigint(ids.id(first_row) as i64)),
-                    max: Some(pintail_common::value::Value::bigint(ids.id(first_row + count - 1) as i64)),
+                    max: Some(pintail_common::value::Value::bigint(
+                        ids.id(first_row + count - 1) as i64
+                    )),
                     ..crate::catalog::ColumnZone::default()
                 }),
                 COLUMN_IDENTIFIER_ROW_NUMBER => None,

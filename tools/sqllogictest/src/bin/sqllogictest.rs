@@ -1,6 +1,6 @@
 use clap::{Parser, ValueEnum};
 use sqllogictest::diff::{DiffEngine, DiffOptions};
-use sqllogictest::engine::{PintailEngine, Engine};
+use sqllogictest::engine::{Engine, PintailEngine};
 use sqllogictest::report;
 use sqllogictest::runner::{self, FileReport, Outcome, RunConfig};
 use std::io::Read;
@@ -97,7 +97,10 @@ struct Args {
 
 fn engine(kind: EngineKind) -> Result<(Box<dyn Engine>, String), String> {
     match kind {
-        EngineKind::Pintail => Ok((Box::new(PintailEngine), format!("pintail {}", env!("CARGO_PKG_VERSION")))),
+        EngineKind::Pintail => Ok((
+            Box::new(PintailEngine),
+            format!("pintail {}", env!("CARGO_PKG_VERSION")),
+        )),
         #[cfg(feature = "reference")]
         EngineKind::Reference => {
             use sqllogictest::engine::ReferenceEngine;

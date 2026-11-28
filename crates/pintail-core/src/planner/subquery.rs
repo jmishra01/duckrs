@@ -21,11 +21,11 @@ use crate::execution::run_plan;
 use crate::function::BuiltinFunctions;
 use crate::function::binder::bind_aggregate_function;
 use crate::optimizer::conjunction_of;
+use parking_lot::Mutex;
 use pintail_common::column_data::ColumnDataCollection;
 use pintail_common::types::LogicalType;
 use pintail_common::value::Value;
 use pintail_parser::ast::{ComparisonOp, JoinType, WindowBoundary, WindowExclude};
-use parking_lot::Mutex;
 use std::sync::Arc;
 
 /// This subquery stays an expression.

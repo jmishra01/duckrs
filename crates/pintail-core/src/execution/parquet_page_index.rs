@@ -9,10 +9,10 @@
 use super::{ParquetScanData, ThriftReader, ThriftValue, read_thrift_struct, statistic_text, try_cast_value};
 use crate::catalog::ColumnZone;
 use crate::planner::expression::{BoundExpr, BoundExprKind};
+use parquet::file::metadata::{ColumnChunkMetaData, ParquetMetaData, RowGroupMetaData};
 use pintail_common::types::{LogicalType, LogicalTypeId};
 use pintail_common::value::Value;
 use pintail_common::{Error, ErrorKind, Result};
-use parquet::file::metadata::{ColumnChunkMetaData, ParquetMetaData, RowGroupMetaData};
 use std::fs::File;
 
 /// `ParquetPageRowRange`: the rows `[begin, end)` of a row group that may still hold matching rows.

@@ -7,6 +7,7 @@
 //! case they were created with. A transaction works on a copy of all of it: see `fork`.
 
 use crate::planner::expression::{BoundExpr, BoundExprKind};
+use parking_lot::{Mutex, RwLock};
 use pintail_common::STANDARD_VECTOR_SIZE;
 use pintail_common::column_data::ColumnDataCollection;
 use pintail_common::string_util::similarity_rating;
@@ -14,7 +15,6 @@ use pintail_common::types::{LogicalType, LogicalTypeId};
 use pintail_common::vector::{DataChunk, SelectionVector, Vector};
 use pintail_common::{Error, ErrorKind, Result};
 use pintail_parser::ast::{Expr, MacroFunction, SelectStatement, sql_identifier, sql_quoted_identifier};
-use parking_lot::{Mutex, RwLock};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Weak};
 

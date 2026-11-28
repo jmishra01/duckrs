@@ -11,10 +11,10 @@ use crate::ffi::{self, CPointer, Handle};
 use crate::function_info::*;
 use crate::types::*;
 use crate::vector::{contains_invalid_or_any, prepare_chunk, prepare_vector};
+use local_states::LocalStates;
 use pintail::udf::{ScalarUdf, ScalarUdfBindInput, ScalarUdfExecutor, ScalarUdfOverload, ScalarUdfSet};
 use pintail::{DataChunk, ErrorKind, LogicalType, LogicalTypeId, Result};
 use pintail_common::vector::Vector;
-use local_states::LocalStates;
 use std::ffi::c_char;
 use std::sync::Arc;
 

@@ -275,7 +275,9 @@ fn scans_of_tables_in_place_answer_as_in_duckdb() {
                 }
             };
             if actual != expected {
-                failures.push(format!("{file}: {query}\n  pintail: {actual:?}\n  DuckDB: {expected:?}"));
+                failures.push(format!(
+                    "{file}: {query}\n  pintail: {actual:?}\n  DuckDB: {expected:?}"
+                ));
             }
         }
     }

@@ -14,10 +14,10 @@ use crate::function::BuiltinFunctions;
 use crate::function::binder::bind_aggregate_function;
 use crate::planner::expression::{BoundAggregate, BoundExpr, BoundExprKind, ColumnBinding};
 use crate::planner::logical::{LogicalOperator, LogicalOperatorKind as K};
+use parking_lot::Mutex;
 use pintail_common::column_data::ColumnDataCollection;
 use pintail_common::types::LogicalType;
 use pintail_common::value::Value;
-use parking_lot::Mutex;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 

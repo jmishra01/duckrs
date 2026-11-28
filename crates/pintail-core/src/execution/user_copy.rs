@@ -5,10 +5,10 @@
 
 use super::physical::{PhysicalOperator, SourceState};
 use crate::function::udf::{CopyToSink, UserCopyTo};
+use parking_lot::Mutex;
 use pintail_common::Result;
 use pintail_common::types::LogicalType;
 use pintail_common::vector::{DataChunk, Vector};
-use parking_lot::Mutex;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 

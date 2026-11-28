@@ -34,11 +34,11 @@ pub mod zone_map;
 
 use crate::planner::expression::{BoundAggregate, BoundExpr, BoundExprKind};
 use crate::planner::logical::{LogicalOperator, LogicalOperatorKind};
+use parking_lot::Mutex;
+use physical::*;
 use pintail_common::Result;
 use pintail_common::column_data::ColumnDataCollection;
 use pintail_common::vector::DataChunk;
-use parking_lot::Mutex;
-use physical::*;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

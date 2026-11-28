@@ -7,9 +7,9 @@
 
 use super::checksum::checksum;
 use super::encryption::{Cipher, ENCRYPTED_BLOCK_HEADER_SIZE, EncryptionRequest, FileEncryption, Version};
+use parking_lot::Mutex;
 use pintail_common::serializer::StorageVersion;
 use pintail_common::{Error, ErrorKind, Result};
-use parking_lot::Mutex;
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};

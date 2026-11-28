@@ -10,11 +10,11 @@
 //! of their own (`CreateExternalResourceCallbackConnection`), as the caller's statement is still running.
 
 use crate::{ClientContext, DatabaseInstance};
+use parking_lot::Mutex;
 use pintail_common::types::{LogicalType, LogicalTypeId};
 use pintail_common::value::{Value, ValueData};
 use pintail_common::{Error, ErrorKind, Result};
 use pintail_core::planner::binder::{ExternalResourceRows, ExternalResourceTables};
-use parking_lot::Mutex;
 use std::cell::Cell;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -955,7 +955,11 @@ impl Deleter {
     }
 
     /// `ResourceDeleter::Delete`: the teardown on a connection of its own; a failure says how to retry it.
-    pub fn delete(&self, db: &Arc<DatabaseInstance>, log: Option<&Arc<pintail_core::logging::LogTarget>>) -> Result<()> {
+    pub fn delete(
+        &self,
+        db: &Arc<DatabaseInstance>,
+        log: Option<&Arc<pintail_core::logging::LogTarget>>,
+    ) -> Result<()> {
         let Some(sql) = self.sql() else {
             return Ok(());
         };

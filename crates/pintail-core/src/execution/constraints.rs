@@ -10,12 +10,12 @@ use super::art::key::{ArtKey, chunk_keys};
 use super::art::tree::{AppendMode, Art};
 use super::expression_executor::execute;
 use crate::catalog::{ForeignKey, IndexTree, TableCatalogEntry, TableConstraint, TableKey, UniqueKeys};
+use parking_lot::MutexGuard;
 use pintail_common::column_data::ColumnDataCollection;
 use pintail_common::sort_key::{OrderModifiers, create_sort_keys};
 use pintail_common::vector::{DataChunk, Vector};
 use pintail_common::{Error, ErrorKind, Result, STANDARD_VECTOR_SIZE};
 use pintail_parser::ast::{sql_identifier, sql_quoted_identifier};
-use parking_lot::MutexGuard;
 use std::collections::HashSet;
 use std::sync::Arc;
 

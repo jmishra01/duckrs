@@ -12,11 +12,11 @@ use crate::catalog::TableOrView;
 use crate::function::BuiltinFunctions;
 use crate::planner::expression::BoundExpr;
 use crate::planner::logical::{LogicalOperator, LogicalOperatorKind};
+use parking_lot::Mutex;
 use pintail_common::Result;
 use pintail_common::types::LogicalType;
 use pintail_common::value::Value;
 use pintail_parser::ast::{self, Expr, ExprKind, QualifiedName, TableRef};
-use parking_lot::Mutex;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 

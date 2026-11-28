@@ -20,11 +20,11 @@ pub use default_secrets::{CreateSecretFunction, CreateSecretInput, SecretType};
 pub use key_value::{KeyValueSecret, SecretDisplayType, SecretPersistType};
 pub(crate) use statements::BoundCreateSecret;
 
+use parking_lot::Mutex;
 use pintail_common::serializer::{BinaryDeserializer, BinarySerializer, SerializationOptions};
 use pintail_common::{Error, ErrorKind, Result};
 use pintail_core::execution::file_system::FileAccess;
 use pintail_parser::ast::sql_quoted_identifier as quoted;
-use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 

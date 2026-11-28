@@ -13,6 +13,7 @@ use super::physical::{
 use crate::execution::LocalSinkState;
 use crate::planner::expression::BoundExpr;
 use crate::planner::logical::JoinCondition;
+use parking_lot::Mutex;
 use pintail_common::column_data::ColumnDataCollection;
 use pintail_common::sort_key::{RowKeySet, create_row_keys};
 use pintail_common::types::LogicalType;
@@ -20,7 +21,6 @@ use pintail_common::value::{Value, ValueData};
 use pintail_common::vector::{DataChunk, SelectionVector, Vector};
 use pintail_common::{Result, STANDARD_VECTOR_SIZE};
 use pintail_parser::ast::{ComparisonOp, JoinType};
-use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 

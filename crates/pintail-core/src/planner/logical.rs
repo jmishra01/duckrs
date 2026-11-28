@@ -8,12 +8,12 @@ use super::expression::{BoundAggregate, BoundExpr, BoundExprKind, BoundWindow, C
 use crate::catalog::{
     ColumnDefinition, GeneratedColumn, OnCreateConflict, SchemaCatalogEntry, TableCatalogEntry, TableConstraint,
 };
+use parking_lot::Mutex;
 use pintail_common::column_data::ColumnDataCollection;
 use pintail_common::sort_key::OrderModifiers;
 use pintail_common::types::LogicalType;
 use pintail_common::value::Value;
 use pintail_parser::ast::{ComparisonOp, JoinType, MergeActionType, MergeCondition, SampleOptions};
-use parking_lot::Mutex;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 

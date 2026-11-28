@@ -6,8 +6,8 @@
 //! Temporary files and spilling come with Phase 8's out-of-core operators.
 
 use super::block_manager::SingleFileBlockManager;
-use pintail_common::Result;
 use parking_lot::Mutex;
+use pintail_common::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
 

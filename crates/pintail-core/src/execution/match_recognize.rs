@@ -15,6 +15,7 @@ use super::expression_executor::execute;
 use super::physical::{PhysicalOperator, SourceState, scan_collection};
 use crate::function::aggregates::{AggregateFunction, value_keys};
 use crate::planner::expression::BoundExpr;
+use parking_lot::Mutex;
 use pintail_common::column_data::ColumnDataCollection;
 use pintail_common::sort_key::{OrderModifiers, create_sort_keys};
 use pintail_common::types::LogicalType;
@@ -22,7 +23,6 @@ use pintail_common::value::Value;
 use pintail_common::vector::{DataChunk, Vector};
 use pintail_common::{Error, ErrorKind, Result, STANDARD_VECTOR_SIZE};
 use pintail_parser::ast::{AfterMatchSkip, RowsPerMatch};
-use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::sync::Arc;
 

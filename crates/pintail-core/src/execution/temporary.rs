@@ -14,11 +14,11 @@
 
 use crate::storage::log_writer::serialize_chunk;
 use crate::storage::wal::deserialize_chunk;
+use parking_lot::Mutex;
 use pintail_common::column_data::ColumnDataCollection;
 use pintail_common::types::{LogicalType, PhysicalType, StringT};
 use pintail_common::vector::DataChunk;
 use pintail_common::{Error, ErrorKind, Result, STANDARD_VECTOR_SIZE};
-use parking_lot::Mutex;
 use std::cell::RefCell;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};

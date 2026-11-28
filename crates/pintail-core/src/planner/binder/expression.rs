@@ -22,6 +22,7 @@ use crate::planner::expression::{
     BoundExpr, BoundExprKind, BoundOperator, BoundSubquery, ColumnBinding, SequenceOp, SubqueryKind,
 };
 use crate::planner::subquery::flatten_subqueries;
+use parking_lot::Mutex;
 use pintail_common::string_util::similarity_rating;
 use pintail_common::types::{LogicalType, LogicalTypeId, bignum, bit, decimal};
 use pintail_common::value::{Value, ValueData};
@@ -32,7 +33,6 @@ use pintail_parser::ast::{
     CastType, ComparisonOp, Expr, ExprKind, FunctionExpr, Literal, LiteralKind, OperatorType, SubqueryType, TypeExpr,
 };
 use pintail_parser::transformer::visit_expr_mut;
-use parking_lot::Mutex;
 use std::sync::Arc;
 
 /// `NumberToValue`: an integer literal is INTEGER, BIGINT, HUGEINT or UHUGEINT if it fits, a
@@ -2751,7 +2751,8 @@ impl Binder<'_> {
                     for schema in self.catalog.schemas() {
                         let mut schema_best: Option<(f64, String)> = None;
                         for entry in schema.macro_entries(false) {
-                            let score = pintail_common::string_util::similarity_rating(&entry.name, &function.name.name);
+                            let score =
+                                pintail_common::string_util::similarity_rating(&entry.name, &function.name.name);
                             if score > schema_best.as_ref().map_or(0.0, |(b, _)| *b) {
                                 schema_best = Some((score, entry.name.clone()));
                             }

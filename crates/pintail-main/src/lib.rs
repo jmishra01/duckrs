@@ -19,6 +19,7 @@ pub use statement_type::{StatementProperties, StatementReturnType, StatementType
 mod settings_table;
 mod tpc;
 
+use parking_lot::{Mutex, RwLock};
 use pintail_common::column_data::ColumnDataCollection;
 use pintail_common::serializer::StorageVersion;
 use pintail_common::sort_key::OrderType;
@@ -51,7 +52,6 @@ use pintail_parser::ast::{
     OnCreateConflict as AstConflict, PragmaInfo, QualifiedName, Statement, sql_quoted_identifier,
 };
 use pintail_parser::ast::{TransactionModifier, TransactionType};
-use parking_lot::{Mutex, RwLock};
 use settings::SettingValues;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -387,7 +387,11 @@ impl DatabaseInstance {
     }
 
     /// `LogManager::RegisterLogStorage`: a log storage `SET logging_storage` can name; false when one has the name.
-    pub fn register_log_storage(&self, name: &str, storage: Arc<dyn pintail_core::logging::LogStorageCallback>) -> bool {
+    pub fn register_log_storage(
+        &self,
+        name: &str,
+        storage: Arc<dyn pintail_core::logging::LogStorageCallback>,
+    ) -> bool {
         self.log_manager
             .lock()
             .map(|mut manager| manager.register_storage(name, storage))
@@ -459,7 +463,8 @@ impl DatabaseInstance {
             .get_schema(pintail_core::catalog::DEFAULT_SCHEMA)
             .ok_or_else(|| Error::new(ErrorKind::Internal, "an in-memory database has a main schema"))?;
         let file = path.to_string_lossy().replace('\'', "''");
-        let Some(Statement::Select(query)) = pintail_parser::parse_ast(&format!("SELECT * FROM '{file}'"))?.pop() else {
+        let Some(Statement::Select(query)) = pintail_parser::parse_ast(&format!("SELECT * FROM '{file}'"))?.pop()
+        else {
             return Err(Error::new(ErrorKind::Internal, "SELECT * FROM a file is a query"));
         };
         let mut views = vec!["file".to_string()];
@@ -2516,7 +2521,8 @@ impl ClientContext {
                     let old_casting = pintail_core::function::cast_rules::set_old_implicit_casting(
                         self.setting_text("old_implicit_casting") == "true",
                     );
-                    let casts = pintail_core::function::cast_rules::RegisteredCastsGuard::set(&self.home.user_functions);
+                    let casts =
+                        pintail_core::function::cast_rules::RegisteredCastsGuard::set(&self.home.user_functions);
                     let result = match self
                         .verify_no_parameters(statement)
                         .and_then(|()| self.verification_statement(statement))
@@ -4044,7 +4050,10 @@ impl ClientContext {
 
     /// CREATE, REGISTER and DESTROY EXTERNAL RESOURCE (`Binder::Bind(ExternalResourceStatement)` +
     /// `PhysicalExternalResource`).
-    fn external_resource_statement(&mut self, statement: &pintail_parser::ast::ExternalResourceStatement) -> Result<()> {
+    fn external_resource_statement(
+        &mut self,
+        statement: &pintail_parser::ast::ExternalResourceStatement,
+    ) -> Result<()> {
         use pintail_parser::ast::ExternalResourceOperation as Operation;
         if statement.name.is_empty() {
             return Err(Error::new(
@@ -6669,7 +6678,8 @@ impl ClientContext {
             }
             kind @ ("MACRO" | "MACRO TABLE") => {
                 let table_macro = kind == "MACRO TABLE";
-                let mut schema = schema_of(&info.name).map_err(|_| pintail_core::unported("this form of DROP MACRO"))?;
+                let mut schema =
+                    schema_of(&info.name).map_err(|_| pintail_core::unported("this form of DROP MACRO"))?;
                 // an unqualified name is looked up along the search path, as in a call
                 if schema.is_none() {
                     let found = |table_macro| {

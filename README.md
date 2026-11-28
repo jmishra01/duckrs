@@ -1,8 +1,67 @@
-# pintail
+# PintailDB
 
 An analytical SQL database engine: a port of [DuckDB](https://github.com/duckdb/duckdb) to Rust.
+It runs DuckDB's SQL, reads and writes DuckDB's database files, Parquet and CSV, and offers
+DuckDB's C API (`duckdb.h`), so programs written against DuckDB can link against it instead.
+(The crates are named `pintail-*`; the project was called duckrs while it was being ported.)
 
-**Status: 5592 files pass, 91.8% of the 6,090 that run (6,367 in all, 277 skipped), against DuckDB's test suite at baseline `d4eea3f208d`.** That meets the overall v1 target of 90%. The phase gates are met (`test/parquet` at 85.6% against 80%; the CTE gate counts as met at 84%). The C API (`crates/pintail-capi`) has 538 of the 548 functions of `duckdb.h` and passes 161 of 179 test cases of DuckDB's C API tests; config options and `duckdb_appender_create_query` are left (item 41 of REMAINING_WORK). Still open for v1: one more TPC-H SF10 run on a quiet machine (the last gave 0.58× of C++'s time against a 1.5× limit). Extensions (`LOAD`, ICU, httpfs, ...) come after v1. Per-directory numbers are in [`docs/STATUS.md`](docs/STATUS.md), and what is left in [`docs/REMAINING_WORK.md`](docs/REMAINING_WORK.md).
+## Status (v1.0.0)
+
+- **SQL:** 5618 of the 6,090 test files that run pass (**92.2%**; 6,367 in all, 277 skipped), against DuckDB's test suite at commit `d4eea3f208d`. The v1 target was 90%.
+- **C API:** all 548 functions of `duckdb.h` (v1); 167 of the 179 test cases of DuckDB's own
+  C API tests pass. What is missing is in item 41 of [`docs/REMAINING_WORK.md`](docs/REMAINING_WORK.md).
+- **Benchmarks:** TPC-H and TPC-DS data generation (`CALL dbgen(sf = 1)`, `CALL dsdgen(sf = 1)`,
+  or the same in a FROM clause) and their queries and answers (`tpch_queries()`, `tpcds_answers()`, ...).
+- **After v1:** extensions (`LOAD`, ICU, httpfs, ...), an event-driven executor and streaming
+  CTEs. Per-directory numbers are in [`docs/STATUS.md`](docs/STATUS.md); what is left is in
+  [`docs/REMAINING_WORK.md`](docs/REMAINING_WORK.md), and what changed in [`CHANGELOG.md`](CHANGELOG.md).
+
+## Install
+
+Build from source with Rust 1.95 or later (`rust-toolchain.toml` picks it):
+
+```bash
+cargo build --release -p pintail-cli -p pintail-capi
+```
+
+This gives the shell at `target/release/pintail` and the C library at
+`target/release/libpintail_capi.{so,dylib,a}`. A tagged release (`v*`) also attaches both, built
+for Linux and macOS, to the [GitHub release](https://github.com/jmishra01/duckrs/releases).
+
+## Quick start
+
+The shell works like DuckDB's:
+
+```bash
+target/release/pintail my.db "CREATE TABLE t AS SELECT range AS i FROM range(10); SELECT sum(i) FROM t"
+target/release/pintail          # an in-memory database, interactively
+```
+
+From Rust, add the `pintail` crate (by path or git for now) and:
+
+```rust
+let db = pintail::Database::open_in_memory()?;
+let mut connection = db.connect()?;
+let result = connection.query("SELECT 42 AS answer")?;
+assert_eq!(result.value(0, 0), pintail::Value::integer(42));
+```
+
+From C, include DuckDB's `duckdb.h` (from DuckDB's `src/include`, at the baseline below) and link
+`-lpintail_capi` in place of `-lduckdb`; nothing else changes:
+
+```c
+duckdb_database db;
+duckdb_connection con;
+duckdb_open(NULL, &db);
+duckdb_connect(db, &con);
+duckdb_result result;
+if (duckdb_query(con, "SELECT 42", &result) == DuckDBSuccess) {
+    printf("%lld\n", (long long)duckdb_value_int64(&result, 0, 0));
+}
+duckdb_destroy_result(&result);
+duckdb_disconnect(&con);
+duckdb_close(&db);
+```
 
 What exists today:
 
@@ -80,13 +139,16 @@ The full roadmap is in [`../RUST_PORT_PLAN.md`](../RUST_PORT_PLAN.md).
 ## Layout
 
 ```
-pintail/
+duckrs/  (the checkout)
 ├── crates/pintail/          # public API (facade crate)
 ├── crates/pintail-common/   # types, vectors, executors, values
 ├── crates/pintail-core/     # catalog, functions, binder/planner, optimizer, execution, storage
 ├── crates/pintail-main/     # Database, Connection and ClientContext, settings, EXPLAIN (DuckDB's src/main)
 ├── crates/pintail-parser/   # tokenizer, PEG grammar engine (+ vendored grammar), AST, transformer
 ├── crates/pintail-cli/      # the pintail shell binary
+├── crates/pintail-capi/     # DuckDB's C API (duckdb.h) as libpintail_capi
+├── crates/pintail-tpch/     # TPC-H dbgen, queries and answers
+├── crates/pintail-tpcds/    # TPC-DS dsdgen, queries and answers
 ├── tools/sqllogictest/     # test runner + known_passing.txt
 └── docs/                   # ARCHITECTURE, PORTING_GUIDE, UPSTREAM_SYNC
 ```
@@ -101,7 +163,8 @@ test it, from the bottom of the stack up:
 [`pintail-cli`](crates/pintail-cli/README.md).
 
 The runner expects the DuckDB checkout at `../duckdb` (override with `--duckdb-root`). The port
-is pinned to the `rust-port-baseline` branch of that checkout.
+follows DuckDB commit `d4eea3f208d` (`DUCKDB_BASELINE` in `.github/workflows/ci.yml`; moves are
+recorded in [`docs/UPSTREAM_SYNC.md`](docs/UPSTREAM_SYNC.md)).
 
 ## Running the test corpus
 
@@ -148,4 +211,4 @@ cargo test --workspace
 
 ## License
 
-MIT, like DuckDB. Ported files name their C++ source with a `// Ported from duckdb/<path> @ rust-port-baseline` header.
+MIT, like DuckDB ([`LICENSE`](LICENSE), which carries DuckDB's notice too); the TPC-H and TPC-DS generators come under the TPC's licenses. Ported files name their C++ source with a `// Ported from duckdb/<path> @ rust-port-baseline` header.

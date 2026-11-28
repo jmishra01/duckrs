@@ -466,7 +466,9 @@ pub fn expression(stored: &Expr) -> Result<g::ParsedExpression> {
 }
 
 pub(crate) fn write_not_ported(what: &str) -> Error {
-    Error::not_implemented(format!("writing {what} to a database file is not yet ported to pintail"))
+    Error::not_implemented(format!(
+        "writing {what} to a database file is not yet ported to pintail"
+    ))
 }
 
 fn sample(stored: &ast::SampleOptions) -> Result<g::SampleOptions> {
