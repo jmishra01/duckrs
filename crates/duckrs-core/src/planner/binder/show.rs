@@ -329,6 +329,7 @@ fn memory_segments(table: &TableCatalogEntry) -> Vec<SegmentInfo> {
                     block_id: -1,
                     block_offset: 0,
                     info: None,
+                    additional_blocks: None,
                 });
             }
         }
@@ -1705,7 +1706,11 @@ impl Binder<'_> {
                 if include_info {
                     row.push(Value::varchar(s.info.unwrap_or_default()));
                 }
-                row.push(Value::null(LogicalType::list(LogicalType::BIGINT)));
+                row.push(match s.additional_blocks {
+                    Some(blocks) => Value::list(LogicalType::BIGINT, blocks.into_iter().map(Value::bigint).collect())
+                        .unwrap_or_else(|_| Value::null(LogicalType::list(LogicalType::BIGINT))),
+                    None => Value::null(LogicalType::list(LogicalType::BIGINT)),
+                });
                 row
             })
             .collect();

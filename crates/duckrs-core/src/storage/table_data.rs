@@ -341,6 +341,33 @@ fn scan_fixed_into(
     Ok(())
 }
 
+/// `ColumnData::count` once `InitializeColumn` read it: the rows of its segments, or of a STRUCT, an ARRAY or a
+/// VARIANT, those of its validity.
+fn column_count(column: &PersistentColumn, ty: &LogicalType) -> u64 {
+    let own = |column: &PersistentColumn| {
+        column
+            .pointers
+            .iter()
+            .fold(0u64, |total, pointer| total.saturating_add(pointer.tuple_count as u64))
+    };
+    if matches!(ty.physical_type(), PhysicalType::Struct | PhysicalType::Array) || ty.id() == LogicalTypeId::Variant {
+        column.validity.as_deref().map_or(0, own)
+    } else {
+        own(column)
+    }
+}
+
+/// `UncompressedStringSegmentState::GetHandle`: a block of overflow strings (or ZSTD pages) of the segment, which
+/// has to be one the segment lists as its own.
+fn owned_block(buffer: &BufferManager, pointer: &DataPointer, block: u64) -> Result<std::sync::Arc<Vec<u8>>> {
+    if i64::try_from(block).map_or(true, |block| !pointer.overflow_blocks.contains(&block)) {
+        return Err(corrupted(
+            "Corrupted uncompressed string segment: overflow string block is not owned by the segment",
+        ));
+    }
+    buffer.pin(block)
+}
+
 fn scan_strings(
     buffer: &BufferManager,
     pointer: &DataPointer,
@@ -355,23 +382,15 @@ fn scan_strings(
     }
     let handle = segment(buffer, pointer)?;
     let data = &handle[pointer.offset..];
+    let pin = |block: u64| owned_block(buffer, pointer, block);
     match pointer.compression {
-        COMPRESSION_UNCOMPRESSED => scan_string_uncompressed(data, count, &|block| buffer.pin(block), out),
+        COMPRESSION_UNCOMPRESSED => scan_string_uncompressed(data, count, &pin, out),
         COMPRESSION_DICTIONARY => scan_dictionary(data, count, out),
         COMPRESSION_FSST => scan_fsst(data, count, out),
         COMPRESSION_DICT_FSST => scan_dict_fsst(data, count, out, nulls),
         COMPRESSION_ZSTD => {
-            // `UncompressedStringSegmentState::GetHandle`: only the pages of the segment
-            let pin = |block: u64| {
-                if !pointer.overflow_blocks.contains(&(block as i64)) {
-                    return Err(Error::new(
-                        duckrs_common::ErrorKind::DataCorruption,
-                        "Corrupted uncompressed string segment: overflow string block is not owned by the segment",
-                    ));
-                }
-                buffer.pin(block)
-            };
-            scan_zstd(data, count, pointer.offset != 0, &pin, out)
+            let memory = (buffer.used_memory(), buffer.memory_limit());
+            scan_zstd(data, count, pointer.offset != 0, &pin, memory, out)
         }
         other => Err(not_ported(other)),
     }
@@ -807,6 +826,7 @@ pub(super) fn column_segments(
                 }
                 _ => None,
             },
+            additional_blocks: Some(pointer.overflow_blocks.clone()),
         });
         start += pointer.tuple_count as u64;
     }
@@ -1024,6 +1044,14 @@ impl DiskTable {
             let mut d = BinaryDeserializer::new(chains.at(&self.buffer, pointer)?);
             Arc::new(read_persistent_column(&mut d, Some(&self.table.columns[column].ty))?)
         };
+        let count = column_count(&read, &self.table.columns[column].ty);
+        let group_count = self.table.row_groups[group].tuple_count;
+        if count != group_count {
+            return Err(corrupted(&format!(
+                "Corrupted database - loaded column with index {column}, count {count} did not match count of row \
+                 group {group_count}"
+            )));
+        }
         Ok(cell.get_or_init(|| read).clone())
     }
 
