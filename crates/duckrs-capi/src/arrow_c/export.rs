@@ -11,16 +11,16 @@ use super::options::ArrowOptions;
 use crate::vector::prepare_vector;
 use arrow::array::{
     Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, DictionaryArray, FixedSizeBinaryArray,
-    FixedSizeListArray, GenericListArray, GenericListViewArray, LargeBinaryArray, LargeStringArray, MapArray, NullArray,
-    OffsetSizeTrait, PrimitiveArray, StringArray, StructArray, UInt64Array,
+    FixedSizeListArray, GenericListArray, GenericListViewArray, LargeBinaryArray, LargeStringArray, MapArray,
+    NullArray, OffsetSizeTrait, PrimitiveArray, StringArray, StructArray, UInt64Array,
 };
 use arrow::buffer::{BooleanBuffer, Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{
     ArrowPrimitiveType, DataType, Date32Type, Decimal32Type, Decimal64Type, Decimal128Type, Field, FieldRef, Fields,
-    Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type, IntervalMonthDayNano, IntervalMonthDayNanoType,
-    IntervalUnit, Time64MicrosecondType, Time64NanosecondType, TimeUnit, TimestampMicrosecondType,
-    TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType, UInt8Type, UInt16Type, UInt32Type,
-    UInt64Type,
+    Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type, IntervalMonthDayNano,
+    IntervalMonthDayNanoType, IntervalUnit, Time64MicrosecondType, Time64NanosecondType, TimeUnit,
+    TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType, UInt8Type,
+    UInt16Type, UInt32Type, UInt64Type,
 };
 use duckrs::{DataChunk, Error, ErrorKind, LogicalType, LogicalTypeId, Result};
 use duckrs_common::types::{Interval, ListEntry, NativeType, PhysicalType, TimeTz, uuid_to_string};
@@ -169,17 +169,15 @@ fn data_type(ty: &LogicalType, options: &ArrowOptions) -> Result<(DataType, Hash
         L::Bit => plain(binary()),
         L::Bignum => Ok((DataType::Binary, opaque("bignum"))),
         L::List => {
-            let child = Arc::new(field(
-                "l",
-                ty.child_type().unwrap_or(&LogicalType::SQLNULL),
-                options,
-            )?);
-            plain(match (options.list_view && options.at_least_1_4(), options.large_offsets) {
-                (true, true) => DataType::LargeListView(child),
-                (true, false) => DataType::ListView(child),
-                (false, true) => DataType::LargeList(child),
-                (false, false) => DataType::List(child),
-            })
+            let child = Arc::new(field("l", ty.child_type().unwrap_or(&LogicalType::SQLNULL), options)?);
+            plain(
+                match (options.list_view && options.at_least_1_4(), options.large_offsets) {
+                    (true, true) => DataType::LargeListView(child),
+                    (true, false) => DataType::ListView(child),
+                    (false, true) => DataType::LargeList(child),
+                    (false, false) => DataType::List(child),
+                },
+            )
         }
         L::Struct | L::Tuple => plain(DataType::Struct(struct_fields(ty, options)?)),
         L::Array => {
@@ -230,10 +228,14 @@ fn strings(vector: &Vector, count: usize) -> Vec<Option<&[u8]>> {
 fn byte_array(strings: Vec<Option<&[u8]>>, data_type: &DataType) -> Result<ArrayRef> {
     Ok(match data_type {
         DataType::Utf8 => Arc::new(StringArray::try_from_binary(BinaryArray::from_iter(strings)).map_err(arrow_error)?),
-        DataType::LargeUtf8 => Arc::new(
-            LargeStringArray::try_from_binary(LargeBinaryArray::from_iter(strings)).map_err(arrow_error)?,
+        DataType::LargeUtf8 => {
+            Arc::new(LargeStringArray::try_from_binary(LargeBinaryArray::from_iter(strings)).map_err(arrow_error)?)
+        }
+        DataType::Utf8View => Arc::new(
+            BinaryViewArray::from_iter(strings)
+                .to_string_view()
+                .map_err(arrow_error)?,
         ),
-        DataType::Utf8View => Arc::new(BinaryViewArray::from_iter(strings).to_string_view().map_err(arrow_error)?),
         DataType::Binary => Arc::new(BinaryArray::from_iter(strings)),
         DataType::LargeBinary => Arc::new(LargeBinaryArray::from_iter(strings)),
         DataType::BinaryView => Arc::new(BinaryViewArray::from_iter(strings)),
@@ -242,7 +244,12 @@ fn byte_array(strings: Vec<Option<&[u8]>>, data_type: &DataType) -> Result<Array
 }
 
 /// A fixed-size binary array of `width` bytes per row, `bytes` giving those of a valid row.
-fn fixed_binary<N: NativeType>(vector: &Vector, count: usize, width: usize, bytes: impl Fn(N) -> Vec<u8>) -> Result<ArrayRef> {
+fn fixed_binary<N: NativeType>(
+    vector: &Vector,
+    count: usize,
+    width: usize,
+    bytes: impl Fn(N) -> Vec<u8>,
+) -> Result<ArrayRef> {
     let mut data = Vec::with_capacity(count * width);
     for (i, &value) in vector.data::<N>()[..count].iter().enumerate() {
         if vector.is_valid(i) {
@@ -321,11 +328,21 @@ fn list_view_array<O: OffsetSizeTrait>(
     child_field: &FieldRef,
     options: &ArrowOptions,
 ) -> Result<ArrayRef> {
-    let child = array(vector.list_child(), vector.list_size(), child_field.data_type(), options)?;
+    let child = array(
+        vector.list_child(),
+        vector.list_size(),
+        child_field.data_type(),
+        options,
+    )?;
     let entries = &vector.data::<ListEntry>()[..count];
     let mut offsets = Vec::with_capacity(count);
     let mut sizes = Vec::with_capacity(count);
-    let too_large = || Error::new(ErrorKind::InvalidInput, "Arrow Appender: list offset too large for a ListView");
+    let too_large = || {
+        Error::new(
+            ErrorKind::InvalidInput,
+            "Arrow Appender: list offset too large for a ListView",
+        )
+    };
     for (i, entry) in entries.iter().enumerate() {
         let (offset, size) = if vector.is_valid(i) {
             (entry.offset, entry.length)
@@ -346,7 +363,13 @@ fn list_view_array<O: OffsetSizeTrait>(
     Ok(Arc::new(list))
 }
 
-fn struct_array(children: &[Vector], fields: &Fields, count: usize, nulls: Option<NullBuffer>, options: &ArrowOptions) -> Result<StructArray> {
+fn struct_array(
+    children: &[Vector],
+    fields: &Fields,
+    count: usize,
+    nulls: Option<NullBuffer>,
+    options: &ArrowOptions,
+) -> Result<StructArray> {
     let arrays = children
         .iter()
         .zip(fields.iter())
@@ -386,9 +409,9 @@ fn array(vector: &Vector, count: usize, data_type: &DataType, options: &ArrowOpt
         }
         (L::HugeInt, _) => primitive::<Decimal128Type, i128>(vector, count, dt, |v| v),
         (L::UHugeInt, _) => primitive::<Decimal128Type, u128>(vector, count, dt, |v| v as i128),
-        (L::Uuid, DataType::FixedSizeBinary(_)) => fixed_binary::<i128>(vector, count, 16, |v| {
-            ((v as u128) ^ (1 << 127)).to_be_bytes().to_vec()
-        })?,
+        (L::Uuid, DataType::FixedSizeBinary(_)) => {
+            fixed_binary::<i128>(vector, count, 16, |v| ((v as u128) ^ (1 << 127)).to_be_bytes().to_vec())?
+        }
         (L::Uuid, _) => {
             let texts: Vec<Option<String>> = vector.data::<i128>()[..count]
                 .iter()
@@ -437,7 +460,13 @@ fn array(vector: &Vector, count: usize, data_type: &DataType, options: &ArrowOpt
             if fields.is_empty() {
                 Arc::new(StructArray::new_empty_fields(count, nulls(vector, count)))
             } else {
-                Arc::new(struct_array(vector.struct_children(), fields, count, nulls(vector, count), options)?)
+                Arc::new(struct_array(
+                    vector.struct_children(),
+                    fields,
+                    count,
+                    nulls(vector, count),
+                    options,
+                )?)
             }
         }
         (L::Array, DataType::FixedSizeList(child_field, size)) => {
@@ -452,7 +481,13 @@ fn array(vector: &Vector, count: usize, data_type: &DataType, options: &ArrowOpt
                 return Err(unsupported(ty));
             };
             let child_count = vector.list_size();
-            let entries = struct_array(vector.list_child().struct_children(), entry_fields, child_count, None, options)?;
+            let entries = struct_array(
+                vector.list_child().struct_children(),
+                entry_fields,
+                child_count,
+                None,
+                options,
+            )?;
             let (offsets, take) = list_offsets::<i32>(vector, count, child_count)?;
             let entries = take_rows(Arc::new(entries), take)?;
             let entries = entries
@@ -486,11 +521,7 @@ fn array(vector: &Vector, count: usize, data_type: &DataType, options: &ArrowOpt
 }
 
 /// The schema of columns `names` of `types`, named `duckdb_query_result` (`ArrowConverter::ToArrowSchema`).
-pub fn schema(
-    types: &[LogicalType],
-    names: &[String],
-    options: &ArrowOptions,
-) -> Result<arrow::ffi::FFI_ArrowSchema> {
+pub fn schema(types: &[LogicalType], names: &[String], options: &ArrowOptions) -> Result<arrow::ffi::FFI_ArrowSchema> {
     let fields = types
         .iter()
         .zip(names)

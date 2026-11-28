@@ -220,8 +220,13 @@ fn map_entries(value: &Value) -> Vec<(Value, Value)> {
 /// `MapTryGet` of a `MAP(VARCHAR, VARCHAR)`.
 fn map_get(value: &Value, key: &str) -> Option<String> {
     map_entries(value).into_iter().find_map(|(k, v)| {
-        (!k.is_null() && k.try_to_string().ok().as_deref() == Some(key))
-            .then(|| if v.is_null() { String::new() } else { v.try_to_string().unwrap_or_default() })
+        (!k.is_null() && k.try_to_string().ok().as_deref() == Some(key)).then(|| {
+            if v.is_null() {
+                String::new()
+            } else {
+                v.try_to_string().unwrap_or_default()
+            }
+        })
     })
 }
 
@@ -248,10 +253,7 @@ pub fn value_sql(value: &Value) -> String {
             format!("MAP {{{}}}::{ty}", entries.join(", "))
         }
         LogicalTypeId::Varchar => sql_string(&value.try_to_string().unwrap_or_default()),
-        _ => format!(
-            "{}::{ty}",
-            sql_string(&value.try_to_string().unwrap_or_default())
-        ),
+        _ => format!("{}::{ty}", sql_string(&value.try_to_string().unwrap_or_default())),
     }
 }
 
@@ -401,7 +403,11 @@ impl CallbackConnection {
             found.value(0, 0).try_to_string().ok()?,
             found.value(1, 0).try_to_string().ok()?,
         );
-        Some([database.as_str(), schema.as_str(), name].map(duckrs_parser::ast::sql_identifier).join("."))
+        Some(
+            [database.as_str(), schema.as_str(), name]
+                .map(duckrs_parser::ast::sql_identifier)
+                .join("."),
+        )
     }
 }
 
@@ -439,9 +445,9 @@ impl ExternalResourceView {
     }
 
     fn register_type(&self, positional: &[Value], named: &[(String, Value)]) -> Result<ExternalResourceRows> {
-        let name = text(&positional[0]).filter(|name| !name.is_empty()).ok_or_else(|| {
-            invalid("register_external_resource_type: name must not be NULL or empty")
-        })?;
+        let name = text(&positional[0])
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| invalid("register_external_resource_type: name must not be NULL or empty"))?;
         let mut resource_type = ExternalResourceType {
             name,
             origin: "user".into(),
@@ -487,7 +493,9 @@ impl ExternalResourceView {
 
     fn register(&self, positional: &[Value], named: &[(String, Value)]) -> Result<ExternalResourceRows> {
         if positional[0].is_null() || positional[1].is_null() {
-            return Err(invalid("register_external_resource: the type and name must not be NULL"));
+            return Err(invalid(
+                "register_external_resource: the type and name must not be NULL",
+            ));
         }
         if positional[2].is_null() {
             return Err(invalid("register_external_resource: the handle must not be NULL"));
@@ -519,9 +527,9 @@ impl ExternalResourceView {
     }
 
     fn deregister(&self, positional: &[Value]) -> Result<ExternalResourceRows> {
-        let name = text(&positional[0]).filter(|name| !name.is_empty()).ok_or_else(|| {
-            invalid("deregister_external_resource: the name must not be NULL or empty")
-        })?;
+        let name = text(&positional[0])
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| invalid("deregister_external_resource: the name must not be NULL or empty"))?;
         if self.registry().remove(&name).is_none() {
             return Err(invalid(format!(
                 "deregister_external_resource: \"{name}\" is not registered"
@@ -587,7 +595,10 @@ impl ExternalResourceView {
             if resource_type.list_function.is_empty() {
                 continue;
             }
-            let Some(callback) = self.connection(&self.search_path)?.qualify(&resource_type.list_function) else {
+            let Some(callback) = self
+                .connection(&self.search_path)?
+                .qualify(&resource_type.list_function)
+            else {
                 return Err(invalid(format!(
                     "external resource discovery for type \"{}\": the list callback \"{}\" does not exist",
                     resource_type.name, resource_type.list_function
@@ -615,9 +626,9 @@ impl ExternalResourceView {
     }
 
     fn destroy(&self, positional: &[Value]) -> Result<ExternalResourceRows> {
-        let function = text(&positional[0]).filter(|f| !f.is_empty()).ok_or_else(|| {
-            invalid("destroy_external_resource: the deleter function must not be NULL or empty")
-        })?;
+        let function = text(&positional[0])
+            .filter(|f| !f.is_empty())
+            .ok_or_else(|| invalid("destroy_external_resource: the deleter function must not be NULL or empty"))?;
         let sql = format!(
             "SELECT * FROM {}({})",
             callback_sql(&function),
@@ -638,8 +649,8 @@ impl ExternalResourceView {
 
     /// `create_external_resource`: create (or adopt) the resource, and poll its status until it is ready.
     fn create(&self, positional: &[Value], named: &[(String, Value)]) -> Result<ExternalResourceRows> {
-        let type_name = text(&positional[0])
-            .ok_or_else(|| invalid("create_external_resource: the type name must not be NULL"))?;
+        let type_name =
+            text(&positional[0]).ok_or_else(|| invalid("create_external_resource: the type name must not be NULL"))?;
         let mut params = empty_map();
         let mut adopt = None;
         let mut teardown_on_failure = true;
@@ -711,7 +722,14 @@ impl ExternalResourceView {
         };
         // what was provisioned here is torn down if it does not get to be ready
         let teardown = !adopting && teardown_on_failure;
-        let ready = self.await_ready(&mut connection, &resource_type, &type_name, &handle, timeout, poll_interval);
+        let ready = self.await_ready(
+            &mut connection,
+            &resource_type,
+            &type_name,
+            &handle,
+            timeout,
+            poll_interval,
+        );
         let status = match ready {
             Ok(status) => status,
             Err(error) => {
@@ -781,11 +799,20 @@ impl ExternalResourceView {
         let deadline = (timeout > 0).then(|| Instant::now() + Duration::from_secs(timeout as u64));
         loop {
             duckrs_core::execution::interrupt::check()?;
-            let sql = format!("SELECT state, result FROM {}({})", callback_sql(function), value_sql(handle));
+            let sql = format!(
+                "SELECT state, result FROM {}({})",
+                callback_sql(function),
+                value_sql(handle)
+            );
             let mut state = String::new();
             let outcome = self.poll(connection, function, type_name, &sql, deadline, &mut state);
             let extra = [("state", state.as_str())];
-            self.log(type_name, "status", &outcome, if state.is_empty() { &[] } else { &extra });
+            self.log(
+                type_name,
+                "status",
+                &outcome,
+                if state.is_empty() { &[] } else { &extra },
+            );
             if let Some(result) = outcome? {
                 return Ok(result);
             }
@@ -918,8 +945,13 @@ impl ExternalResources {
 impl Deleter {
     /// `ResourceDeleter::DeleteSQL`.
     fn sql(&self) -> Option<String> {
-        (!self.function.is_empty())
-            .then(|| format!("SELECT * FROM {}({})", callback_sql(&self.function), value_sql(&self.payload)))
+        (!self.function.is_empty()).then(|| {
+            format!(
+                "SELECT * FROM {}({})",
+                callback_sql(&self.function),
+                value_sql(&self.payload)
+            )
+        })
     }
 
     /// `ResourceDeleter::Delete`: the teardown on a connection of its own; a failure says how to retry it.
@@ -966,7 +998,10 @@ pub fn provision(
     adopt: Option<&Value>,
 ) -> Result<Launched> {
     if provider.is_empty() {
-        return Err(Error::new(ErrorKind::Binder, "EXTERNAL RESOURCE: a resource type is required"));
+        return Err(Error::new(
+            ErrorKind::Binder,
+            "EXTERNAL RESOURCE: a resource type is required",
+        ));
     }
     let entries: Vec<Value> = params
         .iter()
@@ -974,7 +1009,10 @@ pub fn provision(
         .map(|(key, value)| {
             Value::struct_value(vec![
                 ("key".to_string(), Value::varchar(key.clone())),
-                ("value".to_string(), Value::varchar(value.try_to_string().unwrap_or_default())),
+                (
+                    "value".to_string(),
+                    Value::varchar(value.try_to_string().unwrap_or_default()),
+                ),
             ])
         })
         .collect();

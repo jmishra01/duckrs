@@ -13,14 +13,14 @@
 //! expression depth limit) or listed in [`UNHONORED`]: setting one of those to anything but
 //! its default fails as not yet ported, so a test never sees a silently different result.
 
-pub(crate) use duckrs_core::function::cast::cast_value;
-pub use duckrs_core::planner::binder::SettingRow;
 use super::settings_table::SETTINGS;
-use duckrs_core::execution::file_system::{FileAccess, sanitize_allowed_path};
 use duckrs_common::string_util::{candidates_error_message, candidates_message, similarity_rating, top_n_strings};
 use duckrs_common::types::LogicalType;
 use duckrs_common::value::Value;
 use duckrs_common::{Error, ErrorKind, Result};
+use duckrs_core::execution::file_system::{FileAccess, sanitize_allowed_path};
+pub(crate) use duckrs_core::function::cast::cast_value;
+pub use duckrs_core::planner::binder::SettingRow;
 pub use duckrs_parser::ast::SetScope;
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -1074,13 +1074,21 @@ pub fn add_extension_option(option: ExtensionOption, global: &mut SettingValues)
 
 /// `ExtensionOption::ResolveScope`: `true` means global. Extension options support both scopes.
 fn extension_scope(option: &ExtensionOption, scope: SetScope) -> bool {
-    let scope = if scope == SetScope::Automatic { option.default_scope } else { scope };
+    let scope = if scope == SetScope::Automatic {
+        option.default_scope
+    } else {
+        scope
+    };
     scope == SetScope::Global
 }
 
 /// `TryGetCurrentSetting`: the current value of `name` and where it comes from: the session's, else the database's,
 /// else the default (global); `None` for no such setting, or one without a value.
-pub fn lookup_setting(name: &str, global: &SettingValues, session: &SettingValues) -> Option<(Value, SettingLookupScope)> {
+pub fn lookup_setting(
+    name: &str,
+    global: &SettingValues,
+    session: &SettingValues,
+) -> Option<(Value, SettingLookupScope)> {
     let (index, setting) = match find_setting(name) {
         Some((index, setting)) => (index, Some(setting)),
         None => (find_extension_option(name, global)?.0, None),
@@ -1225,7 +1233,10 @@ pub fn check_lock(name: &str, global: &SettingValues, session: &SettingValues) -
         && let duckrs_common::value::ValueData::List(names) = allowed.data()
     {
         for allowed in names {
-            if allowed.try_to_string().is_ok_and(|a| canonical(&a).eq_ignore_ascii_case(&wanted)) {
+            if allowed
+                .try_to_string()
+                .is_ok_and(|a| canonical(&a).eq_ignore_ascii_case(&wanted))
+            {
                 return Ok(());
             }
         }
@@ -1417,7 +1428,11 @@ fn file_access_on_set(name: &str, value: Value, global: &SettingValues, session:
             Ok(if value.is_null() { Value::varchar("") } else { value })
         }
         "disabled_filesystems" => {
-            let text = if value.is_null() { String::new() } else { value.try_to_string()? };
+            let text = if value.is_null() {
+                String::new()
+            } else {
+                value.try_to_string()?
+            };
             Ok(Value::varchar(disabled_file_systems(&text, global, session)?))
         }
         "allowed_directories" | "allowed_paths" => {
@@ -1485,7 +1500,6 @@ pub fn current_value(name: &str, global: &SettingValues, session: &SettingValues
         .cloned()
         .or_else(|| database_default(index, setting, global))
 }
-
 
 /// `DuckDBSettingsInit`: every setting with its current value, each alias as a row of its
 /// own, sorted by name.
@@ -1653,8 +1667,22 @@ mod tests {
             Some((Value::integer(42), SettingLookupScope::Global))
         );
         // SET without a scope uses the option's default scope; the value is cast to its type
-        set_variable("my_option", SetScope::Automatic, &Value::varchar("7"), &mut global, &mut session).unwrap();
-        set_variable("my_global", SetScope::Automatic, &Value::bigint(8), &mut global, &mut session).unwrap();
+        set_variable(
+            "my_option",
+            SetScope::Automatic,
+            &Value::varchar("7"),
+            &mut global,
+            &mut session,
+        )
+        .unwrap();
+        set_variable(
+            "my_global",
+            SetScope::Automatic,
+            &Value::bigint(8),
+            &mut global,
+            &mut session,
+        )
+        .unwrap();
         assert_eq!(
             lookup_setting("my_option", &global, &session),
             Some((Value::integer(7), SettingLookupScope::Local))
@@ -1663,7 +1691,13 @@ mod tests {
         let rows = list_settings(&global, &session);
         let row = rows.iter().find(|r| r.name == "my_option").unwrap();
         assert_eq!((row.scope, &*row.input_type), ("LOCAL", "INTEGER"));
-        let err = set_variable("my_option", SetScope::Automatic, &Value::varchar("x"), &mut global, &mut session);
+        let err = set_variable(
+            "my_option",
+            SetScope::Automatic,
+            &Value::varchar("x"),
+            &mut global,
+            &mut session,
+        );
         assert!(err.is_err());
         // RESET puts the default back, in the session or globally
         reset_variable("my_option", SetScope::Automatic, &mut global, &mut session).unwrap();
@@ -1721,7 +1755,10 @@ mod tests {
         )
         .unwrap_err();
         // a setting of its own implementation lacks `set_local` (`PhysicalSet::SetVariable`)
-        assert!(err.to_string().contains("option threads cannot be set locally"), "{err}");
+        assert!(
+            err.to_string().contains("option threads cannot be set locally"),
+            "{err}"
+        );
         let err = set_variable(
             "thread",
             SetScope::Automatic,

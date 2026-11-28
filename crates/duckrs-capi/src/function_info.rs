@@ -34,7 +34,8 @@ impl OwnedData {
     }
 
     pub(crate) fn ptr(this: &Option<impl AsRef<OwnedData>>) -> *mut std::ffi::c_void {
-        this.as_ref().map_or(std::ptr::null_mut(), |owned| owned.as_ref().data.0)
+        this.as_ref()
+            .map_or(std::ptr::null_mut(), |owned| owned.as_ref().data.0)
     }
 }
 

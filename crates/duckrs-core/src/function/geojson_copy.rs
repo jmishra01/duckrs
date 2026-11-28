@@ -218,7 +218,10 @@ fn column_option(expr: &BoundExpr) -> Result<ColumnOption> {
     if value.is_null() {
         return Ok(None);
     }
-    if !matches!(value.logical_type().id(), LogicalTypeId::Varchar | LogicalTypeId::StringLiteral) {
+    if !matches!(
+        value.logical_type().id(),
+        LogicalTypeId::Varchar | LogicalTypeId::StringLiteral
+    ) {
         return Err(binder_error(format!("{NAME} column options must be VARCHAR or NULL")));
     }
     Ok(Some(value.try_to_string()?))

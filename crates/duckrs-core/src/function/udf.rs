@@ -568,7 +568,10 @@ impl UserFunctions {
     /// ([`AggregateFunction::user`]).
     pub fn register_aggregate(&self, set: AggregateFunctionSet) -> Result<()> {
         if set.functions.is_empty() || set.functions.iter().any(|f| f.user.is_none()) {
-            return Err(Error::new(ErrorKind::Internal, "an aggregate set without user-defined functions"));
+            return Err(Error::new(
+                ErrorKind::Internal,
+                "an aggregate set without user-defined functions",
+            ));
         }
         let key = set.name.to_ascii_lowercase();
         let mut aggregate = self.aggregate.write();

@@ -1122,7 +1122,11 @@ impl PlanWriter {
                 let get = GetFields {
                     table_index: *table_index,
                     types: types.clone(),
-                    names: op.column_bindings().iter().map(|b| b.column_index.to_string()).collect(),
+                    names: op
+                        .column_bindings()
+                        .iter()
+                        .map(|b| b.column_index.to_string())
+                        .collect(),
                     column_ids: (0..types.len()).collect(),
                     projection: Vec::new(),
                     filters: Vec::new(),

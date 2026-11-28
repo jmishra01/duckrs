@@ -7,8 +7,8 @@ use crate::ffi::{self, Handle};
 use crate::result::translate_result;
 use crate::types::*;
 use duckrs::{Connection, Database, LogicalType, Value};
-use std::ffi::c_char;
 use std::collections::HashMap;
+use std::ffi::c_char;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 /// `DatabaseWrapper`.
@@ -167,7 +167,9 @@ impl InstanceCache {
 /// `DBConfig::SetOptionByName`: `value` must name a setting and fit its type.
 fn check_option(name: &str, value: &str) -> Result<(), String> {
     let Some((_, setting)) = duckrs::settings::find_setting(name) else {
-        return Err(format!("Invalid Input Error: The following options were not recognized: {name}"));
+        return Err(format!(
+            "Invalid Input Error: The following options were not recognized: {name}"
+        ));
     };
     let ty = match setting.input_type {
         "BOOLEAN" => LogicalType::BOOLEAN,
@@ -218,9 +220,14 @@ fn open(path: Option<&str>, config: Option<&Config>) -> duckrs::Result<Database>
     }
     let mut connection = database.connect()?;
     for (name, value) in options {
-        if ["access_mode", "storage_compatibility_version", "duckdb_api", "custom_user_agent"]
-            .iter()
-            .any(|n| n.eq_ignore_ascii_case(name))
+        if [
+            "access_mode",
+            "storage_compatibility_version",
+            "duckdb_api",
+            "custom_user_agent",
+        ]
+        .iter()
+        .any(|n| n.eq_ignore_ascii_case(name))
         {
             continue;
         }
@@ -242,7 +249,9 @@ pub unsafe extern "C" fn duckdb_open_ext(
     let path = unsafe { ffi::c_str(path) }.map(String::from_utf8_lossy);
     // SAFETY: C passes a configuration `duckdb_create_config` made, or none.
     let config = unsafe { ffi::get(config) };
-    let opened = ffi::guard(None, || Some(open(path.as_deref(), config).map_err(|error| error.to_string())));
+    let opened = ffi::guard(None, || {
+        Some(open(path.as_deref(), config).map_err(|error| error.to_string()))
+    });
     // SAFETY: C passes where to write the database and the error.
     unsafe { finish_open(opened, out_database, out_error) }
 }
@@ -303,7 +312,9 @@ pub unsafe extern "C" fn duckdb_get_or_create_from_cache(
         return DuckDBError;
     };
     // SAFETY: C passes a NUL-terminated path, or none.
-    let path = unsafe { ffi::c_str(path) }.map(String::from_utf8_lossy).unwrap_or_default();
+    let path = unsafe { ffi::c_str(path) }
+        .map(String::from_utf8_lossy)
+        .unwrap_or_default();
     // SAFETY: C passes a configuration `duckdb_create_config` made, or none.
     let config = unsafe { ffi::get(config) };
     let opened = ffi::guard(None, || Some(cache.get_or_create(&path, config)));
@@ -324,7 +335,10 @@ pub unsafe extern "C" fn duckdb_close(database: *mut duckdb_database) {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn duckdb_connect(database: duckdb_database, out_connection: *mut duckdb_connection) -> duckdb_state {
+pub unsafe extern "C" fn duckdb_connect(
+    database: duckdb_database,
+    out_connection: *mut duckdb_connection,
+) -> duckdb_state {
     // SAFETY: C passes a live database.
     let Some(database) = (unsafe { ffi::get(database) }) else {
         return DuckDBError;
@@ -458,7 +472,11 @@ pub unsafe extern "C" fn duckdb_get_config_flag(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn duckdb_set_config(config: duckdb_config, name: *const c_char, option: *const c_char) -> duckdb_state {
+pub unsafe extern "C" fn duckdb_set_config(
+    config: duckdb_config,
+    name: *const c_char,
+    option: *const c_char,
+) -> duckdb_state {
     // SAFETY: C passes a live configuration.
     let Some(config) = (unsafe { ffi::get_mut(config) }) else {
         return DuckDBError;
@@ -492,7 +510,9 @@ pub unsafe extern "C" fn duckdb_get_table_names(
         return std::ptr::null_mut();
     };
     let query = String::from_utf8_lossy(query);
-    let names = ffi::guard(None, || connection.connection.lock().get_table_names(&query, qualified).ok());
+    let names = ffi::guard(None, || {
+        connection.connection.lock().get_table_names(&query, qualified).ok()
+    });
     let Some(names) = names else {
         return std::ptr::null_mut();
     };

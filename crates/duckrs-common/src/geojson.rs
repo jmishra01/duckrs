@@ -384,8 +384,8 @@ impl Writer {
         let Some(Json::Str(name)) = member(object, "type") else {
             return Err(invalid("Invalid GeoJSON: geometry is missing a \"type\" string"));
         };
-        let ty =
-            geometry_type_of(name).ok_or_else(|| invalid(format!("Invalid GeoJSON: unknown geometry type \"{name}\"")))?;
+        let ty = geometry_type_of(name)
+            .ok_or_else(|| invalid(format!("Invalid GeoJSON: unknown geometry type \"{name}\"")))?;
         let context = geojson_name(ty);
         self.header(ty);
         if ty == GeometryType::GeometryCollection {

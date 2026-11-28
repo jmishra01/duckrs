@@ -145,7 +145,11 @@ impl ClientContext {
                     let schema = table.schema();
                     let spec = TableSpec {
                         name: schema.name,
-                        columns: schema.columns.iter().map(|c| (c.name.to_string(), c.ty.clone())).collect(),
+                        columns: schema
+                            .columns
+                            .iter()
+                            .map(|c| (c.name.to_string(), c.ty.clone()))
+                            .collect(),
                         not_null: true,
                         primary_key: None,
                     };
@@ -247,7 +251,9 @@ impl ClientContext {
         chunks: Vec<DataChunk>,
     ) -> Result<()> {
         self.appended = Some((names, types, Arc::new(chunks)));
-        let result = self.run_sql(&format!("INSERT INTO {name} SELECT * FROM __internal_appender_chunks()"));
+        let result = self.run_sql(&format!(
+            "INSERT INTO {name} SELECT * FROM __internal_appender_chunks()"
+        ));
         self.appended = None;
         result.map(drop)
     }
@@ -271,8 +277,11 @@ impl ClientContext {
             unreachable!("checked by generator_call");
         };
         let function_name = benchmark.generator();
-        let arguments: Vec<FunctionArgument> =
-            call.args.iter().map(duckrs_core::planner::binder::named_argument).collect();
+        let arguments: Vec<FunctionArgument> = call
+            .args
+            .iter()
+            .map(duckrs_core::planner::binder::named_argument)
+            .collect();
         let mut options = GeneratorOptions {
             sf: 0.0,
             catalog: None,
@@ -296,7 +305,10 @@ impl ClientContext {
             let Some(ty) = benchmark.option_type(&name) else {
                 return Err(Error::new(
                     ErrorKind::Binder,
-                    format!("Invalid named parameter \"{}\" for function {function_name}", argument.name),
+                    format!(
+                        "Invalid named parameter \"{}\" for function {function_name}",
+                        argument.name
+                    ),
                 ));
             };
             let value = evaluate_scalar(&bind_constant_expression(&catalog, &argument.expr)?)?;

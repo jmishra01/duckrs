@@ -6,15 +6,15 @@
 //! `TextTreeRenderer` (in [`text_tree_renderer`]) or as JSON. A physical plan takes its details from the logical plan it came from, whose
 //! expressions still have their names.
 
-use duckrs_core::planner::expression::filter_text;
+use duckrs_common::sort_key::OrderType;
 use duckrs_core::execution::physical::PhysicalOperator;
 use duckrs_core::optimizer::join_order::PlanEstimate;
-use duckrs_core::planner::expression::{BoundAggregate, BoundExpr, BoundWindow};
 use duckrs_core::optimizer::range_joins::{range_order, reorder_conditions};
+use duckrs_core::planner::expression::filter_text;
+use duckrs_core::planner::expression::{BoundAggregate, BoundExpr, BoundWindow};
 use duckrs_core::planner::logical::{
     BoundOrderByNode, JoinAlgorithm, JoinCondition, LogicalOperator, LogicalOperatorKind as K,
 };
-use duckrs_common::sort_key::OrderType;
 
 use super::text_tree_renderer::{self, TextTreeConfig, TreeNode, split_lines, strip_outer_parens};
 
@@ -51,8 +51,12 @@ impl ExplainNode {
 fn logical_name(op: &LogicalOperator) -> &'static str {
     match &op.kind {
         // `LogicalGet::GetName`: the table function's name
-        K::Range { generate_series: false, .. } => "RANGE",
-        K::Range { generate_series: true, .. } => "GENERATE_SERIES",
+        K::Range {
+            generate_series: false, ..
+        } => "RANGE",
+        K::Range {
+            generate_series: true, ..
+        } => "GENERATE_SERIES",
         K::Get { .. } | K::ExpressionGet { .. } | K::ChunkGet { .. } | K::UserTableScan { .. } => "SEQ_SCAN",
         K::EmptyResult { .. } => "EMPTY_RESULT",
         K::DummyScan { .. } => "DUMMY_SCAN",
@@ -119,7 +123,12 @@ fn conditions_text(conditions: &[JoinCondition], predicate: Option<String>) -> S
 fn aggregate_text(aggregate: &BoundAggregate) -> String {
     // the arguments of an aggregate duckrs computes from its rows are packed into one (`a0`, `a1`, ...)
     let children = match aggregate.children.as_slice() {
-        [only] if matches!(aggregate.function.kind, duckrs_core::function::aggregates::AggregateKind::Holistic(_)) => {
+        [only]
+            if matches!(
+                aggregate.function.kind,
+                duckrs_core::function::aggregates::AggregateKind::Holistic(_)
+            ) =>
+        {
             match &only.kind {
                 duckrs_core::planner::expression::BoundExprKind::Function { function, children, .. }
                     if function.name == "struct_pack"
@@ -184,7 +193,10 @@ fn scan_filter_lines_marked(filters: &[(BoundExpr, bool)]) -> String {
         _ => text(filter),
     };
     #[allow(clippy::type_complexity, reason = "per column, its filters")]
-    let mut groups: Vec<(Option<duckrs_core::planner::expression::ColumnBinding>, Vec<&(BoundExpr, bool)>)> = Vec::new();
+    let mut groups: Vec<(
+        Option<duckrs_core::planner::expression::ColumnBinding>,
+        Vec<&(BoundExpr, bool)>,
+    )> = Vec::new();
     for filter in filters {
         let key = column(&filter.0);
         match groups.iter_mut().find(|(k, _)| key.is_some() && *k == key) {
@@ -196,6 +208,9 @@ fn scan_filter_lines_marked(filters: &[(BoundExpr, bool)]) -> String {
             None => groups.push((key, vec![filter])),
         }
     }
+    // `TableFilterSet::filters` is a map by the column's position in the scan, and the filters of several columns
+    // (`multi_column_filters`) come after it
+    groups.sort_by_key(|(key, _)| key.map_or((1, 0), |binding| (0, binding.column_index)));
     lines(groups.into_iter().map(|(_, members)| match members.as_slice() {
         [only] => whole(only),
         _ => members.iter().map(|m| part(m)).collect::<Vec<_>>().join(" AND "),
@@ -205,7 +220,10 @@ fn scan_filter_lines_marked(filters: &[(BoundExpr, bool)]) -> String {
 /// The fields of STRUCT columns a filter reads, as C++ shows them: of a column whose field the scan reads in its
 /// place (`IsPushdownExtract`), the filter is one on that field, named by its path (`s.a`); otherwise the key is the
 /// field's name (`struct_extract(s, 'a')`).
-fn with_field_names(filter: &BoundExpr, extracted: &dyn Fn(&duckrs_core::planner::expression::ColumnBinding) -> bool) -> BoundExpr {
+fn with_field_names(
+    filter: &BoundExpr,
+    extracted: &dyn Fn(&duckrs_core::planner::expression::ColumnBinding) -> bool,
+) -> BoundExpr {
     use duckrs_core::planner::expression::BoundExprKind as E;
     fn path(expr: &BoundExpr) -> Option<(duckrs_core::planner::expression::ColumnBinding, String)> {
         match &expr.kind {
@@ -288,7 +306,11 @@ fn window_text(window: &BoundWindow) -> String {
         .iter()
         .enumerate()
         .map(|(at, child)| {
-            if at == 0 && window.distinct { format!("DISTINCT {child}") } else { child.to_string() }
+            if at == 0 && window.distinct {
+                format!("DISTINCT {child}")
+            } else {
+                child.to_string()
+            }
         })
         .collect();
     result += &arguments.join(", ");
@@ -453,7 +475,8 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
         }
         // `PhysicalTableScan::ParamsToString` of a table function without `to_string`
         K::ExpressionGet {
-            function: Some(function), ..
+            function: Some(function),
+            ..
         } if physical => entry("Function", function.to_uppercase()),
         K::MaterializedCte { name, table_index, .. } => {
             let mut info = entry("CTE Name", name.clone());
@@ -521,7 +544,9 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
                 });
                 // the scan reads fields of the column, not all of it
                 let extracted = |binding: &duckrs_core::planner::expression::ColumnBinding| {
-                    let Some(column) = column_ids.get(binding.column_index).filter(|_| binding.table_index == *table_index)
+                    let Some(column) = column_ids
+                        .get(binding.column_index)
+                        .filter(|_| binding.table_index == *table_index)
                     else {
                         return false;
                     };
@@ -587,7 +612,11 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
             if let Some(sample) = sample {
                 let text = if sample.options.is_percentage {
                     let value = sample.options.sample_size.parse::<f64>().unwrap_or(0.0);
-                    let value = if value.fract() == 0.0 { format!("{value:.1}") } else { value.to_string() };
+                    let value = if value.fract() == 0.0 {
+                        format!("{value:.1}")
+                    } else {
+                        value.to_string()
+                    };
                     format!("System: {value}%")
                 } else {
                     format!("System: {} rows", sample.options.sample_size)
@@ -613,8 +642,11 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
             for (base, extract) in &scan.extracts {
                 names.push(format!("{}.{}", names[*base], extract.names.join(".")));
             }
-            let is_projected =
-                |at: usize| scan.projected.as_ref().is_none_or(|p| p.get(at).copied().unwrap_or(true));
+            let is_projected = |at: usize| {
+                scan.projected
+                    .as_ref()
+                    .is_none_or(|p| p.get(at).copied().unwrap_or(true))
+            };
             let positions: Vec<usize> = (0..base_count)
                 .filter(|&at| is_projected(at) || scan.extracts.iter().any(|(base, _)| *base == at))
                 .collect();
@@ -758,7 +790,11 @@ fn operator_info(op: &LogicalOperator, physical: bool) -> Vec<(String, String)> 
                     entry("Sample Size", format!("{value}{unit}"))
                 }
                 method => {
-                    let name = if method == SampleMethod::System { "System" } else { "Bernoulli" };
+                    let name = if method == SampleMethod::System {
+                        "System"
+                    } else {
+                        "Bernoulli"
+                    };
                     if options.is_percentage {
                         entry("Sample Method", format!("{name}: {size:.6}%"))
                     } else {
@@ -849,7 +885,9 @@ fn analyzed_rows(op: &dyn PhysicalOperator) -> Option<u64> {
 
 /// What a scan of `table` is: `REC_CTE_SCAN` of a working table or `REC_REC_CTE_SCAN` of a
 /// recurring one, with the index of its CTE.
-fn recursive_scan(table: &std::sync::Arc<parking_lot::Mutex<duckrs_common::column_data::ColumnDataCollection>>) -> Option<(&'static str, usize)> {
+fn recursive_scan(
+    table: &std::sync::Arc<parking_lot::Mutex<duckrs_common::column_data::ColumnDataCollection>>,
+) -> Option<(&'static str, usize)> {
     let pointer = std::sync::Arc::as_ptr(table) as *const () as usize;
     RECURSIVE_TABLES.with(|tables| {
         tables.borrow().iter().rev().find_map(|&(working, recurring, index)| {
@@ -869,7 +907,9 @@ fn recursive_scan(table: &std::sync::Arc<parking_lot::Mutex<duckrs_common::colum
 fn physical_matches(op: &dyn PhysicalOperator, logical: &LogicalOperator) -> bool {
     let physical = op.name();
     let logical = logical_name(logical);
-    physical == logical || (matches!(physical, "TABLE_SCAN" | "SEQ_SCAN") && matches!(logical, "SEQ_GET" | "TABLE_SCAN" | "SEQ_SCAN" | "GET"))
+    physical == logical
+        || (matches!(physical, "TABLE_SCAN" | "SEQ_SCAN")
+            && matches!(logical, "SEQ_GET" | "TABLE_SCAN" | "SEQ_SCAN" | "GET"))
 }
 
 pub(super) fn physical_tree(
@@ -900,9 +940,17 @@ pub(super) fn physical_tree(
         && logical_children.len() == 1
     {
         let child_estimate = |at: usize| estimate.and_then(|e| e.children.get(at));
-        let anchor = physical_tree(children[0].as_ref(), Some(&logical_children[0]), child_estimate(0), analyze);
+        let anchor = physical_tree(
+            children[0].as_ref(),
+            Some(&logical_children[0]),
+            child_estimate(0),
+            analyze,
+        );
         let pointer = |table: &std::sync::Arc<_>| std::sync::Arc::as_ptr(table) as *const () as usize;
-        RECURSIVE_TABLES.with(|t| t.borrow_mut().push((pointer(working), pointer(recurring), *table_index)));
+        RECURSIVE_TABLES.with(|t| {
+            t.borrow_mut()
+                .push((pointer(working), pointer(recurring), *table_index))
+        });
         let plan = duckrs_core::execution::create_plan((**recursive).clone());
         let rounds = physical_tree(plan.as_ref(), Some(unresolved), child_estimate(1), analyze);
         RECURSIVE_TABLES.with(|t| t.borrow_mut().pop());
@@ -956,7 +1004,8 @@ pub(super) fn physical_tree(
         && children.len() == 1
         && children[0].name() == op.name()
         && children[0].children().len() == 1
-        && duckrs_core::execution::distinct_in_two_steps(groups, aggregates, grouping_sets, grouping_functions).is_some()
+        && duckrs_core::execution::distinct_in_two_steps(groups, aggregates, grouping_sets, grouping_functions)
+            .is_some()
     {
         let estimate = estimate.filter(|e| e.children.len() == 1);
         return ExplainNode {
@@ -1036,7 +1085,12 @@ pub(super) fn physical_tree(
         // the column select of a logical one, or one the physical plan adds above the operator
         let selected = logical.filter(|l| matches!(l.kind, K::ColumnSelect { .. }));
         return match selected {
-            Some(l) => physical_tree(children[0].as_ref(), Some(&l.children[0]), estimate.map(|e| &e.children[0]), analyze),
+            Some(l) => physical_tree(
+                children[0].as_ref(),
+                Some(&l.children[0]),
+                estimate.map(|e| &e.children[0]),
+                analyze,
+            ),
             None => physical_tree(children[0].as_ref(), logical, estimate, analyze),
         };
     }
@@ -1056,7 +1110,10 @@ pub(super) fn physical_tree(
         // `PhysicalTableScan::GetName`
         Some(K::ParquetScan { scan, .. }) => scan.function_name.to_uppercase(),
         Some(K::JsonScan { scan, .. }) => scan.function_name.to_uppercase(),
-        Some(K::ExpressionGet { function: Some(function), .. }) => function.to_uppercase(),
+        Some(K::ExpressionGet {
+            function: Some(function),
+            ..
+        }) => function.to_uppercase(),
         Some(K::WorkingTable { working, .. }) => match recursive_scan(working) {
             Some((name, _)) => name.to_string(),
             None => op.name().to_string(),
@@ -1137,8 +1194,7 @@ pub(super) fn add_dynamic_filters(node: &mut ExplainNode, recorded: &mut impl It
     let scan = node.info.iter().any(|(key, value)| {
         key == "Table" || (key == "Function" && matches!(value.as_str(), "READ_PARQUET" | "PARQUET_SCAN"))
     });
-    if scan && let Some(Some(filters)) = recorded.next()
-    {
+    if scan && let Some(Some(filters)) = recorded.next() {
         let at = node
             .info
             .iter()
@@ -1323,7 +1379,11 @@ pub(super) fn profile_tree(root: Option<duckrs_core::execution::profiler::Profil
             .extra_info
             .iter()
             .map(|(key, value)| {
-                let key = if key == "Estimated Cardinality" { ESTIMATED_CARDINALITY } else { key };
+                let key = if key == "Estimated Cardinality" {
+                    ESTIMATED_CARDINALITY
+                } else {
+                    key
+                };
                 (key.to_string(), value.clone())
             })
             .collect();
@@ -1334,7 +1394,10 @@ pub(super) fn profile_tree(root: Option<duckrs_core::execution::profiler::Profil
             ));
         }
         info.push((CARDINALITY.to_string(), profile.metrics.rows.to_string()));
-        info.push((TIMING.to_string(), format!("{:.2}s", profile.metrics.time.as_secs_f64())));
+        info.push((
+            TIMING.to_string(),
+            format!("{:.2}s", profile.metrics.time.as_secs_f64()),
+        ));
         ExplainNode {
             name: profile.op_type.clone(),
             info,
@@ -1369,7 +1432,9 @@ struct GridNode {
 /// `RenderTree::CreateTree`: each node at its column and depth, a node taking the column of its first child.
 fn grid(root: &ExplainNode, raw_keys: bool) -> Vec<GridNode> {
     fn place(node: &ExplainNode, x: usize, y: usize, raw_keys: bool, out: &mut Vec<GridNode>) -> usize {
-        let estimate = node.estimate.map(|e| (ESTIMATED_CARDINALITY.to_string(), e.to_string()));
+        let estimate = node
+            .estimate
+            .map(|e| (ESTIMATED_CARDINALITY.to_string(), e.to_string()));
         let extra = node
             .info
             .iter()
@@ -1418,7 +1483,10 @@ fn sanitize_key(key: &str) -> String {
         .map(|word| {
             let mut chars = word.chars();
             match chars.next() {
-                Some(first) => first.to_uppercase().chain(chars.flat_map(|c| c.to_lowercase())).collect(),
+                Some(first) => first
+                    .to_uppercase()
+                    .chain(chars.flat_map(|c| c.to_lowercase()))
+                    .collect(),
                 None => String::new(),
             }
         })
@@ -1453,7 +1521,12 @@ fn render_graphviz(root: &ExplainNode) -> String {
         for (key, value) in &node.extra {
             body.push(format!("{key}:\\n{}", json_sanitize(value)));
         }
-        nodes.push(format!("    node_{}_{} [label=\"{}\"];", node.x, node.y, body.join("\\n───\\n")));
+        nodes.push(format!(
+            "    node_{}_{} [label=\"{}\"];",
+            node.x,
+            node.y,
+            body.join("\\n───\\n")
+        ));
         for (cx, cy) in &node.children {
             edges.push(format!("    node_{}_{} -> node_{cx}_{cy};", node.x, node.y));
         }
@@ -1487,7 +1560,11 @@ fn render_compact(root: &ExplainNode, query: Option<std::time::Duration>) -> Str
             } else if key == TIMING {
                 stats.push(format!("time={value}"));
             } else {
-                let key = if key.starts_with("__") { sanitize_key(key) } else { key.clone() };
+                let key = if key.starts_with("__") {
+                    sanitize_key(key)
+                } else {
+                    key.clone()
+                };
                 let value: Vec<&str> = value.split('\n').map(str::trim).filter(|v| !v.is_empty()).collect();
                 properties.push(format!("{key}: {}", value.join(", ")));
             }
@@ -1600,7 +1677,11 @@ fn html_node(nodes: &[GridNode], at: (usize, usize), total: &mut f64, timed: &mu
     let mut details = Vec::new();
     for (key, value) in &node.extra {
         if key == CARDINALITY || key == ESTIMATED_CARDINALITY {
-            let field = if key == CARDINALITY { "cardinality" } else { "estimated_cardinality" };
+            let field = if key == CARDINALITY {
+                "cardinality"
+            } else {
+                "estimated_cardinality"
+            };
             out.push_str(&format!(",\"{field}\":{}", value.parse::<i64>().unwrap_or(0)));
         } else if key == TIMING {
             let seconds: f64 = value.trim_end_matches('s').parse().unwrap_or(0.0);
@@ -1608,7 +1689,11 @@ fn html_node(nodes: &[GridNode], at: (usize, usize), total: &mut f64, timed: &mu
             *total += seconds;
             *timed = true;
         } else {
-            let key = if key.starts_with("__") { sanitize_key(key) } else { key.clone() };
+            let key = if key.starts_with("__") {
+                sanitize_key(key)
+            } else {
+                key.clone()
+            };
             let mut detail = String::from("{\"key\":");
             json_string_compact(&key, &mut detail);
             detail.push_str(",\"values\":[");

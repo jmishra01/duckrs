@@ -140,7 +140,13 @@ impl Durable {
 /// The bytes of some log records, the version they are in, how many there are, and how the file is encrypted.
 /// The bytes, the version they are in, how many records, the encryption, and whether a record updates, deletes or
 /// drops (`UndoBufferProperties::has_updates` / `has_dropped_entries`).
-struct Records(Vec<u8>, StorageVersion, u64, Option<super::encryption::FileEncryption>, bool);
+struct Records(
+    Vec<u8>,
+    StorageVersion,
+    u64,
+    Option<super::encryption::FileEncryption>,
+    bool,
+);
 
 impl Records {
     fn entry(&mut self, wal: u64, body: impl FnOnce(&mut BinarySerializer)) {

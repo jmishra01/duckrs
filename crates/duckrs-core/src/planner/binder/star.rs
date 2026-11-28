@@ -636,10 +636,8 @@ fn replace_unpacked(expr: &mut Expr, columns: &[Expr]) -> Result<()> {
     let mut error = None;
     visit_expr_mut(expr, &mut |e| match &mut e.kind {
         ExprKind::Operator { op, children }
-            if !matches!(
-                op,
-                OperatorType::Coalesce | OperatorType::In | OperatorType::NotIn
-            ) && children.iter().any(is_unpack) =>
+            if !matches!(op, OperatorType::Coalesce | OperatorType::In | OperatorType::NotIn)
+                && children.iter().any(is_unpack) =>
         {
             let name = match op {
                 OperatorType::Not => "OPERATOR_NOT",

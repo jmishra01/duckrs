@@ -368,7 +368,11 @@ fn list_grade_up(args: &DataChunk, result: &mut Vector) -> Result<()> {
         order.sort_by(|a, b| {
             let (left, right) = (values[*a].is_null(), values[*b].is_null());
             if left || right {
-                return if nulls_first { right.cmp(&left) } else { left.cmp(&right) };
+                return if nulls_first {
+                    right.cmp(&left)
+                } else {
+                    left.cmp(&right)
+                };
             }
             if descending {
                 keys[*b].cmp(&keys[*a])

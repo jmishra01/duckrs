@@ -3481,10 +3481,7 @@ pub fn partition_statistics(scan: &ParquetScanData) -> Option<Vec<PartitionStati
 }
 
 /// [`partition_statistics`] of the row groups of one file.
-fn file_partition_statistics(
-    scan: &ParquetScanData,
-    file: &str,
-) -> Option<Vec<PartitionStatistics>> {
+fn file_partition_statistics(scan: &ParquetScanData, file: &str) -> Option<Vec<PartitionStatistics>> {
     let (metadata, _) = read_metadata(file).ok()?;
     let leaves: Vec<Option<usize>> = (0..scan.names.len())
         .map(|column| statistics_leaf(scan, &metadata, column, file))
@@ -3898,7 +3895,10 @@ pub fn bound_column_matches(scan: &ParquetScanData, path: &str, column: usize) -
     };
     let schema = builder.schema();
     // `EqualsIncludingCollation`
-    schema.fields().get(column).is_some_and(|field| field.name().eq_ignore_ascii_case(name))
+    schema
+        .fields()
+        .get(column)
+        .is_some_and(|field| field.name().eq_ignore_ascii_case(name))
         && stored_type(scan, path, name).is_some_and(|stored| &stored == ty && stored.collation() == ty.collation())
 }
 

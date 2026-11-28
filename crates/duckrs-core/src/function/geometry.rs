@@ -155,8 +155,12 @@ pub(crate) fn geometry_of_geojson(input: &[u8]) -> Result<Vec<u8>> {
     let text = String::from_utf8_lossy(input);
     // a document nested deeply is read on a stack as deep as it
     super::json::with_stack_for(&text, || {
-        let json = duckrs_common::json::parse(&text)
-            .map_err(|e| Error::new(ErrorKind::InvalidInput, duckrs_common::json::parse_error_text(&text, &e)))?;
+        let json = duckrs_common::json::parse(&text).map_err(|e| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                duckrs_common::json::parse_error_text(&text, &e),
+            )
+        })?;
         let wkb = duckrs_common::geojson::from_geojson(&json)?;
         geometry::from_wkb(&wkb)
     })
@@ -224,7 +228,12 @@ pub(super) fn geometry_functions() -> Vec<ScalarFunctionSet> {
         ("st_asbinary", vec![geometry.clone()], LogicalType::BLOB, st_aswkb),
         ("st_astext", vec![geometry.clone()], LogicalType::VARCHAR, st_astext),
         // the JSON extension's `ST_AsGeoJSON` and `ST_GeomFromGeoJSON` (`json_geojson.cpp`)
-        ("st_asgeojson", vec![geometry.clone()], super::json::json_type(), st_asgeojson),
+        (
+            "st_asgeojson",
+            vec![geometry.clone()],
+            super::json::json_type(),
+            st_asgeojson,
+        ),
         (
             "st_geomfromgeojson",
             vec![LogicalType::VARCHAR],

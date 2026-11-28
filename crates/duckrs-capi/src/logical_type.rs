@@ -75,7 +75,11 @@ pub unsafe extern "C" fn duckdb_create_array_type(ty: duckdb_logical_type, array
 /// # Safety
 ///
 /// `types` and `names` are null or arrays of `count` logical types and NUL-terminated names.
-unsafe fn members(types: *mut duckdb_logical_type, names: *mut *const c_char, count: idx_t) -> Option<Vec<(String, LogicalType)>> {
+unsafe fn members(
+    types: *mut duckdb_logical_type,
+    names: *mut *const c_char,
+    count: idx_t,
+) -> Option<Vec<(String, LogicalType)>> {
     // SAFETY: by the contract of this function.
     let types = unsafe { ffi::slice(types.cast_const(), count) }?;
     // SAFETY: by the contract of this function.
@@ -96,8 +100,9 @@ pub unsafe extern "C" fn duckdb_create_union_type(
     member_count: idx_t,
 ) -> duckdb_logical_type {
     // SAFETY: C passes `member_count` types and names.
-    unsafe { members(member_types, member_names, member_count) }
-        .map_or(std::ptr::null_mut(), |members| new_type(LogicalType::union_type(members)))
+    unsafe { members(member_types, member_names, member_count) }.map_or(std::ptr::null_mut(), |members| {
+        new_type(LogicalType::union_type(members))
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -118,7 +123,10 @@ pub unsafe extern "C" fn duckdb_create_struct_type(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn duckdb_create_enum_type(member_names: *mut *const c_char, member_count: idx_t) -> duckdb_logical_type {
+pub unsafe extern "C" fn duckdb_create_enum_type(
+    member_names: *mut *const c_char,
+    member_count: idx_t,
+) -> duckdb_logical_type {
     // SAFETY: C passes `member_count` names.
     let Some(names) = (unsafe { ffi::slice(member_names.cast_const(), member_count) }) else {
         return std::ptr::null_mut();
@@ -135,7 +143,10 @@ pub unsafe extern "C" fn duckdb_create_enum_type(member_names: *mut *const c_cha
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn duckdb_create_map_type(key_type: duckdb_logical_type, value_type: duckdb_logical_type) -> duckdb_logical_type {
+pub unsafe extern "C" fn duckdb_create_map_type(
+    key_type: duckdb_logical_type,
+    value_type: duckdb_logical_type,
+) -> duckdb_logical_type {
     // SAFETY: C passes two live logical types.
     let (Some(key), Some(value)) = (unsafe { ffi::get(key_type) }, unsafe { ffi::get(value_type) }) else {
         return std::ptr::null_mut();
@@ -167,13 +178,17 @@ pub unsafe extern "C" fn duckdb_destroy_logical_type(ty: *mut duckdb_logical_typ
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn duckdb_decimal_width(ty: duckdb_logical_type) -> u8 {
     // SAFETY: C passes a live logical type.
-    unsafe { type_with_id(ty, LogicalTypeId::Decimal) }.and_then(LogicalType::decimal_properties).map_or(0, |(w, _)| w)
+    unsafe { type_with_id(ty, LogicalTypeId::Decimal) }
+        .and_then(LogicalType::decimal_properties)
+        .map_or(0, |(w, _)| w)
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn duckdb_decimal_scale(ty: duckdb_logical_type) -> u8 {
     // SAFETY: C passes a live logical type.
-    unsafe { type_with_id(ty, LogicalTypeId::Decimal) }.and_then(LogicalType::decimal_properties).map_or(0, |(_, s)| s)
+    unsafe { type_with_id(ty, LogicalTypeId::Decimal) }
+        .and_then(LogicalType::decimal_properties)
+        .map_or(0, |(_, s)| s)
 }
 
 #[unsafe(no_mangle)]
@@ -218,9 +233,9 @@ pub unsafe extern "C" fn duckdb_enum_dictionary_value(ty: duckdb_logical_type, i
 pub unsafe extern "C" fn duckdb_list_type_child_type(ty: duckdb_logical_type) -> duckdb_logical_type {
     // SAFETY: C passes a live logical type.
     match unsafe { ffi::get(ty) } {
-        Some(ty) if matches!(ty.id(), LogicalTypeId::List | LogicalTypeId::Map) => {
-            ty.child_type().map_or(std::ptr::null_mut(), |child| new_type(child.clone()))
-        }
+        Some(ty) if matches!(ty.id(), LogicalTypeId::List | LogicalTypeId::Map) => ty
+            .child_type()
+            .map_or(std::ptr::null_mut(), |child| new_type(child.clone())),
         _ => std::ptr::null_mut(),
     }
 }
@@ -293,13 +308,15 @@ pub unsafe extern "C" fn duckdb_struct_type_child_type(ty: duckdb_logical_type, 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn duckdb_union_type_member_count(ty: duckdb_logical_type) -> idx_t {
     // SAFETY: C passes a live logical type.
-    unsafe { type_with_id(ty, LogicalTypeId::Union) }.map_or(0, |ty| ty.struct_children().len().saturating_sub(1) as idx_t)
+    unsafe { type_with_id(ty, LogicalTypeId::Union) }
+        .map_or(0, |ty| ty.struct_children().len().saturating_sub(1) as idx_t)
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn duckdb_union_type_member_name(ty: duckdb_logical_type, index: idx_t) -> *mut c_char {
     // SAFETY: C passes a live logical type.
-    match unsafe { type_with_id(ty, LogicalTypeId::Union) }.and_then(|ty| ty.struct_children().get(index as usize + 1)) {
+    match unsafe { type_with_id(ty, LogicalTypeId::Union) }.and_then(|ty| ty.struct_children().get(index as usize + 1))
+    {
         Some((name, _)) => ffi::strdup(name),
         None => std::ptr::null_mut(),
     }
@@ -308,7 +325,8 @@ pub unsafe extern "C" fn duckdb_union_type_member_name(ty: duckdb_logical_type, 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn duckdb_union_type_member_type(ty: duckdb_logical_type, index: idx_t) -> duckdb_logical_type {
     // SAFETY: C passes a live logical type.
-    match unsafe { type_with_id(ty, LogicalTypeId::Union) }.and_then(|ty| ty.struct_children().get(index as usize + 1)) {
+    match unsafe { type_with_id(ty, LogicalTypeId::Union) }.and_then(|ty| ty.struct_children().get(index as usize + 1))
+    {
         Some((_, member)) => new_type(member.clone()),
         None => std::ptr::null_mut(),
     }

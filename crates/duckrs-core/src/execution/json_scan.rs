@@ -390,8 +390,10 @@ pub fn infer_with(records: &[&Json], case_insensitive: bool) -> Structure {
 pub fn infer_options(records: &[&Json], case_insensitive: bool, geojson: bool) -> Structure {
     let mut structure = Structure::Null;
     for record in records {
-        structure =
-            structure.merge_with(Structure::of_options(record, case_insensitive, geojson), case_insensitive);
+        structure = structure.merge_with(
+            Structure::of_options(record, case_insensitive, geojson),
+            case_insensitive,
+        );
     }
     structure
 }
@@ -429,7 +431,8 @@ pub fn geojson_records(records: Vec<Record>) -> Vec<Record> {
         };
         let kind = match &json {
             Json::Object(object)
-                if has_type(object, "FeatureCollection") && matches!(member(object, "features"), Some(Json::Array(_))) =>
+                if has_type(object, "FeatureCollection")
+                    && matches!(member(object, "features"), Some(Json::Array(_))) =>
             {
                 1
             }
@@ -545,11 +548,12 @@ pub fn refine_type(ty: LogicalType, values: &[&Json], formats: &Formats) -> Logi
             // (`infinity`, `epoch`) fitting any; a template with an offset makes it a TIMESTAMPTZ, and values with and
             // without one fit none
             if formats.timestamp.is_none() {
-                let special = |text: &str| {
-                    matches!(text.to_ascii_lowercase().as_str(), "infinity" | "-infinity" | "epoch")
-                };
+                let special =
+                    |text: &str| matches!(text.to_ascii_lowercase().as_str(), "infinity" | "-infinity" | "epoch");
                 if let Some(found) = TIMESTAMP_TEMPLATES.into_iter().find(|format| {
-                    texts.iter().all(|text| special(text) || strptime_micros(text, format).is_ok())
+                    texts
+                        .iter()
+                        .all(|text| special(text) || strptime_micros(text, format).is_ok())
                 }) {
                     if found.contains('Z') || found.contains("%z") {
                         return zoned;
@@ -560,7 +564,10 @@ pub fn refine_type(ty: LogicalType, values: &[&Json], formats: &Formats) -> Logi
                     }
                     return LogicalType::TIMESTAMP;
                 }
-            } else if texts.iter().all(|text| string_fits(text, &LogicalType::TIMESTAMP, formats)) {
+            } else if texts
+                .iter()
+                .all(|text| string_fits(text, &LogicalType::TIMESTAMP, formats))
+            {
                 // a format given makes only TIMESTAMPs, read with it
                 return LogicalType::TIMESTAMP;
             }

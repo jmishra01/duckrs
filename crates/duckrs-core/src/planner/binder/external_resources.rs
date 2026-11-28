@@ -189,7 +189,11 @@ impl Binder<'_> {
         if self.defining {
             return self.bind_rows(table_ref, name, names, types, Vec::new());
         }
-        let Some(tables) = self.session.as_ref().and_then(|session| session.external_resources.clone()) else {
+        let Some(tables) = self
+            .session
+            .as_ref()
+            .and_then(|session| session.external_resources.clone())
+        else {
             return Err(Error::new(
                 ErrorKind::NotImplemented,
                 format!("{name} is not available here"),

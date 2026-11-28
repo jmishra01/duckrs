@@ -214,7 +214,11 @@ pub(crate) fn scale_factor(value: &Value) -> Result<f64> {
 }
 
 fn no_match(function: &str, args: &[FunctionArgument]) -> Error {
-    let positional = args.iter().filter(|a| a.name.is_empty()).map(|_| "?").collect::<Vec<_>>();
+    let positional = args
+        .iter()
+        .filter(|a| a.name.is_empty())
+        .map(|_| "?")
+        .collect::<Vec<_>>();
     binder_error(format!(
         "No function matches the given name and argument types '{function}({})'",
         positional.join(", ")

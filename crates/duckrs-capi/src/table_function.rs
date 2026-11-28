@@ -13,7 +13,9 @@ use crate::function_info::*;
 use crate::scalar_function::logical_type;
 use crate::types::*;
 use crate::vector::{contains_invalid_or_any, prepare_vector};
-use duckrs::udf::{TableUdf, TableUdfBindInput, TableUdfBinding, TableUdfOverload, TableUdfRun, TableUdfScan, TableUdfSet};
+use duckrs::udf::{
+    TableUdf, TableUdfBindInput, TableUdfBinding, TableUdfOverload, TableUdfRun, TableUdfScan, TableUdfSet,
+};
 use duckrs::{DataChunk, ErrorKind, LogicalType, LogicalTypeId, Result};
 use std::ffi::c_char;
 use std::sync::Arc;
@@ -73,7 +75,9 @@ impl CTableScan {
         });
         // SAFETY: the init callback C registered, with an info that lives for the call.
         unsafe { init(ffi::borrowed_handle(&mut info)) };
-        let InitInfo::Table(info) = info else { unreachable!("a table init info") };
+        let InitInfo::Table(info) = info else {
+            unreachable!("a table init info")
+        };
         callback_error(ErrorKind::InvalidInput, info.error)?;
         Ok(info.init_data)
     }
@@ -103,7 +107,9 @@ impl TableUdf for SharedUdf {
         });
         // SAFETY: the bind callback C registered, with an info that lives for the call.
         unsafe { (self.0.bind)(ffi::borrowed_handle(&mut info)) };
-        let BindInfo::Table(info) = info else { unreachable!("a table bind info") };
+        let BindInfo::Table(info) = info else {
+            unreachable!("a table bind info")
+        };
         callback_error(ErrorKind::Binder, info.error)?;
         let scan = Arc::new(CTableScan {
             udf: self.0.clone(),
@@ -150,7 +156,9 @@ impl TableUdfRun for CTableRun {
         });
         // SAFETY: the function C registered, with an info and a chunk that live for the call.
         unsafe { (self.scan.udf.function)(ffi::borrowed_handle(&mut info), ffi::borrowed_handle(output)) };
-        let FunctionInfo::Table(info) = info else { unreachable!("a table function info") };
+        let FunctionInfo::Table(info) = info else {
+            unreachable!("a table function info")
+        };
         callback_error(ErrorKind::InvalidInput, info.error)
     }
 }
@@ -203,13 +211,19 @@ pub unsafe extern "C" fn duckdb_table_function_add_named_parameter(
 ) {
     // SAFETY: C passes a live function, a NUL-terminated name and a live logical type.
     let (Some(function), Some(name), Some(ty)) =
-        (unsafe { function_mut(function) }, unsafe { ffi::c_str(name) }, unsafe { logical_type(ty) })
+        (unsafe { function_mut(function) }, unsafe { ffi::c_str(name) }, unsafe {
+            logical_type(ty)
+        })
     else {
         return;
     };
     let name = String::from_utf8_lossy(name).into_owned();
     // an option that is there already keeps its type
-    if !function.named_parameters.iter().any(|(n, _)| n.eq_ignore_ascii_case(&name)) {
+    if !function
+        .named_parameters
+        .iter()
+        .any(|(n, _)| n.eq_ignore_ascii_case(&name))
+    {
         function.named_parameters.push((name, ty.clone()));
     }
 }
@@ -227,7 +241,10 @@ pub unsafe extern "C" fn duckdb_table_function_set_extra_info(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn duckdb_table_function_set_bind(function: duckdb_table_function, bind: duckdb_table_function_bind_t) {
+pub unsafe extern "C" fn duckdb_table_function_set_bind(
+    function: duckdb_table_function,
+    bind: duckdb_table_function_bind_t,
+) {
     // SAFETY: C passes a live function.
     if let (Some(function), Some(_)) = (unsafe { function_mut(function) }, bind) {
         function.bind = bind;
@@ -235,7 +252,10 @@ pub unsafe extern "C" fn duckdb_table_function_set_bind(function: duckdb_table_f
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn duckdb_table_function_set_init(function: duckdb_table_function, init: duckdb_table_function_init_t) {
+pub unsafe extern "C" fn duckdb_table_function_set_init(
+    function: duckdb_table_function,
+    init: duckdb_table_function_init_t,
+) {
     // SAFETY: C passes a live function.
     if let (Some(function), Some(_)) = (unsafe { function_mut(function) }, init) {
         function.init = init;
@@ -267,7 +287,10 @@ pub unsafe extern "C" fn duckdb_table_function_set_function(
 /// duckrs gives a table function every column, which a function that supports projection pushdown handles as
 /// well: its init reads which columns it gives (all of them).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn duckdb_table_function_supports_projection_pushdown(function: duckdb_table_function, pushdown: bool) {
+pub unsafe extern "C" fn duckdb_table_function_supports_projection_pushdown(
+    function: duckdb_table_function,
+    pushdown: bool,
+) {
     // SAFETY: C passes a live function.
     if let Some(function) = unsafe { function_mut(function) } {
         function.projection_pushdown = pushdown;
@@ -323,9 +346,9 @@ pub unsafe extern "C" fn duckdb_register_table_function(
     function: duckdb_table_function,
 ) -> duckdb_state {
     // SAFETY: C passes a live connection and a live function.
-    let (Some(connection), Some(function)) =
-        (unsafe { ffi::get::<_duckdb_connection>(connection) }, unsafe { ffi::get(function) })
-    else {
+    let (Some(connection), Some(function)) = (unsafe { ffi::get::<_duckdb_connection>(connection) }, unsafe {
+        ffi::get(function)
+    }) else {
         return DuckDBError;
     };
     let ConnectionWrapper { connection, .. } = connection;
@@ -382,11 +405,15 @@ pub unsafe extern "C" fn duckdb_table_function_get_client_context(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn duckdb_bind_add_result_column(info: duckdb_bind_info, name: *const c_char, ty: duckdb_logical_type) {
+pub unsafe extern "C" fn duckdb_bind_add_result_column(
+    info: duckdb_bind_info,
+    name: *const c_char,
+    ty: duckdb_logical_type,
+) {
     // SAFETY: C passes the info of the bind that runs, a NUL-terminated name and a live logical type.
-    let (Some(info), Some(name), Some(ty)) =
-        (unsafe { bind_info(info) }, unsafe { ffi::c_str(name) }, unsafe { logical_type(ty) })
-    else {
+    let (Some(info), Some(name), Some(ty)) = (unsafe { bind_info(info) }, unsafe { ffi::c_str(name) }, unsafe {
+        logical_type(ty)
+    }) else {
         return;
     };
     if contains_invalid_or_any(ty) {
@@ -463,7 +490,11 @@ pub unsafe extern "C" fn duckdb_bind_get_named_parameter(info: duckdb_bind_info,
         return std::ptr::null_mut();
     };
     let name = String::from_utf8_lossy(name);
-    match info.named_parameters.iter().find(|(n, _)| n.eq_ignore_ascii_case(&name)) {
+    match info
+        .named_parameters
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(&name))
+    {
         Some((_, value)) => ffi::into_handle(value.clone()),
         None => std::ptr::null_mut(),
     }
@@ -557,7 +588,9 @@ pub unsafe extern "C" fn duckdb_init_get_column_count(info: duckdb_init_info) ->
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn duckdb_init_get_column_index(info: duckdb_init_info, column_index: idx_t) -> idx_t {
     // SAFETY: C passes the info of the init that runs.
-    unsafe { init_info(info) }.and_then(|info| info.column_ids.get(column_index as usize).copied()).unwrap_or(0)
+    unsafe { init_info(info) }
+        .and_then(|info| info.column_ids.get(column_index as usize).copied())
+        .unwrap_or(0)
 }
 
 /// duckrs scans a table function on one thread; the count is kept for the init data.

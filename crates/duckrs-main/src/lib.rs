@@ -19,6 +19,12 @@ pub use statement_type::{StatementProperties, StatementReturnType, StatementType
 mod settings_table;
 mod tpc;
 
+use duckrs_common::column_data::ColumnDataCollection;
+use duckrs_common::serializer::StorageVersion;
+use duckrs_common::sort_key::OrderType;
+use duckrs_common::types::LogicalType;
+use duckrs_common::value::Value;
+use duckrs_common::{Error, ErrorKind, Result};
 use duckrs_core::catalog::{
     Catalog, DEFAULT_CATALOG, Fork, IndexCatalogEntry, OnCreateConflict, SchemaCatalogEntry, SequenceData, SessionTemp,
     TEMP_SCHEMA, TableOrView, macro_type_name, missing_entry,
@@ -39,12 +45,6 @@ use duckrs_core::planner::statement_names::for_each_table_name;
 use duckrs_core::storage;
 use duckrs_core::storage::buffer_manager::BufferManager;
 use duckrs_core::storage::log_writer::WriteAheadLog;
-use duckrs_common::column_data::ColumnDataCollection;
-use duckrs_common::serializer::StorageVersion;
-use duckrs_common::sort_key::OrderType;
-use duckrs_common::types::LogicalType;
-use duckrs_common::value::Value;
-use duckrs_common::{Error, ErrorKind, Result};
 use duckrs_parser::ParserOptions;
 use duckrs_parser::ast::{
     AlterInfo, AlterKind, CreateInfo, CreateKind, CreateTypeKind, DropInfo, ExplainType, Expr, ExprKind, LiteralKind,
@@ -467,7 +467,14 @@ impl DatabaseInstance {
             views.push(name);
         }
         for view in views {
-            schema.create_view(&view, query.clone(), Vec::new(), OnCreateConflict::Error, Vec::new(), false)?;
+            schema.create_view(
+                &view,
+                query.clone(),
+                Vec::new(),
+                OnCreateConflict::Error,
+                Vec::new(),
+                false,
+            )?;
         }
         Ok(Arc::new(db))
     }
@@ -516,7 +523,9 @@ impl DatabaseInstance {
             if size != file_size {
                 return Err(Error::new(
                     ErrorKind::InvalidInput,
-                    format!("block size parameter does not match the file's block size, got {size}, expected {file_size}"),
+                    format!(
+                        "block size parameter does not match the file's block size, got {size}, expected {file_size}"
+                    ),
                 ));
             }
         }
@@ -606,8 +615,9 @@ impl DatabaseInstance {
                 storage::wal::ReplayedLog::Checkpointed => {
                     let mut log = path.as_os_str().to_owned();
                     log.push(".wal");
-                    std::fs::remove_file(&log)
-                        .map_err(|error| Error::new(ErrorKind::Io, format!("{}: {error}", Path::new(&log).display())))?;
+                    std::fs::remove_file(&log).map_err(|error| {
+                        Error::new(ErrorKind::Io, format!("{}: {error}", Path::new(&log).display()))
+                    })?;
                 }
                 storage::wal::ReplayedLog::Ends(end, version) => {
                     let mut log = file.log.lock();
@@ -662,7 +672,9 @@ impl DatabaseInstance {
             let updates = log.last_commit_updates();
             drop(log);
             drop(reading);
-            if size >= threshold && (!updates || self.transactions.lock().open.is_empty()) && !self.catalog.has_writers()
+            if size >= threshold
+                && (!updates || self.transactions.lock().open.is_empty())
+                && !self.catalog.has_writers()
             {
                 let _writing = self.statements.write();
                 return Ok(self.write_checkpoint_with(abort).err().map(|error| (error, false)));
@@ -725,7 +737,9 @@ impl DatabaseInstance {
             listing.total_blocks = blocks.header().block_count;
             listing.free_blocks = blocks.free_list().len() as u64;
             listing.wal_size = storage::log_writer::log_size(&file.path);
-            listing.cipher = blocks.encryption().map(|encryption| encryption.cipher.name().to_string());
+            listing.cipher = blocks
+                .encryption()
+                .map(|encryption| encryption.cipher.name().to_string());
             listing.metadata_blocks = blocks.metadata_blocks().into_iter().collect();
             listing.cached_blocks = Some(file.buffer.eviction_queue());
         }
@@ -913,9 +927,13 @@ impl DatabaseInstance {
         };
         // `AttachedDatabase::GetVacuumRebuildIndexThreshold`
         let vacuum_rebuild_indexes = file.vacuum_rebuild_indexes.unwrap_or_else(|| {
-            settings::current_value("vacuum_rebuild_indexes", &self.settings.read(), &SettingValues::default())
-                .and_then(|value| value.as_i128())
-                .map_or(0, |rows| rows as u64)
+            settings::current_value(
+                "vacuum_rebuild_indexes",
+                &self.settings.read(),
+                &SettingValues::default(),
+            )
+            .and_then(|value| value.as_i128())
+            .map_or(0, |rows| rows as u64)
         });
         let setting = |name: &str| {
             settings::current_value(name, &self.settings.read(), &SettingValues::default()).is_some_and(|value| {
@@ -953,7 +971,9 @@ impl DatabaseInstance {
 
     /// `abort` is `debug_checkpoint_abort`, which belongs to the session that asked.
     fn write_checkpoint_with(&self, abort: &str) -> Result<()> {
-        duckrs_core::execution::profiler::time_metric("storage.checkpoint_latency", || self.write_checkpoint_timed(abort))
+        duckrs_core::execution::profiler::time_metric("storage.checkpoint_latency", || {
+            self.write_checkpoint_timed(abort)
+        })
     }
 
     fn write_checkpoint_timed(&self, abort: &str) -> Result<()> {
@@ -1117,7 +1137,11 @@ fn unknown_pragma(name: &str) -> Option<Error> {
             ),
         ));
     }
-    if PRAGMA_FUNCTIONS.iter().chain(NO_OP_PRAGMAS).any(|f| f.eq_ignore_ascii_case(name)) {
+    if PRAGMA_FUNCTIONS
+        .iter()
+        .chain(NO_OP_PRAGMAS)
+        .any(|f| f.eq_ignore_ascii_case(name))
+    {
         return None;
     }
     Some(Error::new(
@@ -1465,7 +1489,6 @@ fn error_as_json(error: &Error) -> Error {
     converted
 }
 
-
 /// A fully materialized result (`MaterializedQueryResult`).
 #[derive(Debug)]
 pub struct MaterializedQueryResult {
@@ -1592,7 +1615,10 @@ fn check_print_format(given: &str) -> Result<()> {
     }
     Err(Error::new(
         ErrorKind::InvalidInput,
-        format!("\"{given}\" is not a valid FORMAT argument, valid options are: {}", FORMATS.join(", ")),
+        format!(
+            "\"{given}\" is not a valid FORMAT argument, valid options are: {}",
+            FORMATS.join(", ")
+        ),
     ))
 }
 
@@ -1786,7 +1812,9 @@ pub struct PreparedStatementData {
 impl PreparedStatementData {
     /// The names of its parameters, lowercase, in the order they appear (`1`, `2`, ... for `?` and `$1`).
     pub fn result_columns(&self) -> Option<(&[String], &[LogicalType])> {
-        self.columns.as_ref().map(|(names, types)| (names.as_slice(), types.as_slice()))
+        self.columns
+            .as_ref()
+            .map(|(names, types)| (names.as_slice(), types.as_slice()))
     }
 
     pub fn parameter_names(&self) -> &[String] {
@@ -2247,7 +2275,9 @@ impl ClientContext {
                 name: column.name.to_string(),
                 ty: column.ty.clone(),
                 // `ColumnDefinition::HasDefaultValue`: a generated column has none
-                has_default: column.definition.is_some_and(|definition| definition.default_value.is_some()),
+                has_default: column
+                    .definition
+                    .is_some_and(|definition| definition.default_value.is_some()),
             })
             .collect();
         Ok(Some(TableDescription {
@@ -2336,9 +2366,8 @@ impl ClientContext {
                 .join("."),
         };
         let all_columns = self.table_columns_in(catalog, schema, table).ok();
-        let every_column = all_columns.is_some_and(|all| {
-            all.len() == columns.len() && all.iter().zip(&columns).all(|((a, _), (b, _))| a == b)
-        });
+        let every_column = all_columns
+            .is_some_and(|all| all.len() == columns.len() && all.iter().zip(&columns).all(|((a, _), (b, _))| a == b));
         let mut query = format!("INSERT INTO {target}");
         if !every_column {
             let list: Vec<String> = columns.iter().map(|(name, _)| sql_identifier(name)).collect();
@@ -2362,7 +2391,11 @@ impl ClientContext {
         types: Vec<LogicalType>,
         chunks: Vec<duckrs_common::vector::DataChunk>,
     ) -> Result<()> {
-        let alias = if table_name.is_empty() { "appended_data" } else { table_name };
+        let alias = if table_name.is_empty() {
+            "appended_data"
+        } else {
+            table_name
+        };
         // `Binder::Bind(ColumnDataRef &)`
         for i in names.len()..types.len() {
             names.push(format!("col{}", i + 1));
@@ -2461,7 +2494,10 @@ impl ClientContext {
                         self.setting_text("old_implicit_casting") == "true",
                     );
                     let casts = duckrs_core::function::cast_rules::RegisteredCastsGuard::set(&self.home.user_functions);
-                    let result = match self.verify_no_parameters(statement).and_then(|()| self.verification_statement(statement)) {
+                    let result = match self
+                        .verify_no_parameters(statement)
+                        .and_then(|()| self.verification_statement(statement))
+                    {
                         Ok(Some(replacement)) => self.run_statement(&replacement),
                         Ok(None) => self.run_statement(statement),
                         Err(error) => Err(error),
@@ -2492,7 +2528,11 @@ impl ClientContext {
     }
 
     /// `EnableProfiling` and `DisableProfiling`: the options are the profiling settings, set as SET sets them.
-    fn profiling_call(&mut self, name: &str, call: &duckrs_parser::ast::FunctionExpr) -> Result<MaterializedQueryResult> {
+    fn profiling_call(
+        &mut self,
+        name: &str,
+        call: &duckrs_parser::ast::FunctionExpr,
+    ) -> Result<MaterializedQueryResult> {
         if name == "disable_profiling" {
             if !call.args.is_empty() {
                 return Err(Error::new(
@@ -2513,7 +2553,13 @@ impl ClientContext {
         };
         let (mut format, mut coverage, mut save_location, mut mode, mut metrics) = (None, None, None, None, None);
         // one parameter, `metrics`: a second positional argument matches no overload
-        if call.args.iter().filter(|argument| duckrs_core::planner::binder::named_argument(argument).name.is_empty()).count() > 1 {
+        if call
+            .args
+            .iter()
+            .filter(|argument| duckrs_core::planner::binder::named_argument(argument).name.is_empty())
+            .count()
+            > 1
+        {
             return Err(Error::new(
                 ErrorKind::Binder,
                 "No function matches the given name and argument types 'enable_profiling(VARCHAR, VARCHAR)'. You might \
@@ -2539,9 +2585,14 @@ impl ClientContext {
                 "" | "metrics" => {
                     let ty = value.logical_type();
                     let varchar = |ty: &LogicalType| {
-                        matches!(ty.id(), duckrs_common::types::LogicalTypeId::Varchar | duckrs_common::types::LogicalTypeId::StringLiteral)
+                        matches!(
+                            ty.id(),
+                            duckrs_common::types::LogicalTypeId::Varchar
+                                | duckrs_common::types::LogicalTypeId::StringLiteral
+                        )
                     };
-                    let list_of_names = ty.id() == duckrs_common::types::LogicalTypeId::List && ty.child_type().is_some_and(varchar);
+                    let list_of_names =
+                        ty.id() == duckrs_common::types::LogicalTypeId::List && ty.child_type().is_some_and(varchar);
                     if !varchar(ty) && !list_of_names {
                         return Err(Error::new(
                             ErrorKind::Binder,
@@ -2629,7 +2680,9 @@ impl ClientContext {
         }
         // the statements a PIVOT was rewritten into, a PREPARE among them, each by itself
         if let Statement::Multi(statements) = statement {
-            return statements.iter().try_for_each(|statement| self.verify_no_parameters(statement));
+            return statements
+                .iter()
+                .try_for_each(|statement| self.verify_no_parameters(statement));
         }
         let missing: Vec<String> = parameter_names(&statement.to_string())
             .into_iter()
@@ -2677,14 +2730,14 @@ impl ClientContext {
         // these run without the binder, and have no parameters
         let client_statement = configuring_select(&statement).is_some()
             || matches!(
-            statement,
-            Statement::SetVariable { .. }
-                | Statement::ResetVariable { .. }
-                | Statement::Pragma(_)
-                | Statement::Create(_)
-                | Statement::Drop(_)
-                | Statement::Vacuum { .. }
-        );
+                statement,
+                Statement::SetVariable { .. }
+                    | Statement::ResetVariable { .. }
+                    | Statement::Pragma(_)
+                    | Statement::Create(_)
+                    | Statement::Drop(_)
+                    | Statement::Vacuum { .. }
+            );
         let mut bound_at_prepare = false;
         let mut result_types = None;
         let mut columns = None;
@@ -2692,7 +2745,10 @@ impl ClientContext {
         if !client_statement {
             let mut bound = self.bind_to_prepare(&statement, &parameters);
             parameter_types = parameters.inferred_types();
-            if bound.as_ref().is_err_and(|error| error.kind != ErrorKind::ParameterNotResolved) {
+            if bound
+                .as_ref()
+                .is_err_and(|error| error.kind != ErrorKind::ParameterNotResolved)
+            {
                 // what duckrs's binder does not handle yet with parameters of unknown types binds as before, with
                 // the parameters as NULLs: a statement it binds is then not refused
                 parameters = Arc::new(ParameterValues {
@@ -2712,7 +2768,10 @@ impl ClientContext {
                         }
                     }
                     // `Planner::CreatePlan`: the result is one column `unknown` of type UNKNOWN
-                    columns = Some((vec!["unknown".to_string()], vec![LogicalType::new(duckrs_common::types::LogicalTypeId::Unknown)]));
+                    columns = Some((
+                        vec!["unknown".to_string()],
+                        vec![LogicalType::new(duckrs_common::types::LogicalTypeId::Unknown)],
+                    ));
                 }
                 other => {
                     (columns, result_types) = other?;
@@ -2767,7 +2826,11 @@ impl ClientContext {
         binder.parameters = Some(parameters.clone());
         binder.session = Some(self.session_values());
         let bound = binder.bind(statement)?;
-        if bound.types.iter().any(|ty| ty.contains_id(duckrs_common::types::LogicalTypeId::Unknown)) {
+        if bound
+            .types
+            .iter()
+            .any(|ty| ty.contains_id(duckrs_common::types::LogicalTypeId::Unknown))
+        {
             return Err(Error::new(
                 ErrorKind::ParameterNotResolved,
                 "Could not determine the types of the prepared statement parameters",
@@ -2838,8 +2901,10 @@ impl ClientContext {
         values: HashMap<String, Value>,
     ) -> Result<MaterializedQueryResult> {
         let _temp = SessionTemp::enter(&self.temp);
-        let values: HashMap<String, Value> =
-            values.into_iter().map(|(name, value)| (name.to_lowercase(), value)).collect();
+        let values: HashMap<String, Value> = values
+            .into_iter()
+            .map(|(name, value)| (name.to_lowercase(), value))
+            .collect();
         let typed = values
             .iter()
             .filter(|(_, value)| !value.is_null())
@@ -3061,7 +3126,10 @@ impl ClientContext {
             // `error.Merge`: with nothing in the log, the commit failed (`TransactionContext::Commit`)
             Some((error, false)) => {
                 let failure = self.checkpoint_failure(&self.db.clone(), error);
-                Err(Error::new(ErrorKind::Transaction, format!("Failed to commit: {}", failure.message)))
+                Err(Error::new(
+                    ErrorKind::Transaction,
+                    format!("Failed to commit: {}", failure.message),
+                ))
             }
         }
     }
@@ -3387,8 +3455,7 @@ impl ClientContext {
             return self.run_statement_inner(statement);
         }
         let limit = self.setting_text("max_execution_time").parse::<u64>().unwrap_or(0);
-        let deadline =
-            (limit > 0).then(|| std::time::Instant::now() + std::time::Duration::from_millis(limit));
+        let deadline = (limit > 0).then(|| std::time::Instant::now() + std::time::Duration::from_millis(limit));
         interrupt::with_deadline(deadline, || self.run_statement_inner(statement))
     }
 
@@ -3951,7 +4018,10 @@ impl ClientContext {
         for (name, expression) in options {
             let mut binder = Binder::with_options(&catalog, self.bind_options());
             binder.session = Some(self.session_values());
-            values.push((name.to_lowercase(), evaluate_scalar(&binder.bind_value_expression(expression)?)?));
+            values.push((
+                name.to_lowercase(),
+                evaluate_scalar(&binder.bind_value_expression(expression)?)?,
+            ));
         }
         Ok(values)
     }
@@ -3961,7 +4031,10 @@ impl ClientContext {
     fn external_resource_statement(&mut self, statement: &duckrs_parser::ast::ExternalResourceStatement) -> Result<()> {
         use duckrs_parser::ast::ExternalResourceOperation as Operation;
         if statement.name.is_empty() {
-            return Err(Error::new(ErrorKind::Binder, "EXTERNAL RESOURCE requires a name (AS <name>)"));
+            return Err(Error::new(
+                ErrorKind::Binder,
+                "EXTERNAL RESOURCE requires a name (AS <name>)",
+            ));
         }
         let home = self.home.clone();
         let log = Some(self.log_target.clone());
@@ -4016,12 +4089,21 @@ impl ClientContext {
             let launched =
                 external_resources::provision(&home, log.as_ref(), &resource.provider, &params, &info.name, None)?;
             let owned = launched.deleter(&resource.provider, &info.name);
-            (launched, external_resources::Attachment { owned: Some(owned), borrowed: None })
+            (
+                launched,
+                external_resources::Attachment {
+                    owned: Some(owned),
+                    borrowed: None,
+                },
+            )
         } else {
             let Some(instance) = home.external_resources.lookup(&resource.reference_name) else {
                 return Err(Error::new(
                     ErrorKind::InvalidInput,
-                    format!("no external resource named \"{}\" is registered", resource.reference_name),
+                    format!(
+                        "no external resource named \"{}\" is registered",
+                        resource.reference_name
+                    ),
                 ));
             };
             let launched = external_resources::provision(
@@ -4032,7 +4114,13 @@ impl ClientContext {
                 &instance.name,
                 Some(&instance.handle),
             )?;
-            (launched, external_resources::Attachment { owned: None, borrowed: Some(instance.name) })
+            (
+                launched,
+                external_resources::Attachment {
+                    owned: None,
+                    borrowed: Some(instance.name),
+                },
+            )
         };
         // from here on the resource exists with nothing owning it: any failure reaps one this provisioned
         let attached = (|| -> Result<()> {
@@ -4047,7 +4135,9 @@ impl ClientContext {
             *attach.path = Expr::constant(duckrs_parser::ast::Literal::string(launched.uri.clone()));
             for (name, value) in launched.attach_options(&given)? {
                 let text = value.try_to_string()?;
-                attach.parsed_options.push((name, Expr::constant(duckrs_parser::ast::Literal::string(text))));
+                attach
+                    .parsed_options
+                    .push((name, Expr::constant(duckrs_parser::ast::Literal::string(text))));
             }
             self.attach(&attach)
         })();
@@ -4288,7 +4378,10 @@ impl ClientContext {
         }
         // `MetricStorageWaitingToAttachLatency`: one instance attaches at a time, so there is no wait.
         if !in_memory {
-            duckrs_core::execution::profiler::add_timing("storage.waiting_to_attach_latency", std::time::Duration::ZERO);
+            duckrs_core::execution::profiler::add_timing(
+                "storage.waiting_to_attach_latency",
+                std::time::Duration::ZERO,
+            );
         }
         let stem = Path::new(&path)
             .file_stem()
@@ -4438,7 +4531,14 @@ impl ClientContext {
                 && let Some(TableOrView::View(file)) = schema.get_entry("file")
                 && schema.get_entry(&name).is_none()
             {
-                schema.create_view(&name, file.query.clone(), Vec::new(), OnCreateConflict::Error, Vec::new(), false)?;
+                schema.create_view(
+                    &name,
+                    file.query.clone(),
+                    Vec::new(),
+                    OnCreateConflict::Error,
+                    Vec::new(),
+                    false,
+                )?;
             }
             DatabaseInstance::write_ahead_with(&opened);
             opened
@@ -4554,11 +4654,7 @@ impl ClientContext {
 
     /// `PhysicalExplain`: the plan in text form, as a key and a value per plan.
     /// What `EXECUTE` names, and the values it gives.
-    fn bound_execute(
-        &self,
-        name: &str,
-        values: &[(String, Expr)],
-    ) -> Result<BoundExecute> {
+    fn bound_execute(&self, name: &str, values: &[(String, Expr)]) -> Result<BoundExecute> {
         let Some(prepared) = self.prepared_statements.get(&name.to_lowercase()).cloned() else {
             return Err(Error::new(
                 ErrorKind::Binder,
@@ -4664,7 +4760,9 @@ impl ClientContext {
                     "VIEW" => {
                         let view = match catalog.get_entry(schema_name.as_deref(), None, name) {
                             Ok(TableOrView::View(view)) => view,
-                            _ if duckrs_core::catalog::defaults::default_view(schema_name.as_deref(), name).is_some() => {
+                            _ if duckrs_core::catalog::defaults::default_view(schema_name.as_deref(), name)
+                                .is_some() =>
+                            {
                                 return Err(system());
                             }
                             _ => return Err(missing_entry("View", name)),
@@ -4691,8 +4789,12 @@ impl ClientContext {
                             let builtin = duckrs_core::function::BuiltinFunctions::get();
                             if builtin.scalar(name).is_some()
                                 || builtin.aggregate(name).is_some()
-                                || duckrs_core::catalog::defaults::default_macro(schema_name.as_deref(), name, table_macro)
-                                    .is_some()
+                                || duckrs_core::catalog::defaults::default_macro(
+                                    schema_name.as_deref(),
+                                    name,
+                                    table_macro,
+                                )
+                                .is_some()
                             {
                                 return Err(system());
                             }
@@ -4875,7 +4977,9 @@ impl ClientContext {
                 info.columns.clear();
                 // the bound name: database, schema path and table (`base.GetQualifiedName()`)
                 if let Some(schema) = created_in.filter(|_| !info.temporary) {
-                    info.name.qualification = std::iter::once(self.db.name.clone()).chain(schema.path.clone()).collect();
+                    info.name.qualification = std::iter::once(self.db.name.clone())
+                        .chain(schema.path.clone())
+                        .collect();
                 }
                 info.to_string()
             }
@@ -4982,8 +5086,10 @@ impl ClientContext {
             // without a FORMAT of its own, EXPLAIN ANALYZE prints the profile as `enable_profiling` would
             let profiling = self.setting_text("enable_profiling").to_ascii_lowercase();
             let shown = if format == "default"
-                && matches!(profiling.as_str(), "json" | "html" | "graphviz" | "mermaid" | "yaml" | "compact")
-            {
+                && matches!(
+                    profiling.as_str(),
+                    "json" | "html" | "graphviz" | "mermaid" | "yaml" | "compact"
+                ) {
                 profiling
             } else {
                 format.to_ascii_lowercase()
@@ -4995,7 +5101,9 @@ impl ClientContext {
                     self.profile_json(&sql, time, &profiler, Vec::new(), root)
                 }
                 // the other formats render the profiling tree (`RenderProfilingNodeTree`)
-                Some((root, _, time)) if matches!(shown.as_str(), "html" | "graphviz" | "mermaid" | "yaml" | "compact") => {
+                Some((root, _, time))
+                    if matches!(shown.as_str(), "html" | "graphviz" | "mermaid" | "yaml" | "compact") =>
+                {
                     let tree = explain::profile_tree(root);
                     let sql = self.current_query.clone();
                     explain::render_with_query(&tree, &shown, upper, Some((time, sql.as_str())))
@@ -5316,8 +5424,12 @@ impl ClientContext {
                     && let duckrs_common::value::ValueData::List(entries) = value.data()
                 {
                     for entry in entries {
-                        let duckrs_common::value::ValueData::Struct(pair) = entry.data() else { continue };
-                        let (Some(key), Some(setting)) = (pair.first(), pair.get(1)) else { continue };
+                        let duckrs_common::value::ValueData::Struct(pair) = entry.data() else {
+                            continue;
+                        };
+                        let (Some(key), Some(setting)) = (pair.first(), pair.get(1)) else {
+                            continue;
+                        };
                         let key = key.try_to_string()?.to_lowercase();
                         let text = setting.try_to_string()?;
                         let invalid = |message: String| Err(Error::new(ErrorKind::InvalidInput, message));
@@ -5396,7 +5508,8 @@ impl ClientContext {
                 let deprecated = settings::find_setting(name)
                     .filter(|(_, setting)| setting.is_deprecated)
                     .map(|(_, setting)| setting.name);
-                let warning = |name: &str| format!("The '{name}' setting is deprecated and will be removed in a future release.");
+                let warning =
+                    |name: &str| format!("The '{name}' setting is deprecated and will be removed in a future release.");
                 if let Err(error) = settings::set_variable(name, *scope, &value, &mut global, &mut self.settings) {
                     // a valid value of a deprecated setting duckrs does not honor yet: C++ warns before it applies it
                     if let Some(name) = deprecated
@@ -5960,10 +6073,13 @@ impl ClientContext {
                     .map(|(name, time)| (format!("optimizer.{name}"), *time)),
             );
             let select_coverage = !self.setting_text("profiling_coverage").eq_ignore_ascii_case("all");
-            let root =
-                duckrs_core::execution::profiler::ProfileNode::of(collector.children[0].as_ref(), operators, select_coverage)
-                    .into_iter()
-                    .next();
+            let root = duckrs_core::execution::profiler::ProfileNode::of(
+                collector.children[0].as_ref(),
+                operators,
+                select_coverage,
+            )
+            .into_iter()
+            .next();
             self.pending_profile = Some((phases, root));
         }
         let collection = collector.result.into_inner();
@@ -6504,7 +6620,14 @@ impl ClientContext {
                         if schema.get_entry(&info.name.name).is_some() {
                             self.drop_trigger_dependents(&catalog, &info.name.name, kind, info.cascade)?;
                             drop_view_dependents(&catalog, &schema.ident(), &info.name.name, kind, info.cascade)?;
-                            drop_macro_dependents(&catalog, &schema.ident(), &info.name.name, None, kind, info.cascade)?;
+                            drop_macro_dependents(
+                                &catalog,
+                                &schema.ident(),
+                                &info.name.name,
+                                None,
+                                kind,
+                                info.cascade,
+                            )?;
                         }
                         let dropped = schema.drop_entry(&info.name.name, type_name)?;
                         if dropped && kind == "TABLE" {
@@ -6530,11 +6653,15 @@ impl ClientContext {
             }
             kind @ ("MACRO" | "MACRO TABLE") => {
                 let table_macro = kind == "MACRO TABLE";
-                let mut schema =
-                    schema_of(&info.name).map_err(|_| duckrs_core::unported("this form of DROP MACRO"))?;
+                let mut schema = schema_of(&info.name).map_err(|_| duckrs_core::unported("this form of DROP MACRO"))?;
                 // an unqualified name is looked up along the search path, as in a call
                 if schema.is_none() {
-                    let found = |table_macro| catalog.get_macro_in(None, None, &info.name.name, table_macro).ok().flatten();
+                    let found = |table_macro| {
+                        catalog
+                            .get_macro_in(None, None, &info.name.name, table_macro)
+                            .ok()
+                            .flatten()
+                    };
                     let found = found(table_macro).or_else(|| if table_macro { None } else { found(true) });
                     schema = found.map(|(schema, _)| schema);
                 }
@@ -6661,7 +6788,10 @@ impl ClientContext {
 fn check_shredding_type(ty: &duckrs_common::types::LogicalType) -> Result<()> {
     use duckrs_common::types::LogicalTypeId;
     match ty.id() {
-        LogicalTypeId::Struct => ty.struct_children().iter().try_for_each(|(_, child)| check_shredding_type(child)),
+        LogicalTypeId::Struct => ty
+            .struct_children()
+            .iter()
+            .try_for_each(|(_, child)| check_shredding_type(child)),
         LogicalTypeId::List => ty.child_type().map_or(Ok(()), check_shredding_type),
         _ if ty.is_nested() => Err(Error::new(
             ErrorKind::InvalidInput,
@@ -8771,7 +8901,7 @@ mod tests {
             "Top N",
             "Top: 10",
             "Seq Scan",
-            "Table: a",
+            "Table: memory.main.a",
             "Type: Sequential Scan",
             "~1,000 rows",
         ] {
@@ -8798,7 +8928,7 @@ mod tests {
         ] {
             assert!(plan.contains(expected), "{expected} in {plan}");
         }
-        assert!(plan.starts_with('[') && plan.ends_with(']'), "{plan}");
+        assert!(plan.starts_with('[') && plan.trim_end().ends_with(']'), "{plan}");
         let plan = explain(&mut context, "(FORMAT JSON) SELECT x, x + 1 FROM a");
         assert!(plan.contains("\"Projections\": [\"x\", \"(x + 1)\"]"), "{plan}");
         // the estimates in the logical plan
@@ -8827,10 +8957,11 @@ mod tests {
         // one column goes into the scan, and no operator is left
         let plan = explain(&mut context, "SELECT i FROM t WHERE j = 5");
         assert!(plan.contains("Filters: j = 5") && !plan.contains("Filter\n"), "{plan}");
-        // several columns stay above it, and each conjunct goes its own way
+        // each conjunct goes its own way: `i > j` with `j = 5` is `i > 5`, so all three go into the scan, in the
+        // order the scan reads the columns
         let plan = explain(&mut context, "SELECT i FROM t WHERE j = 5 AND i > j AND s <> '55'");
-        assert!(plan.contains("Filters: j = 5,\ns != '55'"), "{plan}");
-        assert!(plan.contains("Filter\n") && plan.contains("i > j"), "{plan}");
+        assert!(plan.contains("Filters: i > 5,\nj = 5,\ns != '55'"), "{plan}");
+        assert!(!plan.contains("Filter\n"), "{plan}");
         // and an OR on one column is one filter, without parentheses around all of it
         let plan = explain(&mut context, "SELECT i FROM t WHERE j = 5 OR j = 6");
         assert!(!plan.contains("Filter\n"), "{plan}");
@@ -9506,17 +9637,21 @@ mod tests {
         );
         run(&mut context, "CREATE TABLE mid AS SELECT i AS id FROM range(500) t(i)");
         run(&mut context, "CREATE TABLE small AS SELECT i AS id FROM range(20) t(i)");
+        // the JSON plan has the children of an operator in order, the left one first, so the table found first is
+        // the one furthest left (the boxes of the text plan sit side by side, so their lines don't say that)
         let explain =
             |context: &mut ClientContext, sql: &str| flat_plan(&run(context, &format!("EXPLAIN {sql}"))[0][1]);
+        let json = |context: &mut ClientContext, sql: &str| {
+            run(context, &format!("EXPLAIN (FORMAT JSON) {sql}"))[0][1].clone()
+        };
         let at = |plan: &str, table: &str| {
-            let line = format!("Table: {table}");
-            let line = plan.lines().position(|text| text.trim() == line);
-            line.unwrap_or_else(|| panic!("{table} in {plan}"))
+            let text = format!("\"Table\": \"memory.main.{table}\"");
+            plan.find(&text).unwrap_or_else(|| panic!("{table} in {plan}"))
         };
         // written with the cross product first; the smaller tables are built, with no cross product
         let query = "FROM small, mid, big WHERE big.mid_id = mid.id AND big.small_id = small.id";
-        let plan = explain(&mut context, &format!("SELECT count(*) {query}"));
-        assert!(!plan.contains("Cross Product"), "{plan}");
+        let plan = json(&mut context, &format!("SELECT count(*) {query}"));
+        assert!(!plan.contains("CROSS_PRODUCT"), "{plan}");
         assert!(
             at(&plan, "big") < at(&plan, "mid") && at(&plan, "big") < at(&plan, "small"),
             "{plan}"
@@ -9527,7 +9662,7 @@ mod tests {
             "big, mid WHERE big.mid_id = mid.id",
             "mid, big WHERE big.mid_id = mid.id",
         ] {
-            let plan = explain(&mut context, &format!("SELECT count(*) FROM {query}"));
+            let plan = json(&mut context, &format!("SELECT count(*) FROM {query}"));
             assert!(at(&plan, "big") < at(&plan, "mid"), "{plan}");
         }
         // columns keep their order, also through a set operation, which reads them by position
@@ -9580,7 +9715,7 @@ mod tests {
             &mut context,
             "SELECT count(*) FROM fact f, pairs x WHERE f.p = x.p AND f.q = x.q",
         );
-        assert!(plan.contains("~20,000 rows\n      Seq Scan"), "{plan}");
+        assert!(plan.contains("Conditions: p = p, q = q\n~20,000 rows\n"), "{plan}");
         // the answer does not depend on any of that
         let rows = run(
             &mut context,
@@ -9601,7 +9736,7 @@ mod tests {
         assert!(plan.contains("Cross Product"), "{plan}");
         // off under the name DuckDB has for it: the query stays as it is written
         run(&mut context, "SET disabled_optimizers = 'join_order'");
-        let plan = explain(&mut context, "SELECT count(*) FROM mid, big WHERE big.mid_id = mid.id");
+        let plan = json(&mut context, "SELECT count(*) FROM mid, big WHERE big.mid_id = mid.id");
         assert!(at(&plan, "mid") < at(&plan, "big"), "{plan}");
     }
 
@@ -9693,7 +9828,10 @@ mod tests {
             &mut context,
             "EXPLAIN SELECT x FROM a WHERE x > 1 AND EXISTS (SELECT 1 FROM b WHERE b.k = a.k)",
         );
-        assert!(explained[0][1].contains("LEFT_DELIM_JOIN"), "{explained:?}");
+        // `x > 1` filters the left side, and `b.k = a.k` rejects the NULLs of the right side: the marker-only EXISTS
+        // is a RIGHT_SEMI join (the delimiter rewrite of `delim_join_as_cte`, which is on by default), no delim join
+        assert!(explained[0][1].contains("RIGHT_SEMI"), "{explained:?}");
+        assert!(!explained[0][1].contains("DELIM_JOIN"), "{explained:?}");
         // the left rows keep their order
         assert_eq!(
             run(&mut context, "SELECT x, (SELECT sum(y) FROM b WHERE b.k = a.k) FROM a"),
@@ -11092,9 +11230,14 @@ fn macro_dependents(
     schema: &str,
     name: &str,
     kind: Option<bool>,
-) -> Vec<(Arc<duckrs_core::catalog::SchemaCatalogEntry>, Arc<duckrs_core::catalog::MacroCatalogEntry>)> {
-    let mut found: Vec<(Arc<duckrs_core::catalog::SchemaCatalogEntry>, Arc<duckrs_core::catalog::MacroCatalogEntry>)> =
-        Vec::new();
+) -> Vec<(
+    Arc<duckrs_core::catalog::SchemaCatalogEntry>,
+    Arc<duckrs_core::catalog::MacroCatalogEntry>,
+)> {
+    let mut found: Vec<(
+        Arc<duckrs_core::catalog::SchemaCatalogEntry>,
+        Arc<duckrs_core::catalog::MacroCatalogEntry>,
+    )> = Vec::new();
     let mut pending = vec![(schema.to_string(), name.to_string(), kind)];
     while let Some((schema, name, kind)) = pending.pop() {
         for entry_schema in catalog.schemas() {
@@ -11131,7 +11274,9 @@ fn macro_reaches(
     let mut pending: Vec<duckrs_core::catalog::MacroDependency> = dependencies.to_vec();
     while let Some(dependency) = pending.pop() {
         let Some(kind) = dependency.table_macro else { continue };
-        if dependency.schema.eq_ignore_ascii_case(schema) && dependency.name.eq_ignore_ascii_case(name) && kind == table_macro
+        if dependency.schema.eq_ignore_ascii_case(schema)
+            && dependency.name.eq_ignore_ascii_case(name)
+            && kind == table_macro
         {
             return true;
         }
@@ -11247,8 +11392,14 @@ fn configuring_select(statement: &Statement) -> Option<Expr> {
         && node.qualify.is_none()
         && node.groups.group_expressions.is_empty();
     let configuring = call.name.qualification.iter().all(String::is_empty)
-        && ["enable_logging", "disable_logging", "truncate_duckdb_logs", "enable_profiling", "disable_profiling"]
-            .iter()
-            .any(|name| call.name.name.eq_ignore_ascii_case(name));
+        && [
+            "enable_logging",
+            "disable_logging",
+            "truncate_duckdb_logs",
+            "enable_profiling",
+            "disable_profiling",
+        ]
+        .iter()
+        .any(|name| call.name.name.eq_ignore_ascii_case(name));
     (plain && configuring).then(|| (**function).clone())
 }

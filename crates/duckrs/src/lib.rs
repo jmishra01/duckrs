@@ -11,17 +11,19 @@ pub use duckrs_common::types::{LogicalType, LogicalTypeId};
 pub use duckrs_common::value::Value;
 pub use duckrs_common::vector::DataChunk;
 pub use duckrs_common::{Error, ErrorKind, Result};
+/// What a replacement scan reads in place of a table ([`Database::add_replacement_scan`]).
+pub use duckrs_core::planner::binder::Replacement;
 pub use duckrs_main::MaterializedQueryResult as QueryResult;
 pub use duckrs_main::with_error_location;
 pub use duckrs_main::{StatementProperties, StatementReturnType, StatementType};
 pub use duckrs_main::{TableDescription, TableDescriptionColumn};
-/// What a replacement scan reads in place of a table ([`Database::add_replacement_scan`]).
-pub use duckrs_core::planner::binder::Replacement;
 
 /// The configuration options (`DBConfig::GetOptionByIndex` / `GetOptionByName`).
 pub mod settings {
-    pub use duckrs_main::settings::{ExtensionOption, SettingDefinition, SettingLookupScope, all_settings, find_setting};
     pub use duckrs_main::settings::SetScope;
+    pub use duckrs_main::settings::{
+        ExtensionOption, SettingDefinition, SettingLookupScope, all_settings, find_setting,
+    };
 }
 
 /// `Value::DefaultCastAs`: `value` cast to `ty`, as a SQL `CAST` would.
@@ -30,9 +32,18 @@ pub fn cast_value(value: &Value, ty: &LogicalType) -> Result<Value> {
 }
 
 /// `VectorOperations::Cast`: the first `count` rows of `source` cast to `ty`, as a SQL `CAST` would.
-pub fn cast_vector(source: &duckrs_common::vector::Vector, ty: &LogicalType, count: usize) -> Result<duckrs_common::vector::Vector> {
+pub fn cast_vector(
+    source: &duckrs_common::vector::Vector,
+    ty: &LogicalType,
+    count: usize,
+) -> Result<duckrs_common::vector::Vector> {
     let mut result = duckrs_common::vector::Vector::new(ty.clone(), count);
-    duckrs_core::function::cast::cast_vector(source, &mut result, count, duckrs_core::function::cast::CastMode::Strict)?;
+    duckrs_core::function::cast::cast_vector(
+        source,
+        &mut result,
+        count,
+        duckrs_core::function::cast::CastMode::Strict,
+    )?;
     Ok(result)
 }
 
@@ -276,9 +287,10 @@ impl Connection {
         + Sync
         + 'static,
     ) {
-        self.context.add_replacement_scan(std::sync::Arc::new(move |name: &str| {
-            scan(name).map(|rows| rows.map(Replacement::Rows))
-        }));
+        self.context
+            .add_replacement_scan(std::sync::Arc::new(move |name: &str| {
+                scan(name).map(|rows| rows.map(Replacement::Rows))
+            }));
     }
 
     /// The current value of setting `name` for this connection (`current_setting`), or `None` for no such setting.
@@ -728,7 +740,13 @@ mod tests {
         let result = con.query("SELECT string_agg(v, ',' ORDER BY i) FROM t").unwrap();
         assert_eq!(result.value(0, 0), Value::varchar("v5,w"));
         let err = con
-            .append_query("SELECT 1", "", Vec::new(), vec![LogicalType::INTEGER], vec![chunk(&[1])])
+            .append_query(
+                "SELECT 1",
+                "",
+                Vec::new(),
+                vec![LogicalType::INTEGER],
+                vec![chunk(&[1])],
+            )
             .unwrap_err();
         assert!(err.message.contains("Unsupported statement type for appender"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -764,14 +782,26 @@ mod tests {
         let mut con = db.connect().unwrap();
         con.query("CREATE TABLE a (i INTEGER, s VARCHAR)").unwrap();
         let type_of = |con: &mut Connection, sql: &str, name: &str| {
-            con.prepare(sql).unwrap().parameter_type(name).map(LogicalType::to_string)
+            con.prepare(sql)
+                .unwrap()
+                .parameter_type(name)
+                .map(LogicalType::to_string)
         };
         let integer = Some("INTEGER".to_string());
         assert_eq!(type_of(&mut con, "INSERT INTO a VALUES (?, 'x')", "1"), integer);
         assert_eq!(type_of(&mut con, "SELECT sum(i) FROM a WHERE i > ?", "1"), integer);
-        assert_eq!(type_of(&mut con, "SELECT * FROM a WHERE s = $1", "1"), Some("VARCHAR".to_string()));
-        assert_eq!(type_of(&mut con, "SELECT CAST($v AS BIGINT)", "v"), Some("BIGINT".to_string()));
-        assert_eq!(type_of(&mut con, "SELECT CAST(CAST($1 AS INTEGER) AS VARCHAR)", "1"), integer);
+        assert_eq!(
+            type_of(&mut con, "SELECT * FROM a WHERE s = $1", "1"),
+            Some("VARCHAR".to_string())
+        );
+        assert_eq!(
+            type_of(&mut con, "SELECT CAST($v AS BIGINT)", "v"),
+            Some("BIGINT".to_string())
+        );
+        assert_eq!(
+            type_of(&mut con, "SELECT CAST(CAST($1 AS INTEGER) AS VARCHAR)", "1"),
+            integer
+        );
         // uses that disagree leave the parameter without a type, as does a use that gives none
         assert_eq!(type_of(&mut con, "SELECT $1::INTEGER + $1::BIGINT", "1"), None);
         let prepared = con.prepare("SELECT $1::INTEGER, $2").unwrap();
@@ -782,7 +812,9 @@ mod tests {
         assert_eq!(names, ["unknown"]);
         assert_eq!(types[0].id(), LogicalTypeId::Unknown);
         // values are still bound when it runs
-        let result = con.execute(&prepared, &[Value::integer(1), Value::varchar("b")]).unwrap();
+        let result = con
+            .execute(&prepared, &[Value::integer(1), Value::varchar("b")])
+            .unwrap();
         assert_eq!(result.value(1, 0), Value::varchar("b"));
     }
 

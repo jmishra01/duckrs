@@ -122,7 +122,10 @@ impl Appender {
 
     /// `GetActiveTypes`.
     fn types(&self) -> Vec<LogicalType> {
-        self.active_columns().into_iter().map(|i| self.columns[i].1.clone()).collect()
+        self.active_columns()
+            .into_iter()
+            .map(|i| self.columns[i].1.clone())
+            .collect()
     }
 
     fn active_columns(&self) -> Vec<usize> {
@@ -166,7 +169,12 @@ impl Appender {
 
     /// `AppendValueInternal<T>`: a value of a C type, written as it is into a column of the type it is, and cast
     /// otherwise.
-    fn append_native<T: NativeType>(&mut self, input: T, id: LogicalTypeId, value: impl FnOnce() -> Value) -> duckrs::Result<()> {
+    fn append_native<T: NativeType>(
+        &mut self,
+        input: T,
+        id: LogicalTypeId,
+        value: impl FnOnce() -> Value,
+    ) -> duckrs::Result<()> {
         self.check_column()?;
         let row = self.chunk.len();
         let vector = self.chunk.column_mut(self.column);
@@ -246,7 +254,9 @@ impl Appender {
 
     fn end_row(&mut self) -> duckrs::Result<()> {
         if self.column != self.chunk.column_count() {
-            return Err(invalid_input("Call to EndRow before all columns have been appended to!"));
+            return Err(invalid_input(
+                "Call to EndRow before all columns have been appended to!",
+            ));
         }
         self.column = 0;
         let count = self.chunk.len() + 1;
@@ -282,15 +292,24 @@ impl Appender {
         }
         let chunks = std::mem::take(&mut self.collection);
         self.collected_rows = 0;
-        let columns: Vec<(String, LogicalType)> =
-            self.active_columns().into_iter().map(|i| self.columns[i].clone()).collect();
+        let columns: Vec<(String, LogicalType)> = self
+            .active_columns()
+            .into_iter()
+            .map(|i| self.columns[i].clone())
+            .collect();
         let mut connection = self.connection.lock();
         match &self.query {
             Some(query) => {
                 let types = columns.into_iter().map(|(_, ty)| ty).collect();
                 connection.append_query(&query.query, &query.table_name, query.names.clone(), types, chunks)
             }
-            None => connection.append_chunks(self.catalog.as_deref(), self.schema.as_deref(), &self.table, columns, chunks),
+            None => connection.append_chunks(
+                self.catalog.as_deref(),
+                self.schema.as_deref(),
+                &self.table,
+                columns,
+                chunks,
+            ),
         }
     }
 
@@ -464,7 +483,8 @@ pub unsafe extern "C" fn duckdb_appender_create_query(
         column_types.push(ty.clone());
     }
     // SAFETY: C passes a NUL-terminated table name, or none.
-    let table_name = unsafe { ffi::c_str(table_name) }.map_or_else(String::new, |n| String::from_utf8_lossy(n).into_owned());
+    let table_name =
+        unsafe { ffi::c_str(table_name) }.map_or_else(String::new, |n| String::from_utf8_lossy(n).into_owned());
     let mut names = Vec::new();
     // SAFETY: C passes `column_count` column names, or none.
     if let Some(name_ptrs) = unsafe { ffi::slice(column_names.cast_const(), column_count) } {
@@ -505,7 +525,9 @@ unsafe fn run(appender: duckdb_appender, function: impl FnOnce(&mut Appender) ->
         wrapper.error = ErrorData::new(ErrorKind::Invalid, "not a valid appender");
         return DuckDBError;
     };
-    let outcome = ffi::guard(Err(Error::new(ErrorKind::Internal, "Unknown appender error")), || function(inner));
+    let outcome = ffi::guard(Err(Error::new(ErrorKind::Internal, "Unknown appender error")), || {
+        function(inner)
+    });
     match outcome {
         Ok(()) => DuckDBSuccess,
         Err(error) => {
@@ -520,7 +542,10 @@ unsafe fn run(appender: duckdb_appender, function: impl FnOnce(&mut Appender) ->
 /// # Safety
 ///
 /// As for [`run`].
-unsafe fn run_flush(appender: duckdb_appender, function: impl FnOnce(&mut Appender) -> duckrs::Result<()>) -> duckdb_state {
+unsafe fn run_flush(
+    appender: duckdb_appender,
+    function: impl FnOnce(&mut Appender) -> duckrs::Result<()>,
+) -> duckdb_state {
     // SAFETY: by the contract of this function.
     let state = unsafe { run(appender, function) };
     if state == DuckDBError {
@@ -555,7 +580,9 @@ pub unsafe extern "C" fn duckdb_appender_destroy(appender: *mut duckdb_appender)
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn duckdb_appender_add_column(appender: duckdb_appender, name: *const c_char) -> duckdb_state {
     // SAFETY: C passes a NUL-terminated name.
-    let name = unsafe { ffi::c_str(name) }.map(|n| String::from_utf8_lossy(n).into_owned()).unwrap_or_default();
+    let name = unsafe { ffi::c_str(name) }
+        .map(|n| String::from_utf8_lossy(n).into_owned())
+        .unwrap_or_default();
     // SAFETY: C passes a live appender.
     unsafe { run(appender, |a| a.add_column(&name)) }
 }
@@ -575,7 +602,9 @@ pub unsafe extern "C" fn duckdb_appender_error(appender: duckdb_appender) -> *co
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn duckdb_appender_error_data(appender: duckdb_appender) -> duckdb_error_data {
     // SAFETY: C passes a live appender.
-    let error = unsafe { ffi::get(appender) }.map(|wrapper| wrapper.error.clone()).unwrap_or_default();
+    let error = unsafe { ffi::get(appender) }
+        .map(|wrapper| wrapper.error.clone())
+        .unwrap_or_default();
     ffi::into_handle(error)
 }
 
@@ -616,7 +645,11 @@ macro_rules! append_native {
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn $name(appender: duckdb_appender, value: $t) -> duckdb_state {
             // SAFETY: C passes a live appender.
-            unsafe { run(appender, |a| a.append_native(value, LogicalTypeId::$id, || $make(value))) }
+            unsafe {
+                run(appender, |a| {
+                    a.append_native(value, LogicalTypeId::$id, || $make(value))
+                })
+            }
         }
     };
 }
@@ -637,28 +670,44 @@ append_native!(duckdb_append_double, f64, Double, Value::double);
 pub unsafe extern "C" fn duckdb_append_hugeint(appender: duckdb_appender, value: duckdb_hugeint) -> duckdb_state {
     let value = value.to_i128();
     // SAFETY: C passes a live appender.
-    unsafe { run(appender, |a| a.append_native(value, LogicalTypeId::HugeInt, || Value::hugeint(value))) }
+    unsafe {
+        run(appender, |a| {
+            a.append_native(value, LogicalTypeId::HugeInt, || Value::hugeint(value))
+        })
+    }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn duckdb_append_uhugeint(appender: duckdb_appender, value: duckdb_uhugeint) -> duckdb_state {
     let value = value.to_u128();
     // SAFETY: C passes a live appender.
-    unsafe { run(appender, |a| a.append_native(value, LogicalTypeId::UHugeInt, || Value::uhugeint(value))) }
+    unsafe {
+        run(appender, |a| {
+            a.append_native(value, LogicalTypeId::UHugeInt, || Value::uhugeint(value))
+        })
+    }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn duckdb_append_date(appender: duckdb_appender, value: duckdb_date) -> duckdb_state {
     let date = Date(value.days);
     // SAFETY: C passes a live appender.
-    unsafe { run(appender, |a| a.append_native(date, LogicalTypeId::Date, || Value::date(date))) }
+    unsafe {
+        run(appender, |a| {
+            a.append_native(date, LogicalTypeId::Date, || Value::date(date))
+        })
+    }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn duckdb_append_time(appender: duckdb_appender, value: duckdb_time) -> duckdb_state {
     let time = Time(value.micros);
     // SAFETY: C passes a live appender.
-    unsafe { run(appender, |a| a.append_native(time, LogicalTypeId::Time, || Value::time(time))) }
+    unsafe {
+        run(appender, |a| {
+            a.append_native(time, LogicalTypeId::Time, || Value::time(time))
+        })
+    }
 }
 
 #[unsafe(no_mangle)]

@@ -937,7 +937,10 @@ impl Binder<'_> {
             }
             let mut binder = self.child_binder();
             binder.outer_contexts.push(context);
-            let in_having = self.aggregates.as_ref().is_some_and(|a| a.mode == super::ColumnMode::Having);
+            let in_having = self
+                .aggregates
+                .as_ref()
+                .is_some_and(|a| a.mode == super::ColumnMode::Having);
             for (alias, aliased) in &self.alias_fallback {
                 if in_having {
                     binder.refused_aliases.push((
@@ -1016,7 +1019,10 @@ impl Binder<'_> {
                     // the groups, as the select list does below
                     if !group_expressions
                         && error.message.contains("must appear in the GROUP BY clause")
-                        && self.aggregates.as_ref().is_some_and(|state| !state.group_map.is_empty())
+                        && self
+                            .aggregates
+                            .as_ref()
+                            .is_some_and(|state| !state.group_map.is_empty())
                     {
                         self.subquery_group_expressions = true;
                         let retried = self.bind_subquery(subquery, subquery_type, parsed_child, comparison);
@@ -1642,7 +1648,12 @@ impl Binder<'_> {
                      referenced before it is defined"
                 )));
             }
-            if let Some((_, error)) = self.refused_aliases.iter().rev().find(|(a, _)| a.eq_ignore_ascii_case(name)) {
+            if let Some((_, error)) = self
+                .refused_aliases
+                .iter()
+                .rev()
+                .find(|(a, _)| a.eq_ignore_ascii_case(name))
+            {
                 return Err(binder_error(error.clone()));
             }
             // an alias of a query around this one
@@ -2499,7 +2510,8 @@ impl Binder<'_> {
                     }
                     return Ok(bound);
                 }
-                if function.name.name.eq_ignore_ascii_case(super::json_plan::NAME) && function.name.qualification.is_empty()
+                if function.name.name.eq_ignore_ascii_case(super::json_plan::NAME)
+                    && function.name.qualification.is_empty()
                 {
                     return self.bind_json_serialize_plan(function);
                 }
@@ -2518,7 +2530,10 @@ impl Binder<'_> {
                         target,
                     );
                 }
-                if function.name.name.eq_ignore_ascii_case(crate::function::geojson_copy::NAME)
+                if function
+                    .name
+                    .name
+                    .eq_ignore_ascii_case(crate::function::geojson_copy::NAME)
                     && function.name.qualification.is_empty()
                 {
                     let children = function

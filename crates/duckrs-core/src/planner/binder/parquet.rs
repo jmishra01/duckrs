@@ -290,7 +290,10 @@ impl Binder<'_> {
                     filename.as_deref().is_some_and(|f| f.eq_ignore_ascii_case(column))
                         || (file_row_number && column.eq_ignore_ascii_case("file_row_number"))
                         || (hive_options.wanted == Some(true)
-                            && hive_options.types.iter().any(|(key, _)| key.eq_ignore_ascii_case(column)))
+                            && hive_options
+                                .types
+                                .iter()
+                                .any(|(key, _)| key.eq_ignore_ascii_case(column)))
                 };
                 bound.iter().filter(|(column, _)| !role(column)).cloned().unzip()
             }
@@ -1558,7 +1561,9 @@ fn column_statistics_key(key: &str) -> Result<Vec<String>> {
         let mut component = String::new();
         loop {
             let Some(&c) = chars.get(at) else {
-                return Err(invalid(format!("column_statistics: key '{key}' has an unterminated quote")));
+                return Err(invalid(format!(
+                    "column_statistics: key '{key}' has an unterminated quote"
+                )));
             };
             if c == '"' {
                 if chars.get(at + 1) == Some(&'"') {
@@ -1640,7 +1645,11 @@ fn apply_column_statistics(
 fn unknown_statistics(ty: &LogicalType) -> crate::catalog::ColumnStatistics {
     let mut statistics = crate::catalog::ColumnStatistics::unknown();
     if ty.id() == LogicalTypeId::Struct {
-        statistics.children = ty.struct_children().iter().map(|(_, child)| unknown_statistics(child)).collect();
+        statistics.children = ty
+            .struct_children()
+            .iter()
+            .map(|(_, child)| unknown_statistics(child))
+            .collect();
     }
     statistics
 }

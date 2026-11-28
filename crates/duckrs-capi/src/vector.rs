@@ -64,15 +64,19 @@ pub(crate) fn contains_invalid_or_any(ty: &LogicalType) -> bool {
         LogicalTypeId::List | LogicalTypeId::Map | LogicalTypeId::Array => {
             ty.child_type().is_some_and(contains_invalid_or_any)
         }
-        LogicalTypeId::Struct | LogicalTypeId::Union | LogicalTypeId::Tuple => {
-            ty.struct_children().iter().any(|(_, child)| contains_invalid_or_any(child))
-        }
+        LogicalTypeId::Struct | LogicalTypeId::Union | LogicalTypeId::Tuple => ty
+            .struct_children()
+            .iter()
+            .any(|(_, child)| contains_invalid_or_any(child)),
         _ => false,
     }
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn duckdb_create_data_chunk(column_types: *mut duckdb_logical_type, column_count: idx_t) -> duckdb_data_chunk {
+pub unsafe extern "C" fn duckdb_create_data_chunk(
+    column_types: *mut duckdb_logical_type,
+    column_count: idx_t,
+) -> duckdb_data_chunk {
     // SAFETY: C passes `column_count` logical types.
     let Some(handles) = (unsafe { ffi::slice(column_types.cast_const(), column_count) }) else {
         return std::ptr::null_mut();
@@ -150,7 +154,9 @@ pub unsafe extern "C" fn duckdb_create_vector(ty: duckdb_logical_type, capacity:
     if contains_invalid_or_any(ty) {
         return std::ptr::null_mut();
     }
-    ffi::guard(std::ptr::null_mut(), || ffi::into_handle(Vector::new(ty.clone(), capacity as usize)))
+    ffi::guard(std::ptr::null_mut(), || {
+        ffi::into_handle(Vector::new(ty.clone(), capacity as usize))
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -245,7 +251,9 @@ pub unsafe extern "C" fn duckdb_vector_assign_string_element_len(
     length: idx_t,
 ) {
     // SAFETY: C passes a live vector and `length` bytes.
-    let (Some(vector), Some(bytes)) = (unsafe { ffi::get_mut(vector) }, unsafe { ffi::bytes(text.cast(), length) }) else {
+    let (Some(vector), Some(bytes)) = (unsafe { ffi::get_mut(vector) }, unsafe {
+        ffi::bytes(text.cast(), length)
+    }) else {
         return;
     };
     let check = vector.logical_type().id() == LogicalTypeId::Varchar;
@@ -260,7 +268,9 @@ pub unsafe extern "C" fn duckdb_unsafe_vector_assign_string_element_len(
     length: idx_t,
 ) {
     // SAFETY: C passes a live vector and `length` bytes.
-    let (Some(vector), Some(bytes)) = (unsafe { ffi::get_mut(vector) }, unsafe { ffi::bytes(text.cast(), length) }) else {
+    let (Some(vector), Some(bytes)) = (unsafe { ffi::get_mut(vector) }, unsafe {
+        ffi::bytes(text.cast(), length)
+    }) else {
         return;
     };
     assign_string(vector, index as usize, bytes, false);
@@ -270,7 +280,9 @@ pub unsafe extern "C" fn duckdb_unsafe_vector_assign_string_element_len(
 pub unsafe extern "C" fn duckdb_list_vector_get_child(vector: duckdb_vector) -> duckdb_vector {
     // SAFETY: C passes a live vector.
     match unsafe { ffi::get_mut(vector) } {
-        Some(vector) if vector.physical_type() == PhysicalType::List => ffi::borrowed_handle(flat(vector).list_child_mut()),
+        Some(vector) if vector.physical_type() == PhysicalType::List => {
+            ffi::borrowed_handle(flat(vector).list_child_mut())
+        }
         _ => std::ptr::null_mut(),
     }
 }
@@ -288,12 +300,10 @@ pub unsafe extern "C" fn duckdb_list_vector_get_size(vector: duckdb_vector) -> i
 pub unsafe extern "C" fn duckdb_list_vector_set_size(vector: duckdb_vector, size: idx_t) -> duckdb_state {
     // SAFETY: C passes a live vector.
     match unsafe { ffi::get_mut(vector) } {
-        Some(vector) if vector.physical_type() == PhysicalType::List => {
-            ffi::guard(DuckDBError, || {
-                flat(vector).set_list_size(size as usize);
-                DuckDBSuccess
-            })
-        }
+        Some(vector) if vector.physical_type() == PhysicalType::List => ffi::guard(DuckDBError, || {
+            flat(vector).set_list_size(size as usize);
+            DuckDBSuccess
+        }),
         _ => DuckDBError,
     }
 }
@@ -331,7 +341,9 @@ pub unsafe extern "C" fn duckdb_struct_vector_get_child(vector: duckdb_vector, i
 pub unsafe extern "C" fn duckdb_array_vector_get_child(vector: duckdb_vector) -> duckdb_vector {
     // SAFETY: C passes a live vector.
     match unsafe { ffi::get_mut(vector) } {
-        Some(vector) if vector.physical_type() == PhysicalType::Array => ffi::borrowed_handle(flat(vector).array_child_mut()),
+        Some(vector) if vector.physical_type() == PhysicalType::Array => {
+            ffi::borrowed_handle(flat(vector).array_child_mut())
+        }
         _ => std::ptr::null_mut(),
     }
 }
@@ -423,9 +435,9 @@ pub unsafe extern "C" fn duckdb_vector_copy_sel(
         return;
     }
     // SAFETY: C passes two live, distinct vectors and a live selection vector.
-    let (Some(source), Some(target), Some(sel)) =
-        (unsafe { ffi::get(src) }, unsafe { ffi::get_mut(dst) }, unsafe { ffi::get(sel) })
-    else {
+    let (Some(source), Some(target), Some(sel)) = (unsafe { ffi::get(src) }, unsafe { ffi::get_mut(dst) }, unsafe {
+        ffi::get(sel)
+    }) else {
         return;
     };
     let (start, end) = (src_offset as usize, (src_count as usize).min(sel.len()));

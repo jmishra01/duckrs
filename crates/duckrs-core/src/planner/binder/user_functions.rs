@@ -22,7 +22,12 @@ use duckrs_parser::ast::{CopyInfo, FunctionExpr, InsertStatement, InsertValues, 
 use std::sync::Arc;
 
 /// `MapCastFunction`: `child` cast to `target` by the registered `cast`, which runs on the vectors of the rows.
-pub(crate) fn user_cast_expression(child: BoundExpr, cast: UserCast, target: &LogicalType, try_cast: bool) -> BoundExpr {
+pub(crate) fn user_cast_expression(
+    child: BoundExpr,
+    cast: UserCast,
+    target: &LogicalType,
+    try_cast: bool,
+) -> BoundExpr {
     fn unbound(_: &DataChunk, _: &mut Vector) -> Result<()> {
         Err(Error::new(
             ErrorKind::Internal,
@@ -50,7 +55,9 @@ fn binder_error(message: impl Into<String>) -> Error {
 
 impl Binder<'_> {
     fn user_functions(&self) -> Option<&Arc<UserFunctions>> {
-        self.session.as_ref().and_then(|session| session.user_functions.as_ref())
+        self.session
+            .as_ref()
+            .and_then(|session| session.user_functions.as_ref())
     }
 
     fn connection_id(&self) -> u64 {
@@ -132,7 +139,10 @@ impl Binder<'_> {
         }
         // each overload with as many parameters as there are arguments, its varargs repeated
         fn unbound(_: &DataChunk, _: &mut Vector) -> Result<()> {
-            Err(Error::new(ErrorKind::Internal, "a user-defined function runs once it is bound"))
+            Err(Error::new(
+                ErrorKind::Internal,
+                "a user-defined function runs once it is bound",
+            ))
         }
         let mut candidates = ScalarFunctionSet::new(set.name.clone());
         let mut overloads = Vec::new();
@@ -244,7 +254,12 @@ impl Binder<'_> {
                 let mut scores: Vec<(String, f64)> = overload
                     .named_parameters
                     .iter()
-                    .map(|(option, _)| (option.clone(), duckrs_common::string_util::similarity_rating(option, &lower)))
+                    .map(|(option, _)| {
+                        (
+                            option.clone(),
+                            duckrs_common::string_util::similarity_rating(option, &lower),
+                        )
+                    })
                     .filter(|(_, score)| *score >= 0.8)
                     .collect();
                 scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -359,7 +374,12 @@ impl Binder<'_> {
             .iter()
             .filter(|(_, e)| e.is_none())
             .map(|(n, _)| n.to_lowercase())
-            .chain(info.options.iter().filter(|(_, l)| l.is_empty()).map(|(n, _)| n.to_lowercase()))
+            .chain(
+                info.options
+                    .iter()
+                    .filter(|(_, l)| l.is_empty())
+                    .map(|(n, _)| n.to_lowercase()),
+            )
             .collect();
         Ok(self
             .copy_options(info)?
@@ -447,10 +467,7 @@ impl Binder<'_> {
             types.push(table.columns[index].ty.clone());
         }
         // the INSERT, of rows that stand in for those of the function (`ColumnDataRef` `__copy_from`)
-        let row: Vec<String> = types
-            .iter()
-            .map(|ty| format!("NULL::{ty}"))
-            .collect();
+        let row: Vec<String> = types.iter().map(|ty| format!("NULL::{ty}")).collect();
         let select = super::table_functions::parse_select(
             &format!("SELECT * FROM (VALUES ({})) __copy_from", row.join(", ")),
             "Expected a single SELECT statement",
@@ -501,8 +518,16 @@ impl Binder<'_> {
             expected_types: types.clone(),
         })?;
         // `FindCopySource`: the stand-in rows give way to the function's scan
-        fn replace(op: &mut LogicalOperator, scan: &mut Option<crate::function::udf::UserTableScan>, types: &[LogicalType]) {
-            if let LogicalOperatorKind::ExpressionGet { table_index, types: get_types, .. } = &op.kind
+        fn replace(
+            op: &mut LogicalOperator,
+            scan: &mut Option<crate::function::udf::UserTableScan>,
+            types: &[LogicalType],
+        ) {
+            if let LogicalOperatorKind::ExpressionGet {
+                table_index,
+                types: get_types,
+                ..
+            } = &op.kind
                 && get_types == types
                 && let Some(scan) = scan.take()
             {

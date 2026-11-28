@@ -2158,7 +2158,9 @@ impl Binder<'_> {
             visit_expr_mut(&mut aliased.clone(), &mut |e| match &e.kind {
                 ExprKind::ColumnRef(_) => reads = true,
                 ExprKind::Function(f) if !f.is_operator => {
-                    reads |= crate::function::BuiltinFunctions::get().aggregate(&f.name.name).is_some();
+                    reads |= crate::function::BuiltinFunctions::get()
+                        .aggregate(&f.name.name)
+                        .is_some();
                 }
                 _ => {}
             });
@@ -2498,7 +2500,12 @@ impl Binder<'_> {
                 .bindings
                 .iter()
                 .any(|b| b.alias.eq_ignore_ascii_case(&star.relation_name))
-            && self.bind_context.matching_binding(&star.relation_name).ok().flatten().is_none()
+            && self
+                .bind_context
+                .matching_binding(&star.relation_name)
+                .ok()
+                .flatten()
+                .is_none()
         {
             let mut columns: Option<Vec<(String, Vec<String>)>> = None;
             for context in self.outer_contexts.iter().rev() {
@@ -2537,7 +2544,11 @@ impl Binder<'_> {
             if let Some(columns) = columns {
                 let mut excluded = vec![false; star.exclude_list.len()];
                 for (name, path) in columns {
-                    if let Some(position) = star.exclude_list.iter().position(|e| e.column.eq_ignore_ascii_case(&name)) {
+                    if let Some(position) = star
+                        .exclude_list
+                        .iter()
+                        .position(|e| e.column.eq_ignore_ascii_case(&name))
+                    {
                         excluded[position] = true;
                         continue;
                     }
@@ -2863,7 +2874,9 @@ impl Binder<'_> {
             (TableRefKind::BaseTable { name, .. }, Some(location), Err(mut error))
                 if error.position.is_none()
                     && error.kind == ErrorKind::Catalog
-                    && error.message.starts_with(&format!("Table with name {} does not exist", name.name)) =>
+                    && error
+                        .message
+                        .starts_with(&format!("Table with name {} does not exist", name.name)) =>
             {
                 error.position = Some(location);
                 Err(error)
@@ -2898,9 +2911,18 @@ impl Binder<'_> {
                 let lower = full_path.to_lowercase();
                 // a name a file reader would read is a file: with the local file system off, that is the error
                 if self.options.local_file_system_disabled
-                    && [".csv", ".tsv", ".json", ".jsonl", ".ndjson", ".parquet", ".geojson", ".geojsonl"]
-                        .iter()
-                        .any(|end| lower.trim_end_matches(".gz").trim_end_matches(".zst").ends_with(end))
+                    && [
+                        ".csv",
+                        ".tsv",
+                        ".json",
+                        ".jsonl",
+                        ".ndjson",
+                        ".parquet",
+                        ".geojson",
+                        ".geojsonl",
+                    ]
+                    .iter()
+                    .any(|end| lower.trim_end_matches(".gz").trim_end_matches(".zst").ends_with(end))
                 {
                     self.check_file_access(&full_path)?;
                 }
@@ -3154,7 +3176,10 @@ impl Binder<'_> {
                             Some(super::Replacement::Rows((names, types, chunks))) => {
                                 return self.bind_chunks(table_ref, &name.name, names, types, chunks);
                             }
-                            Some(super::Replacement::TableFunction { name: function, parameters }) => {
+                            Some(super::Replacement::TableFunction {
+                                name: function,
+                                parameters,
+                            }) => {
                                 return self.bind_replacement_function(table_ref, &name.name, &function, &parameters);
                             }
                         }
@@ -3336,7 +3361,8 @@ impl Binder<'_> {
                 if let ExprKind::Function(call) = &function.kind
                     && let [catalog, schema] = call.name.qualification.as_slice()
                     && catalog.eq_ignore_ascii_case("system")
-                    && (schema.eq_ignore_ascii_case(crate::catalog::DEFAULT_SCHEMA) || schema.eq_ignore_ascii_case("pg_catalog"))
+                    && (schema.eq_ignore_ascii_case(crate::catalog::DEFAULT_SCHEMA)
+                        || schema.eq_ignore_ascii_case("pg_catalog"))
                     && crate::catalog::defaults::default_macro(Some(schema), &call.name.name, true).is_none()
                     && CPP_TABLE_FUNCTIONS.contains(&call.name.name.to_lowercase().as_str())
                 {
@@ -4860,7 +4886,8 @@ impl Binder<'_> {
 fn volatile_with_subqueries(expr: &BoundExpr) -> bool {
     fn plan_is_volatile(op: &LogicalOperator) -> bool {
         let mut probe = LogicalOperator::new(op.kind.clone(), Vec::new());
-        probe.expressions_mut().into_iter().any(|e| volatile_with_subqueries(e)) || op.children.iter().any(plan_is_volatile)
+        probe.expressions_mut().into_iter().any(|e| volatile_with_subqueries(e))
+            || op.children.iter().any(plan_is_volatile)
     }
     if expr.is_volatile() {
         return true;

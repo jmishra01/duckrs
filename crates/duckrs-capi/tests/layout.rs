@@ -37,12 +37,39 @@ fn layout() -> Vec<(String, usize)> {
         )*};
     }
     size!(
-        duckdb_string_t, duckdb_date, duckdb_date_struct, duckdb_time, duckdb_time_struct, duckdb_time_ns,
-        duckdb_time_tz, duckdb_time_tz_struct, duckdb_timestamp, duckdb_timestamp_struct, duckdb_timestamp_s,
-        duckdb_timestamp_ms, duckdb_timestamp_ns, duckdb_interval, duckdb_hugeint, duckdb_uhugeint, duckdb_decimal,
-        duckdb_query_progress_type, duckdb_list_entry, duckdb_column, duckdb_string, duckdb_blob, duckdb_bit,
-        duckdb_bignum, duckdb_result, duckdb_type, duckdb_state, duckdb_error_type, duckdb_statement_type,
-        duckdb_result_type, duckdb_pending_state, idx_t, sel_t
+        duckdb_string_t,
+        duckdb_date,
+        duckdb_date_struct,
+        duckdb_time,
+        duckdb_time_struct,
+        duckdb_time_ns,
+        duckdb_time_tz,
+        duckdb_time_tz_struct,
+        duckdb_timestamp,
+        duckdb_timestamp_struct,
+        duckdb_timestamp_s,
+        duckdb_timestamp_ms,
+        duckdb_timestamp_ns,
+        duckdb_interval,
+        duckdb_hugeint,
+        duckdb_uhugeint,
+        duckdb_decimal,
+        duckdb_query_progress_type,
+        duckdb_list_entry,
+        duckdb_column,
+        duckdb_string,
+        duckdb_blob,
+        duckdb_bit,
+        duckdb_bignum,
+        duckdb_result,
+        duckdb_type,
+        duckdb_state,
+        duckdb_error_type,
+        duckdb_statement_type,
+        duckdb_result_type,
+        duckdb_pending_state,
+        idx_t,
+        sel_t
     );
     offsets!(duckdb_date_struct: year, month, day);
     offsets!(duckdb_time_struct: hour, min, sec, micros);
@@ -67,7 +94,10 @@ fn layout() -> Vec<(String, usize)> {
         deprecated_error_message,
         internal_data
     );
-    checks.push(("offsetof(duckdb_string_t, value.pointer.ptr)".into(), offset_of!(duckdb_string_t_pointer, ptr)));
+    checks.push((
+        "offsetof(duckdb_string_t, value.pointer.ptr)".into(),
+        offset_of!(duckdb_string_t_pointer, ptr),
+    ));
     checks.push((
         "offsetof(duckdb_string_t, value.inlined.inlined)".into(),
         offset_of!(duckdb_string_t_inlined, inlined),
@@ -84,7 +114,8 @@ fn structs_match_duckdb_h() {
     let checks = layout();
     let dir = std::env::temp_dir().join(format!("duckrs_capi_layout_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let mut program = String::from("#include <stdio.h>\n#include <stddef.h>\n#include \"duckdb.h\"\nint main(void) {\n");
+    let mut program =
+        String::from("#include <stdio.h>\n#include <stddef.h>\n#include \"duckdb.h\"\nint main(void) {\n");
     for (expression, _) in &checks {
         program.push_str(&format!("\tprintf(\"%zu\\n\", (size_t)({expression}));\n"));
     }

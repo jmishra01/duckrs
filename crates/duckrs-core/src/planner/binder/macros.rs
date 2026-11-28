@@ -210,7 +210,6 @@ pub(super) fn has_parameter(expr: &Expr) -> bool {
     found
 }
 
-
 /// The schema of the system catalog with a function `name` (`FindSystemFunctionSchema`): a scalar, aggregate,
 /// window or table function, or one of its macros.
 fn system_function(name: &str) -> Option<&'static str> {
@@ -226,10 +225,12 @@ fn system_function(name: &str) -> Option<&'static str> {
     {
         return Some(crate::catalog::DEFAULT_SCHEMA);
     }
-    [crate::catalog::DEFAULT_SCHEMA, "pg_catalog"].into_iter().find(|schema| {
-        crate::catalog::defaults::default_macro(Some(schema), name, false).is_some()
-            || crate::catalog::defaults::default_macro(Some(schema), name, true).is_some()
-    })
+    [crate::catalog::DEFAULT_SCHEMA, "pg_catalog"]
+        .into_iter()
+        .find(|schema| {
+            crate::catalog::defaults::default_macro(Some(schema), name, false).is_some()
+                || crate::catalog::defaults::default_macro(Some(schema), name, true).is_some()
+        })
 }
 
 /// `ExpressionBinder::QualifySystemMacroReferences` for one expression: an unqualified call of a function of

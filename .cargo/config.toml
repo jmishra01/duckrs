@@ -1,0 +1,5 @@
+[env]
+# Threads that Rust spawns, test threads included, get 2 MiB of stack by default; a main thread gets 8 MiB. The
+# binder recurses down to DuckDB's expression depth limit (1000), which in a debug build needs about a main
+# thread's stack, so the tests get that much too.
+RUST_MIN_STACK = "8388608"
