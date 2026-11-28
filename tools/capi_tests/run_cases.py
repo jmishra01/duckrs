@@ -9,6 +9,7 @@ assertions are not counted. The summary goes to stdout and to results.md; the ou
 """
 import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -44,6 +45,8 @@ def run(binary):
     asserts_passed = asserts_failed = 0
     failures = []
     for case in cases:
+        # each case starts with an empty test directory, as DuckDB's test runner gives it
+        shutil.rmtree(os.environ.get("DUCKRS_CAPI_TEST_DIR", "duckrs_capi_test_dir"), ignore_errors=True)
         try:
             proc = subprocess.run([binary, spec(case)], capture_output=True, text=True, timeout=TIMEOUT,
                                   errors="replace")

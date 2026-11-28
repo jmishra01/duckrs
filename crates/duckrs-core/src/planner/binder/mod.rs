@@ -34,6 +34,8 @@ mod table_constraints;
 mod table_functions;
 pub mod tpc;
 mod user_functions;
+mod extract_names;
+pub use extract_names::ExtractNames;
 pub use table_functions::named_argument;
 mod window;
 
@@ -1105,6 +1107,8 @@ pub struct Binder<'a> {
     used_types: Arc<std::sync::Mutex<Vec<String>>>,
     /// the table function whose arguments are being bound, for `TableFunctionBinder`'s errors
     table_function_name: String,
+    /// `BindingMode::EXTRACT_NAMES`: the statement binds only for the names of its tables
+    extract_names: Option<Arc<ExtractNames>>,
     /// how many bodies of system macros are being bound
     system_macro_depth: usize,
     /// the table function being bound was called as `system.main.f`: no macro shadows it
@@ -1233,6 +1237,7 @@ impl<'a> Binder<'a> {
             system_table_function: false,
             system_macro_depth: 0,
             table_function_name: String::new(),
+            extract_names: None,
             row_subquery: false,
             bound_macros: Vec::new(),
             macro_arguments: Vec::new(),
@@ -1342,6 +1347,7 @@ impl<'a> Binder<'a> {
         binder.read_macros = self.read_macros.clone();
         binder.system_macro_depth = self.system_macro_depth;
         binder.table_function_name = self.table_function_name.clone();
+        binder.extract_names = self.extract_names.clone();
         binder.defining = self.defining;
         binder.parameters = self.parameters.clone();
         binder.ctes = self.ctes.clone();

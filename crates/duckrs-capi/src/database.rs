@@ -1,12 +1,14 @@
-// Ported from duckdb/src/main/capi/v1/duckdb-c.cpp and config-c.cpp @ rust-port-baseline
+// Ported from duckdb/src/main/capi/v1/duckdb-c.cpp and config-c.cpp, and the parts of
+// duckdb/src/main/db_instance_cache.cpp the instance cache uses @ rust-port-baseline
 
-//! Databases, connections, configurations and `duckdb_query`.
+//! Databases, the instance cache, connections, configurations and `duckdb_query`.
 
 use crate::ffi::{self, Handle};
 use crate::result::translate_result;
 use crate::types::*;
 use duckrs::{Connection, Database, LogicalType, Value};
 use std::ffi::c_char;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 /// `DatabaseWrapper`.
@@ -24,6 +26,20 @@ impl DatabaseWrapper {
 /// A connection (`Connection`). Prepared statements and appenders share it, as C++'s share its `ClientContext`.
 pub struct ConnectionWrapper {
     pub(crate) connection: SharedConnection,
+    /// `ClientContext::GetConnectionId`, which a callback of a query on the connection asks for while the query has
+    /// the connection
+    pub(crate) connection_id: u64,
+}
+
+/// What a client context (`duckdb_client_context`, which holds a connection id) reaches of its connection: the
+/// database and the connection, by connection id, for each connection `duckdb_connect` made until it is
+/// disconnected.
+static CONTEXTS: Mutex<Option<HashMap<u64, (duckrs::WeakDatabase, SharedConnection)>>> = Mutex::new(None);
+
+/// The database and the connection of the connection `connection_id`, while it is connected.
+pub(crate) fn context_of(connection_id: u64) -> Option<(duckrs::WeakDatabase, SharedConnection)> {
+    let contexts = CONTEXTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    contexts.as_ref()?.get(&connection_id).cloned()
 }
 
 /// A connection that statements and appenders made on it hold on to.
@@ -35,10 +51,15 @@ impl SharedConnection {
     pub fn lock(&self) -> MutexGuard<'_, Connection> {
         self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+
+    /// Whether something runs on the connection now (a query, whose callbacks ask): it is then in a transaction.
+    pub(crate) fn is_busy(&self) -> bool {
+        matches!(self.0.try_lock(), Err(std::sync::TryLockError::WouldBlock))
+    }
 }
 
 /// `DBConfig`: the options set on it, by name, in order.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct Config {
     options: Vec<(String, String)>,
 }
@@ -53,6 +74,94 @@ impl Handle for _duckdb_connection {
 
 impl Handle for _duckdb_config {
     type Target = Config;
+}
+
+/// `DBInstanceCache`: the databases it opened, by `GetCacheKey` of their path, while they are open, with the options
+/// each was opened with.
+#[derive(Default)]
+pub struct InstanceCache {
+    instances: Mutex<HashMap<String, (duckrs::WeakDatabase, Config)>>,
+}
+
+impl Handle for _duckdb_instance_cache {
+    type Target = InstanceCache;
+}
+
+const IN_MEMORY_PATH: &str = ":memory:";
+
+/// `GetDBAbsolutePath`: `:memory:` for an empty path, a path of an in-memory database as it is, and any other path
+/// made absolute and normalized (`CanonicalizePath`), after `~` is expanded (`ExpandPath`).
+fn absolute_path(path: &str) -> String {
+    let path = match path.strip_prefix('~') {
+        Some(rest) => format!("{}{rest}", std::env::var("HOME").unwrap_or_default()),
+        None => path.to_string(),
+    };
+    if path.is_empty() {
+        return IN_MEMORY_PATH.to_string();
+    }
+    if path.starts_with(IN_MEMORY_PATH) || path.contains("://") {
+        return path;
+    }
+    let joined = match std::env::current_dir() {
+        Ok(dir) if !std::path::Path::new(&path).is_absolute() => dir.join(&path),
+        _ => std::path::PathBuf::from(&path),
+    };
+    let mut normalized = std::path::PathBuf::new();
+    for component in joined.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other),
+        }
+    }
+    normalized.to_string_lossy().into_owned()
+}
+
+/// `GetCacheKey`: the absolute path, in lower case where the file system ignores case.
+fn cache_key(path: &str) -> String {
+    let path = absolute_path(path);
+    if cfg!(any(windows, target_os = "macos")) {
+        path.to_lowercase()
+    } else {
+        path
+    }
+}
+
+impl InstanceCache {
+    /// `DBInstanceCache::GetOrCreateInstance` with `CacheBehavior::AUTOMATIC`: the open database of `path` if there
+    /// is one (with the same options), else a new one, kept unless it is an unnamed in-memory one.
+    fn get_or_create(&self, path: &str, config: Option<&Config>) -> Result<Database, String> {
+        let default = Config::default();
+        let config = config.unwrap_or(&default);
+        let cached = !(path.is_empty() || path == IN_MEMORY_PATH);
+        let key = cache_key(path);
+        let mut instances = self.instances.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if cached && let Some((weak, options)) = instances.get(&key) {
+            match weak.upgrade() {
+                Some(database) if options != config => {
+                    drop(database);
+                    return Err("Connection Error: Can't open a connection to same database file with a different                                 configuration than existing connections"
+                        .to_string());
+                }
+                Some(database) => return Ok(database),
+                None => {
+                    instances.remove(&key);
+                }
+            }
+        }
+        // `CreateInstanceInternal`: the database opens at its absolute path
+        let mut instance_path = absolute_path(path);
+        if instance_path.starts_with(IN_MEMORY_PATH) {
+            instance_path = IN_MEMORY_PATH.to_string();
+        }
+        let database = open(Some(&instance_path), Some(config)).map_err(|error| error.to_string())?;
+        if cached {
+            instances.insert(key, (database.downgrade(), config.clone()));
+        }
+        Ok(database)
+    }
 }
 
 /// `DBConfig::SetOptionByName`: `value` must name a setting and fit its type.
@@ -126,7 +235,22 @@ pub unsafe extern "C" fn duckdb_open_ext(
     let path = unsafe { ffi::c_str(path) }.map(String::from_utf8_lossy);
     // SAFETY: C passes a configuration `duckdb_create_config` made, or none.
     let config = unsafe { ffi::get(config) };
-    let opened = ffi::guard(None, || Some(open(path.as_deref(), config)));
+    let opened = ffi::guard(None, || Some(open(path.as_deref(), config).map_err(|error| error.to_string())));
+    // SAFETY: C passes where to write the database and the error.
+    unsafe { finish_open(opened, out_database, out_error) }
+}
+
+/// The end of `duckdb_open_internal`: the database `opened` gave written to `out_database`, or its error to
+/// `out_error`.
+///
+/// # Safety
+///
+/// `out_database` and `out_error` are null or valid for a write of a pointer.
+unsafe fn finish_open(
+    opened: Option<Result<Database, String>>,
+    out_database: *mut duckdb_database,
+    out_error: *mut *mut c_char,
+) -> duckdb_state {
     let error = match opened {
         Some(Ok(database)) => {
             let handle = ffi::into_handle(DatabaseWrapper { database });
@@ -138,12 +262,46 @@ pub unsafe extern "C" fn duckdb_open_ext(
             drop(unsafe { ffi::take(&mut { handle }) });
             return DuckDBError;
         }
-        Some(Err(error)) => error.to_string(),
+        Some(Err(error)) => error,
         None => "Unknown error".to_string(),
     };
     // SAFETY: C passes where to write the error, or no place.
     unsafe { ffi::write(out_error, ffi::strdup(error)) };
     DuckDBError
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn duckdb_create_instance_cache() -> duckdb_instance_cache {
+    ffi::into_handle(InstanceCache::default())
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn duckdb_destroy_instance_cache(instance_cache: *mut duckdb_instance_cache) {
+    // SAFETY: C passes a cache `duckdb_create_instance_cache` made; the databases it opened stay open.
+    drop(unsafe { ffi::take(instance_cache) });
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn duckdb_get_or_create_from_cache(
+    instance_cache: duckdb_instance_cache,
+    path: *const c_char,
+    out_database: *mut duckdb_database,
+    config: duckdb_config,
+    out_error: *mut *mut c_char,
+) -> duckdb_state {
+    // SAFETY: C passes a live instance cache, or none.
+    let Some(cache) = (unsafe { ffi::get(instance_cache) }) else {
+        // SAFETY: C passes where to write the error, or no place.
+        unsafe { ffi::write(out_error, ffi::strdup("instance cache cannot be nullptr")) };
+        return DuckDBError;
+    };
+    // SAFETY: C passes a NUL-terminated path, or none.
+    let path = unsafe { ffi::c_str(path) }.map(String::from_utf8_lossy).unwrap_or_default();
+    // SAFETY: C passes a configuration `duckdb_create_config` made, or none.
+    let config = unsafe { ffi::get(config) };
+    let opened = ffi::guard(None, || Some(cache.get_or_create(&path, config)));
+    // SAFETY: C passes where to write the database and the error.
+    unsafe { finish_open(opened, out_database, out_error) }
 }
 
 #[unsafe(no_mangle)]
@@ -170,8 +328,16 @@ pub unsafe extern "C" fn duckdb_connect(database: duckdb_database, out_connectio
     let Some(Ok(connection)) = ffi::guard(None, || Some(database.database.connect())) else {
         return DuckDBError;
     };
+    let connection_id = connection.connection_id();
+    let shared = SharedConnection(Arc::new(Mutex::new(connection)));
+    CONTEXTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(connection_id, (database.database.downgrade(), shared.clone()));
     let handle = ffi::into_handle(ConnectionWrapper {
-        connection: SharedConnection(Arc::new(Mutex::new(connection))),
+        connection: shared,
+        connection_id,
     });
     // SAFETY: C passes where to write the connection; it is not null.
     unsafe { ffi::write(out_connection, handle) };
@@ -181,7 +347,13 @@ pub unsafe extern "C" fn duckdb_connect(database: duckdb_database, out_connectio
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn duckdb_disconnect(connection: *mut duckdb_connection) {
     // SAFETY: C passes a connection `duckdb_connect` made.
-    drop(unsafe { ffi::take(connection) });
+    let Some(connection) = (unsafe { ffi::take(connection) }) else {
+        return;
+    };
+    let mut contexts = CONTEXTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(contexts) = contexts.as_mut() {
+        contexts.remove(&connection.connection_id);
+    }
 }
 
 /// `Connection::Interrupt`. duckrs runs a query to its end, so there is nothing to interrupt yet.
@@ -300,4 +472,26 @@ pub unsafe extern "C" fn duckdb_set_config(config: duckdb_config, name: *const c
 pub unsafe extern "C" fn duckdb_destroy_config(config: *mut duckdb_config) {
     // SAFETY: C passes a configuration `duckdb_create_config` made.
     drop(unsafe { ffi::take(config) });
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn duckdb_get_table_names(
+    connection: duckdb_connection,
+    query: *const c_char,
+    qualified: bool,
+) -> duckdb_value {
+    // SAFETY: C passes a live connection and a NUL-terminated query.
+    let (Some(connection), Some(query)) = (unsafe { ffi::get(connection) }, unsafe { ffi::c_str(query) }) else {
+        return std::ptr::null_mut();
+    };
+    let query = String::from_utf8_lossy(query);
+    let names = ffi::guard(None, || connection.connection.lock().get_table_names(&query, qualified).ok());
+    let Some(names) = names else {
+        return std::ptr::null_mut();
+    };
+    let names = names.into_iter().map(Value::varchar).collect();
+    match Value::list(LogicalType::VARCHAR, names) {
+        Ok(list) => ffi::into_handle::<_duckdb_value>(list),
+        Err(_) => std::ptr::null_mut(),
+    }
 }

@@ -898,7 +898,7 @@ impl PlanWriter {
             | K::JsonScan { .. }
             | K::ParquetScan { .. }
             | K::UserTableScan { .. } => "LOGICAL_GET",
-            K::CopyToParquet { .. } | K::CopyToFile { .. } => "LOGICAL_COPY_TO_FILE",
+            K::CopyToParquet { .. } | K::CopyToFile { .. } | K::UserCopyTo { .. } => "LOGICAL_COPY_TO_FILE",
             K::EmptyResult { .. } => "LOGICAL_EMPTY_RESULT",
             K::DummyScan { .. } => "LOGICAL_DUMMY_SCAN",
             K::ChunkGet { .. } => "LOGICAL_CHUNK_GET",
@@ -1100,6 +1100,7 @@ impl PlanWriter {
                 self.copy_to_file(s, op, path, names, format);
             }
             K::CopyToParquet { path, names, .. } => self.copy_to_file(s, op, path, names, "parquet"),
+            K::UserCopyTo { names, copy } => self.copy_to_file(s, op, &copy.path, names, &copy.name),
             K::EmptyResult { types, bindings } => {
                 s.write_property_with_default(200, "return_types", types);
                 s.write_property_with_default(

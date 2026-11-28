@@ -1259,6 +1259,7 @@ fn can_skip(op: &mut LogicalOperator) -> bool {
             | K::MergeInto { .. }
             | K::CopyToFile { .. }
             | K::CopyToParquet { .. }
+            | K::UserCopyTo { .. }
             | K::CteRef { .. }
             | K::RecursiveCte { .. }
     ) || has_volatile_expressions(op)

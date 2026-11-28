@@ -336,3 +336,13 @@ pub unsafe extern "C" fn duckdb_logical_type_set_alias(ty: duckdb_logical_type, 
 pub(crate) fn is_unusable(ty: &LogicalType) -> bool {
     contains_invalid_or_any(ty)
 }
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn duckdb_geometry_type_get_crs(ty: duckdb_logical_type) -> *mut c_char {
+    // SAFETY: C passes a live logical type.
+    match unsafe { type_with_id(ty, LogicalTypeId::Geometry) }.and_then(LogicalType::crs) {
+        // `GeoType::GetCRS(type).GetDefinition()`
+        Some(crs) => ffi::strdup(&crs.definition),
+        None => std::ptr::null_mut(),
+    }
+}

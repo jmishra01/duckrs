@@ -786,23 +786,45 @@ pub const DENORMALIZED_JOIN: &str = "SELECT l.context_id, scope, connection_id, 
      timestamp, type, log_level, message FROM (SELECT row_number() OVER () AS rowid, * FROM duckdb_logs()) as l \
      JOIN duckdb_log_contexts() as c ON l.context_id=c.context_id order by timestamp, l.rowid;";
 
+/// A log storage a client registered (`duckdb_register_log_storage`): each entry goes to its callback, and it keeps
+/// nothing to scan (`CallbackLogStorage`).
+pub trait LogStorageCallback: Send + Sync {
+    /// `WriteLogEntry`: an entry, its time in microseconds since the epoch.
+    fn write_entry(&self, timestamp: i64, level: LogLevel, log_type: &str, message: &str);
+}
+
+/// A registered [`LogStorageCallback`].
+#[derive(Clone)]
+pub struct CallbackStorage(pub Arc<dyn LogStorageCallback>);
+
+impl std::fmt::Debug for CallbackStorage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CallbackStorage")
+    }
+}
+
 #[derive(Debug)]
 enum Storage {
     Memory(MemoryStorage),
     Stdout,
     File(FileStorage),
+    Callback(CallbackStorage),
 }
 
 impl Storage {
-    fn create(name: &str) -> Result<Self> {
+    /// The storage `name` (lower case) names: a built-in one, or one a client registered.
+    fn create(name: &str, registered: &HashMap<String, CallbackStorage>) -> Result<Self> {
         match name {
             MEMORY_STORAGE => Ok(Storage::Memory(MemoryStorage::new())),
             STDOUT_STORAGE => Ok(Storage::Stdout),
             FILE_STORAGE => Ok(Storage::File(FileStorage::new())),
-            _ => Err(Error::new(
-                ErrorKind::InvalidInput,
-                format!("Log storage '{name}' is not yet registered"),
-            )),
+            _ => match registered.get(name) {
+                Some(callback) => Ok(Storage::Callback(callback.clone())),
+                None => Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("Log storage '{name}' is not yet registered"),
+                )),
+            },
         }
     }
 }
@@ -815,6 +837,8 @@ pub struct LogManager {
     next_context_id: u64,
     /// the context of the database's own logger (`GlobalLogger`)
     global_context: RegisteredContext,
+    /// `registered_log_storages` beyond the built-in ones, by lower-case name
+    registered: HashMap<String, CallbackStorage>,
 }
 
 impl Default for LogManager {
@@ -822,6 +846,7 @@ impl Default for LogManager {
         let mut manager = Self {
             config: LogConfig::default(),
             storage: Storage::Memory(MemoryStorage::new()),
+            registered: HashMap::new(),
             next_context_id: 0,
             global_context: RegisteredContext {
                 id: 0,
@@ -887,6 +912,12 @@ impl LogManager {
                 print_entry(&entry, context);
                 Ok(())
             }
+            Storage::Callback(callback) => {
+                callback
+                    .0
+                    .write_entry(entry.timestamp, entry.level, &entry.log_type, &entry.message);
+                Ok(())
+            }
         }
     }
 
@@ -910,7 +941,7 @@ impl LogManager {
         match &mut self.storage {
             Storage::Memory(storage) => storage.flush_all(),
             Storage::File(storage) => storage.flush_all()?,
-            Storage::Stdout => {}
+            Storage::Stdout | Storage::Callback(_) => {}
         }
         Ok(())
     }
@@ -934,7 +965,7 @@ impl LogManager {
         if self.config.storage == lower {
             return Ok(());
         }
-        let storage = Storage::create(&lower).map_err(|error| {
+        let storage = Storage::create(&lower, &self.registered).map_err(|error| {
             if error.kind == ErrorKind::InvalidInput {
                 Error::new(
                     ErrorKind::InvalidInput,
@@ -948,6 +979,17 @@ impl LogManager {
         self.storage = storage;
         self.config.storage = lower;
         Ok(())
+    }
+
+    /// `LogManager::RegisterLogStorage`: false when a storage has the name already.
+    pub fn register_storage(&mut self, name: &str, storage: Arc<dyn LogStorageCallback>) -> bool {
+        let lower = name.to_lowercase();
+        if [MEMORY_STORAGE, STDOUT_STORAGE, FILE_STORAGE].contains(&lower.as_str()) || self.registered.contains_key(&lower)
+        {
+            return false;
+        }
+        self.registered.insert(lower, CallbackStorage(storage));
+        true
     }
 
     pub fn set_enabled(&mut self, enabled: bool) {
@@ -1009,7 +1051,7 @@ impl LogManager {
         let name = config.storage.to_lowercase();
         let mut previous_storage = None;
         if name != self.config.storage {
-            let storage = Storage::create(&name).map_err(|error| {
+            let storage = Storage::create(&name, &self.registered).map_err(|error| {
                 if error.kind == ErrorKind::InvalidInput {
                     Error::new(
                         ErrorKind::InvalidInput,
@@ -1066,6 +1108,15 @@ impl LogManager {
                 }
                 Ok(())
             }
+            // `LogStorage::UpdateConfig`
+            Storage::Callback(_) if !config.is_empty() => Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "Log storage '{}' does not support passing configuration",
+                    self.config.storage
+                ),
+            )),
+            Storage::Callback(_) => Ok(()),
         }
     }
 
@@ -1074,7 +1125,7 @@ impl LogManager {
         match &mut self.storage {
             Storage::Memory(storage) => storage.reset(),
             Storage::File(storage) => storage.truncate()?,
-            Storage::Stdout => {}
+            Storage::Stdout | Storage::Callback(_) => {}
         }
         Ok(())
     }
@@ -1096,7 +1147,7 @@ impl LogManager {
     pub fn scan(&self) -> Result<(&[LogEntry], &[RegisteredContext])> {
         match &self.storage {
             Storage::Memory(storage) => Ok((&storage.flushed_entries, &storage.flushed_contexts)),
-            Storage::Stdout | Storage::File(_) => Err(Error::new(
+            Storage::Stdout | Storage::File(_) | Storage::Callback(_) => Err(Error::new(
                 ErrorKind::InvalidConfiguration,
                 format!(
                     "Log storage '{}' does not support this query. Select a queryable storage, such as 'memory' or \

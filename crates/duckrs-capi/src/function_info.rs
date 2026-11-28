@@ -144,11 +144,20 @@ pub(crate) struct TableFunctionInfo {
     pub(crate) error: CallbackError,
 }
 
-/// The `duckdb_function_info` of a scalar, an aggregate or a table function.
+/// `CCastExecuteInfo`.
+pub(crate) struct CastFunctionInfo {
+    pub(crate) extra: CPointer,
+    /// `parameters.error_message != nullptr`: TRY_CAST
+    pub(crate) try_cast: bool,
+    pub(crate) error: CallbackError,
+}
+
+/// The `duckdb_function_info` of a scalar, an aggregate or a table function, or of a cast.
 pub(crate) enum FunctionInfo {
     Scalar(ScalarFunctionInfo),
     Aggregate(AggregateFunctionInfo),
     Table(TableFunctionInfo),
+    Cast(CastFunctionInfo),
 }
 
 impl Handle for _duckdb_bind_info {
@@ -220,16 +229,10 @@ pub unsafe extern "C" fn duckdb_connection_get_client_context(
     let Some(connection) = (unsafe { ffi::get::<_duckdb_connection>(connection) }) else {
         return;
     };
-    let ConnectionWrapper { connection } = connection;
-    let id = ffi::guard(None, || Some(connection.lock().connection_id()));
-    match id {
-        // SAFETY: C passes where to write the context.
-        Some(id) => unsafe { write_client_context(out_context, id) },
-        // SAFETY: C passes where to write the context, or no place.
-        None => unsafe {
-            ffi::write(out_context, std::ptr::null_mut());
-        },
-    }
+    // the id is the connection's own, which a callback of a query on the connection can ask for
+    let ConnectionWrapper { connection_id, .. } = connection;
+    // SAFETY: C passes where to write the context.
+    unsafe { write_client_context(out_context, *connection_id) };
 }
 
 #[unsafe(no_mangle)]
