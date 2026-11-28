@@ -2817,7 +2817,9 @@ impl StatisticsPropagator {
             if stats.min.as_ref().is_some_and(|v| !v.logical_type().is_integral()) {
                 continue;
             }
-            if max >= min && max - min < values.len() as i128 + 1 && (min..=max).all(|v| values.contains(&v)) {
+            // a range wider than `i128` (HUGEINT statistics at both ends) is never covered by the excluded values
+            let narrow = max.checked_sub(min).is_some_and(|width| width >= 0 && width < values.len() as i128 + 1);
+            if narrow && (min..=max).all(|v| values.contains(&v)) {
                 *op = empty_result(op);
                 return;
             }
@@ -3434,7 +3436,7 @@ impl StatisticsPropagator {
                 .zip(stats.max.as_ref().and_then(Value::as_i128));
             let key = match known.filter(|_| ranged) {
                 Some((min, max)) => {
-                    let range = u128::try_from(max - min).ok()?;
+                    let range = u128::try_from(max.checked_sub(min)?).ok()?;
                     range + 1 + u128::from(stats.can_be_null)
                 }
                 None => match ty.id() {
@@ -3479,7 +3481,7 @@ impl StatisticsPropagator {
             if max < min {
                 return None;
             }
-            let range = u64::try_from(max - min).ok()?;
+            let range = u64::try_from(max.checked_sub(min)?).ok()?;
             if range >= i32::MAX as u64 {
                 return None;
             }

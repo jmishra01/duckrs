@@ -196,7 +196,7 @@ fn renders_statements_like_duckdb() {
         ),
         (
             "INSERT INTO t AS x DEFAULT VALUES ON CONFLICT (A) WHERE a > 1 DO UPDATE SET B = 1 WHERE b < 2",
-            "INSERT INTO t AS x DEFAULT VALUES ON CONFLICT (a ) WHERE (a > 1) DO UPDATE SET b = 1 WHERE (b < 2)",
+            "INSERT INTO t AS x DEFAULT VALUES ON CONFLICT (A) WHERE (a > 1) DO UPDATE SET B = 1 WHERE (b < 2)",
         ),
         (
             "INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING",
@@ -620,7 +620,7 @@ fn renders_utility_statements_like_duckdb() {
         ),
         (
             "ATTACH 'x' (TYPE NULL)",
-            "Binder Error: NULL is not supported as a valid option for ATTACH option type",
+            "Binder Error: NULL is not supported as a valid option for ATTACH option \"type\"",
         ),
         ("VACUUM FULL", "Not implemented Error: FULL is not yet implemented"),
         ("VACUUM (FOO)", "Parser Error: unrecognized VACUUM option \"FOO\""),
@@ -750,7 +750,11 @@ fn renders_match_recognize_and_remaining_statements_like_duckdb() {
             "CREATE EXTERNAL RESOURCE 'kv' AS r (ttl 5)",
             "CREATE EXTERNAL RESOURCE 'kv' AS r (ttl 5)",
         ),
-        ("SHOW ALL EXTERNAL RESOURCES", "SHOW ALL EXTERNAL RESOURCES"),
+        // a query over `duckdb_external_resources` (`TransformShowExternalResources`)
+        (
+            "SHOW ALL EXTERNAL RESOURCES",
+            "SELECT * FROM duckdb_external_resources(discover := true)",
+        ),
         (
             "ATTACH TO EXTERNAL RESOURCE r AS db (READ_ONLY)",
             "ATTACH TO EXTERNAL RESOURCE r AS db (read_only true);",

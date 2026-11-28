@@ -8765,7 +8765,7 @@ mod tests {
             "Top N",
             "Top: 10",
             "Seq Scan",
-            "Table: a",
+            "Table: memory.main.a",
             "Type: Sequential Scan",
             "~1,000 rows",
         ] {
@@ -8792,7 +8792,7 @@ mod tests {
         ] {
             assert!(plan.contains(expected), "{expected} in {plan}");
         }
-        assert!(plan.starts_with('[') && plan.ends_with(']'), "{plan}");
+        assert!(plan.starts_with('[') && plan.trim_end().ends_with(']'), "{plan}");
         let plan = explain(&mut context, "(FORMAT JSON) SELECT x, x + 1 FROM a");
         assert!(plan.contains("\"Projections\": [\"x\", \"(x + 1)\"]"), "{plan}");
         // the estimates in the logical plan
@@ -8821,10 +8821,11 @@ mod tests {
         // one column goes into the scan, and no operator is left
         let plan = explain(&mut context, "SELECT i FROM t WHERE j = 5");
         assert!(plan.contains("Filters: j = 5") && !plan.contains("Filter\n"), "{plan}");
-        // several columns stay above it, and each conjunct goes its own way
+        // each conjunct goes its own way: `i > j` with `j = 5` is `i > 5`, so all three go into the scan, in the
+        // order the scan reads the columns
         let plan = explain(&mut context, "SELECT i FROM t WHERE j = 5 AND i > j AND s <> '55'");
-        assert!(plan.contains("Filters: j = 5,\ns != '55'"), "{plan}");
-        assert!(plan.contains("Filter\n") && plan.contains("i > j"), "{plan}");
+        assert!(plan.contains("Filters: i > 5,\nj = 5,\ns != '55'"), "{plan}");
+        assert!(!plan.contains("Filter\n"), "{plan}");
         // and an OR on one column is one filter, without parentheses around all of it
         let plan = explain(&mut context, "SELECT i FROM t WHERE j = 5 OR j = 6");
         assert!(!plan.contains("Filter\n"), "{plan}");
@@ -9500,17 +9501,21 @@ mod tests {
         );
         run(&mut context, "CREATE TABLE mid AS SELECT i AS id FROM range(500) t(i)");
         run(&mut context, "CREATE TABLE small AS SELECT i AS id FROM range(20) t(i)");
+        // the JSON plan has the children of an operator in order, the left one first, so the table found first is
+        // the one furthest left (the boxes of the text plan sit side by side, so their lines don't say that)
         let explain =
             |context: &mut ClientContext, sql: &str| flat_plan(&run(context, &format!("EXPLAIN {sql}"))[0][1]);
+        let json = |context: &mut ClientContext, sql: &str| {
+            run(context, &format!("EXPLAIN (FORMAT JSON) {sql}"))[0][1].clone()
+        };
         let at = |plan: &str, table: &str| {
-            let line = format!("Table: {table}");
-            let line = plan.lines().position(|text| text.trim() == line);
-            line.unwrap_or_else(|| panic!("{table} in {plan}"))
+            let text = format!("\"Table\": \"memory.main.{table}\"");
+            plan.find(&text).unwrap_or_else(|| panic!("{table} in {plan}"))
         };
         // written with the cross product first; the smaller tables are built, with no cross product
         let query = "FROM small, mid, big WHERE big.mid_id = mid.id AND big.small_id = small.id";
-        let plan = explain(&mut context, &format!("SELECT count(*) {query}"));
-        assert!(!plan.contains("Cross Product"), "{plan}");
+        let plan = json(&mut context, &format!("SELECT count(*) {query}"));
+        assert!(!plan.contains("CROSS_PRODUCT"), "{plan}");
         assert!(
             at(&plan, "big") < at(&plan, "mid") && at(&plan, "big") < at(&plan, "small"),
             "{plan}"
@@ -9521,7 +9526,7 @@ mod tests {
             "big, mid WHERE big.mid_id = mid.id",
             "mid, big WHERE big.mid_id = mid.id",
         ] {
-            let plan = explain(&mut context, &format!("SELECT count(*) FROM {query}"));
+            let plan = json(&mut context, &format!("SELECT count(*) FROM {query}"));
             assert!(at(&plan, "big") < at(&plan, "mid"), "{plan}");
         }
         // columns keep their order, also through a set operation, which reads them by position
@@ -9574,7 +9579,7 @@ mod tests {
             &mut context,
             "SELECT count(*) FROM fact f, pairs x WHERE f.p = x.p AND f.q = x.q",
         );
-        assert!(plan.contains("~20,000 rows\n      Seq Scan"), "{plan}");
+        assert!(plan.contains("Conditions: p = p, q = q\n~20,000 rows\n"), "{plan}");
         // the answer does not depend on any of that
         let rows = run(
             &mut context,
@@ -9595,7 +9600,7 @@ mod tests {
         assert!(plan.contains("Cross Product"), "{plan}");
         // off under the name DuckDB has for it: the query stays as it is written
         run(&mut context, "SET disabled_optimizers = 'join_order'");
-        let plan = explain(&mut context, "SELECT count(*) FROM mid, big WHERE big.mid_id = mid.id");
+        let plan = json(&mut context, "SELECT count(*) FROM mid, big WHERE big.mid_id = mid.id");
         assert!(at(&plan, "mid") < at(&plan, "big"), "{plan}");
     }
 
@@ -9687,7 +9692,10 @@ mod tests {
             &mut context,
             "EXPLAIN SELECT x FROM a WHERE x > 1 AND EXISTS (SELECT 1 FROM b WHERE b.k = a.k)",
         );
-        assert!(explained[0][1].contains("LEFT_DELIM_JOIN"), "{explained:?}");
+        // `x > 1` filters the left side, and `b.k = a.k` rejects the NULLs of the right side: the marker-only EXISTS
+        // is a RIGHT_SEMI join (the delimiter rewrite of `delim_join_as_cte`, which is on by default), no delim join
+        assert!(explained[0][1].contains("RIGHT_SEMI"), "{explained:?}");
+        assert!(!explained[0][1].contains("DELIM_JOIN"), "{explained:?}");
         // the left rows keep their order
         assert_eq!(
             run(&mut context, "SELECT x, (SELECT sum(y) FROM b WHERE b.k = a.k) FROM a"),

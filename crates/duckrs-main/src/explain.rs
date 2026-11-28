@@ -196,6 +196,9 @@ fn scan_filter_lines_marked(filters: &[(BoundExpr, bool)]) -> String {
             None => groups.push((key, vec![filter])),
         }
     }
+    // `TableFilterSet::filters` is a map by the column's position in the scan, and the filters of several columns
+    // (`multi_column_filters`) come after it
+    groups.sort_by_key(|(key, _)| key.map_or((1, 0), |binding| (0, binding.column_index)));
     lines(groups.into_iter().map(|(_, members)| match members.as_slice() {
         [only] => whole(only),
         _ => members.iter().map(|m| part(m)).collect::<Vec<_>>().join(" AND "),

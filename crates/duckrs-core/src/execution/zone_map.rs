@@ -793,7 +793,9 @@ impl Group<'_> {
             let (Some(min), Some(max)) = (min.as_i128(), max.as_i128()) else {
                 return false;
             };
-            max >= min && max - min < values.len() as i128 && (min..=max).all(|v| values.contains(&v))
+            // a range wider than `i128` (HUGEINT values at both ends) is never covered by the excluded values
+            let narrow = max.checked_sub(min).is_some_and(|width| width >= 0 && width < values.len() as i128);
+            narrow && (min..=max).all(|v| values.contains(&v))
         })
     }
 
