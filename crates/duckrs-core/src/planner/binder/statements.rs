@@ -3670,8 +3670,8 @@ impl Binder<'_> {
             {
                 for entry in entries.flatten() {
                     let file_name = entry.file_name().to_string_lossy().into_owned();
-                    let spilled = file_name.ends_with(".block")
-                        || file_name.starts_with(duckrs_common::SPILL_FILE_PREFIX);
+                    let spilled =
+                        file_name.ends_with(".block") || file_name.starts_with(duckrs_common::SPILL_FILE_PREFIX);
                     // another query can remove its file before its size is read
                     let Ok(metadata) = entry.metadata() else { continue };
                     if spilled && metadata.is_file() {

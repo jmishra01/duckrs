@@ -251,7 +251,8 @@ pub(crate) const VOLATILE_FUNCTIONS: &[&str] = &[
 
 /// The table functions computed while binding that are `FunctionStability::VOLATILE`: they read
 /// live state, so two calls in one query are not the same rows.
-pub(crate) const VOLATILE_TABLE_FUNCTIONS: &[&str] = &["duckdb_memory", "duckdb_temporary_files", "duckdb_external_file_cache"];
+pub(crate) const VOLATILE_TABLE_FUNCTIONS: &[&str] =
+    &["duckdb_memory", "duckdb_temporary_files", "duckdb_external_file_cache"];
 
 /// The functions that give the same in one query, but not in the next (`FunctionStability::CONSISTENT_WITHIN_QUERY`):
 /// they may move as other expressions do, but are not worked out when the query is planned.

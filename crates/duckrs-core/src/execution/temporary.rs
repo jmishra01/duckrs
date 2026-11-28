@@ -134,7 +134,10 @@ impl QueryMemory {
                 std::fs::create_dir_all(directory).map_err(|e| {
                     Error::new(
                         ErrorKind::Io,
-                        format!("Failed to create the temporary directory \"{}\": {e}", directory.display()),
+                        format!(
+                            "Failed to create the temporary directory \"{}\": {e}",
+                            directory.display()
+                        ),
                     )
                 })?;
                 *made = true;

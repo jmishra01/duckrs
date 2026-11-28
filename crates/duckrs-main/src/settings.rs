@@ -1005,7 +1005,9 @@ fn default_value(setting: &SettingDefinition) -> Option<Value> {
         "max_streaming_buffer_size" => return Some(Value::varchar("10.0 MiB")),
         // `MaxTempDirectorySizeSetting::GetSetting`: nothing set, and no temporary directory in use
         "max_temp_directory_size" => {
-            return Some(Value::varchar(duckrs_core::execution::temporary::DEFAULT_TEMP_DIRECTORY_SIZE));
+            return Some(Value::varchar(
+                duckrs_core::execution::temporary::DEFAULT_TEMP_DIRECTORY_SIZE,
+            ));
         }
         _ => {}
     }
