@@ -109,8 +109,14 @@ impl StringT {
     pub unsafe fn as_bytes(&self) -> &[u8] {
         if self.is_inlined() {
             // SAFETY: repr(C) places `prefix` at offset 4 and `tail` at offset 8 with no padding,
-            // so an inlined string's len <= 12 bytes are contiguous inside `self`.
-            unsafe { std::slice::from_raw_parts(self.prefix.as_ptr(), self.len()) }
+            // so an inlined string's len <= 12 bytes are contiguous inside `self`. The pointer is taken
+            // from all of `self`, not from `prefix`, so that it may read on into `tail`.
+            unsafe {
+                let bytes = std::ptr::from_ref(self)
+                    .cast::<u8>()
+                    .add(std::mem::offset_of!(StringT, prefix));
+                std::slice::from_raw_parts(bytes, self.len())
+            }
         } else {
             // SAFETY: the caller guarantees the pointee is alive; it holds len bytes.
             unsafe { std::slice::from_raw_parts(self.tail.ptr, self.len()) }
@@ -160,9 +166,50 @@ impl fmt::Debug for StringT {
 
 const CHUNK_SIZE: usize = 16 * 1024;
 
+/// One block of a [`StringHeap`], held by the pointer its allocation gave. Strings point into it, so it is written
+/// only through that pointer: a `&mut [u8]` over the block would end those pointers (under Stacked Borrows, which
+/// Miri checks), though the bytes they read are never written again.
+struct Chunk {
+    ptr: std::ptr::NonNull<u8>,
+    len: usize,
+}
+
+impl Chunk {
+    fn new(len: usize) -> Self {
+        let block: Box<[u8]> = vec![0u8; len].into_boxed_slice();
+        let ptr = std::ptr::NonNull::new(Box::into_raw(block).cast::<u8>()).expect("a box is never null");
+        Self { ptr, len }
+    }
+
+    /// Copies `bytes` to `at` and gives where they now are.
+    fn write(&mut self, at: usize, bytes: &[u8]) -> *const u8 {
+        assert!(at + bytes.len() <= self.len, "a write past the end of the chunk");
+        // SAFETY: `at..at + bytes.len()` is within the block (checked above), which this chunk owns and which no
+        // string points into yet (bytes are only ever appended after `used`), and `bytes` is not in it.
+        unsafe {
+            let to = self.ptr.as_ptr().add(at);
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), to, bytes.len());
+            to.cast_const()
+        }
+    }
+}
+
+impl Drop for Chunk {
+    fn drop(&mut self) {
+        // SAFETY: `ptr` and `len` are those of the boxed slice `new` leaked, which is freed only here.
+        drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(self.ptr.as_ptr(), self.len)) });
+    }
+}
+
+// SAFETY: a chunk owns its block as a `Box<[u8]>` would; the heap writes to it only under its lock, and strings
+// read only the bytes written before they were made.
+unsafe impl Send for Chunk {}
+// SAFETY: as for `Send`: shared access only reads bytes that are no longer written.
+unsafe impl Sync for Chunk {}
+
 #[derive(Default)]
 struct Arena {
-    chunks: Vec<Box<[u8]>>,
+    chunks: Vec<Chunk>,
     used: usize,
     /// buffers of bytes the heap took as they are ([`StringHeap::adopt`])
     adopted: Vec<Vec<u8>>,
@@ -194,16 +241,15 @@ impl StringHeap {
             return StringT::inlined(bytes);
         }
         let mut arena = self.arena.lock();
-        let fits = arena.chunks.last().is_some_and(|c| c.len() - arena.used >= bytes.len());
+        let fits = arena.chunks.last().is_some_and(|c| c.len - arena.used >= bytes.len());
         if !fits {
             let size = bytes.len().max(CHUNK_SIZE);
-            arena.chunks.push(vec![0u8; size].into_boxed_slice());
+            arena.chunks.push(Chunk::new(size));
             arena.used = 0;
         }
         let used = arena.used;
         let chunk = arena.chunks.last_mut().expect("chunk was just ensured");
-        chunk[used..used + bytes.len()].copy_from_slice(bytes);
-        let ptr = chunk[used..].as_ptr();
+        let ptr = chunk.write(used, bytes);
         arena.used += bytes.len();
         // SAFETY: the bytes live in a boxed chunk that is never moved or freed before the heap.
         unsafe { StringT::from_raw_parts(ptr, bytes.len()) }
@@ -221,7 +267,7 @@ impl StringHeap {
     /// Bytes allocated so far, for memory accounting.
     pub fn allocated(&self) -> usize {
         let arena = self.arena.lock();
-        arena.chunks.iter().map(|c| c.len()).sum::<usize>() + arena.adopted.iter().map(Vec::capacity).sum::<usize>()
+        arena.chunks.iter().map(|c| c.len).sum::<usize>() + arena.adopted.iter().map(Vec::capacity).sum::<usize>()
     }
 }
 

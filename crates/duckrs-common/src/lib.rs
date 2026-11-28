@@ -34,16 +34,17 @@ pub const STANDARD_VECTOR_SIZE: usize = 2048;
 #[inline(always)]
 pub fn prefetch<T: ?Sized>(value: &T) {
     let address = std::ptr::from_ref(value).cast::<u8>();
-    #[cfg(target_arch = "aarch64")]
+    // (Miri runs no inline assembly or prefetch intrinsics, and a prefetch changes nothing it checks)
+    #[cfg(all(target_arch = "aarch64", not(miri)))]
     // SAFETY: `prfm` only hints at a read of a valid address; it reads no register and writes no memory
     unsafe {
         std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) address, options(nostack, readonly, preserves_flags));
     }
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
     // SAFETY: a prefetch only hints at a read; it never faults
     unsafe {
         std::arch::x86_64::_mm_prefetch(address.cast::<i8>(), std::arch::x86_64::_MM_HINT_T0);
     }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    #[cfg(any(miri, not(any(target_arch = "aarch64", target_arch = "x86_64"))))]
     let _ = address;
 }
