@@ -1142,6 +1142,7 @@ impl WriteAheadLog {
         iteration: u64,
         block_size: usize,
         ahead: Option<WriteAhead>,
+        flush: bool,
     ) -> Result<bool> {
         let current = Durable::of(catalog);
         self.check_storable(catalog, name, &current)?;
@@ -1153,7 +1154,10 @@ impl WriteAheadLog {
         if records.0.is_empty() {
             return Ok(false);
         }
-        records.entry(wal_type::WAL_FLUSH, |_| {});
+        // without its `WAL_FLUSH` (a crash before it, `debug_checkpoint_abort`), nothing of it is committed
+        if flush {
+            records.entry(wal_type::WAL_FLUSH, |_| {});
+        }
         self.open(path, identifier, iteration)?;
         self.append(path, &records.0)?;
         self.entries += records.2;

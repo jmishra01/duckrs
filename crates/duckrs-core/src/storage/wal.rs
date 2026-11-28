@@ -696,7 +696,8 @@ struct Scan {
     expected_iteration: Option<u64>,
 }
 
-fn scan(data: &[u8], file: &FileState, kind: LogKind) -> Result<Scan> {
+/// `abort`, `abort_on_wal_failure`, refuses a log that ends torn, as a crash leaves it.
+fn scan(data: &[u8], file: &FileState, kind: LogKind, abort: bool) -> Result<Scan> {
     let mut reader = Reader {
         file,
         kind,
@@ -735,7 +736,7 @@ fn scan(data: &[u8], file: &FileState, kind: LogKind) -> Result<Scan> {
                 }
             }
             // what a crash leaves at the end of a log
-            Err(error) if error.kind == ErrorKind::Serialization => break,
+            Err(error) if error.kind == ErrorKind::Serialization && !abort => break,
             Err(error) => return Err(error),
         }
     }
@@ -772,8 +773,9 @@ fn replay_log(
     buffer: &BufferManager,
     file: &FileState,
     kind: LogKind,
+    abort: bool,
 ) -> Result<Vec<Record>> {
-    let scanned = scan(data, file, kind)?;
+    let scanned = scan(data, file, kind, abort)?;
     let mut after = None;
     if let Some((marker, end)) = scanned.checkpoint {
         if kind == LogKind::Checkpoint {
@@ -787,7 +789,7 @@ fn replay_log(
         match (checkpoint_log, clean) {
             (None, true) => return Ok(Vec::new()),
             (None, false) => {}
-            (Some(log), true) => return replay_log(&log, path, buffer, file, LogKind::Checkpoint),
+            (Some(log), true) => return replay_log(&log, path, buffer, file, LogKind::Checkpoint, abort),
             (Some(log), false) => after = Some(log),
         }
     }
@@ -796,18 +798,31 @@ fn replay_log(
     }
     let mut records = scanned.records;
     if let Some(log) = after {
-        records.extend(replay_log(&log, path, buffer, file, LogKind::Checkpoint)?);
+        records.extend(replay_log(&log, path, buffer, file, LogKind::Checkpoint, abort)?);
     }
     Ok(records)
 }
 
-/// `WriteAheadLog::Replay`: the committed records of the log of the file at `path`.
-pub(super) fn read_records(path: &Path, buffer: &BufferManager) -> Result<Vec<Record>> {
-    let Some(data) = read_log(&with_suffix(path, ".wal"))? else {
+/// `WriteAheadLog::Replay`: the committed records of the log of the file at `path`. With `abort`
+/// (`abort_on_wal_failure`), a torn log is an error rather than what a crash left.
+pub(super) fn read_records(path: &Path, buffer: &BufferManager, abort: bool) -> Result<Vec<Record>> {
+    let wal = with_suffix(path, ".wal");
+    let Some(data) = read_log(&wal)? else {
         return Ok(Vec::new());
     };
     let file = FileState::of(buffer);
-    replay_log(&data, path, buffer, &file, LogKind::Main)
+    replay_log(&data, path, buffer, &file, LogKind::Main, abort).map_err(|error| {
+        if abort && error.kind == ErrorKind::Serialization {
+            let message = format!(
+                "Failure while replaying WAL file \"{}\": {}",
+                wal.display(),
+                error.message
+            );
+            Error::new(ErrorKind::Serialization, message)
+        } else {
+            error
+        }
+    })
 }
 
 /// What became of the log of a file that was replayed.
@@ -828,7 +843,7 @@ pub(super) fn replayed_end(path: &Path, buffer: &BufferManager) -> Result<Replay
     };
     let header = buffer.block_manager().header();
     let file = FileState::of(buffer);
-    let Ok(scanned) = scan(&data, &file, LogKind::Main) else {
+    let Ok(scanned) = scan(&data, &file, LogKind::Main, false) else {
         return Ok(ReplayedLog::None);
     };
     let clean = scanned
