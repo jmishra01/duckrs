@@ -1022,6 +1022,9 @@ impl<'a> Replay<'a> {
     /// Puts an entry in the catalog.
     pub(super) fn add_entry(&mut self, entry: StoredEntry) -> Result<()> {
         match entry {
+            // `CheckpointReader::ReadSchema` ignores a conflict: older files hold the internal schemas of the system
+            // catalog too, which exist already
+            StoredEntry::Schema(path) if path.len() == 1 && crate::catalog::defaults::is_default_schema(&path[0]) => {}
             StoredEntry::Schema(path) => self.catalog.create_schema_path(&path, OnCreateConflict::Ignore)?,
             StoredEntry::Table(table) => self.load_table(*table)?,
             StoredEntry::View {
