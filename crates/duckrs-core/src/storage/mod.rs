@@ -65,12 +65,14 @@ pub fn is_database_file(path: &Path) -> bool {
 
 /// Puts what the last checkpoint of the file at `path` left into `catalog`, with what its write-ahead
 /// log committed since. The tables stay in the file, which is what the result reads them through.
-/// `encryption` is what `ATTACH` gave to open an encrypted file with.
+/// `encryption` is what `ATTACH` gave to open an encrypted file with, and `abort_on_wal_failure` refuses a log
+/// that ends torn (`debug_abort_on_wal_failure`).
 pub fn load_database(
     path: &Path,
     catalog: &Catalog,
     read_only: bool,
     encryption: Option<&encryption::EncryptionRequest>,
+    abort_on_wal_failure: bool,
 ) -> Result<Arc<BufferManager>> {
     let blocks = Arc::new(SingleFileBlockManager::open(path, read_only, encryption)?);
     // until a query sets it from `memory_limit`, its default (`DBConfig::SetDefaultMaxMemory`)
@@ -80,7 +82,9 @@ pub fn load_database(
     ));
     use crate::execution::profiler::{add_counter, time_metric};
     metadata::load_free_list(&buffer)?;
-    let records = time_metric("storage.attach_replay_wal_latency", || wal::read_records(path, &buffer))?;
+    let records = time_metric("storage.attach_replay_wal_latency", || {
+        wal::read_records(path, &buffer, abort_on_wal_failure)
+    })?;
     let stored = time_metric("storage.attach_load_storage_latency", || {
         checkpoint::read_catalog(&buffer)
     })?;
@@ -157,7 +161,7 @@ mod tests {
             .join("../duckrs/tests/fixtures")
             .join(file);
         let catalog = Catalog::new("test");
-        load_database(&path, &catalog, true, None).unwrap();
+        load_database(&path, &catalog, true, None, false).unwrap();
         catalog
     }
 
@@ -168,7 +172,7 @@ mod tests {
         use crate::execution::art::allocator::{FixedSizeAllocator, PREFIX_METADATA_SIZE, segment_sizes};
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../duckrs/tests/fixtures/parsed_v200.db");
         let catalog = Catalog::new("test");
-        let buffer = load_database(&path, &catalog, true, None).unwrap();
+        let buffer = load_database(&path, &catalog, true, None, false).unwrap();
         let block_size = buffer.block_manager().block_size();
         assert_eq!(block_size, 16_376);
         let mut buffers = 0;
@@ -209,7 +213,7 @@ mod tests {
         let files = std::env::var("DUCKRS_ART_FILES").expect("the files to read");
         for file in files.split(':') {
             let catalog = Catalog::new("test");
-            let buffer = load_database(Path::new(file), &catalog, true, None).unwrap();
+            let buffer = load_database(Path::new(file), &catalog, true, None, false).unwrap();
             let block_size = buffer.block_manager().block_size();
             let tables = checkpoint::read_catalog(&buffer).unwrap().entries.into_iter();
             let table = tables
@@ -340,7 +344,7 @@ mod tests {
     fn a_group_is_read_a_column_at_a_time() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../duckrs/tests/fixtures/scan_v122880.db");
         let catalog = Catalog::new("test");
-        load_database(&path, &catalog, true, None).unwrap();
+        load_database(&path, &catalog, true, None, false).unwrap();
         let table = catalog.get_table(None, "big").unwrap();
         let source = table.source().unwrap();
         let chunk = source.read_group(1, &[0]).unwrap();

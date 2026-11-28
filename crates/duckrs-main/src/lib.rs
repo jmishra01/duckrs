@@ -516,7 +516,20 @@ impl DatabaseInstance {
                 &mut db.settings.write(),
             ),
         }
-        let buffer = storage::load_database(path, &db.catalog, read_only, options.encryption.as_ref())?;
+        // `DBConfig::options.abort_on_wal_failure`
+        let abort_on_wal_failure = settings::current_value(
+            "debug_abort_on_wal_failure",
+            &db.settings.read(),
+            &SettingValues::default(),
+        )
+        .is_some_and(|value| matches!(value.data(), duckrs_common::value::ValueData::Bool(true)));
+        let buffer = storage::load_database(
+            path,
+            &db.catalog,
+            read_only,
+            options.encryption.as_ref(),
+            abort_on_wal_failure,
+        )?;
         // `SingleFileStorageManager::LoadDatabase`: a block size given has to be the file's
         if let Some(size) = options.block_size {
             let file_size = buffer.block_manager().block_alloc_size() as u64;
@@ -688,6 +701,8 @@ impl DatabaseInstance {
              first: usize,
              first_id: u64| self.write_ahead(table, rows, first, first_id, true);
         let ahead: Option<storage::log_writer::WriteAhead> = Some(&write_ahead);
+        // `before_wal_flush`: the entries are written, and the crash comes before their `WAL_FLUSH`
+        let crash = abort == "before_wal_flush";
         if !log.commit(
             &file.path,
             &self.catalog,
@@ -696,8 +711,16 @@ impl DatabaseInstance {
             blocks.header().iteration,
             blocks.block_size(),
             ahead,
+            !crash,
         )? {
             return Ok(None);
+        }
+        if crash {
+            const CRASH: &str = "Simulated crash before WAL_FLUSH write";
+            drop(log);
+            drop(reading);
+            self.invalidate(CRASH);
+            return Err(Error::new(ErrorKind::Fatal, CRASH));
         }
         self.changed.store(true, AtomicOrdering::SeqCst);
         let full = log.size() >= threshold || (entry_limit > 0 && entries >= entry_limit);
@@ -3210,14 +3233,7 @@ impl ClientContext {
                 "debug_force_wal_fsync_failure: injected WAL fsync failure",
             ));
         }
-        if self
-            .setting_text("debug_checkpoint_abort")
-            .eq_ignore_ascii_case("before_wal_flush")
-        {
-            const CRASH: &str = "Simulated crash before WAL_FLUSH write";
-            self.db.invalidate(CRASH);
-            return Some(Error::new(ErrorKind::Fatal, CRASH));
-        }
+        // `before_wal_flush` crashes while the log is written (`DatabaseInstance::log_commit`)
         None
     }
 

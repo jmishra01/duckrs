@@ -722,8 +722,16 @@ fn zstd_corrupt(message: &str) -> Error {
 
 /// `ZSTDStorage::StringScan`: per vector of 2048 strings their lengths and one zstd frame of them, on the page
 /// of the segment or a page of its own, and on from there through pages whose last 8 bytes say which is next.
-/// `segment` is the segment to the end of its block, and `packed` says whether others share that block.
-pub fn scan_zstd(segment: &[u8], count: usize, packed: bool, pin: &PinBlock<'_>, out: &mut StringRows) -> Result<()> {
+/// `segment` is the segment to the end of its block, and `packed` says whether others share that block. `memory` is
+/// what the buffer manager holds and may hold: the strings of a vector are allocated within it.
+pub fn scan_zstd(
+    segment: &[u8],
+    count: usize,
+    packed: bool,
+    pin: &PinBlock<'_>,
+    memory: (usize, usize),
+    out: &mut StringRows,
+) -> Result<()> {
     const INVALID_BLOCK: i64 = -1;
     let vectors = count.div_ceil(ZSTD_VECTOR_ROWS);
     let what = "the metadata of a ZSTD segment";
@@ -741,6 +749,12 @@ pub fn scan_zstd(segment: &[u8], count: usize, packed: bool, pin: &PinBlock<'_>,
         let mut visited = std::collections::HashSet::new();
         let first_page;
         let page: &[u8] = if block_id == INVALID_BLOCK {
+            // `ZSTDScanState::LoadVector`: the data on the segment's page comes after the vectors' directory
+            // (`ReadLayout`'s `data_offset`), and its offset is from there
+            let data_offset = compressed_at + 8 * vectors;
+            if offset < data_offset || offset > segment.len() {
+                return Err(corrupted("Corrupted ZSTD segment data: offset is outside the segment"));
+            }
             segment
         } else {
             first_page = pin(block_id as u64)?;
@@ -782,8 +796,27 @@ pub fn scan_zstd(segment: &[u8], count: usize, packed: bool, pin: &PinBlock<'_>,
             current = Some(next_page);
         }
         // `DecompressString`: as many bytes as the strings take, streamed from the frame
-        let wanted: usize = lengths.iter().sum();
+        let wanted = lengths
+            .iter()
+            .fold(0usize, |total, &length| total.saturating_add(length));
         let _ = uncompressed;
+        // `StringVector::AllocateShrinkableBuffer`: the strings' arena, whose blocks double until they hold
+        // them (`ArenaAllocator::AllocateNewBlock`), asks the buffer manager for them within `memory_limit` (the
+        // blocks it holds can be evicted)
+        let (used, limit) = memory;
+        let block = wanted.checked_next_power_of_two().unwrap_or(usize::MAX);
+        if block > limit {
+            use duckrs_common::string_util::bytes_to_human_readable as human;
+            return Err(Error::new(
+                ErrorKind::OutOfMemory,
+                format!(
+                    "failed to allocate data of size {} ({}/{} used)",
+                    human(block as u64),
+                    human(used as u64),
+                    human(limit as u64)
+                ),
+            ));
+        }
         let mut data = vec![0u8; wanted];
         let mut decoder =
             zstd::stream::read::Decoder::with_buffer(frame.as_slice()).map_err(|e| zstd_corrupt(&e.to_string()))?;
@@ -860,60 +893,83 @@ pub fn scan_string_uncompressed(segment: &[u8], count: usize, pin: &PinBlock<'_>
 /// where index 0 is NULL.
 pub fn scan_dictionary(segment: &[u8], count: usize, out: &mut StringRows) -> Result<()> {
     const HEADER_SIZE: usize = 20;
-    let what = "the header of a dictionary segment";
-    let dict_size = u32_at(segment, 0, what)? as usize;
-    let dict_end = u32_at(segment, 4, what)? as usize;
-    let index_offset = u32_at(segment, 8, what)? as usize;
-    let index_count = u32_at(segment, 12, what)? as usize;
-    let width = u32_at(segment, 16, what)? as usize;
-    if index_count == 0 || index_offset < HEADER_SIZE {
-        return Err(out_of_bounds("a dictionary"));
+    // `CompressionSegmentReader` of "dictionary segment"
+    let range = || corrupted("Corrupted dictionary segment: requested range extends past the end of the segment");
+    let read = |offset: usize| -> Result<usize> {
+        segment
+            .get(offset..offset + 4)
+            .map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")) as usize)
+            .ok_or_else(|| corrupted("Corrupted dictionary segment: attempted to read past the end of the segment"))
+    };
+    let dict_size = read(0)?;
+    let dict_end = read(4)?;
+    let index_offset = read(8)?;
+    let index_count = read(12)?;
+    let width = read(16)?;
+    // `CompressedStringScanState::ReadLayout`
+    let dictionary_range = || {
+        corrupted(
+            "Failed to scan dictionary string - dictionary was out of range. Database file appears to be corrupted.",
+        )
+    };
+    let selection_range = || {
+        corrupted(
+            "Failed to scan dictionary string - selection buffer was out of range. Database file appears to be \
+             corrupted.",
+        )
+    };
+    // index 0 is NULL, so even a segment of only NULLs has one offset
+    if index_count == 0 {
+        return Err(dictionary_range());
     }
-    // selections refer to entries of the offset table, so its size says how wide they are
+    // selections refer to entries of the offset table, so its last index says how wide they are
     if width != (usize::BITS - (index_count - 1).leading_zeros()) as usize {
-        return Err(corrupt("the bitpacking width of a dictionary segment is invalid"));
-    }
-    if index_offset - HEADER_SIZE != packed_size(count, width) {
         return Err(corrupted(
-            "Failed to scan dictionary string - selection buffer was out of range",
+            "Failed to scan dictionary string - bitpacking width was invalid. Database file appears to be corrupted.",
         ));
     }
-    let table = bytes(segment, index_offset, index_count * 4, "a dictionary offset table")?;
-    if dict_size > dict_end || dict_end - dict_size < index_offset + index_count * 4 {
-        return Err(out_of_bounds("a dictionary"));
+    if index_offset < HEADER_SIZE {
+        return Err(selection_range());
     }
+    let selection = segment.get(HEADER_SIZE..index_offset).ok_or_else(range)?;
+    // exactly the whole groups of bits the rows need
+    if selection.len() != packed_size(count, width) {
+        return Err(selection_range());
+    }
+    let table = index_count
+        .checked_mul(4)
+        .and_then(|size| segment.get(index_offset..index_offset.checked_add(size)?))
+        .ok_or_else(|| corrupted("Corrupted dictionary segment: array count extends past the end of the segment"))?;
+    let table_end = index_offset + table.len();
+    // the dictionary grows backwards from its end, and must not overlap the offset table
+    if dict_size > dict_end || dict_end - dict_size < table_end {
+        return Err(dictionary_range());
+    }
+    let dictionary = segment.get(dict_end - dict_size..dict_end).ok_or_else(range)?;
     let table: Vec<u32> = table
         .chunks_exact(4)
         .map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")))
         .collect();
-    let start = dict_end
-        .checked_sub(dict_size)
-        .ok_or_else(|| out_of_bounds("a dictionary"))?;
-    let dictionary = bytes(segment, start, dict_size, "a dictionary")?;
-    let selection = bytes(
-        segment,
-        HEADER_SIZE,
-        index_offset - HEADER_SIZE,
-        "dictionary selections",
-    )?;
+    // `ValidateIndexBuffer`: the offsets grow, and the last is within the dictionary
+    if table.windows(2).any(|pair| pair[1] < pair[0]) || table[table.len() - 1] as usize > dictionary.len() {
+        return Err(corrupted(
+            "Failed to scan dictionary string - dictionary offset was out of range. Database file appears to be corrupted.",
+        ));
+    }
     for index in unpack(selection, count, width, "dictionary selections")? {
         let index = index as usize;
         if index == 0 {
             out.push_empty(1);
             continue;
         }
-        let (&current, &previous) = table
-            .get(index)
-            .zip(table.get(index - 1))
-            .ok_or_else(|| corrupted("Failed to scan dictionary string - dictionary index was out of range"))?;
-        let length = current
-            .checked_sub(previous)
-            .ok_or_else(|| corrupt("dictionary offsets decrease"))?;
-        let from = dictionary
-            .len()
-            .checked_sub(current as usize)
-            .ok_or_else(|| corrupted("Failed to scan dictionary string - dictionary offset was out of range. Database file appears to be corrupted."))?;
-        out.push(bytes(dictionary, from, length as usize, "a dictionary string")?);
+        let (&current, &previous) = table.get(index).zip(table.get(index - 1)).ok_or_else(|| {
+            corrupted(
+                "Failed to scan dictionary string - dictionary index was out of range. Database file appears to \
+                     be corrupted.",
+            )
+        })?;
+        let (from, length) = (dictionary.len() - current as usize, (current - previous) as usize);
+        out.push(&dictionary[from..from + length]);
     }
     Ok(())
 }
@@ -1460,6 +1516,15 @@ pub fn scan_roaring(segment: &[u8], count: usize, out: &mut Vec<bool>) -> Result
     let mut metadata = body
         .get(metadata_offset..)
         .ok_or_else(|| corrupted("Corrupted Roaring segment body: offset is outside the segment"))?;
+    // `RoaringScanState::ReadLayout`: the containers' data is what comes before the metadata
+    let body = &body[..metadata_offset];
+    // each container's data has to fit in it (`data.Skip` of the constructor)
+    let fits = |position: usize, size: usize| {
+        if position.checked_add(size).is_none_or(|end| end > body.len()) {
+            return Err(read_past(DATA));
+        }
+        Ok(())
+    };
 
     let containers = count.div_ceil(ROARING_CONTAINER_SIZE);
     let types = advance(&mut metadata, packed_size(containers, 2), METADATA)?;
@@ -1480,13 +1545,14 @@ pub fn scan_roaring(segment: &[u8], count: usize, out: &mut Vec<bool>) -> Result
             if !compressed {
                 position = align(position, 4);
             }
-            let data = body.get(position..).ok_or_else(|| read_past(DATA))?;
-            let values = compressed_positions(data, number * 2, compressed, 2)?;
-            position += if compressed {
+            let size_in_bytes = if compressed {
                 COMPRESSED_SEGMENT_COUNT + number * 2
             } else {
                 number * 4
             };
+            fits(position, size_in_bytes)?;
+            let values = compressed_positions(&body[position..], number * 2, compressed, 2)?;
+            position += size_in_bytes;
             out.resize(start + size, true);
             let mut previous_end = 0;
             for pair in values.chunks_exact(2) {
@@ -1509,8 +1575,8 @@ pub fn scan_roaring(segment: &[u8], count: usize, out: &mut Vec<bool>) -> Result
         if cardinality == BITSET_CONTAINER_SENTINEL {
             position = align(position, 8);
             let stored = size.div_ceil(64) * 8;
-            let data = body.get(position..).filter(|data| data.len() >= stored);
-            scan_validity(data.ok_or_else(|| read_past(DATA))?, size, out)?;
+            fits(position, stored)?;
+            scan_validity(&body[position..], size, out)?;
             position += stored;
             continue;
         }
@@ -1518,13 +1584,14 @@ pub fn scan_roaring(segment: &[u8], count: usize, out: &mut Vec<bool>) -> Result
         if !compressed {
             position = align(position, 2);
         }
-        let data = body.get(position..).ok_or_else(|| read_past(DATA))?;
-        let values = compressed_positions(data, cardinality, compressed, 2)?;
-        position += if compressed {
+        let size_in_bytes = if compressed {
             COMPRESSED_SEGMENT_COUNT + cardinality
         } else {
             cardinality * 2
         };
+        fits(position, size_in_bytes)?;
+        let values = compressed_positions(&body[position..], cardinality, compressed, 2)?;
+        position += size_in_bytes;
         // inverted arrays list the NULLs, and the others the values
         let listed_valid = container_type & IS_INVERTED == 0;
         out.resize(start + size, !listed_valid);

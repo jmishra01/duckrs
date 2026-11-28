@@ -323,6 +323,9 @@ pub struct SegmentInfo {
     pub block_offset: u64,
     /// `get_segment_info`, for the codecs that have one and if it was asked for.
     pub info: Option<String>,
+    /// `visit_block_ids` of a segment in the file: the blocks its state owns (overflow strings, ZSTD pages);
+    /// `None` of one in memory
+    pub additional_blocks: Option<Vec<i64>>,
 }
 
 /// A database as `duckdb_databases()` and `pragma_database_size()` list it.
