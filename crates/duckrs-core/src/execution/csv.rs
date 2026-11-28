@@ -105,6 +105,10 @@ pub fn read_csv_file(path: &str, options: &CsvReadOptions) -> Result<Vec<u8>> {
     match encoding.as_str() {
         "utf-8" | "utf8" => Ok(data),
         "latin-1" | "latin1" => {
+            // `DecodeLatin1ToUTF8`: the C1 controls are taken for a file in another encoding
+            if data.iter().any(|&b| (0x80..=0x9f).contains(&b)) {
+                return Err(Error::new(ErrorKind::InvalidInput, "File is not latin-1 encoded"));
+            }
             let text: String = data.iter().map(|&b| char::from(b)).collect();
             Ok(text.into_bytes())
         }
@@ -253,6 +257,9 @@ pub struct CsvScanData {
     /// the columns of `output_types` the scan outputs, in order (`column_ids`); `None` for all.
     /// The others are not converted, so their values cannot fail.
     pub projection: Option<Vec<usize>>,
+    /// Nothing reads any column (`COLUMN_IDENTIFIER_EMPTY`, a `count(*)`): the one column of `projection` is there for
+    /// the rows to have a count, and is not converted, so no row fails.
+    pub empty_projection: bool,
     /// the order the binder read the columns in, which projection pushdown keeps
     pub column_order: crate::execution::multi_file::ColumnOrder,
     /// `ExtraOperatorInfo::file_filters`: the filters that left files out, as text
@@ -520,13 +527,53 @@ fn sniff_next_file(scan: &CsvScanData, file: &CsvFile, data: &[u8]) -> Result<Cs
             mapping: (0..scan.names.len()).map(Some).collect(),
         });
     }
-    let mapping = if by_name.iter().all(Option::is_some) {
+    // `CSVSchema::SchemasMatch`: a column it has by name has to cast to the type of the schema
+    let mistyped: Vec<String> = scan
+        .names
+        .iter()
+        .zip(&by_name)
+        .enumerate()
+        .filter_map(|(column, (name, found))| {
+            let found = (*found)?;
+            let (has, expected) = (sniffed.types.get(found)?, scan.types.get(column)?);
+            (!crate::planner::binder::can_we_cast_it(has.id(), expected.id())).then(|| {
+                format!("Column with name: \"{name}\" is expected to have type: {expected} But has type: {has}\n")
+            })
+        })
+        .collect();
+    let mapping = if by_name.iter().all(Option::is_some)
+        && !mistyped.is_empty()
+        && !scan.columns_set
+        && !scan.filename
+        && scan.hive.is_empty()
+        && !scan.options.ignore_errors
+    {
+        let mut error = format!(
+            "Schema mismatch between globbed files.\nMain file schema: {}\nCurrent file: {}\n",
+            first.path, file.path
+        );
+        error.extend(mistyped);
+        error += "Potential Fixes \n* Consider setting union_by_name=true.\n* Consider setting files_to_sniff to a \
+                  higher value (e.g., files_to_sniff = -1)\n";
+        return Err(Error::new(ErrorKind::InvalidInput, error));
+    } else if by_name.iter().all(Option::is_some) {
         by_name
     } else if same_shape && (!sniffed.header || !first.header) {
         (0..scan.names.len()).map(Some).collect()
+    } else if (scan.filename || !scan.hive.is_empty())
+        && !by_name.iter().enumerate().any(|(column, found)| found.is_none() && reads_column(scan, column))
+    {
+        // `MultiFileColumnMapper` maps the columns that are read: one that nothing reads is not missing
+        by_name
     } else if scan.filename || !scan.hive.is_empty() {
         // `MultiFileOptions::AnySet`: the sniffer leaves the mismatch to `MultiFileColumnMapper`
-        let missing = scan.names.iter().zip(&by_name).find(|(_, found)| found.is_none());
+        let missing = scan
+            .names
+            .iter()
+            .zip(&by_name)
+            .enumerate()
+            .find(|(column, (_, found))| found.is_none() && reads_column(scan, *column))
+            .map(|(_, pair)| pair);
         let missing = missing.map_or("", |(name, _)| name.as_str());
         return Err(Error::new(
             ErrorKind::InvalidInput,
@@ -539,6 +586,9 @@ fn sniff_next_file(scan: &CsvScanData, file: &CsvFile, data: &[u8]) -> Result<Cs
                 candidates = sniffed.names.join(", "),
             ),
         ));
+    } else if scan.options.ignore_errors {
+        // `AdaptiveSniff`: ignoring errors, the file goes on with its own schema, its columns found by name
+        by_name
     } else {
         let mut error = format!(
             "Schema mismatch between globbed files.\nMain file schema: {}\nCurrent file: {}\n",
@@ -920,7 +970,10 @@ fn scan_file_chunk(scan: &CsvScanData, state: &mut CsvScanState) -> Result<Optio
             if file.header {
                 let header_start = skip_rows(&data, &machine.dialect, &machine.transitions(), bom, rows - 1);
                 let header = &data[header_start..begin.max(header_start)];
-                let size = header.iter().rposition(|&c| c != b'\n' && c != b'\r').map_or(0, |at| at + 1);
+                let end = header.iter().rposition(|&c| c != b'\n' && c != b'\r').map_or(0, |at| at + 1);
+                // (the comment lines skipped before it are not part of its line)
+                let line_start = header[..end].iter().rposition(|&c| c == b'\n').map_or(0, |at| at + 1);
+                let size = end - line_start;
                 if size > scan.options.maximum_line_size() {
                     return Err(line_size_error(&scan.options, size));
                 }
@@ -1106,6 +1159,27 @@ fn parsed_directly(ty: &LogicalType) -> bool {
 }
 
 /// The scan of one row that didn't parse: a line of its own in the rejects, or the error.
+/// The row at `before` that has a value with text after its closing quote, as a scanner that is not strict reads it,
+/// where it ends on its own line (a quote that is not closed takes no more of the file).
+fn unquoted_row<'a>(data: &'a [u8], file: &CsvFile, before: usize) -> Option<super::csv_state_machine::Row<'a>> {
+    let mut dialect = file.dialect.clone();
+    dialect.strict = false;
+    let line_end = data[before..]
+        .iter()
+        .position(|&b| b == b'\n' || b == b'\r')
+        .map_or(data.len(), |at| before + at);
+    let mut scanner = ValueScanner::new(Machine::new(dialect, before));
+    match scanner.next(data) {
+        Some(Scanned::Row(row)) if row.start == before && row.end <= line_end => Some(row),
+        _ => None,
+    }
+}
+
+/// Whether the scan outputs column `column` of the file's schema (`column_ids`).
+fn reads_column(scan: &CsvScanData, column: usize) -> bool {
+    !scan.empty_projection && scan.projection.as_ref().is_none_or(|columns| columns.contains(&column))
+}
+
 #[allow(clippy::too_many_arguments)] // each says something else of the row
 fn bad_line(
     data: &[u8],
@@ -1236,9 +1310,10 @@ fn read_rows(
             if margin.is_some_and(|margin| data.len() - before < margin) {
                 break;
             }
-            let row = match scanner.next(data) {
+            // `prior`: the line of a row whose unquoted value was already reported, rescanned to check the rest
+            let (row, prior) = match scanner.next(data) {
                 None => break,
-                Some(Scanned::Row(row)) => row,
+                Some(Scanned::Row(row)) => (row, None),
                 Some(Scanned::EmptyLine) => {
                     let position = scanner.machine.position;
                     state.line += count_lines(data, before, position);
@@ -1266,6 +1341,7 @@ fn read_rows(
                          to empty or to a different value (e.g., quote='')\n",
                         strict_fix(scan)
                     );
+                    let line = state.line + 1;
                     bad_line(
                         data,
                         scan,
@@ -1276,7 +1352,12 @@ fn read_rows(
                         "Value with unterminated quote found.".to_string(),
                         fixes,
                     )?;
-                    continue;
+                    // `StringValueScanner`: the scanner goes on past the quote to the end of the line, whose other
+                    // values are checked too, so their errors are reported with it; the row does not stay
+                    match unquoted_row(data, file, before) {
+                        Some(row) => (row, Some(line)),
+                        None => continue,
+                    }
                 }
                 Some(Scanned::Invalid) => {
                     let fixes = if scan.options.strict_mode {
@@ -1299,16 +1380,36 @@ fn read_rows(
                     continue;
                 }
             };
-            let position = scanner.machine.position;
-            let mut row_fields = row.fields;
-            let span = RowSpan {
-                line: state.line + count_lines(data, before, row.start.max(before)) + 1,
-                start: row.start,
-                end: row.end,
+            let (position, span) = match prior {
+                // (`bad_line` took the scanner past it and counted its lines)
+                Some(line) => (
+                    row.end,
+                    RowSpan {
+                        line,
+                        start: row.start,
+                        end: row.end,
+                    },
+                ),
+                None => {
+                    let position = state.scanner.as_ref().expect("a scan has a scanner").machine.position;
+                    let span = RowSpan {
+                        line: state.line + count_lines(data, before, row.start.max(before)) + 1,
+                        start: row.start,
+                        end: row.end,
+                    };
+                    state.line += count_lines(data, before, position);
+                    (position, span)
+                }
             };
-            state.line += count_lines(data, before, position);
-            let line_size = position.saturating_sub(span.start);
-            let mut doomed_row = false;
+            let mut row_fields = row.fields;
+            // (the comment lines skipped before the row are not part of its line)
+            let first_value = row_fields.first().map_or(span.start, |f| f.offset).clamp(span.start, data.len());
+            let line_start = data[span.start..first_value]
+                .iter()
+                .rposition(|&b| b == b'\n')
+                .map_or(span.start, |at| span.start + at + 1);
+            let line_size = position.saturating_sub(line_start);
+            let mut doomed_row = prior.is_some();
             if line_size > scan.options.maximum_line_size() {
                 // `CSVError::LineSizeError` of the scanner: the size of the line without its new line
                 let text = span.text(data);
@@ -1596,10 +1697,11 @@ fn typed_chunk(
     let mut bad: std::collections::BTreeSet<usize> = (0..count).filter(|&row| doomed[row]).collect();
     for (index, (ty, column)) in scan.types.iter().zip(&file.mapping).enumerate() {
         // a column nothing reads is not converted (`column_ids` of the scan)
-        if scan
-            .projection
-            .as_ref()
-            .is_some_and(|columns| !columns.contains(&index))
+        if scan.empty_projection
+            || scan
+                .projection
+                .as_ref()
+                .is_some_and(|columns| !columns.contains(&index))
         {
             result.push(Vector::constant_null(ty.clone()));
             continue;

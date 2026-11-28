@@ -1010,7 +1010,12 @@ impl Binder<'_> {
 
     /// `CSVSchemaDiscovery::SchemaDiscovery`: the files after the first are sniffed until enough lines are, or
     /// `files_to_sniff` files, and the types of those with rows are merged into the first's.
-    fn merge_sniffed_schemas(arguments: &CsvArguments, first: &Sniffed, types: &mut [LogicalType]) -> Result<()> {
+    fn merge_sniffed_schemas(
+        arguments: &CsvArguments,
+        first: &Sniffed,
+        names: &mut Vec<String>,
+        types: &mut Vec<LogicalType>,
+    ) -> Result<()> {
         let rows_read = |sniffed: &Sniffed| {
             sniffed
                 .lines_sniffed
@@ -1020,12 +1025,17 @@ impl Binder<'_> {
         let mut total = first.lines_sniffed;
         let mut best_rows = rows_read(first);
         let count = arguments.files.len().min(arguments.files_to_sniff);
+        // `CSVSchemaDiscovery`: files that are all empty leave no schema at all
+        let mut all_empty = first.lines_sniffed == 0;
+        let mut sniffed_files = 1;
         for path in arguments.files.iter().take(count).skip(1) {
             if total >= required {
                 break;
             }
             let (file, data) = Self::csv_sniff(arguments, path)?;
+            sniffed_files += 1;
             total += file.lines_sniffed;
+            all_empty &= file.lines_sniffed == 0;
             let rows = rows_read(&file);
             if data.as_ref().is_some_and(Vec::is_empty) || rows == 0 {
                 continue;
@@ -1039,6 +1049,18 @@ impl Binder<'_> {
                 continue;
             }
             merge_schema_types(types, &file.types);
+            // `CSVSchema::MergeSchemas`: with null padding, the columns a later file has more of join the schema
+            if arguments.options.null_padding && file.types.len() > types.len() {
+                names.extend(file.names[types.len()..].iter().cloned());
+                types.extend(file.types[types.len()..].iter().cloned());
+            }
+        }
+        if all_empty && sniffed_files > 1 {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "No columns found in CSV files. Provide the columns option or ensure at least one file contains a \
+                 header or data row.",
+            ));
         }
         Ok(())
     }
@@ -1207,7 +1229,7 @@ impl Binder<'_> {
             }
         } else {
             if arguments.columns.is_none() {
-                Self::merge_sniffed_schemas(&arguments, &first, &mut types)?;
+                Self::merge_sniffed_schemas(&arguments, &first, &mut names, &mut types)?;
             }
             replace_null_with_varchar(&mut types);
             for path in &arguments.files {
@@ -1303,6 +1325,7 @@ impl Binder<'_> {
             filename: arguments.filename.is_some(),
             first_data: std::sync::Mutex::new(first_data.map(std::sync::Arc::new)),
             projection: None,
+            empty_projection: false,
             column_order: self.column_order(table_index),
             file_filters: String::new(),
             total_files: None,
@@ -1357,6 +1380,7 @@ impl Binder<'_> {
             rejects: None,
             first_data: std::sync::Mutex::new(None),
             projection: None,
+            empty_projection: false,
             column_order: Default::default(),
             file_filters: String::new(),
             total_files: None,
@@ -1787,6 +1811,14 @@ impl Binder<'_> {
             if name.eq_ignore_ascii_case("partition_path") {
                 continue;
             }
+            // `CSVReaderOptions::SetReadOption`: a NULL given no strings is an empty list of them
+            if expression.is_none() && matches!(name.to_lowercase().as_str(), "null" | "nullstr") {
+                return Err(binder_error(format!(
+                    "CSV Reader function option \"{}\" requires a non-empty list of possible null strings (varchar) \
+                     as input",
+                    name.to_lowercase()
+                )));
+            }
             let value = match expression {
                 Some(expression) if expression.is_empty_star() => Value::varchar("*"),
                 Some(expression) => self.argument_value(expression, false)?,
@@ -1802,6 +1834,14 @@ impl Binder<'_> {
             result.push((name.to_lowercase(), value));
         }
         for (name, literals) in &info.options {
+            // `CSVReaderOptions::SetReadOption`: a NULL given no strings is an empty list of them
+            if literals.is_empty() && matches!(name.to_lowercase().as_str(), "null" | "nullstr") {
+                return Err(binder_error(format!(
+                    "CSV Reader function option \"{}\" requires a non-empty list of possible null strings (varchar) \
+                     as input",
+                    name.to_lowercase()
+                )));
+            }
             let value = match literals.as_slice() {
                 [] => Value::boolean(true),
                 [literal] => self.constant_argument(&Expr::constant(literal.clone()))?,
@@ -3276,7 +3316,7 @@ fn replace_null_with_varchar(types: &mut [LogicalType]) {
 }
 
 /// `CSVSchema::CanWeCastIt`, for the types the sniffer detects.
-fn can_we_cast_it(source: LogicalTypeId, destination: LogicalTypeId) -> bool {
+pub(crate) fn can_we_cast_it(source: LogicalTypeId, destination: LogicalTypeId) -> bool {
     use LogicalTypeId as T;
     if destination == T::Varchar || source == destination {
         return true;
