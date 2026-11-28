@@ -79,11 +79,47 @@ pub(crate) struct NestedStores {
     pub(crate) structs: HashMap<usize, NestedStores>,
 }
 
+/// One block of rows, zeroed, 8-byte aligned, held by the pointer its allocation gave. Row pointers into it are
+/// all taken from that pointer, and the block is never reached through a `&` or `&mut` of all of it: one would end
+/// (or make read-only) the row pointers given before it, under Stacked Borrows, which Miri checks.
+struct RowBlock {
+    ptr: NonNull<u64>,
+    words: usize,
+}
+
+impl RowBlock {
+    fn new(words: usize) -> Self {
+        let block: Box<[u64]> = vec![0u64; words].into_boxed_slice();
+        let ptr = NonNull::new(Box::into_raw(block).cast::<u64>()).expect("a box is never null");
+        Self { ptr, words }
+    }
+
+    /// The address of byte `offset` of the block, which must lie within it.
+    fn at(&self, offset: usize) -> *mut u8 {
+        assert!(offset < self.words * 8, "an offset past the end of the block");
+        // SAFETY: `offset` is within the block (checked above).
+        unsafe { self.ptr.as_ptr().cast::<u8>().add(offset) }
+    }
+}
+
+impl Drop for RowBlock {
+    fn drop(&mut self) {
+        // SAFETY: `ptr` and `words` are those of the boxed slice `new` leaked, which is freed only here.
+        drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(self.ptr.as_ptr(), self.words)) });
+    }
+}
+
+// SAFETY: a block owns its memory as a `Box<[u64]>` would, and the collection that holds it is `Send` and `Sync`
+// on the same terms as before: its rows are written through the row pointers it gives, as they were.
+unsafe impl Send for RowBlock {}
+// SAFETY: as for `Send`.
+unsafe impl Sync for RowBlock {}
+
 /// Rows stored in DuckDB's row format (`TupleDataCollection`): the input to hash tables,
 /// aggregation and sorting.
 pub struct TupleDataCollection {
     layout: TupleDataLayout,
-    blocks: Vec<Box<[u64]>>,
+    blocks: Vec<RowBlock>,
     rows_in_last: usize,
     rows_per_block: usize,
     count: usize,
@@ -131,7 +167,7 @@ impl TupleDataCollection {
     /// The bytes of its blocks and of its strings (`SizeInBytes`), for memory accounting: the values of its LIST
     /// and ARRAY columns are not counted.
     pub fn size_in_bytes(&self) -> usize {
-        let blocks: usize = self.blocks.iter().map(|block| block.len() * 8).sum();
+        let blocks: usize = self.blocks.iter().map(|block| block.words * 8).sum();
         blocks + self.strings.allocated()
     }
 
@@ -139,15 +175,15 @@ impl TupleDataCollection {
     fn allocate_row(&mut self) -> RowPtr {
         if self.blocks.is_empty() || self.rows_in_last == self.rows_per_block {
             let words = (self.rows_per_block * self.layout.row_width()).div_ceil(8);
-            self.blocks.push(vec![0u64; words.max(1)].into_boxed_slice());
+            self.blocks.push(RowBlock::new(words.max(1)));
             self.rows_in_last = 0;
         }
         let block = self.blocks.last_mut().expect("just ensured");
         let offset = self.rows_in_last * self.layout.row_width();
         self.rows_in_last += 1;
         self.count += 1;
-        // SAFETY: offset + row_width fits within the block, which was sized for rows_per_block rows.
-        let ptr = unsafe { block.as_mut_ptr().cast::<u8>().add(offset) };
+        // offset + row_width fits within the block, which was sized for rows_per_block rows
+        let ptr = block.at(offset);
         RowPtr(NonNull::new(ptr).expect("block pointers are non-null"))
     }
 
@@ -188,10 +224,9 @@ impl TupleDataCollection {
             } else {
                 self.rows_per_block
             };
-            let base = block.as_ptr().cast::<u8>().cast_mut();
             for r in 0..rows {
-                // SAFETY: r < rows, so the offset lies within the block.
-                let ptr = unsafe { base.add(r * width) };
+                // r < rows, so the offset lies within the block
+                let ptr = block.at(r * width);
                 out.push(RowPtr(NonNull::new(ptr).expect("block pointers are non-null")));
             }
         }
