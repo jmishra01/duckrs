@@ -59,10 +59,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release -p sqllogictest
       - name: Run the corpus against pintail (fails only on regressions)
-        run: >
-          ./target/release/sqllogictest --duckdb-root duckdb --allow-failures --isolate --timeout 60
-          --known-passing tools/sqllogictest/known_passing.txt
-          --status-out STATUS.md
+        # The runner has 4 cores and 16 GiB. Some files of the corpus build very large intermediate
+        # results, and four at once ran the machine out of memory, which took the runner down with them
+        # ("received a shutdown signal"). Two at a time, each test process limited to 6 GiB of address
+        # space, so a file that needs more fails on its own. Memory and disk are logged every minute so
+        # that a run that still dies shows why.
+        run: |
+          ( while sleep 60; do echo "[monitor] $(free -m | awk '/^Mem:/ {print "mem used " $3 " MiB of " $2 ", available " $7}'); $(df -h . | awk 'NR==2 {print "disk used " $3 " of " $2}')"; done ) &
+          ulimit -v 6291456
+          ./target/release/sqllogictest -j 2 --duckdb-root duckdb --allow-failures --isolate --timeout 60 \
+            --known-passing tools/sqllogictest/known_passing.txt \
+            --status-out STATUS.md
+      - name: Memory and disk after a failure
+        if: failure()
+        run: |
+          free -m
+          df -h
+          sudo dmesg | grep -i -E 'killed process|out of memory' | tail -20 || true
       - name: Parse and transform the corpus (parse rate >= 99.9%, every transformed SELECT round trips)
         run: cargo run --release -q -p pintail-parser --example corpus -- duckdb --min-parse 99.9 --min-transform 99.99 --min-reject 88
       - uses: actions/upload-artifact@v4
